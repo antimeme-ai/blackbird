@@ -11717,3 +11717,75 @@ SchemaValue/ReplyCommand arguments and the stable reference returned by optional
 emplacement, without suppression. Retain the first hook log, run affected direct
 cases and diagnostics, then rerun the required source hook on the final staged
 result. No third behavioral review or additional assurance scope.
+
+
+## 2026-11-01 — portable resources for the embedded Oxcart runtime
+
+Own this unit on work/oxcart-portable-resources-2026-11-01 in one isolated
+worktree, from exact tested b14d5f13/tree6992e557 (Lua5.5.1), without modifying the
+active checkout, its dirty bead backups, artwork/research or any running runtime.
+Read current repository doctrine/gates, application/job/install code and write
+papers/2026-11-01-portable-runtime-resources.md before product edits. Root approved.
+
+Actual old relocated BBM2 startup fails io(2) when its privately compiled resource
+origin is renamed; explicit CLI workflow attempts a real PTY command but cannot
+launch the compiled helper after its private build origin is renamed. The first
+helper fixture used unavailable Lua os.getenv and is retained as fixture error;
+the corrected exact-owned-command old red, not that error, is the product case.
+
+One resolver now reads executable-owned bundle programs/assets/instrument and
+starts sibling job/archive helpers, with no developer fallback for a recognized
+bundle missing its files. Nonbundle development/install defaults and explicit
+sprite/workflow choices remain. Optional application.open.workflow forwards to
+the existing CLI parser/session behavior. Stored workflow paths are not migrated.
+No provider/authentication policy, dependency/Lua upgrade, installer activation,
+browser or input change.
+
+Direct current run with both private original origins absent passes actual BBM2
+ready/host negotiation/close, explicitly selected native application workflow with
+real PTY output and file effect, CLI override, and missing bundled-file refusal.
+Original old/new protocol streams and runtime state remain under the private
+blackbird-portable-2026-11-01/1e2b0a8d… research root. Source gate/commit and push
+are recorded after the mandatory hook, not claimed by these focused checks.
+
+Installed bd1.3.1 refuses even readonly backup status on this legacy0.58 Dolt
+workspace without explicit migration. Preserve .beads unchanged; do not migrate,
+reconfigure its server or overwrite the active dirty backups. Record this backup
+tool blocker rather than claiming that plain bd backup's help text made a backup.
+
+The new application workflow field additionally rejects embedded NUL before argv
+forwarding. A direct unchanged-process red accepted a valid workflow prefix plus
+NUL suffix as ready; the corrected fixture rejects it and wrong types. Final
+native process fixture passes all cases with a nonempty negotiated host catalog,
+original compiled origins absent, and real owned helper output/effect observed.
+`bd --readonly backup status --json` returned1 with an explicit legacy-Dolt
+migration refusal; original active backup bytes were copied privately, not
+modified or represented as a fresh database backup.
+
+The first mandatory source hook stopped after258/267 CTest cases: eight needed
+the pinned Microsoft tui-test executable installed in this new worktree. Restore
+it from the already-retained SHA-qualified archive, no network or new dependency.
+The ninth exposed an existing fixture ordering race: after destruction, a still
+concurrent nonblocking observer may legitimately return busy before reading the
+retired flag. Root reviewed/approved moving the final exact-retired assertion
+after stopping/joining the concurrent reader; owner.reset still occurs while
+that reader is active, all concurrent status assertions and error propagation
+remain. No Participants product logic changes. Preserve first failed gate log;
+rerun only failed checks, then the required hook, without bypass.
+
+All nine originally failed cases pass after the scoped prerequisite/fixture fixes
+(91.10s); the final mandatory source hook follows with source staged/unchanged.
+No check was disabled, deadline relaxed, baseline regenerated or hook bypassed.
+
+The next full hook passed267/267 CTest cases (316.06s) but native lint correctly
+rejected two easily-swappable adjacent path parameters in the new resolver API.
+Root approved a named RuntimePath aggregate with designated relative/development
+call-site fields; lookup behavior is unchanged, with no diagnostic suppression.
+Keep that267-pass/lint-fail log separate from the final corrected source gate.
+The operator briefly moved then restored ~/archives during disk cleanup. Verify
+the exact original staged tree86f91fb9/source and all logs before resuming;
+a Git-index/tar recovery snapshot was preserved but no second checkout created.
+
+Named-path source now passes its exact clang-tidy check and the same full
+model-free relocated process fixture with both private origins absent. The final
+mandatory commit-hook run records the complete current-source result separately.

@@ -1,4 +1,5 @@
 #include "blackbird/sprite.hpp"
+#include "blackbird/runtime_paths.hpp"
 #include <array>
 #include <cstdlib>
 #include <stdexcept>
@@ -104,10 +105,13 @@ std::string_view setting(const char *name) {
   const auto *value = std::getenv(name);
   return value ? std::string_view{value} : std::string_view{};
 }
-std::string_view image_path() {
+std::string image_path() {
   const auto override_path = setting("BLACKBIRD_SPRITE_ASSET");
-  return override_path.empty() ? std::string_view{BLACKBIRD_SPRITE_ASSET}
-                               : override_path;
+  return override_path.empty()
+             ? runtime_resource({.relative = "assets/sr71.png",
+                                 .development = BLACKBIRD_SPRITE_ASSET})
+                   .string()
+             : std::string{override_path};
 }
 std::string base64_path(std::string_view path) {
   constexpr std::string_view alphabet =

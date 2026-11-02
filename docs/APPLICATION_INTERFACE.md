@@ -13,8 +13,10 @@ The implementation and the exact BBM2 tags/word table are in
 emit text strings (tag 6), including object keys, instead of word-table tokens.
 Strings must be UTF-8. IDs are nonempty strings of at most 128 bytes selected by the host.
 
-The first packet is `open` with `id`, `session` (directory), optional `model` and
-`effort`. Ordinary Blackbird session settings, retained context, locking and recovery
+The first packet is `open` with `id`, `session` (directory), optional `model`,
+`effort` and `workflow` strings. The workflow selection follows the ordinary CLI
+`--workflow` validation and session persistence; omitting it preserves a saved
+selection or uses the executable-owned default for a new session. Ordinary Blackbird session settings, retained context, locking and recovery
 apply. Successful opening emits `ready` with the open ID, `protocol: 1`, `model`
 and `session`. Startup failure emits `error` and exits.
 

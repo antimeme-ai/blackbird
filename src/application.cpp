@@ -146,9 +146,12 @@ Value ApplicationConnection::open() {
   open_id_ = text(*packet, "id");
   if (open_id_.empty() || open_id_.size() > 128 || text(*packet, "session").empty())
     throw Error{ErrorCode::invalid_range};
-  for (const auto name : {"model", "effort"})
+  for (const auto name : {"model", "effort", "workflow"})
     if (packet->find(name))
       (void)text(*packet, name);
+  if (packet->find("workflow") &&
+      text(*packet, "workflow").find('\0') != std::string::npos)
+    throw Error{ErrorCode::invalid_range};
   if (const auto *offer = packet->find("host_tools")) {
     if (!std::holds_alternative<Value::Object>(offer->value()))
       throw Error{ErrorCode::invalid_range};

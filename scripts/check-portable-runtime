@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Model-free relocated native application and real PTY-helper process checks."""
+import argparse
+import importlib.util
+import os
+from pathlib import Path
+import select
+import shutil
+import struct
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('native_packet', ROOT/'scripts/native-packet.py')
+packet = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packet)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('executable', type=Path)
+parser.add_argument('--resources', type=Path, default=ROOT)
+parser.add_argument('--artifacts', type=Path)
+parser.add_argument('--case', choices=('all', 'default', 'cli-pty'), default='all')
+args = parser.parse_args()
+root = args.artifacts or Path(tempfile.mkdtemp(prefix='blackbird-portable-'))
+root.mkdir(parents=True, exist_ok=True)
+bundle = root/'Relocated Blackbird.app/Contents'
+macos = bundle/'MacOS'
+macos.mkdir(parents=True)
+for name in ('blackbird', 'blackbird-job-runner', 'blackbird-archive'):
+    shutil.copy2(args.executable.parent/name, macos/name)
+resources = bundle/'Resources/Blackbird'
+resources.mkdir(parents=True)
+for name in ('programs', 'assets'):
+    shutil.copytree(args.resources/name, resources/name)
+executable = macos/'blackbird'
+home = root/'home'
+home.mkdir()
+environment = dict(os.environ, HOME=str(home), BLACKBIRD_AUTH_HOME=str(home/'auth'),
+                   XDG_CONFIG_HOME=str(home/'config'), XDG_STATE_HOME=str(home/'state'))
+def workflow_for(effect):
+    value = str(effect)
+    level = ''
+    while ']' + level + ']' in value:
+        level += '='
+    literal = '[' + level + '[' + value + ']' + level + ']'
+    workflow = root/(effect.name+'-workflow.lua')
+    workflow.write_text("""local result = blackbird.call('exec', {
+  argv={'/bin/sh', '-c', 'printf PORTABLE_EFFECT > "$1"; printf PORTABLE_OUTPUT',
+        'owned', """ + literal + """}, pty=true, timeout_seconds=10})
+assert(result.exit_code == 0, 'real PTY helper did not finish successfully')
+assert(string.find(result.output or '', 'PORTABLE_OUTPUT', 1, true), 'PTY output absent')
+print('PORTABLE_PTY_VERIFIED')
+""")
+    return workflow
+
+
+def cli_pty(name, succeeds=True):
+    effect = root/(name+'-effect')
+    workflow = workflow_for(effect)
+    child_environment = dict(environment, PORTABLE_EFFECT=str(effect))
+    result = subprocess.run([str(executable), '--plain', '--session', str(root/name),
+                             '--workflow', str(workflow), '--once', 'offline owned command'],
+                            env=child_environment, cwd=root, capture_output=True, timeout=30)
+    (root/(name+'.stdout')).write_bytes(result.stdout)
+    (root/(name+'.stderr')).write_bytes(result.stderr)
+    if succeeds:
+        assert result.returncode == 0 and b'PORTABLE_PTY_VERIFIED' in result.stdout, result
+        assert effect.read_bytes() == b'PORTABLE_EFFECT'
+    else:
+        assert result.returncode != 0 and not effect.exists(), result
+
+
+def application(name, *, run_job=False, expect_ready=True, workflow_override=None):
+    effect = root/(name+'-effect')
+    workflow = workflow_for(effect)
+    child_environment = dict(environment, PORTABLE_EFFECT=str(effect))
+    with (root/(name+'.stderr')).open('wb') as errors, \
+         (root/(name+'.input-wire')).open('wb') as sent, \
+         (root/(name+'.output-wire')).open('wb') as received:
+        child = subprocess.Popen([str(executable), '--application'], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=errors, env=child_environment, cwd=root)
+        def send(value):
+            file = root/(name+'-packet.bbm')
+            packet.write_packet(file, value)
+            data = file.read_bytes()
+            wire = struct.pack('>I', len(data))+data
+            sent.write(wire)
+            child.stdin.write(wire)
+            child.stdin.flush()
+        def exact(length):
+            data = bytearray()
+            while len(data) < length:
+                assert select.select([child.stdout], [], [], 30)[0], 'native frame absent'
+                part = os.read(child.stdout.fileno(), length-len(data))
+                assert part, 'native frame ended early'
+                received.write(part)
+                data.extend(part)
+            return data
+        def read():
+            length = struct.unpack('>I', exact(4))[0]
+            assert 5 <= length <= 4*1024*1024, length
+            return packet.decode_packet(exact(length))
+        try:
+            opening = {'type':'open', 'id':'open', 'session':str(root/name),
+                       'host_tools':{'version':1, 'catalog':[{'name':'portable_source',
+                           'description':'Read this offline fixture source',
+                           'arguments':{'kind':'object', 'fields':[]},
+                           'result':{'kind':'object', 'fields':[]}}]}}
+            if run_job:
+                opening['workflow'] = str(workflow)
+            if workflow_override is not None:
+                opening['workflow'] = workflow_override
+            send(opening)
+            value = read()
+            if not expect_ready:
+                assert value['type'] == 'error', value
+                child.stdin.close()
+                assert child.wait(timeout=15) != 0
+                return
+            assert value['type'] == 'ready' and value['id'] == 'open', value
+            assert value['host_tools'] == {'version':1, 'names':['portable_source']}, value
+            if run_job:
+                send({'type':'turn', 'id':'job', 'objective':'offline owned PTY command'})
+                output = ''
+                while True:
+                    value = read()
+                    if value['type'] == 'text':
+                        output += value['text']
+                    if value['type'] == 'final':
+                        assert value['id'] == 'job' and value['outcome'] == 'completed', value
+                        output += value.get('text', '')
+                        break
+                    assert value['type'] != 'error', value
+                assert 'PORTABLE_PTY_VERIFIED' in output, output
+                assert effect.read_bytes() == b'PORTABLE_EFFECT'
+            send({'type':'close', 'id':'close'})
+            assert read() == {'type':'closed', 'id':'close'}
+            child.stdin.close()
+            assert child.wait(timeout=15) == 0
+        finally:
+            if child.poll() is None:
+                child.terminate()  # Only this exact owned test child; never a process-tree sweep.
+                child.wait(timeout=15)
+
+
+try:
+    if args.case == 'cli-pty':
+        cli_pty('cli-pty')
+    else:
+        application('default-open')
+        if args.case == 'all':
+            turn = resources/'programs/turn.lua'
+            retained_turn = turn.with_suffix('.lua-retained')
+            turn.rename(retained_turn)
+            try:
+                application('missing-bundle-workflow', expect_ready=False)
+            finally:
+                retained_turn.rename(turn)
+            # Earlier missing-bundle refusal stops old code before an application
+            # that ignores the new explicit workflow field could request a model.
+            application('invalid-workflow-type', expect_ready=False, workflow_override=42)
+            application('nul-workflow', expect_ready=False,
+                        workflow_override=str(workflow_for(root/'nul-effect'))+'\0suffix')
+            application('application-pty', run_job=True)
+            cli_pty('cli-override')
+            runner = macos/'blackbird-job-runner'
+            retained_runner = runner.with_suffix('.retained')
+            runner.rename(retained_runner)
+            try:
+                cli_pty('missing-bundle-helper', succeeds=False)
+            finally:
+                retained_runner.rename(runner)
+    print('Relocated native ready/host negotiation, owned PTY effect/output, explicit override and missing bundle refusals passed')
+    print(root)
+except BaseException:
+    print('Retained portable runtime fixture:', root, flush=True)
+    raise

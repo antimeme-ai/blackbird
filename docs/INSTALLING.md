@@ -79,3 +79,8 @@ Generation build trees are intentionally retained with the executables: the
 helper paths were compiled at those fixed paths. This is a host installation,
 rather than a relocatable binary distribution. macOS and Linux use their native
 atomic symlink-replacement flags; other platforms are refused.
+
+The runtime also resolves executable-owned programs/assets and helper siblings
+when deliberately packaged or moved. See [portable runtime resources](PORTABLE_RUNTIME.md)
+for the supported layouts, explicit overrides and saved-session limits. This does
+not change the source installer or activate a new generation.

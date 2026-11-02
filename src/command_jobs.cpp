@@ -4,6 +4,7 @@
 #include "blackbird/local_timing.hpp"
 #include "blackbird/process_lifetime.hpp"
 #include "blackbird/raw_retained.hpp"
+#include "blackbird/runtime_paths.hpp"
 #include "blackbird/tools.hpp"
 #include <algorithm>
 #include <array>
@@ -642,7 +643,10 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
           throw Error{ErrorCode::io, errno};
         pipe_fds(boot_read, boot_write);
         arguments.insert(arguments.begin(), slave);
-        arguments.insert(arguments.begin(), BLACKBIRD_JOB_RUNNER);
+        arguments.insert(arguments.begin(),
+                         runtime_helper({.relative = "blackbird-job-runner",
+                                         .development = BLACKBIRD_JOB_RUNNER})
+                             .string());
       } else {
         pipe_fds(input_read, input_write);
         pipe_fds(output_read, output_write);

@@ -350,12 +350,12 @@ void lifecycle() {
         "reader entered actual owner retirement schedule");
   const auto old_scope = ready(reader).incarnation;
   owner.reset();
-  require(reader.try_observe({}).status == ParticipantObservationStatus::retired,
-          "retained reader cannot pin or dereference destroyed participant owner");
   concurrent.request_stop();
   concurrent.join();
   if (failure)
     std::rethrow_exception(failure);
+  require(reader.try_observe({}).status == ParticipantObservationStatus::retired,
+          "retained reader cannot pin or dereference destroyed participant owner");
   Participants restored{
       running_saved,
       [](const OriginalCapture &) { return std::optional<SourceReference>{}; },

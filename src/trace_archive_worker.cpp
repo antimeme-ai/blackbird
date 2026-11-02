@@ -1,4 +1,5 @@
 #include "blackbird/foundation.hpp"
+#include "blackbird/runtime_paths.hpp"
 #include "blackbird/trace_archive.hpp"
 #include <cerrno>
 #include <csignal>
@@ -53,7 +54,10 @@ TraceArchiveWorker::start(const std::filesystem::path &session) {
           &actions, STDERR_FILENO, (session / "trace-archive.log").c_str(),
           O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
     pid_t process = -1;
-    std::string executable = BLACKBIRD_ARCHIVE_EXECUTABLE;
+    std::string executable =
+        runtime_helper({.relative = "blackbird-archive",
+                        .development = BLACKBIRD_ARCHIVE_EXECUTABLE})
+            .string();
     std::string operation = "watch", path = session.string();
     char *args[]{executable.data(), operation.data(), path.data(), nullptr};
     if (code == 0)

@@ -16,6 +16,7 @@
 #include "blackbird/raw_runtime.hpp"
 #include "blackbird/raw_storage.hpp"
 #include "blackbird/responses_provider.hpp"
+#include "blackbird/runtime_paths.hpp"
 #include "blackbird/sprite.hpp"
 #include "blackbird/station.hpp"
 #include "blackbird/terminal.hpp"
@@ -87,7 +88,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       throw Error{ErrorCode::invalid_range};
     std::filesystem::path session;
     const auto session_root = std::filesystem::path{home} / ".local/state/blackbird";
-    std::filesystem::path workflow = BLACKBIRD_WORKFLOW;
+    std::filesystem::path workflow = runtime_resource(
+        {.relative = "programs/turn.lua", .development = BLACKBIRD_WORKFLOW});
     std::string model = "gpt-6.1-sol", once, seed_path, backstop_path, station_path;
     Value backstop_mission;
     bool one = false, inspect = false, plain = false, rebuild_session = false,
@@ -1630,7 +1632,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       std::optional<InstrumentSource> instrument_source;
       try {
         const auto instrument_path =
-            std::filesystem::path{BLACKBIRD_WORKFLOW}.parent_path() /
+            runtime_resource(
+                {.relative = "programs/turn.lua", .development = BLACKBIRD_WORKFLOW})
+                .parent_path() /
             "instruments/results.lua";
         RawEventRef original;
         auto script = unwrap(tui::lua::Script::create(read_file(
@@ -1842,7 +1846,7 @@ int main(int argc, char **argv) {
       id = string_field(open, "id");
       std::vector<std::string> storage{argv[0], "--session",
                                        string_field(open, "session")};
-      for (const auto name : {"model", "effort"})
+      for (const auto name : {"model", "effort", "workflow"})
         if (const auto *value = open.find(name)) {
           storage.push_back("--" + std::string{name});
           storage.push_back(value->string());
