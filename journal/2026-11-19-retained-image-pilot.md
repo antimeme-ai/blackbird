@@ -33,3 +33,10 @@ config; original API bytes are retained before staging. Both ordinary auth and
 legacy OpenAI use this path; small request behavior is unchanged. The initial
 failed candidate remains alongside its successor. Source: curl's official manual
 https://curl.se/docs/manpage.html, config and data-binary sections.
+
+The sole whole-unit review is complete. Its one finding concerned Oxcart's
+screenshot archive wait; fixed with immediate source/Stop recheck and nonblocking
+intent. Root found no other issue and directed matched staging. The packaged
+complete-body successor passes actual local HTTPS requests exceeding17MB,
+full30 native tools, exact PNG bytes and retained-session replay. Live provider
+inference remains a separate root-owned acceptance after key availability.
