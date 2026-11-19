@@ -1,4 +1,5 @@
 #include "blackbird/coding.hpp"
+#include "blackbird/image_input.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
 #include "blackbird/packet.hpp"
@@ -2918,9 +2919,10 @@ void recover_coding_session(RetainedState &root, RecoveryMode mode,
                     check, 4,
                     [&] {
                       return name == "exec" || name == "process" ||
-                             name == "read_file" || name == "write_file" ||
-                             name == "edit_file" || name == "lua" ||
-                             name == "workflow_execute" || name == "workflow_invoke";
+                             name == "read_file" || name == "read_image" ||
+                             name == "write_file" || name == "edit_file" ||
+                             name == "lua" || name == "workflow_execute" ||
+                             name == "workflow_invoke";
                     },
                     4447);
                 if (!provider &&
@@ -4631,8 +4633,25 @@ Value CodingEngine::request(Value options) {
                         &owner, attempt_phase.reference(), nullptr,
                         &operation_context.receipt};
                     attempt_phase.stage(23);
+                    const auto outbound = materialize_provider_images(
+                        request, [this](const Value &source) {
+                          if (!std::holds_alternative<Value::Object>(source.value()) ||
+                              source.object().size() != 2)
+                            throw Error{ErrorCode::invalid_range};
+                          const auto journal =
+                              parse_id<AuditStreamId>(string_field(source, "journal"));
+                          const auto sequence =
+                              command_number(source, "sequence", UINT64_MAX);
+                          if (!sequence)
+                            throw Error{ErrorCode::invalid_range};
+                          const auto original =
+                              unwrap(log_.root().source({journal, sequence}));
+                          return std::string{
+                              reinterpret_cast<const char *>(original.data()),
+                              original.size()};
+                        });
                     result = provider_.respond(
-                        request,
+                        outbound,
                         [&](std::string_view raw) {
                           poll_commands();
                           capture.append(raw);
@@ -5582,7 +5601,8 @@ Value CodingEngine::call(std::string name, Value arguments) {
         }
         if (name == "lua")
           return runtime_->eval(string_field(arguments, "code"));
-        if (name == "read_file" && arguments.find("snapshot")) {
+        if ((name == "read_file" || name == "read_image") &&
+            arguments.find("snapshot")) {
           if (arguments.find("path"))
             throw Error{ErrorCode::invalid_range};
           const auto &snapshot = field(arguments, "snapshot");
@@ -5599,6 +5619,18 @@ Value CodingEngine::call(std::string name, Value arguments) {
           const auto raw = unwrap(log_.root().source({journal, sequence}));
           const std::string bytes{reinterpret_cast<const char *>(raw.data()),
                                   raw.size()};
+          if (name == "read_image") {
+            for (const auto &[key, value] : arguments.object()) {
+              (void)value;
+              if (key != "snapshot" && key != "detail")
+                throw Error{ErrorCode::invalid_range};
+            }
+            auto result = image_original_result(
+                bytes,
+                arguments.find("detail") ? string_field(arguments, "detail") : "auto");
+            result.object().emplace_back("image_original", snapshot);
+            return result;
+          }
           auto result = file_content_presentation(bytes, arguments);
           result.object().emplace_back("snapshot", snapshot);
           return result;
@@ -5625,6 +5657,15 @@ Value CodingEngine::call(std::string name, Value arguments) {
           return cancelled && cancelled();
         };
         auto result = tools.run(name, arguments, nullptr, nullptr, &file_effect);
+        if (name == "read_image") {
+          if (!file_snapshot)
+            throw Error{ErrorCode::conflict};
+          result.object().emplace_back(
+              "image_original",
+              Value::object(
+                  {{"journal", Value{hex_identity(file_snapshot->journal.bytes())}},
+                   {"sequence", Value{Number{file_snapshot->sequence}}}}));
+        }
         if (name == "read_file" && file_snapshot)
           result.object().emplace_back(
               "snapshot",

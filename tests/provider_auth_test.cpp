@@ -81,6 +81,23 @@ int main() {
     check(status.find("secret") == std::string::npos, "status secret leak");
     (void)auth.request("openai", "responses", Value::object({}), 10);
     check(requests == 1, "request absent");
+    { // Full image wire body exceeds the former arbitrary 16MiB request ceiling.
+      auto large_config = config;
+      std::string image(17 * 1024 * 1024, 'i');
+      bool sent = false;
+      large_config.http = [&](const ProviderHttpRequest &r,
+                              ProviderHttpResponseLease &response) {
+        check(r.body.size() > image.size(), "Full image request was truncated");
+        check(r.body.find(image) != std::string::npos, "Full image bytes absent");
+        sent = true;
+        return reply(response, 200, "{}");
+      };
+      ProviderAuth large{large_config};
+      (void)large.request("openai", "responses",
+                          Value::object({{"input", Value{image}}}), 10);
+      check(sent, "Large image body not sent");
+    }
+
     rejects([&] { auth.set_key("openai", "bad", "key\nInjected: yes"); },
             ErrorCode::invalid_range);
     rejects([&] { auth.set_key("openai", "../escape", "secret"); },

@@ -3,6 +3,7 @@
 #include "blackbird/json.hpp"
 #include "blackbird/provider_auth.hpp"
 #include "blackbird/raw_auth.hpp"
+#include "curl_body.hpp"
 #include "native_process.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <poll.h>
 #include <signal.h>
@@ -382,14 +384,15 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
     std::string encoded_body;
     std::optional<RawCapacityClaim> body_credit;
     if (request != nullptr) {
-      if (raw_enabled())
-        body_credit.emplace(own_value(raw_claim_data(
-            ValueLimits{}.bytes + raw_envelope_size + 24 + 3 * sizeof(std::size_t) +
-            sizeof("POST") - 1 + target_url.size())));
-      auto encoded = dump_json(export_provider_request(*request));
+      auto encoded = dump_json(export_provider_request(*request),
+                               {.bytes = std::numeric_limits<std::size_t>::max()});
       if (!encoded.has_value())
         throw encoded.error();
       encoded_body = std::move(encoded).value();
+      if (raw_enabled())
+        body_credit.emplace(own_value(raw_claim_data(
+            encoded_body.size() + raw_envelope_size + 24 + 3 * sizeof(std::size_t) +
+            sizeof("POST") - 1 + target_url.size())));
     }
     trace->body(request ? "POST" : "GET", target_url, encoded_body,
                 body_credit ? &*body_credit : nullptr);
@@ -409,8 +412,11 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
         fail(ErrorCode::invalid_range);
       input += "header = " + config_quote("session-id: " + *text) + "\n";
     }
+    detail::CurlBody body(request ? std::string_view{encoded_body}
+                                  : std::string_view{});
     if (request)
-      input += "data-binary = " + config_quote(encoded_body) + "\n";
+      input += body.staged() ? "data-binary = \"@/dev/fd/3\"\n"
+                             : "data-binary = " + config_quote(encoded_body) + "\n";
     Child child;
     child.deadline_error = {ErrorCode::provider_transport, 28};
     child.raw_capture(trace->reference());
@@ -421,7 +427,8 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
     // output.
     child.start({config.curl_executable, "--disable", "--silent", "--no-buffer",
                  "--max-time", std::to_string(config.timeout_seconds), "--write-out",
-                 "\n%{http_code}", "--config", "-"});
+                 "\n%{http_code}", "--config", "-"},
+                {}, false, body.descriptor());
     child.send(input, deadline);
     child.close_input();
     int curl_exit = 0;

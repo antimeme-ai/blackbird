@@ -63,6 +63,30 @@ std::string stream(const Value::Array &content, std::string reason = "tool_use")
   out += event(json(R"({"type":"message_stop"})"));
   return out;
 }
+void image_parts() {
+  auto input = request();
+  Value *input_items = nullptr;
+  for (auto &[key, value] : input.object())
+    if (key == "input")
+      input_items = &value;
+  check(input_items != nullptr);
+  auto &items = input_items->array();
+  items.push_back(json(
+      R"({"type":"function_call","call_id":"image","name":"read_image","arguments":{}})"));
+  items.push_back(json(
+      R"({"type":"function_call_output","call_id":"image","blackbird_output_parts":true,"output":[{"type":"input_text","text":"Original viewport"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"original"}]})"));
+  auto wire = export_anthropic_request(input);
+  const auto &result =
+      field(field(wire, "messages").array().back(), "content").array().front();
+  const auto &parts = field(result, "content").array();
+  check(parts.size() == 2);
+  check(string_field(parts[1], "type") == "image");
+  const auto &source = field(parts[1], "source");
+  check(string_field(source, "type") == "base64" &&
+        string_field(source, "media_type") == "image/png" &&
+        string_field(source, "data") == "iVBORw0KGgo=");
+  check(!parts[1].find("image_original"));
+}
 void roundtrip() {
   const auto original = blocks();
   auto response = unwrap(anthropic_completed_response(stream(original)));
@@ -305,6 +329,7 @@ int main(int argc, char **argv) {
       std::filesystem::remove_all(path);
       return 0;
     }
+    image_parts();
     roundtrip();
     malformed();
     deltas_and_preview();

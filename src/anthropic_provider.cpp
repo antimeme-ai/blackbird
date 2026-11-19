@@ -15,6 +15,40 @@ void put(Value &value, std::string_view name, Value next) {
     }
   value.object().emplace_back(name, std::move(next));
 }
+Value image_block(const Value &part) {
+  const auto &url = string_field(part, "image_url");
+  Value source;
+  if (url.starts_with("data:")) {
+    const auto split = url.find(";base64,");
+    if (split == std::string::npos)
+      throw Error{ErrorCode::invalid_range};
+    const auto media = url.substr(5, split - 5);
+    if (media != "image/png" && media != "image/jpeg" && media != "image/gif" &&
+        media != "image/webp")
+      throw Error{ErrorCode::unsupported};
+    source = Value::object({{"type", Value{"base64"}},
+                            {"media_type", Value{media}},
+                            {"data", Value{url.substr(split + 8)}}});
+  } else if (url.starts_with("https://") || url.starts_with("http://"))
+    source = Value::object({{"type", Value{"url"}}, {"url", Value{url}}});
+  else
+    throw Error{ErrorCode::unsupported};
+  return Value::object({{"type", Value{"image"}}, {"source", std::move(source)}});
+}
+Value explicit_content(const Value &content) {
+  Value::Array parts;
+  for (const auto &part : content.array()) {
+    const auto &kind = string_field(part, "type");
+    if (kind == "input_text")
+      parts.push_back(
+          Value::object({{"type", Value{"text"}}, {"text", field(part, "text")}}));
+    else if (kind == "input_image")
+      parts.push_back(image_block(part));
+    else
+      throw Error{ErrorCode::unsupported};
+  }
+  return Value{std::move(parts)};
+}
 std::uint64_t natural(const Value &value) {
   const auto *number = std::get_if<Number>(&value.value());
   if (!number)
@@ -396,15 +430,17 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
     } else if (type == "function_call_output") {
       if (pending.erase(string_field(item, "call_id")) != 1)
         throw Error{ErrorCode::conflict};
-      if (item.find("blackbird_output_parts"))
-        throw Error{ErrorCode::unsupported};
+      const auto *parts = item.find("blackbird_output_parts");
+      if (parts && *parts != Value{true})
+        throw Error{ErrorCode::invalid_range};
       const auto &output = field(item, "output");
-      auto result =
-          Value::object({{"type", Value{"tool_result"}},
-                         {"tool_use_id", field(item, "call_id")},
-                         {"content", std::holds_alternative<std::string>(output.value())
-                                         ? output
-                                         : Value{unwrap(dump_json(output))}}});
+      auto result = Value::object(
+          {{"type", Value{"tool_result"}},
+           {"tool_use_id", field(item, "call_id")},
+           {"content", parts ? explicit_content(output)
+                       : std::holds_alternative<std::string>(output.value())
+                           ? output
+                           : Value{unwrap(dump_json(output))}}});
       if (const auto *error = output.find("error"); error && *error != Value{})
         result.object().emplace_back("is_error", Value{true});
       append("user", std::move(result), {});
@@ -435,6 +471,12 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
       } else {
         for (const auto &part : content.array()) {
           const auto &kind = string_field(part, "type");
+          if (kind == "input_image") {
+            if (role == "assistant")
+              throw Error{ErrorCode::unsupported};
+            append("user", image_block(part), group);
+            continue;
+          }
           if (kind != "input_text" && kind != "output_text" && kind != "refusal")
             throw Error{ErrorCode::unsupported};
           append(

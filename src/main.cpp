@@ -1846,7 +1846,7 @@ int main(int argc, char **argv) {
       id = string_field(open, "id");
       std::vector<std::string> storage{argv[0], "--session",
                                        string_field(open, "session")};
-      for (const auto name : {"model", "effort", "workflow"})
+      for (const auto name : {"provider", "model", "effort", "workflow"})
         if (const auto *value = open.find(name)) {
           storage.push_back("--" + std::string{name});
           storage.push_back(value->string());

@@ -146,9 +146,13 @@ Value ApplicationConnection::open() {
   open_id_ = text(*packet, "id");
   if (open_id_.empty() || open_id_.size() > 128 || text(*packet, "session").empty())
     throw Error{ErrorCode::invalid_range};
-  for (const auto name : {"model", "effort", "workflow"})
+  for (const auto name : {"provider", "model", "effort", "workflow"})
     if (packet->find(name))
       (void)text(*packet, name);
+  if (packet->find("provider") &&
+      (text(*packet, "provider").empty() ||
+       text(*packet, "provider").find('\0') != std::string::npos))
+    throw Error{ErrorCode::invalid_range};
   if (packet->find("workflow") &&
       text(*packet, "workflow").find('\0') != std::string::npos)
     throw Error{ErrorCode::invalid_range};
@@ -384,6 +388,7 @@ int ApplicationConnection::run(CodingEngine &engine, AuditLog &log,
                               {"id", Value{open_id_}},
                               {"protocol", Value{Number{1}}},
                               {"model", Value{settings.model}},
+                              {"provider", Value{settings.provider}},
                               {"session", Value{session.string()}}});
   if (host_catalog_) {
     engine.host_tools(*host_catalog_, [&](const HostToolCall &call) {

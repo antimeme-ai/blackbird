@@ -122,7 +122,8 @@ public:
   }
 
   void start(std::vector<std::string> args,
-             const std::filesystem::path &codex_home = {}, bool merge_error = false) {
+             const std::filesystem::path &codex_home = {}, bool merge_error = false,
+             int private_input = -1) {
     try {
       if (raw_options)
         trace.emplace(raw_options->request, raw_options->stdout_bytes,
@@ -226,6 +227,13 @@ public:
                                                                     STDERR_FILENO)
                                : ::posix_spawn_file_actions_addopen(
                                      &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+            spawn_errno = errno;
+          }
+          if (rc == 0 && private_input >= 0) {
+            native_stage = 16;
+            rc = private_input < 10
+                     ? EINVAL
+                     : ::posix_spawn_file_actions_adddup2(&actions, private_input, 3);
             spawn_errno = errno;
           }
           if (rc == 0 && !cwd.empty()) {

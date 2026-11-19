@@ -28,13 +28,30 @@ for step = 1, 64 do
         end
       end
       local result = blackbird.call(item.name, args)
-      blackbird.append({
-        {
-          type = "function_call_output",
-          call_id = item.call_id,
-          output = result,
-        },
-      })
+      local output = {
+        type = "function_call_output",
+        call_id = item.call_id,
+        output = result,
+      }
+      if item.name == "read_image" and result.image_original ~= nil then
+        output.blackbird_output_parts = true
+        output.output = {
+          {
+            type = "input_text",
+            text = "Retained image original: "
+              .. result.mime_type
+              .. "; "
+              .. tostring(result.file_bytes)
+              .. " bytes.",
+          },
+          {
+            type = "input_image",
+            image_original = result.image_original,
+            detail = result.detail,
+          },
+        }
+      end
+      blackbird.append({output})
     elseif item.type == "custom_tool_call" then
       error("Default workflow cannot dispatch a custom tool call")
     elseif item.type == "message" then

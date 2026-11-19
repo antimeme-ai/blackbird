@@ -3,12 +3,14 @@
 #include "blackbird/packet.hpp"
 #include "blackbird/raw_auth.hpp"
 #include "blackbird/tools.hpp"
+#include "curl_body.hpp"
 #include "native_process.hpp"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
+#include <limits>
 #include <mutex>
 #include <sys/file.h>
 #include <sys/random.h>
@@ -460,7 +462,7 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
       phase->link(trace->reference());
     https_url(r.url);
     if (r.timeout_seconds < 1 || r.timeout_seconds > 3600 ||
-        r.body.size() > 16 * 1024 * 1024 || (r.method != "GET" && r.method != "POST"))
+        (r.method != "GET" && r.method != "POST"))
       throw Error{ErrorCode::invalid_range};
     if (!bound_trace && trace)
       trace->body(r.method, r.url,
@@ -499,8 +501,11 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
       secret(v);
       input += "header = " + quote(k + ": " + v) + "\n";
     }
+    detail::CurlBody body(r.method == "POST" ? std::string_view{r.body}
+                                             : std::string_view{});
     if (r.method == "POST")
-      input += "data-binary = " + quote(r.body) + "\n";
+      input += body.staged() ? "data-binary = \"@/dev/fd/3\"\n"
+                             : "data-binary = " + quote(r.body) + "\n";
     detail::Child child;
     child.cancelled = c.cancelled;
     child.deadline_error = {ErrorCode::provider_transport, 28};
@@ -511,7 +516,8 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
         application && raw_context ? raw_context->originals : nullptr;
     child.start({c.curl_executable, "--disable", "--silent", "--no-buffer", "--proto",
                  "=https", "--max-time", std::to_string(r.timeout_seconds),
-                 "--write-out", "\n%{http_code}", "--config", "-"});
+                 "--write-out", "\n%{http_code}", "--config", "-"},
+                {}, false, body.descriptor());
     const auto deadline =
         initial_deadline
             ? *initial_deadline
@@ -1525,12 +1531,19 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
     adapter.link(resolution);
     if (call.receipt && http_trace->reference().ordinal)
       call.receipt->request = http_trace->reference();
+    // Media originals stay out of native control frames. At this external JSON
+    // boundary, encode the whole request and reserve its actual raw byte extent.
+    // The service enforces its own image/request limits; never crop/truncate here.
+    std::string encoded =
+        method == "POST"
+            ? unwrap(
+                  dump_json(body, {.bytes = std::numeric_limits<std::size_t>::max()}))
+            : std::string{};
     std::optional<RawCapacityClaim> body_credit;
     if (raw_enabled())
-      body_credit.emplace(unwrap(raw_claim_data(
-          (method == "POST" ? ValueLimits{}.bytes : 0) + raw_envelope_size + 24 +
-          3 * sizeof(std::size_t) + target.size() + method.size())));
-    std::string encoded = method == "POST" ? unwrap(dump_json(body)) : std::string{};
+      body_credit.emplace(unwrap(raw_claim_data(encoded.size() + raw_envelope_size +
+                                                24 + 3 * sizeof(std::size_t) +
+                                                target.size() + method.size())));
     http_trace->body(method, target, encoded, body_credit ? &*body_credit : nullptr);
     body_credit.reset();
     ProviderHttpRequest r{target,

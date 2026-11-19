@@ -1,8 +1,10 @@
 #include "blackbird/tools.hpp"
+#include "blackbird/image_input.hpp"
 #include "blackbird/raw_file.hpp"
 #include "native_process.hpp"
 #include <charconv>
 #include <fstream>
+#include <limits>
 #include <sys/stat.h>
 
 namespace blackbird {
@@ -343,18 +345,36 @@ Value LocalTools::run(std::string_view name, const Value &args,
                       const RawAdapterContext *raw_context,
                       RawControlToken *native_return,
                       FileEffectObservation *file_effect) {
-  if (name == "read_file" || name == "write_file" || name == "edit_file") {
-    const auto method = name == "read_file"    ? RawFileMethod::read
+  if (name == "read_file" || name == "read_image" || name == "write_file" ||
+      name == "edit_file") {
+    const auto method = (name == "read_file" || name == "read_image")
+                            ? RawFileMethod::read
                         : name == "write_file" ? RawFileMethod::write
                                                : RawFileMethod::edit;
     RawFileToolTrace trace{raw_context, method};
     return trace.run([&] {
       captured_.clear();
-      if (name == "read_file") {
+      if (name == "read_file" || name == "read_image") {
         const auto *path_value = args.find("path");
         if (args.find("snapshot") || !path_value ||
             !std::holds_alternative<std::string>(path_value->value()))
           throw Error{ErrorCode::invalid_range};
+        if (name == "read_image") {
+          for (const auto &[key, value] : args.object()) {
+            (void)value;
+            if (key != "path" && key != "detail")
+              throw Error{ErrorCode::invalid_range};
+          }
+          const auto &path = string_field(args, "path");
+          trace.argument(0, path);
+          RawEventRef read_owner{};
+          auto raw = read_file(path, std::numeric_limits<std::size_t>::max(),
+                               trace.context(), &read_owner);
+          trace.selection(1, read_owner, raw.size());
+          capture("file.read", raw, &trace);
+          return image_original_result(
+              raw, args.find("detail") ? string_field(args, "detail") : "auto");
+        }
         (void)file_range(args);
         (void)range_index(args, "output_max_bytes", SIZE_MAX);
         const auto &path = string_field(args, "path");
@@ -882,6 +902,47 @@ Value tool_definitions() {
                   "until a successful workflow boundary."}},
            {"parameters", Value::object({{"type", Value{"object"}},
                                          {"properties", Value::object({})}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
+           {"name", Value{"read_image"}},
+           {"description",
+            Value{"Read a complete local PNG/JPEG/GIF/WebP as actual model image "
+                  "input. Originals are retained and replayed immutably; output is "
+                  "pixels, not a hex/text representation. Use the PNG path returned by "
+                  "oxcart_screenshot or a completed original image download. Choose "
+                  "exactly path or a prior retained snapshot; no cropping/truncation "
+                  "is performed."}},
+           {"parameters",
+            Value::object(
+                {{"type", Value{"object"}},
+                 {"properties",
+                  Value::object(
+                      {{"path", Value::object({{"type", Value{"string"}}})},
+                       {"snapshot",
+                        Value::object(
+                            {{"type", Value{"object"}},
+                             {"properties",
+                              Value::object(
+                                  {{"journal",
+                                    Value::object({{"type", Value{"string"}}})},
+                                   {"sequence",
+                                    Value::object({{"type", Value{"integer"}},
+                                                   {"minimum", Value{Number{1}}}})}})},
+                             {"required",
+                              Value{Value::Array{Value{"journal"}, Value{"sequence"}}}},
+                             {"additionalProperties", Value{false}}})},
+                       {"detail",
+                        Value::object(
+                            {{"type", Value{"string"}},
+                             {"enum", Value{Value::Array{Value{"auto"}, Value{"high"},
+                                                         Value{"low"},
+                                                         Value{"original"}}}}})}})},
+                 {"oneOf",
+                  Value{Value::Array{
+                      Value::object({{"required", Value{Value::Array{Value{"path"}}}}}),
+                      Value::object(
+                          {{"required", Value{Value::Array{Value{"snapshot"}}}}})}}},
+                 {"additionalProperties", Value{false}}})}}),
       Value::object(
           {{"type", Value{"function"}},
            {"name", Value{"read_file"}},
