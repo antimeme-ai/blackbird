@@ -6,7 +6,7 @@ namespace blackbird {
 // Stdout contains only length-prefixed BBM2 packets.
 class ApplicationConnection {
 public:
-  static constexpr std::size_t max_packet_bytes = 4 * 1024 * 1024;
+  static constexpr std::size_t max_packet_bytes = HostToolCatalog::max_catalog_bytes;
   struct Descriptors {
     int input = 0;
     int output = 1;

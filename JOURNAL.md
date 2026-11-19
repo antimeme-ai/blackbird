@@ -11789,3 +11789,32 @@ a Git-index/tar recovery snapshot was preserved but no second checkout created.
 Named-path source now passes its exact clang-tidy check and the same full
 model-free relocated process fixture with both private origins absent. The final
 mandatory commit-hook run records the complete current-source result separately.
+
+
+2026-11-19 — Oxcart full native host contract successor. The actual25-tool
+catalog failed the selected10c786f application open because child attributes
+used an invalid open object schema. The same executable opened a valid single
+state-tool offer; all original failures are retained outside this repository.
+The owning repair explicitly negotiates host-tools v2 with typed dynamic maps
+and owned native values, preserving v1 vocabulary/limits and strict closed
+arguments. V2 catalog metadata uses the existing4MiB application frame budget;
+native values preserve exact types and decoder bounds, UTF-8 and unique keys.
+No content/dataset cap, dropped tools, flattened maps or opaque packing.
+
+Qualified isolated Linux Clang/libc++23.1.4 and Lua5.5.1 build passes the focused
+application/host-tools/coding checks. Direct native validation accepts all25
+actual Oxcart schemas and376 original successful replies, including historical
+and current shapes. Real model-free --application open echoes all25 v2 names,
+then closes/reaps normally. Original packets/results and failed historical-field
+fixture retained under Neuromancer's external X-bookmark mission host-contract
+folder. No inference, provider credentials or browser input used. Sole review,
+source checks and matched relocated runtime pin are recorded at closeout.
+
+The complete qualified Linux native build and267/267 CTest source cases pass
+(386.69s CTest report; independently measured by observer04). Changed C++ format
+and diff checks pass. host_tools.cpp clang-tidy passes. Application and its host
+test inherit Padding diagnostics in CodingEngine/native_process under this Linux
+LLVM analyzer; exact untouched10c786f reproduces both classes (CodingEngine40
+padding bytes versus successor32; Child36 unchanged). Original diagnostic logs
+are retained. The tracked rigor launcher is explicitly macOSarm64-only; no Mac
+native hold was resumed, host profile weakened or diagnostic suppressed.

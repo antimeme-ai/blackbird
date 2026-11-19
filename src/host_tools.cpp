@@ -22,7 +22,8 @@ void name_text(std::string_view name, std::size_t limit) {
   if (name.empty() || name.size() > limit || !valid_utf8(name))
     throw Error{ErrorCode::invalid_range};
 }
-void schema(const Value &value, std::size_t depth, std::size_t &nodes) {
+void schema(const Value &value, std::size_t depth, std::size_t &nodes,
+            unsigned version) {
   if (depth > 16 || ++nodes > 256)
     throw Error{ErrorCode::capacity};
   const auto &kind = string_field(value, "kind");
@@ -39,17 +40,50 @@ void schema(const Value &value, std::size_t depth, std::size_t &nodes) {
       if (!names.insert(name).second ||
           !std::holds_alternative<bool>(field(entry, "required").value()))
         throw Error{ErrorCode::invalid_range};
-      schema(field(entry, "schema"), depth + 1, nodes);
+      schema(field(entry, "schema"), depth + 1, nodes, version);
     }
-  } else if (kind == "array") {
+  } else if (kind == "array" || (version == 2 && kind == "map")) {
     keys(value, {"kind", "element"});
-    schema(field(value, "element"), depth + 1, nodes);
+    schema(field(value, "element"), depth + 1, nodes, version);
   } else {
     keys(value, {"kind"});
     if (kind != "string" && kind != "integer" && kind != "number" &&
-        kind != "boolean" && kind != "null")
+        kind != "boolean" && kind != "null" && !(version == 2 && kind == "value"))
       throw Error{ErrorCode::unsupported};
   }
+}
+// Owned native values keep their exact numeric/container representation. These
+// are the same tree bounds as the native decoder, not a harvested-content limit.
+void native_value(const Value &value, std::size_t depth, std::size_t &nodes,
+                  std::size_t &bytes) {
+  const ValueLimits limits;
+  if (depth > limits.depth || ++nodes > limits.nodes)
+    throw Error{ErrorCode::capacity};
+  const auto text = [&](std::string_view value_text) {
+    if (!valid_utf8(value_text))
+      throw Error{ErrorCode::invalid_range};
+    if (value_text.size() > limits.bytes - bytes)
+      throw Error{ErrorCode::capacity};
+    bytes += value_text.size();
+  };
+  if (const auto *string = std::get_if<std::string>(&value.value()))
+    text(*string);
+  else if (const auto *array = std::get_if<Value::Array>(&value.value()))
+    for (const auto &entry : *array)
+      native_value(entry, depth + 1, nodes, bytes);
+  else if (const auto *object = std::get_if<Value::Object>(&value.value())) {
+    std::set<std::string_view> names;
+    for (const auto &[name, entry] : *object) {
+      text(name);
+      if (!names.insert(name).second)
+        throw Error{ErrorCode::invalid_range};
+      native_value(entry, depth + 1, nodes, bytes);
+    }
+  }
+}
+void native_value(const Value &value) {
+  std::size_t nodes = 0, bytes = 0;
+  native_value(value, 0, nodes, bytes);
 }
 struct SchemaValue {
   const Value &schema;
@@ -59,6 +93,17 @@ void validate(SchemaValue input) {
   const auto &schema = input.schema;
   const auto &value = input.value;
   const auto &kind = string_field(schema, "kind");
+  if (kind == "value")
+    return;
+  if (kind == "map") {
+    if (!std::holds_alternative<Value::Object>(value.value()))
+      throw Error{ErrorCode::invalid_range};
+    for (const auto &[name, entry] : value.object()) {
+      (void)name;
+      validate({.schema = field(schema, "element"), .value = entry});
+    }
+    return;
+  }
   if (kind == "object") {
     if (!std::holds_alternative<Value::Object>(value.value()))
       throw Error{ErrorCode::invalid_range};
@@ -110,6 +155,12 @@ void validate(SchemaValue input) {
 }
 Value provider_schema(const Value &schema) {
   const auto &kind = string_field(schema, "kind");
+  if (kind == "value")
+    return Value::object({});
+  if (kind == "map")
+    return Value::object(
+        {{"type", Value{"object"}},
+         {"additionalProperties", provider_schema(field(schema, "element"))}});
   auto result = Value::object({{"type", Value{kind}}});
   if (kind == "object") {
     Value::Object properties;
@@ -128,10 +179,14 @@ Value provider_schema(const Value &schema) {
   return result;
 }
 } // namespace
-HostToolCatalog::HostToolCatalog(Value catalog) : catalog_(std::move(catalog)) {
+HostToolCatalog::HostToolCatalog(Value catalog, unsigned version)
+    : catalog_(std::move(catalog)), version_(version) {
+  if (version != 1 && version != 2)
+    throw Error{ErrorCode::unsupported};
   if (!std::holds_alternative<Value::Array>(catalog_.value()))
     throw Error{ErrorCode::invalid_range};
-  if (catalog_.array().size() > 32 || unwrap(encode_packet(catalog_)).size() > 65536)
+  if (catalog_.array().size() > 32 || unwrap(encode_packet(catalog_)).size() >
+                                          (version == 1 ? 65536 : max_catalog_bytes))
     throw Error{ErrorCode::capacity};
   std::set<std::string> names;
   for (const auto &entry : catalog_.array()) {
@@ -146,8 +201,8 @@ HostToolCatalog::HostToolCatalog(Value catalog) : catalog_(std::move(catalog)) {
       throw Error{ErrorCode::invalid_range};
     name_text(string_field(entry, "description"), 4096);
     std::size_t nodes = 0;
-    schema(field(entry, "arguments"), 0, nodes);
-    schema(field(entry, "result"), 0, nodes);
+    schema(field(entry, "arguments"), 0, nodes, version);
+    schema(field(entry, "result"), 0, nodes, version);
     if (string_field(field(entry, "arguments"), "kind") != "object")
       throw Error{ErrorCode::invalid_range};
   }
@@ -179,6 +234,7 @@ void HostToolCatalog::validate_arguments(std::string_view name,
   const auto *definition = find(name);
   if (!definition)
     throw Error{ErrorCode::unsupported};
+  native_value(arguments);
   validate({.schema = field(*definition, "arguments"), .value = arguments});
 }
 void HostToolCatalog::validate_result(std::string_view name,
@@ -186,6 +242,7 @@ void HostToolCatalog::validate_result(std::string_view name,
   const auto *definition = find(name);
   if (!definition)
     throw Error{ErrorCode::unsupported};
+  native_value(result);
   validate({.schema = field(*definition, "result"), .value = result});
 }
 } // namespace blackbird

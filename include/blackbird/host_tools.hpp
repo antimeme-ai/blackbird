@@ -7,7 +7,9 @@ namespace blackbird {
 // Its schemas use owned kind/fields/element values, never a JSON IPC contract.
 class HostToolCatalog {
 public:
-  explicit HostToolCatalog(Value catalog);
+  static constexpr std::size_t max_catalog_bytes = 4 * 1024 * 1024;
+  explicit HostToolCatalog(Value catalog, unsigned version = 1);
+  unsigned version() const noexcept { return version_; }
   const Value &native() const noexcept { return catalog_; }
   const Value *find(std::string_view name) const;
   Value names() const;
@@ -18,6 +20,7 @@ public:
 
 private:
   Value catalog_;
+  unsigned version_;
 };
 struct HostToolCall {
   std::string_view name;

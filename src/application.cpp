@@ -160,9 +160,11 @@ Value ApplicationConnection::open() {
       if (key != "version" && key != "catalog")
         throw Error{ErrorCode::invalid_range};
     }
-    if (field(*offer, "version") != Value{Number{1}})
+    if (field(*offer, "version") != Value{Number{1}} &&
+        field(*offer, "version") != Value{Number{2}})
       throw Error{ErrorCode::unsupported};
-    host_catalog_.emplace(field(*offer, "catalog"));
+    host_catalog_.emplace(field(*offer, "catalog"),
+                          field(*offer, "version") == Value{Number{2}} ? 2U : 1U);
   }
   return *packet;
 }
@@ -387,9 +389,10 @@ int ApplicationConnection::run(CodingEngine &engine, AuditLog &log,
     engine.host_tools(*host_catalog_, [&](const HostToolCall &call) {
       return host_call(engine, call);
     });
-    ready.object().emplace_back("host_tools",
-                                Value::object({{"version", Value{Number{1}}},
-                                               {"names", host_catalog_->names()}}));
+    ready.object().emplace_back(
+        "host_tools",
+        Value::object({{"version", Value{Number{host_catalog_->version()}}},
+                       {"names", host_catalog_->names()}}));
   }
   send(ready);
   while (!closing_ && !eof_) {

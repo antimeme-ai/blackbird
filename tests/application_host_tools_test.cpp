@@ -1,6 +1,7 @@
 #include "blackbird/application.hpp"
 #include "blackbird/json.hpp"
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <poll.h>
 #include <sys/socket.h>
@@ -600,10 +601,104 @@ void invalid_open(Value offer) {
   (void)::close(descriptors[0]);
   (void)::close(descriptors[1]);
 }
+void native_catalog_v2() {
+  auto definition = field(catalog(), "catalog").array().front();
+  const auto map =
+      Value::object({{"kind", Value{"map"}}, {"element", scalar("string")}});
+  assign(definition, "result",
+         Value::object(
+             {{"kind", Value{"object"}},
+              {"fields",
+               Value{Value::Array{typed_field("attributes", map),
+                                  typed_field("observation", scalar("value"))}}}}));
+  const auto definitions = Value{Value::Array{definition}};
+  refused([&] { (void)HostToolCatalog{definitions}; }, "v1 rejects v2 vocabulary");
+  const HostToolCatalog tools{definitions, 2};
+  const auto result = Value::object(
+      {{"attributes", Value::object({{"aria-label", Value{"Read"}},
+                                     {"data-unanticipated", Value{"complete"}}})},
+       {"observation",
+        Value::object(
+            {{"nullable", Value{}},
+             {"exact", Value{Number{UINT64_MAX}}},
+             {"tree", Value{Value::Array{Value{true},
+                                         Value{Number{"1.0000000000000000001"}}}}}})}});
+  const auto original = unwrap(encode_packet(result));
+  tools.validate_result("oxcart_state", result);
+  check(unwrap(encode_packet(result)) == original,
+        "native value unchanged after validation");
+  auto bad = result;
+  assign(bad, "attributes", Value::object({{"number", Value{Number{3}}}}));
+  refused([&] { tools.validate_result("oxcart_state", bad); },
+          "typed map rejects non-string");
+  assign(bad, "attributes",
+         Value::object({{"same", Value{"a"}}, {"same", Value{"b"}}}));
+  refused([&] { tools.validate_result("oxcart_state", bad); },
+          "map duplicate key rejected");
+  assign(bad, "attributes", Value::object({{std::string(1, '\xff'), Value{"a"}}}));
+  refused([&] { tools.validate_result("oxcart_state", bad); },
+          "map invalid UTF8 rejected");
+  assign(bad, "observation", Value::object({{"same", Value{}}, {"same", Value{}}}));
+  assign(bad, "attributes", Value::object({}));
+  refused([&] { tools.validate_result("oxcart_state", bad); },
+          "native tree duplicate key rejected");
+  Value deep;
+  for (std::size_t i = 0; i < ValueLimits{}.depth + 1; ++i)
+    deep = Value{Value::Array{std::move(deep)}};
+  assign(bad, "observation", deep);
+  refused([&] { tools.validate_result("oxcart_state", bad); },
+          "native decoder depth bound retained");
+  refused(
+      [&] {
+        tools.validate_arguments(
+            "oxcart_state",
+            Value::object({{"document", Value{"doc-7"}}, {"extra", Value{}}}));
+      },
+      "v2 arguments remain closed");
+  const auto argument_schema = Value::object(
+      {{"kind", Value{"object"}},
+       {"fields", Value{Value::Array{typed_field("attributes", map),
+                                     typed_field("observation", scalar("value"))}}}});
+  assign(definition, "arguments", argument_schema);
+  const HostToolCatalog provider_tools{Value{Value::Array{definition}}, 2};
+  // Retain the provider tree before taking references to its children.
+  const auto provider = provider_tools.provider_tools();
+  const auto &properties =
+      field(field(provider.array().front(), "parameters"), "properties");
+  check(field(field(properties, "attributes"), "additionalProperties") ==
+                Value::object({{"type", Value{"string"}}}) &&
+            field(properties, "observation") == Value::object({}),
+        "provider boundary typed maps/native values");
+  Value::Array large;
+  for (unsigned i = 0; i < 25; ++i) {
+    auto entry = field(catalog(), "catalog").array().front();
+    assign(entry, "name", Value{"operation_" + std::to_string(i)});
+    assign(entry, "description", Value{std::string(3000, 'x')});
+    large.push_back(std::move(entry));
+  }
+  const Value large_catalog{std::move(large)};
+  refused([&] { (void)HostToolCatalog{large_catalog}; },
+          "legacy catalog byte bound preserved");
+  check(HostToolCatalog{large_catalog, 2}.names().array().size() == 25,
+        "v2 complete catalog uses application frame budget");
+  int descriptors[2]{};
+  check(::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors) == 0, "v2 socketpair");
+  auto opening = packet("open", "open");
+  opening.object().emplace_back("session", Value{"unused"});
+  opening.object().emplace_back(
+      "host_tools",
+      Value::object({{"version", Value{Number{2}}}, {"catalog", definitions}}));
+  send(descriptors[1], opening);
+  ApplicationConnection app{{.input = descriptors[0], .output = descriptors[0]}};
+  check(field(field(app.open(), "host_tools"), "version") == Value{Number{2}},
+        "actual application open accepts v2 native catalog");
+  (void)::close(descriptors[0]);
+  (void)::close(descriptors[1]);
+}
 void installation(const std::filesystem::path &directory) {
   invalid_open(Value{false});
   auto unsupported = catalog();
-  assign(unsupported, "version", Value{Number{2}});
+  assign(unsupported, "version", Value{Number{3}});
   invalid_open(unsupported);
   std::filesystem::create_directory(directory);
   std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
@@ -689,6 +784,29 @@ int main(int argc, char **argv) {
   if (!path)
     return 2;
   try {
+    if (argc == 3 && std::string_view{argv[1]} == "--native-fixture") {
+      std::ifstream input(argv[2], std::ios::binary);
+      const std::vector<char> bytes{std::istreambuf_iterator<char>{input}, {}};
+      check(bool(input) || input.eof(), "Cannot read native fixture");
+      const auto fixture = unwrap(decode_packet(std::as_bytes(std::span{bytes})));
+      const HostToolCatalog tools{field(fixture, "catalog"), 2};
+      std::size_t count = 0;
+      for (const auto &sample : field(fixture, "samples").array()) {
+        try {
+          tools.validate_result(string_field(sample, "tool"), field(sample, "result"));
+        } catch (const Error &) {
+          std::cerr << string_field(sample, "source") << ": "
+                    << string_field(sample, "tool") << '\n';
+          throw;
+        }
+        ++count;
+      }
+      std::cout << "Validated " << tools.names().array().size()
+                << " complete native tool schemas and " << count
+                << " original actual success replies\n";
+      std::filesystem::remove_all(path);
+      return 0;
+    }
     if (argc == 2) {
       if (std::string_view{argv[1]} == "integer")
         exact_integers();
@@ -701,6 +819,7 @@ int main(int argc, char **argv) {
     }
     installation(std::filesystem::path{path} / "installation");
     catalog_checks();
+    native_catalog_v2();
     exact_integers();
     oversized_call(std::filesystem::path{path} / "oversize");
     received_before_bad_frame(std::filesystem::path{path} / "received");

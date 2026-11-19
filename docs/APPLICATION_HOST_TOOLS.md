@@ -1,4 +1,4 @@
-# Native application host tools, version 1
+# Native application host tools, versions 1 and 2
 
 2026-10-23. Version-1 extension accepted by the Oxcart colleague. This is the
 Blackbird-side implementation contract; Oxcart must implement and opt into it
@@ -12,10 +12,13 @@ entry has `name`, `description`, `arguments` and `result`. Names use provider
 function-name characters (ASCII letters/digits/underscore/hyphen), at most 64
 bytes, and cannot collide with native or effective/pending Lua tools. Catalogs
 are connection-local and immutable until close; restored tool descriptions never
-restore a host callback. At most 32 tools and 64 KiB of encoded catalog are
-accepted. These are control metadata limits, not reading/capture limits.
+restore a host callback. At most32 tools are accepted. Version1 retains its64KiB
+encoded catalog budget. Version2 uses the existing4MiB application frame budget;
+the enclosing open packet must also fit that frame. These are control metadata
+limits, not reading/capture limits.
 
-Successful `ready` echoes `host_tools: {version: 1, names: [...]}`. Unsupported
+Version2 is explicitly offered with `version: 2`; version1 remains supported.
+Successful `ready` echoes the offered version and complete tool names. Unsupported
 versions, malformed catalogs and collisions fail opening before any turn. Hosts
 must check this echo before advertising a connected operation. Omitting the
 extension emits no new host-tool events.
@@ -27,6 +30,21 @@ schema). Empty objects use `fields: []`. Nested schemas have at most 16 levels
 and 256 nodes per tool. Unknown schema fields/kinds, duplicate names and invalid
 UTF-8 reject. Arguments must be objects. Provider JSON schemas are produced only
 when assembling the provider tool catalog; IPC and retention use BBM2.
+
+Version2 adds `{kind: "map", element: ...}` for objects whose literal string
+keys are observed dynamically. Every value must match `element`; key names and
+values are preserved. For example, HTML attributes use a map of strings.
+`{kind: "value"}` accepts the owned native null/bool/Number/text/array/object
+algebra, retaining exact numeric variants and complete rich observations. It is
+not an opaque serialized payload. All argument/result trees retain the native
+decoder's existing UTF-8, unique-key, byte, node and depth bounds; no result data
+is projected or coerced. Closed object schemas remain closed, including the
+mandatory outer argument object. Version1 rejects the new kinds.
+
+At the provider JSON-schema boundary, a map becomes an object whose
+`additionalProperties` is its element schema; native value becomes the empty
+schema. Native transport and retention continue to carry the original BBM2
+value. No JSON encode/parse round trip occurs inside the application contract.
 
 Example implemented Oxcart operation (illustrative, host must supply its actual
 catalog): `oxcart_state`, arguments `{kind: "object", fields: []}`, result
