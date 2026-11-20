@@ -66,6 +66,29 @@ void exports() {
       value.array()[1].object().emplace_back("encrypted_content", Value{"opaque"});
   rejects([&] { (void)export_registered_responses_request(changed, true); },
           ErrorCode::unsupported);
+  auto reasoning = changed;
+  for (auto &[key, value] : reasoning.object()) {
+    if (key != "input")
+      continue;
+    auto &items = value.array();
+    const auto opaque_only = items[1];
+    items[1].object().emplace_back(
+        "content", unwrap(parse_json(
+                       R"([{"type":"reasoning_text","text":"keep this"}])")));
+    items.insert(items.begin() + 2, opaque_only);
+  }
+  wire = export_registered_responses_request(reasoning, true,
+                                             "https://api.deepseek.com");
+  const auto &deepseek_input = field(wire, "input").array();
+  check(deepseek_input.size() == 4);
+  check(!deepseek_input[1].find("summary"));
+  check(!deepseek_input[1].find("encrypted_content"));
+  check(field(deepseek_input[1], "content") ==
+        field(field(reasoning, "input").array()[1], "content"));
+  check(string_field(deepseek_input[2], "call_id") == "c1");
+  check(string_field(deepseek_input[3], "call_id") == "c1");
+  check(string_field(field(reasoning, "input").array()[1],
+                     "encrypted_content") == "opaque");
   changed = request();
   for (auto &[key, value] : changed.object())
     if (key == "store")

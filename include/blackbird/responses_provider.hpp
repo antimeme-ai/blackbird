@@ -27,7 +27,8 @@ private:
   Value binding_;
   bool group_ = false, responding_ = false;
 };
-Value export_registered_responses_request(Value request, bool portable);
+Value export_registered_responses_request(Value request, bool portable,
+                                          std::string_view base_url = {});
 Result<Value>
 registered_responses_completed_response(std::string_view stream,
                                         const RawAdapterContext *context = nullptr);

@@ -1,6 +1,7 @@
 #include "blackbird/responses_provider.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/raw_auth.hpp"
+#include <algorithm>
 #include <chrono>
 #include <set>
 namespace blackbird {
@@ -14,13 +15,15 @@ void replace(Value &value, std::string_view name, Value next) {
   value.object().emplace_back(name, std::move(next));
 }
 } // namespace
-Value export_registered_responses_request(Value request, bool portable) {
+Value export_registered_responses_request(Value request, bool portable,
+                                          std::string_view base_url) {
   if (field(request, "store") != Value{false} ||
       field(request, "stream") != Value{true} ||
       (request.find("previous_response_id") &&
        field(request, "previous_response_id") != Value{}))
     throw Error{ErrorCode::unsupported};
   if (portable) {
+    const bool deepseek = base_url == "https://api.deepseek.com";
     if (const auto *reasoning = request.find("reasoning")) {
       const auto *effort = reasoning->find("effort");
       if (effort && *effort != Value{"low"} && *effort != Value{"high"} &&
@@ -39,14 +42,34 @@ Value export_registered_responses_request(Value request, bool portable) {
         for (auto &tool : input.array())
           if (string_field(tool, "type") == "function" && !tool.find("strict"))
             replace(tool, "strict", Value{false});
-      if (key == "input")
-        for (auto &item : input.array()) {
+      if (key == "input") {
+        auto &items = input.array();
+        const auto deepseek_reasoning = [deepseek](const Value &item) {
+          const auto *type = item.find("type");
+          return deepseek && type && *type == Value{"reasoning"};
+        };
+        // DeepSeek replays plaintext reasoning and returns an opaque field
+        // that its Responses input does not support. Keep the raw response.
+        std::erase_if(items, [&](const Value &item) {
+          if (!deepseek_reasoning(item))
+            return false;
+          const auto *content = item.find("content");
+          return !content || *content == Value{} || content->array().empty();
+        });
+        for (auto &item : items) {
+          if (deepseek_reasoning(item)) {
+            std::erase_if(item.object(), [](const auto &field) {
+              return field.first == "summary" ||
+                     field.first == "encrypted_content";
+            });
+          }
           if (const auto *encrypted = item.find("encrypted_content");
               encrypted && *encrypted != Value{} && *encrypted != Value{""})
             throw Error{ErrorCode::unsupported};
           if (const auto *role = item.find("role"); role && *role == Value{"developer"})
             replace(item, "role", Value{"system"});
         }
+      }
     }
   }
   return export_provider_request(std::move(request));
@@ -145,7 +168,8 @@ Value RegisteredResponsesCodingProvider::respond(
     config.cancelled = cancelled;
     ProviderAuth auth{std::move(config)};
     const auto wire = export_registered_responses_request(
-        request, string_field(binding_, "protocol") == "responses-portable");
+        request, string_field(binding_, "protocol") == "responses-portable",
+        string_field(binding_, "base_url"));
     const auto response =
         auth.request(config_.provider, "responses", wire, config_.timeout_seconds,
                      capture, &binding_, owner, context);
