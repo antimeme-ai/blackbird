@@ -11959,3 +11959,24 @@ and source-reading activity independently observed. Cron has no async completion
 notifications; scheduled reads remain required. No unknown queued effects replay,
 sibling merge, primary-user-file edits, issue-store writes, install or activation.
 Publish checked text-only coordination update under own matching claim.
+
+## 2026-11-20 — restore Ultramarine startup on macOS
+
+The report for PID 30031 faults in `lua_tointegerx` from the Lua TUI composition
+worker. The active generation `generation-6QI9PQx9` was linked against Lua 5.4.8
+through Homebrew's unversioned `opt/lua` path. That path now resolves to Lua
+5.5.1. The qualified 5.4.8 library was still present in the local Cellar.
+
+Copied Lua 5.4.8 into the active generation and rebound its two affected
+executables, `blackbird` and `arco`, to the generation-local library. Verified the
+ad hoc signatures and ran the tiny-terminal PTY check on the staged executable
+before replacing the binaries. The originals are in the generation's
+`pre-lua-repair/` directory. This repair is specific to the installed generation.
+Future installs still need a way to preserve the qualified runtime independently
+of Homebrew's active Lua version.
+
+The managed launcher opened two temporary `paper/ultramarine-1-flash` sessions
+from the operator's working directory. At medium effort it displayed the
+expected effort question and exited cleanly. At high effort it executed a local
+Lua command, rendered its result and exited cleanly. No inference was submitted
+and the saved conversations were left intact.
