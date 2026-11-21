@@ -13073,3 +13073,155 @@ from the operator's working directory. At medium effort it displayed the
 expected effort question and exited cleanly. At high effort it executed a local
 Lua command, rendered its result and exited cleanly. No inference was submitted
 and the saved conversations were left intact.
+
+## 2026-10-27 — chat usability study and private actual-use diagnosis
+
+Own the first research-only unit of **blackbird chat usability, polish, and
+stop-embarassing-ourselves** on work/autodev-chat-study-2026-10-27 from b7c082e.
+Write ROOT/chat-study-01/STATUS.md subplan and two-layer allowance before research.
+Read governing brief/campaign/oversight, prior interaction/TUI doctrine and research,
+primary corpus assessments and deferred findings. Preserve composition's original
+failed309/310 gate and fd12 semantic-audit full-sync progress frontier; no sibling
+edit/merge/hook retry or speculative storage repair.
+
+Trace actual submission/queue/worker/turn/provider/tool/child owners and focus paths.
+Read installed launcher/cache, exact executable bytes and live process4954 read-only.
+Pin managed generation-6QI9PQx9 for two new isolated-auth physical-PTY observations;
+no provider requests or operator-session interaction in those reproductions. Bare ESC
+leaves pure-Lua work active; Ctrl-C interrupts and keeps draft. Equal queued submits
+execute separately. Command folding and Ctrl-O originals already work in the observed
+case; lower process blocks/long quoted headers still overwhelm hierarchy. Raw child
+ledger proves Ctrl-X/ESC/Ctrl-C reach private PTY input. Narrow inspection hides detail;
+ordinary reopen keeps draft. Retain raw streams, input logs and real decoded screens.
+
+Reuse four exact original reference archives; seven studied source files match ZIP
+members. No acquired agent code executed, dependency adopted, Git metadata restored,
+product/test/config edit, build, test suite, lint/source hook, AFL or issue-store work.
+Read primary instrumental-interaction/direct-manipulation extracts and challenge the
+existing theory against actual task failures rather than infer usability from tests.
+
+Initial combined JOURNAL read was truncated. A research-only full-journal reader first
+received piped --plain input incorrectly as separate lines; terminate only that owned
+native process after discovering the error, retaining its unknown last remote request.
+Then explicitly issue a distinct --once full-journal reading action, openai/gpt-6.1-sol,
+medium: native872934-byte request,177562 input tokens, exit0, returned full-extent digest.
+Retain its contribution in the paper; no claim the failed ingestion read the full file.
+
+Study candidate in papers/chat-usability-2026-10-27 covers identity/provenance, reference
+synthesis, actual use, owners/control/failure map, systematic walkthrough, priorities,
+open decisions and later task/semantic/physical/readable-screen obligations. It supplies
+later holistic design, not an approved layout/plan, implementation or usability repair.
+One fresh-context consequential review and ONE findings recheck/fixes follow. Text-only
+checks and per-command hook override apply; source qualification remains untouched.
+
+The ONE fresh-context review completes normally with six consequential findings.
+Retain its original report. Remediate: avoid unsupported duplicate-external-effect
+promise; separate studied source from unknown installed-source causation and lone-ESC
+qualification; add whole delegated-return/direction, governing-change and context-repair
+episodes/obligations; withdraw unobserved normal child-exit claim; qualify no-inference
+as dispatch-source/fixture inference rather than network/attempt census; distinguish
+submitted error text from actual runtime-cause availability. Historical notes saying
+no provider calls in the two PTY cases described fixture intent/source path, not an
+independent absence measurement; isolated auth selection does not exclude every
+fallback path. Add exact capture hashes and concrete reference restore commands.
+No new reproduction, product source change or assurance family for these text fixes.
+One focused findings recheck follows; no third layer or review of the review.
+
+The ONE focused findings recheck returns exit0: five findings resolved; one categorical
+inventory sentence still overgeneralized no-inference beyond the private fixtures.
+Apply its exact fixture-specific source-path wording, keeping independent attempt/
+network-census and fallback-auth limitations. This is the layer-two fix, not a passed
+third review. Retain original review/recheck answers and explicit requested versus
+unextracted actual-model distinction. All findings dispositioned; no further assurance
+layer or runtime experiment. Final documentation/JSON/local-link/capture-hash and
+changed-path checks, then normal work-branch publication with exact remote readback.
+Holistic design/pressure-tested plan remains orchestrator's next commission, not code.
+
+The final staged whitespace check flags Markdown hard-break trailing spaces copied
+from the recheck answer. The shell did not stop on that nonzero and created local
+d8298fd anyway; do not report that staged check as passed. Normalize only those
+trailing spaces in the tracked rendering, retaining exact original recheck.log
+unchanged and stating the rendering distinction. Run the corrected text check with
+fail-fast shell before the final publication checkpoint. No source-hook bypass is
+being used for product changes; only JOURNAL/papers are in this branch delta.
+
+## 2026-10-27 — holistic chat design, before delivery planning
+
+Own documentation-only chat-design-01 on work/autodev-chat-design-2026-10-27
+from exact accepted study d8dc2af. Read workspace/checkout instructions, primary
+current oversight/campaign/brief, entire accepted study including manifests,
+references, original review/final recheck and full-history reading contribution;
+relevant recent and original chat-first/composer/fold journal ranges. Read full
+interaction theory/TUI doctrine/components/views/plan and testing/performance,
+instrumentation, command/definition/reopen contracts. Read selected actual native
+input, queue, launch, turn/context/program activation, result and participant
+source ranges. Omitted tool output recovered where necessary; no claim to have
+personally reread every historical journal line. Read Rhizome rigor proposal's
+ownership/oracle cautions read-only; no foreign scope/language decision imported.
+
+RUN/STATUS declares concrete task/resource allowance: one consequential design
+review/fix, then derive plan, then one FINAL design-findings recheck plus plan
+review/fixes. No arbitrary mission timer and no third layer. Accepted study's
+allowance stays closed. No source/test/config edits, builds/source gates,
+experiments, runtime change or sibling mutation.
+
+Select chat-first receipts/current-work strip/call-linked evidence, stop-first
+ESC in harness modes with Ctrl-G local Back and Ctrl-B PTY return, held queue
+on stop, honest requested-versus-observed endpoints, compact typed cards and
+anchored reader/original inspection. These are proposed owner changes, not
+implemented UI. Write labeled storyboards plus lifecycle/failure/continuity,
+delegated-return, instrument-authoring and context-repair contracts. Missing
+provider/remote/generic flood/reading/accessibility/operator evidence remains
+later obligations, not passes. Do not change storage policy or reopen composition
+full-sync/gate diagnosis. Next is the ONE fresh-context design pressure test;
+delivery plan will be derived only after fixes.
+
+First design review completed under pinned native generation with explicit
+openai/gpt-6.1-sol/medium, single --once objective and private review session.
+No tools/implementation permitted. Original request/answer retained in run;
+tracked answer/provenance/disposition added. Six consequential valid findings
+(three blockers) fixed before plan derivation: decoded stop admission serializes
+queue launch; unambiguous Apply/Release queue table; native definition editors
+queue independent guarded engine workflows rather than borrowing an active
+transaction; authored-output bounds; finite reader pins/return stack; coherent
+emitted-scene pointer target capture/refusal. Unknown physical paint and later
+source/actual-use qualification remain limits. No extra review or source gate.
+Meaningful context selection removed completed large read groups with original
+recovery retained and an explicit source/limit continuation summary; no objective
+or live tool group removed. Next derive plan, then one FINAL layer only.
+
+After remediation checkpoint dafb417, derive delivery PLAN as whole episodes:
+T1 intention/correction/stop, T2 typed result/cause/original and authored flood,
+T3 reading/anchors/backpressure/layout, T4 delegated return/direction, T5
+independent definition transaction/context repair/reopen, T6 actual expert-task
+qualification and separate activation decision. Each has source owners/files,
+proposed contracts, old-behavior RED obligations (not claimed observed failures),
+semantic/physical/readable-screen oracles, task criteria and uncertainty recovery.
+T4 can proceed without T3/T5; useful earlier work does not wait for remote/provider
+or assistive-tech gaps. No parked sibling/continuity dependency. Matched per-tranche
+Release performance deltas retain all attempts and raw endpoints; inactive helper
+status explicit, later qualified observer/fresh baseline needed rather than claiming
+nonexistent installed tooling. Source debug/lint/direct/Linux gates belong only to
+later commissioned units through shared build slot. No source checks run here.
+Next: ONE final focused design-findings recheck + consequential plan review/fixes;
+no authority to commission third review after that.
+
+SECOND/FINAL native review completed (single --once, explicit provider/model/
+effort, private final-session). Original answer and request hash/provenance
+retained. It resolved the six original findings on supplied prose, identified
+T1/T5 shared stop-fence scheduling gap and missing fault-specific provider
+wait/retry/partial-stream stop oracles. Both valid and fixed within final layer:
+shared native dispatch fence holds accepted queued definition ops, exact-ID
+release separate from chat, ordinary failure vs Stop and both winning orders;
+provider stop/retry ordering plus safe response-wait/retry-wait/partial-stream
+fixtures, retained attempts/originals and honest remote unknown. Directly read
+existing coding retry loop4485ff/4662ff and registered response cancellation
+125ff to ground exact owners, not to claim qualification. No source changes.
+
+Review allowance now CLOSED; no third review or certifying recheck. Final
+original BLOCKED-pending-two-document-fixes wording preserved, not changed to
+reviewer approval. Owner fixed specified document blockers; COMPLETE documentation
+handoff subject to orchestrator acceptance, with product design inactive until
+commissioned implementation. Native reviewer processes settled, exit0 only
+process/result fact, not quality certification. Final text checks/publication
+next; no implementation after publication.
