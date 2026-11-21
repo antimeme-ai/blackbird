@@ -577,12 +577,17 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     auto &interrupt_wake = interrupt_owner.wake();
     RawWaitScope interrupt_wait{{{interrupt_wake.read_fd(), -1}, {}}};
     std::atomic_bool cancelled{false};
+    engine.turn_dispatch = std::make_shared<TurnDispatch>();
     engine.cancelled = [&] {
       return interrupted.load(std::memory_order_relaxed) || cancelled.load();
     };
     TerminalUI ui{"Blackbird · " + model + " · " + effort +
                   (settings.effort_pending ? " (choose effort)" : "") + " · " +
                   session.string()};
+    engine.next_turns = ui.next_turns();
+    ui.launching_intention = [&](std::string_view id) {
+      engine.current_intention = id;
+    };
     struct ParticipantShutdown {
       CodingEngine &engine;
       ~ParticipantShutdown() {
@@ -1207,6 +1212,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               emit(unwrap(dump_json(result)) + "\n");
             } else if (prompt.starts_with("/lua ")) {
               raw_main_branch(dispatch, 39);
+              if (!engine.current_intention.empty())
+                engine.next_turns->route(engine.current_intention, "local Lua program");
               engine.turn({"", prompt.substr(5)});
             } else {
               raw_main_branch(dispatch, 40);
@@ -1244,8 +1251,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         } catch (const Error &e) {
           dispatch.require_capture();
           input.require_capture();
-          if (tui)
-            ui.failed();
+          if (tui) {
+            if (e.code == ErrorCode::interrupted)
+              ui.interrupted();
+            else
+              ui.failed();
+          }
           emit("\n" + std::string{error_name(e.code)} + " (" +
                std::to_string(e.detail) + "); context/audit retained\n");
           if (root->maintenance_error())
@@ -1683,7 +1694,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             },
             engine.command_jobs(), interrupt_wake.read_fd(),
             [&] { return interrupt_owner.reset(); }, root.get(), center_context,
-            std::move(instrument_source));
+            std::move(instrument_source), engine.turn_dispatch);
       });
       return finish_interactive();
     }

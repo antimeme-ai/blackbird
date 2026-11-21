@@ -94,7 +94,7 @@ void validate_control(const Value &value, bool mailbox) {
         (op == "read" && (key == "count" || key == "offset")) ||
         (op == "foreground" && (key == "yield_ms" || key == "output_max_bytes")) ||
         (op == "background" && key == "wait_epoch") ||
-        (op == "input" && key == "bytes") ||
+        (op == "input" && (key == "bytes" || key == "wait_epoch")) ||
         (op == "resize" && (key == "rows" || key == "columns")) ||
         (op == "signal" && key == "signal") ||
         (op == "configure" && (key == "max_live" || key == "max_records"));
@@ -861,7 +861,15 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
         if (!job->input.empty()) {
           auto &delivery = job->deliveries.at(job->input.front());
           const auto op = string_field(delivery.request, "op");
-          if (op == "input" && group_ready) {
+          if (op == "input" && delivery.request.find("wait_epoch") &&
+              (waiting != job->id ||
+               integer(delivery.request, "wait_epoch", 0) != epoch ||
+               job->release_epoch == epoch)) {
+            // Revalidate at physical consumption too, under the same owner mutex.
+            job->input_bytes -= delivery.bytes().size() - delivery.written;
+            delivery.failed = delivery.done = true;
+            delivery.consumption = CommandDeliveryConsumption::worker;
+          } else if (op == "input" && group_ready) {
             const auto remaining = delivery.bytes().size() - delivery.written;
             const auto &delivery_id = job->input.front();
             const auto delivery_size = delivery_id.size();
@@ -1941,6 +1949,10 @@ Value CommandJobs::control(const Value &arguments) {
       trace.finish(2, delivery.written, delivery.done, delivery.failed);
       return result;
     }
+    if (op == "input" && arguments.find("wait_epoch") &&
+        (impl_->waiting != id || integer(arguments, "wait_epoch", 0) != impl_->epoch ||
+         job.release_epoch == impl_->epoch))
+      throw Error{ErrorCode::conflict};
     if (job.finished)
       throw Error{ErrorCode::busy};
     Impl::Delivery delivery{arguments};
@@ -2048,6 +2060,10 @@ void CommandJobs::request(Value arguments) {
       put(arguments, "job_id", Value{id});
     }
     auto &job = impl_->find(id);
+    if (op == "input" && arguments.find("wait_epoch") &&
+        (impl_->waiting != id || integer(arguments, "wait_epoch", 0) != impl_->epoch ||
+         job.release_epoch == impl_->epoch))
+      throw Error{ErrorCode::conflict};
     if (string_field(arguments, "op") == "input" &&
         (!job.launch.pty || string_field(arguments, "bytes").size() > input_limit))
       throw Error{ErrorCode::invalid_range};

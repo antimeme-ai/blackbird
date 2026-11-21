@@ -3,10 +3,12 @@
 #include "blackbird/command_center.hpp"
 #include "blackbird/command_jobs.hpp"
 #include "blackbird/display_text.hpp"
+#include "blackbird/next_turns.hpp"
 #include "blackbird/raw_ui.hpp"
 #include "blackbird/tasks.hpp"
 #include "blackbird/tui_instrument.hpp"
 #include "blackbird/tui_navigation.hpp"
+#include "blackbird/turn_dispatch.hpp"
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -22,6 +24,9 @@ enum class InputAction {
   none,
   submit,
   cancel,
+  back,
+  next_turns,
+  send_refused,
   quit,
   page_up,
   page_down,
@@ -53,6 +58,7 @@ struct InputResult {
   std::string text;
   RawUiSource source{};
   std::optional<tui::ViewRoute> view{};
+  std::string intention{};
 };
 struct TerminalState {
   std::string draft;
@@ -60,6 +66,11 @@ struct TerminalState {
   std::vector<std::string> history, queued;
   RawUiSource draft_source{};
   std::vector<RawUiSource> history_sources{}, queued_sources{};
+  Value intentions{};
+  Value independent_drafts{Value::Array{}};
+  std::string draft_predecessor{};
+  std::string parked_draft{};
+  std::size_t parked_cursor = 0;
 };
 struct EditorResult {
   bool accepted = false;
@@ -96,6 +107,7 @@ std::vector<ComposerChoice> terminal_view_choices(tui::ViewRoute current);
 class Composer {
 public:
   InputResult feed(char byte, RawUiInput *raw = nullptr, bool inspecting = false);
+  std::function<std::string(const std::string &, RawUiSource)> acquire_send;
   std::uint64_t capture_bound(std::size_t acquired_bytes) const;
   void restore(const TerminalState &state);
   TerminalState state() const;
@@ -106,7 +118,8 @@ public:
   bool slash_open() const noexcept { return slash_open_; }
   bool escape_pending() const noexcept { return !escape_.empty(); }
   bool pasted() const noexcept { return pasted_; }
-  bool flush_escape();
+  bool flush_escape(bool preserve_local = false);
+  bool bare_escape_pending() const noexcept { return escape_ == "\x1b" && !pasted_; }
   // Input ownership moved between the composer and a PTY child: forget any
   // partial escape; optionally skip the rest of a mouse report the child held.
   void reset_escape(bool skip_report_tail = false) noexcept {
@@ -145,12 +158,12 @@ private:
 };
 // One poll-turn decision: expiry is serviced for ready and idle input alike.
 struct TerminalInputDispatch {
-  bool read_input = false, redraw = false, focus_editor = false;
+  bool read_input = false, redraw = false, focus_editor = false, stop = false;
 };
 TerminalInputDispatch
 terminal_input_dispatch(Composer &composer, std::chrono::steady_clock::time_point now,
                         std::chrono::steady_clock::time_point escape_deadline,
-                        short events);
+                        short events, bool active = false);
 struct TerminalScrollUpdate {
   std::size_t scroll, previous, before_trim, after_trim, height;
 };
@@ -165,6 +178,8 @@ DisplayPosition terminal_caret(std::string_view text, ByteOffset source,
 class TerminalUI {
 public:
   explicit TerminalUI(std::string title);
+  std::shared_ptr<NextTurns> next_turns() const { return next_turns_; }
+  std::function<void(std::string_view)> launching_intention;
   ~TerminalUI();
   void raw_capture(bool enabled, RawUiSource initial = {}) noexcept {
     raw_capture_ = enabled;
@@ -181,6 +196,7 @@ public:
   void status(std::string_view text);
   void operation_completed(std::string_view text, Ink outcome = Ink::muted);
   void failed();
+  void interrupted();
   void title(std::string_view text);
   void question(std::optional<TerminalQuestion> question);
   void sessions(const Value &listing, RawUiValueOrigin origin = {});
@@ -198,7 +214,8 @@ public:
            const std::function<Result<void>()> &reset_interrupt = {},
            RetainedState *raw_root = nullptr,
            std::optional<CommandCenterContext> center_context = {},
-           std::optional<InstrumentSource> instrument_source = {});
+           std::optional<InstrumentSource> instrument_source = {},
+           std::shared_ptr<TurnDispatch> turn_dispatch = {});
 
 private:
   enum class Kind {
@@ -217,7 +234,8 @@ private:
     operation_complete,
     failure,
     instrument_source,
-    question
+    question,
+    interrupted
   };
   struct Message {
     Kind kind;
@@ -229,6 +247,7 @@ private:
     std::optional<InstrumentSource> instrument{};
     std::shared_ptr<const TerminalQuestion> question{};
   };
+  std::shared_ptr<NextTurns> next_turns_ = std::make_shared<NextTurns>();
   bool raw_capture_ = false;
   RawUiSource initial_source_{};
   RawEventRef raw_parent_{};

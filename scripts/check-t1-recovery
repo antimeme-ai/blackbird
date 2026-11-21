@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Actual-main stale edit, independent draft, withdrawal and save-refusal episodes."""
+import argparse
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import struct
+import subprocess
+import termios
+import time
+import uuid
+
+ROOT=Path(__file__).resolve().parent.parent
+
+def module(name,file):
+    spec=importlib.util.spec_from_file_location(name,ROOT/'scripts'/file)
+    result=importlib.util.module_from_spec(spec);spec.loader.exec_module(result);return result
+
+packet=module('packet','native-packet.py')
+vt=module('vt','terminal-screen-oracle.py')
+
+class Session:
+    def __init__(self,executable,work,workflow=None):
+        self.work=work;work.mkdir(parents=True,exist_ok=True)
+        self.master,self.slave=pty.openpty()
+        fcntl.ioctl(self.slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+        args=[str(executable),'--session',str(work/'session')]
+        if workflow:args+=['--workflow',str(workflow)]
+        env=dict(os.environ)
+        for key in ('BLACKBIRD_EXECUTABLE','ARCO_EXECUTABLE','BLACKBIRD_SPRITE_ASSET'):env.pop(key,None)
+        self.child=subprocess.Popen(args,stdin=self.slave,stdout=self.slave,stderr=self.slave,env=env,start_new_session=True)
+        self.raw=bytearray();self.screen=vt.Screen()
+        self.wait(lambda:'Workflow reloads' in self.screen.text(),'startup')
+    def pump(self,seconds=.08):
+        until=time.monotonic()+seconds
+        while time.monotonic()<until:
+            if select.select([self.master],[],[],.01)[0]:
+                try:data=os.read(self.master,65536)
+                except OSError:break
+                if not data:break
+                self.raw.extend(data);self.screen.feed(data)
+    def send(self,data):
+        os.write(self.master,data if isinstance(data,bytes) else data.encode());self.pump()
+    def state(self):return packet.read_packet(self.work/'session/ui-state.bbm')
+    def wait(self,predicate,label):
+        until=time.monotonic()+10
+        while time.monotonic()<until:
+            self.pump(.02)
+            if predicate():return
+        raise AssertionError((label,self.screen.text()))
+    def close(self,label,expected=0):
+        if self.child.poll() is None:
+            self.send(b'\x1b');self.pump(.15);self.send(b'\x07\x15/exit\r')
+        rc=self.child.wait(timeout=15)
+        (self.work/(label+'-terminal.bin')).write_bytes(self.raw)
+        (self.work/(label+'-screen.txt')).write_text(self.screen.text())
+        (self.work/(label+'-process.json')).write_text(json.dumps({'pid':self.child.pid,'returncode':rc}))
+        os.close(self.master);os.close(self.slave)
+        assert rc==expected
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('executable',type=Path);parser.add_argument('--artifacts',type=Path,required=True)
+    parser.add_argument('--case',choices=('all','crash'),default='all')
+    args=parser.parse_args();executable=args.executable.resolve()
+    root=args.artifacts.resolve()/('recovery-'+uuid.uuid4().hex[:10]);root.mkdir(parents=True)
+    checks=[]
+    if args.case=='all':
+        work=root/'concurrent';work.mkdir()
+        workflow=work/'gated.lua'
+        gate_command="while [ ! -f " + str(work/'discard') + " ]; do sleep 0.02; done"
+        workflow.write_text("print('EDIT_GATE_READY')\nblackbird.call('exec',{argv={'/bin/sh','-c',"+json.dumps(gate_command)+"}})\n"+'''local rows=blackbird.call('next_turns',{op='read'})
+    for _,r in ipairs(rows) do
+      if r.edit~=nil then blackbird.call('next_turns',{op='discard',id=r.id,revision=r.revision,edit_version=r.edit_version}) end
+    end
+    print('MODEL_DISCARD_DONE')
+    while true do end
+    ''')
+        session=Session(executable,work,workflow)
+        try:
+            session.send('start gated editor test\r')
+            session.wait(lambda:'EDIT_GATE_READY' in session.screen.text(),'workflow gate')
+            session.send('queued committed bytes\r')
+            queued=next(row for row in session.state()['intentions'] if row['revisions']==['queued committed bytes'])
+            session.send('UNRELATED_CURSOR\x01\x06')
+            before=session.state()
+            session.send(b'\x12\r\r')
+            session.wait(lambda:'Editing held' in session.screen.text(),'open native edit')
+            session.send(b'\x15NATIVE_PRIVATE_PROPOSAL')
+            (work/'discard').touch()
+            session.wait(lambda:'MODEL_DISCARD_DONE' in session.screen.text(),'guarded model discard')
+            session.send(b'x') # forces stale native buffer synchronization
+            state=session.state()
+            assert state['draft']==before['draft'] and state['cursor']==before['cursor']
+            assert any(row['text']=='NATIVE_PRIVATE_PROPOSALx' and row['predecessor']==queued['id'] for row in state['independent_drafts'])
+            owner=next(row for row in state['intentions'] if row['id']==queued['id'])
+            assert owner['revisions']==['queued committed bytes'] and owner['state']=='held'
+            session.send(b'\x1b')
+            session.wait(lambda:any(row['state']=='interrupted locally' for row in session.state()['intentions']),'stop after stale edit')
+            checks.append('stale native proposal recovered; committed revision and unrelated cursor preserved; stop serviced')
+        finally:session.close('first')
+        session=Session(executable,work,workflow)
+        try:
+            assert any(row['text']=='NATIVE_PRIVATE_PROPOSALx' for row in session.state()['independent_drafts'])
+            session.send('/drafts\r')
+            session.wait(lambda:'NATIVE_PRIVATE_PROPOSALx' in session.screen.text(),'conflict proposal after reopen')
+            checks.append('independent conflict draft survives reopen without replay')
+        finally:session.close('reopen')
+
+        work=root/'unkeyed';session=Session(executable,work)
+        try:
+            session.send('PARKED_WITHOUT_INTENTION\x14help\r')
+            session.wait(lambda:'Command loaded' in session.screen.text(),'generic picker parks draft')
+        finally:session.close('first')
+        session=Session(executable,work)
+        try:
+            assert any(row['text']=='PARKED_WITHOUT_INTENTION' for row in session.state()['independent_drafts'])
+            session.send('/drafts\r')
+            session.wait(lambda:'PARKED_WITHOUT_INTENTION' in session.screen.text(),'unkeyed draft after reopen')
+            checks.append('unkeyed command-picker draft survives alongside native intentions')
+        finally:session.close('reopen')
+
+        work=root/'save-refusal';session=Session(executable,work)
+        effect=work/'effect'
+        try:
+            path=work/'session/ui-state.bbm';backup=work/'accepted-before-refusal.bbm'
+            # Create an initial ordinary save, then make exactly the native rename fail.
+            session.send('/keys\r');path.rename(backup);path.mkdir()
+            command='/lua blackbird.call("write_file",{path='+json.dumps(str(effect))+',content="EXACT_RELEASE"})'
+            session.send(command+'\r')
+            assert not effect.exists()
+            path.rmdir();backup.rename(path)
+            session.send(b'\x15/queue\r');session.send(b'\x07')
+            row=next(row for row in session.state()['intentions'] if row['revisions']==[command])
+            assert row['state']=='held'
+            session.send(f'/next release {row["id"]} 1\r')
+            session.wait(effect.exists,'release formerly save-refused idle intention')
+            assert effect.read_text()=='EXACT_RELEASE'
+            checks.append('save-refused idle intention releases through authoritative native scheduler')
+            session.send('/lua while true do end\r');session.pump(.15)
+            session.send('WITHDRAW_EXACT_DRAFT\r');session.send(b'\x1b');session.pump(.2)
+            withdrawn=next(row for row in session.state()['intentions'] if row['revisions']==['WITHDRAW_EXACT_DRAFT'])
+            session.send(f'/next withdraw {withdrawn["id"]} 1\r')
+            session.send('/drafts\r')
+            session.wait(lambda:'WITHDRAW_EXACT_DRAFT' in session.screen.text(),'withdraw to drafts')
+        finally:session.close('first')
+        session=Session(executable,work)
+        try:
+            session.send('/drafts\r')
+            session.wait(lambda:'WITHDRAW_EXACT_DRAFT' in session.screen.text(),'withdraw draft after reopen')
+            checks.append('withdrawal to exact draft survives reopen without execution')
+        finally:session.close('reopen')
+    work=root/'crash-cut';session=Session(executable,work)
+    effect=work/'explicit-effect'
+    try:
+        session.send('/lua while true do end\r')
+        command='/lua blackbird.call("write_file",{path='+json.dumps(str(effect))+',content="FRESH_SEND_ONLY"})'
+        session.send(command+'\r')
+        session.wait(lambda:any(row['revisions']==[command] for row in session.state()['intentions']),'accepted queue before deliberate crash cut')
+        old=next(row for row in session.state()['intentions'] if row['revisions']==[command])
+        (work/'before-crash-native.json').write_text(json.dumps(session.state(),indent=2))
+        assert not effect.exists()
+        os.killpg(session.child.pid,signal.SIGKILL) # deliberate fixture crash, not silence cleanup
+        session.child.wait(timeout=10)
+    finally:session.close('deliberate-crash',expected=-signal.SIGKILL)
+    session=Session(executable,work)
+    try:
+        assert not effect.exists(),'reopen replayed accepted work'
+        session.send('/drafts\r')
+        session.wait(lambda:'Recovered drafts: 2' in session.screen.text(),'fresh owner recovery projection')
+        native=session.state()
+        recovered=next(row for row in native['intentions'] if row['id']==old['id'])
+        assert recovered['state']=='recovered · explicit Send required'
+        session.send('/drafts\r')
+        session.wait(lambda:'Recovered drafts: 2' in session.screen.text(),'both interrupted active and pending originals offered')
+        session.send('/draft 2\r')
+        assert not effect.exists(),'loading recovery executed it'
+        session.send(b'\r')
+        session.wait(effect.exists,'new deliberate recovered Send executes')
+        session.wait(lambda:any(row['predecessor']==old['id'] for row in session.state()['intentions']),'fresh predecessor receipt')
+        new=next(row for row in session.state()['intentions'] if row['predecessor']==old['id'])
+        assert new['id']!=old['id'] and effect.read_text()=='FRESH_SEND_ONLY'
+        (work/'after-explicit-send-native.json').write_text(json.dumps(session.state(),indent=2))
+        checks.append('deliberate main crash: accepted bytes recover without replay; fresh Send has predecessor and independent effect')
+    finally:session.close('reopen')
+    (root/'checks.json').write_text(json.dumps(checks,indent=2));print(root);print(json.dumps(checks,indent=2))
+
+if __name__=='__main__':main()

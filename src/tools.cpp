@@ -606,6 +606,28 @@ Value tool_definitions() {
                                      Value{"context"}, Value{"profile"}}}}})}}),
       Value::object(
           {{"type", Value{"function"}},
+           {"name", Value{"next_turns"}},
+           {"description",
+            Value{"Native next-turn owner: read; or "
+                  "hold/edit/buffer/apply/discard/release/withdraw with exact id and "
+                  "revision; buffer/apply/discard also require returned edit_version. "
+                  "Apply keeps held, dirty release refuses. Stop holds "
+                  "pending work. Native acquisition is not provider delivery. "
+                  "Recovered items require new explicit Send. Save may still be "
+                  "pending; terminal dispatch requires successful save."}},
+           {"parameters",
+            Value::object(
+                {{"type", Value{"object"}},
+                 {"properties",
+                  Value::object(
+                      {{"op", Value::object({{"type", Value{"string"}}})},
+                       {"id", Value::object({{"type", Value{"string"}}})},
+                       {"revision", Value::object({{"type", Value{"integer"}}})},
+                       {"edit_version", Value::object({{"type", Value{"integer"}}})},
+                       {"text", Value::object({{"type", Value{"string"}}})}})},
+                 {"required", Value{Value::Array{Value{"op"}}}}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
            {"name", Value{"tasks_read"}},
            {"description",
             Value{"Read current durable session task/subtask state. query: id, status "

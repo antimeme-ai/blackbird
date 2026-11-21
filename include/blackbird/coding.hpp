@@ -3,12 +3,14 @@
 #include "blackbird/colleague.hpp"
 #include "blackbird/command_jobs.hpp"
 #include "blackbird/decision_models.hpp"
+#include "blackbird/next_turns.hpp"
 #include "blackbird/observations.hpp"
 #include "blackbird/openai.hpp"
 #include "blackbird/participants.hpp"
 #include "blackbird/raw_program.hpp"
 #include "blackbird/session.hpp"
 #include "blackbird/tools.hpp"
+#include "blackbird/turn_dispatch.hpp"
 
 #include "blackbird/tasks.hpp"
 #include "blackbird/workflows.hpp"
@@ -114,6 +116,9 @@ public:
   std::function<void(std::string_view, AttemptDisposition)> operation_outcome;
   std::function<void(std::string_view)> process_output;
   std::function<bool()> cancelled;
+  std::shared_ptr<TurnDispatch> turn_dispatch;
+  std::shared_ptr<NextTurns> next_turns;
+  std::string current_intention;
   // Optional native effect restriction for a scoped workflow (e.g. recovery
   // evidence protection). Throwing refuses admission; it is not Lua authority.
   std::function<void(std::string_view, const Value &)> effect_policy;

@@ -237,11 +237,14 @@ The basic controls are intentionally ordinary:
 | Alt-Enter / Ctrl-J / Shift-Enter | Insert a newline. Shift-Enter needs a terminal that reports it, such as Ghostty. |
 | PgUp / PgDn / mouse wheel | Move through the conversation; Shift-drag selects text; `/mouse off` restores plain-drag selection, and the wheel may then arrive as history-recalling arrow keys. |
 | Up / Down | Recall submitted prompts. |
-| Ctrl-C | Stop the active turn, clear its queue, and preserve the current draft. |
+| Esc / Ctrl-C | While a main turn is active, stop that captured turn and hold pending next turns; preserve draft, edit buffer and local selection. |
+| Ctrl-G | Local Back, without stopping work; a dirty next-turn edit remains held. |
+| Ctrl-R / `/queue` | Keyed Next turns shelf; select an exact intention/revision to edit. Enter applies an edit and keeps it held; `/next release ID REV` releases only that item. |
+| Alt-E / `/edit` | External editor (idle only). |
 | Ctrl-Q | Exit with drafts and queued work preserved as recoverable drafts. |
 | Ctrl-O / `/jobs` | Inspect resident command results; Ctrl-O preserves the draft and toggles back. |
 | Ctrl-X / `/center` | Inspect current-session tasks, participants and commands; Ctrl-X preserves the draft. Routes retain independent selections and reading positions. |
-| Inspector arrows / PgUp / PgDn / Home / End | Navigate the focused collection or detail. Tab changes focus; Escape or typing returns to the draft. |
+| Inspector arrows / PgUp / PgDn / Home / End | Navigate the focused collection or detail. Tab changes focus; Ctrl-G or typing returns to the draft. Active Esc is main stop, not inspector Back. |
 | Inspector Ctrl-Left / Ctrl-Right | Page the selected kind's catalog or result bytes, according to focus. |
 | Center T / P / J | Tasks, participants and command jobs. Counts describe loaded pages; `+` means more. Sources are independent; stale and retired observations remain labeled. |
 | `/exit` or `/quit` | Exit, stopping active work first. |
@@ -251,6 +254,8 @@ The basic controls are intentionally ordinary:
 | `/new` | Create and enter a fresh saved session beside the current one, keeping model, effort and workflow settings. Waits behind active work; old context, tasks and drafts remain saved. |
 | `/workflow FILE` | Select the turn program. |
 | `/restart NOTE` | Arrange restart/resume/continue. |
+
+Native Send receipts distinguish local acquisition, held/queued work, launch and observed local result. Structured model/Lua `next_turns` access uses the same exact-ID/revision owner; context inclusion and attempt links appear only when published by their owners, never from matching text. A local `/lua` route is not provider delivery. See [T1 owner contracts](docs/T1_SEND_STOP.md).
 
 Drafts and prompt history survive ordinary reopen and restart. Previously queued prompts reopen as drafts requiring explicit submission, rather than silently running. Display trimming and composer limits are separate from the original audit and provider context. Complex grapheme editing and richer terminal views remain future work.
 

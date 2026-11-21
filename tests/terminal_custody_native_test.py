@@ -106,9 +106,9 @@ def main():
                                     bytes(output[-2000:])))
                     output.extend(os.read(master, 65536))
 
-            until(b"Ctrl-G editor")
+            until(b"Ctrl-G Back")
             process.send_signal(signal.SIGWINCH)
-            os.write(master, b"\x07")
+            os.write(master, b"\x1be")
             until(b"Editor returned")
             until(b"native-editor-result")
             os.write(master, b"\x11")

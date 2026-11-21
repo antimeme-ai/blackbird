@@ -874,6 +874,45 @@ void retry_tests(const std::string &path) {
     if (provider.calls != 2 || provider.begins != 2 || provider.ends != 2)
       throw Error{ErrorCode::corrupt};
   }
+  {
+    ContextStore context{log};
+    FlakyProvider provider;
+    CodingEngine engine{log, context, provider, "test"};
+    engine.turn_dispatch = std::make_shared<TurnDispatch>();
+    const auto target = engine.turn_dispatch->begin();
+    engine.effect_policy = [&](std::string_view name, const Value &) {
+      if (name == "provider")
+        (void)engine.turn_dispatch->stop(target);
+    };
+    bool interrupted = false;
+    try {
+      engine.turn({"stop won before transport", "arco.request()"});
+    } catch (const Error &error) {
+      interrupted = error.code == ErrorCode::interrupted;
+    }
+    if (!interrupted || provider.calls != 0)
+      throw Error{ErrorCode::corrupt};
+  }
+  {
+    ContextStore context{log};
+    FlakyProvider provider;
+    CodingEngine engine{log, context, provider, "test"};
+    engine.turn_dispatch = std::make_shared<TurnDispatch>();
+    const auto target = engine.turn_dispatch->begin();
+    engine.status = [&](std::string_view event) {
+      if (event.find("retry 2/") != std::string_view::npos)
+        (void)engine.turn_dispatch->stop(target);
+    };
+    bool interrupted = false;
+    try {
+      engine.turn(
+          {"stop won retry", "arco.request({retry_policy={base_ms=0,cap_ms=0}})"});
+    } catch (const Error &error) {
+      interrupted = error.code == ErrorCode::interrupted;
+    }
+    if (!interrupted || provider.calls != 1 || provider.begins != provider.ends)
+      throw Error{ErrorCode::corrupt};
+  }
 }
 void owned_route_tests(const std::string &path) {
   for (const std::string mode :

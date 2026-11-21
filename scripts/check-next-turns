@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Actual-main held correction episode. Isolated session, local Lua only."""
+import os, sys, pty, fcntl, termios, struct, subprocess, time, select, importlib.util, json, argparse, uuid, runpy, signal
+from pathlib import Path
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('executable',type=Path)
+parser.add_argument('--artifacts',type=Path,required=True)
+parser.add_argument('--columns',type=int,default=120)
+parser.add_argument('--rows',type=int,default=40)
+args=parser.parse_args()
+root=args.artifacts.resolve()
+checkout=Path(__file__).resolve().parent.parent
+def load(name,path):
+    spec=importlib.util.spec_from_file_location(name,path); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+packet=load('packet',checkout/'scripts/native-packet.py')
+vt=load('vt',checkout/'scripts/terminal-screen-oracle.py')
+work=root/('next-turns-'+uuid.uuid4().hex[:10]);work.mkdir(parents=True,exist_ok=False)
+master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',args.rows,args.columns,0,0))
+env=dict(os.environ)
+for k in ('BLACKBIRD_EXECUTABLE','ARCO_EXECUTABLE','BLACKBIRD_SPRITE_ASSET'):env.pop(k,None)
+p=subprocess.Popen([str(args.executable.resolve()),'--session',str(work/'session')],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
+raw=bytearray();screen=vt.Screen();checks=[];endpoints=[]
+def stamp(name,**facts):endpoints.append(dict(name=name,clock_ns=time.monotonic_ns(),output_offset=len(raw),**facts))
+def pump(seconds=.12):
+    until=time.monotonic()+seconds
+    while time.monotonic()<until:
+        if select.select([master],[],[],.02)[0]:
+            try:data=os.read(master,65536)
+            except OSError:break
+            if not data:break
+            raw.extend(data);screen.feed(data)
+def send(data):os.write(master,data);pump()
+def wait(text,seconds=8):
+    until=time.monotonic()+seconds
+    while time.monotonic()<until:
+        pump(.03)
+        if text in screen.text():return
+    raise AssertionError((text,screen.text()))
+def state():return packet.read_packet(work/'session/ui-state.bbm')
+def wait_native(predicate,description):
+    until=time.monotonic()+8
+    while time.monotonic()<until:
+        pump(.02)
+        if predicate(state()):return
+    raise AssertionError((description,state(),screen.text()))
+def item(id):return next(x for x in state()['intentions'] if x['id']==id)
+def check(name,good):
+    checks.append({'name':name,'passed':bool(good)})
+    assert good,(name,screen.text())
+def interrupted(signum,_frame):raise KeyboardInterrupt(f'fixture signal {signum}')
+signal.signal(signal.SIGTERM,interrupted)
+signal.signal(signal.SIGINT,interrupted)
+try:
+    wait('Workflow reloads')
+    send(b'/lua print("LOOP_".."ACTIVE"); while true do end\r');wait('LOOP_ACTIVE')
+    effect=work/'released-effect'
+    command='/lua blackbird.call("write_file",{path='+json.dumps(str(effect))+',content="RELEASED"})'
+    stamp('busy_send:write_begin')
+    send(command.encode()+b'\r')
+    acquired=next(x for x in state()['intentions'] if x['revisions']==[command])
+    stamp('busy_send:local_receipt_observed',id=acquired['id'],revision=1,state=acquired['state'])
+    send(command.encode()+b'\r')
+    entries=[x for x in state()['intentions'] if x['revisions']==[command]]
+    check('equal deliberate sends have independently observed distinct IDs',len(entries)==2 and entries[0]['id']!=entries[1]['id'])
+    first,second=[x['id'] for x in entries]
+    send(b'UNRELATED_DRAFT\x01\x1b[C') # preserve a nonterminal cursor too
+    wait_native(lambda s:bytes.fromhex(s['draft'])==b'UNRELATED_DRAFT' and s['cursor']==1,'unrelated draft and cursor saved')
+    before=state(); before_text=bytes.fromhex(before['draft']).decode(); before_cursor=before['cursor']
+    (work/'before-edit.json').write_text(json.dumps(before,indent=2))
+    send(b'\x12');wait('Next turns');send(b'\r');wait('Receipt ');send(b'\r');wait('Editing held next turn')
+    wait_native(lambda s:bytes.fromhex(s['draft']).decode()==command,'native editor loaded and saved')
+    correction=command.replace('RELEASED','CORRECTED')
+    send(b'\x15'+correction.encode())
+    wait_native(lambda s:next(x for x in s['intentions'] if x['id']==first)['edit']==correction,'private corrected buffer saved')
+    send(b'\x07')
+    wait_native(lambda s:s['draft']==before['draft'] and s['cursor']==before_cursor,'Back restores saved native composer')
+    after=state()
+    (work/'after-back.json').write_text(json.dumps(after,indent=2))
+    check('Back restores unrelated draft and cursor',after['draft']==before['draft'] and after['cursor']==before_cursor)
+    check('Back retains held dirty edit buffer',item(first)['edit']==correction and item(first)['state']=='held · editing')
+    stamp('stop:write_begin')
+    send(b'\x1b');wait('interrupted')
+    stamp('stop:result_frame_observed')
+    check('Stop does not run either held item',not effect.exists() and item(second)['state']=='held')
+    stamp('dirty_release:write_begin',id=first,revision=1)
+    send(b'\x15'+f'/next release {first} 1'.encode()+b'\r');wait('action refused')
+    stamp('dirty_release:refusal_observed',id=first,revision=1)
+    check('Dirty release refused without executing old or proposed text',not effect.exists() and item(first)['edit']==correction)
+    stamp('correction:write_begin',id=first,revision=1)
+    send(f'/next edit {first} 1'.encode()+b'\r');wait('Editing held next turn');send(b'\r');wait('Correction applied')
+    check('Apply creates retained revision and keeps held',item(first)['revisions']==[command,correction] and item(first)['state']=='held')
+    stamp('correction:held_revision_observed',id=first,revision=item(first)['revisions'].__len__())
+    stamp('release:write_begin',id=first,revision=2)
+    send(f'/next release {first} 2'.encode()+b'\r')
+    until=time.monotonic()+8
+    while not effect.exists() and time.monotonic()<until:pump(.03)
+    stamp('release:independent_effect_observed',id=first,revision=2)
+    check('Selected corrected revision executed',effect.exists() and effect.read_text()=='CORRECTED')
+    check('Sibling intention remains held',item(second)['state']=='held')
+    (work/'screen.txt').write_text(screen.text())
+finally:
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    signal.signal(signal.SIGINT,signal.SIG_IGN)
+    send(b'\x07\x15/exit\r');pump(.3)
+    rc=p.wait(timeout=15)
+    (work/'terminal.bin').write_bytes(raw)
+    (work/'process.json').write_text(json.dumps({'pid':p.pid,'returncode':rc}))
+    (work/'checks.json').write_text(json.dumps(checks,indent=2))
+    (work/'endpoints.json').write_text(json.dumps(endpoints,indent=2))
+    raw_records=runpy.run_path(str(checkout/'scripts/check-main-provider-stop'))['raw_ui_records'](work/'session')
+    owners=[]
+    for lane,site,ordinal,body in raw_records:
+        if site in (4191,4192):
+            turn,ticks,num,den,outcome=struct.unpack_from('<QqqqB',body)
+            owners.append(dict(site=site,lane=lane.hex(),ordinal=ordinal,turn=turn,ticks=ticks,clock_num=num,clock_den=den,outcome=outcome,intention_id=body[33:].decode()))
+    (work/'native-owners.json').write_text(json.dumps(owners,indent=2))
+    assert rc==0
+    os.close(master);os.close(slave)
+print(json.dumps(checks,indent=2))

@@ -156,7 +156,7 @@ find_package(Lua 5.4 EXACT REQUIRED)
 if(NOT LUA_VERSION_STRING STREQUAL "5.4.8")
   message(FATAL_ERROR "Coding runtime requires qualified Lua 5.4.8")
 endif()
-add_library(blackbird_coding src/coding.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
+add_library(blackbird_coding src/next_turns.cpp src/coding.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
 target_sources(blackbird_coding PRIVATE src/openrouter.cpp src/responses_provider.cpp src/anthropic_provider.cpp src/application.cpp)
 add_executable(anthropic_provider_test tests/anthropic_provider_test.cpp)
 target_link_libraries(anthropic_provider_test PRIVATE blackbird_coding)
@@ -569,6 +569,13 @@ add_test(NAME participants_pty COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}
 set_tests_properties(participants_pty PROPERTIES TIMEOUT 35)
 add_test(NAME tiny_terminal_pty COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/check-tiny-terminal-pty $<TARGET_FILE:blackbird>)
 set_tests_properties(tiny_terminal_pty PROPERTIES TIMEOUT 25)
+add_test(NAME next_turns_pty COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/check-next-turns $<TARGET_FILE:blackbird>
+  --artifacts ${CMAKE_BINARY_DIR}/next-turns)
+add_test(NAME main_provider_stop COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/check-main-provider-stop $<TARGET_FILE:blackbird>
+  --artifacts ${CMAKE_BINARY_DIR}/provider-stop)
+add_test(NAME t1_recovery COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/check-t1-recovery $<TARGET_FILE:blackbird>
+  --artifacts ${CMAKE_BINARY_DIR}/t1-recovery)
+set_tests_properties(next_turns_pty main_provider_stop t1_recovery PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 set_tests_properties(colleague PROPERTIES TIMEOUT 15)
 
 add_custom_target(arco-colleague DEPENDS blackbird-colleague

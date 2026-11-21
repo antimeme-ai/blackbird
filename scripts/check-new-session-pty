@@ -90,8 +90,10 @@ with tempfile.TemporaryDirectory(prefix="blackbird-new-") as work:
         assert 'OLD_CONTEXT' in context(original)
         assert 'OLD_TASK' in tasks(original)
         old_ui = native_packet.read_packet((original / 'ui-state.bbm'))
-        assert any('SHOULD_REMAIN_QUEUED' in bytes.fromhex(value).decode()
-                   for value in old_ui['queued'])
+        retained = [item for item in old_ui['intentions']
+                    if 'SHOULD_REMAIN_QUEUED' in
+                    item['revisions'][-1]]
+        assert len(retained) == 1 and retained[0]['state'] == 'queued · next turn', retained
         command("/tasks add NEW_TASK")
         wait(lambda: "t1 NEW_TASK" in screen.text(), "new task ID starts fresh")
         # Repeated restarts must stay in this session, including after re-exec.

@@ -54,14 +54,16 @@ available through an owned native route.
 
 The proposed conventional browse gestures are arrows for list movement, Enter
 for opening the selected item, Space for explicit multi-selection, `?` for
-context help, and Escape for leaving the current local interaction. Actual
+context help, and Ctrl-G for leaving the current local interaction. Actual
 bindings are supplied by the binding system, remappable and shown from its
 effective state. Tab changes focus region; status filters are named actions,
 not an unrelated hidden meaning for the same focus key. Prefix/gesture/device
 capability negotiation remains in the input design, not inside each widget.
 
-Escape first ends a local prefix/search/edit interaction, then returns to the
-previous route/focus. It never silently cancels work. Stop is a distinct domain
+The current T1 binding gives decoded Escape priority to stop the captured main
+turn while active, even in a local route; it holds queued next turns. Ctrl-G is
+local Back and preserves dirty held edits. Without an active main turn, Escape
+may dismiss local state nondestructively. Stop is a distinct domain
 operation; its target and observed disposition stay visible. A dialog or pending
 RPC must not require painting to finish before a promised native escape/control
 can be serviced. Actual containment limits remain explicit.

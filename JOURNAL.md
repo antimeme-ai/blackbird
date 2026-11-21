@@ -11970,3 +11970,89 @@ accessibility or activation claim. No source layer completed or reset. Continue
 same T1 allowance from these retained REDs; do not promote this documentation
 checkpoint as implementation or a repaired chat. See run HANDOFF for incomplete
 obligations; no concrete external/source-gate blocker has been established yet.
+
+## 2026-10-27 — T1 successor source, still inactive
+
+Continued the original T1 commission in `chat-t1-02` from documentation-only
+`c5048d2`; reused verified old actual-main REDs and initial source/binary archives.
+Implemented native Send intention/revision owner, keyed held correction/release,
+model/Lua owner access and binary no-replay recovery; captured decoded main-stop,
+queue holds, actual local result and shared provider retry dispatch fence. Worker
+payload shares its immutable admitted revision; checkpoint generation refuses a
+save/correction/launch race. Launch refusal retains held known-not-started text.
+
+Actual-main three-regression GREENs and eight correction/release assertions are
+retained in successor run. Isolated registered fake-provider response-wait,
+retry-wait and partial-stream cases pass with independent request ledgers and
+retained partial originals; remote disposition unknown. Separate physical output
+pressure observes native interrupted saved result before drain, actual raw
+EAGAIN before that save, and coherent eventual screen after drain. Native owner,
+stop-order and CodingEngine gate cases pass. Prior compiler/assertion failures
+remain in ignored run evidence. These checks are not full source qualification.
+
+Added a fresh read-only paired PTY endpoint observer/report, qualified with one
+trial per variant/geometry against the exact initial executable and candidate;
+incomplete-round report refusal passes. Thirty-trial matched collection, source
+hook/host/screen gates and the original independent review/recheck remain
+separate requirements. No runtime install, activation, T2 or sibling adoption.
+
+Original layer1 native source review found nine consequential defects. Remediation
+adds private edit-version guards/recovery, checked edit-capacity accounting,
+separately retained independent drafts, native authoritative release scheduling,
+withdrawal recovery, exact private PTY input epochs and inspectable keyed receipts.
+Actual-main save refusal/idle release, concurrent model/editor correction and
+explicit disposable crash/reopen/no-replay/predecessor Send checks are GREEN;
+original failed assertions remain retained. Changed-path Debug migration checks
+also found/fixed lost explicit restart continuation. Legacy queue assertions now
+inspect the actual native owner, not invented compatibility duplicates.
+
+Microsoft ghostty styled/readable geometry captures are retained at80x24,120x40,
+42x16. Expanded observer smoke includes new busy receipt, held correction/release
+and blocked stop/native-before-drain/eventual-frame cases. Signal qualification
+caught old Ctrl-G editor cleanup; fixed to idle ESC Back for both matched variants,
+then interrupted observer retained originals and its child independently exited0.
+First full owned lint exposed API copy/swappable-parameter diagnostics; not waived.
+Candidate remains inactive; final focused recheck and full source/host/performance
+qualification are separate pending obligations, not completed by these direct checks.
+
+The original single FINAL focused source recheck was actually dispatched once,
+not merely planned. Pinned native --once openai/gpt-6.1-sol/medium process exited1,
+external_unknown(0), before returning an answer. Exact retained provider SSE says
+response.failed/service_unavailable_error/server_is_overloaded. This is not a
+proven saved-state-capacity failure. Request, exact reviewed diff/inventory,
+native session, diagnostic originals and raw finalization observations remain in
+chat-t1-02; preceding saved publishes succeeded. No unknown replay, alternate
+reviewer, third assurance layer or claimed recheck success. Candidate remains
+INACTIVE; final review qualification is BLOCKED for the orchestrator to disposition.
+
+Independent relevant Release checks34/36 passed; retained genuine failures were
+narrow current-strip receipt metadata clipping prior scroll state and a legacy
+capacity assertion against intentionally removed duplicate queue bytes. Moved
+scroll before receipt metadata and asserted128 identical native independent draft
+payloads; scoped Release2/2 GREEN. These final-layer direct fixes have no separate
+independent recheck/certification claim. Linux profiles and remaining independent
+source/performance qualification continue without resetting the review allowance.
+
+Final T1 disposition: INACTIVE / BLOCKED, not a qualified source checkpoint.
+Standalone macOS full Debug gate passed268/268 plus owned C++ and Lua lint;
+relevant Release36 checks passed across the original34 and scoped2 fixes. Actual
+Neuroses Linux Debug gate failed3/36 (capacity corrupt0, PTY BG3 observation,
+synthetic auth conflict0); Linux Release/ASan did not run. PTY observation fixture
+was corrected and passed macOS full gate, not Linux rechecked. Other causes stay
+unresolved, not called flaky. Final independent recheck failed before an answer;
+no third layer or replay. Full source commit/push is therefore not attempted.
+
+Matched Release performance retained30 trials/variant/geometry of six legacy
+scenarios (120 processes, all exit0), exact e99a4fd binary versus candidate SHA
+89fab5cdaa9901035dd360028e9d87ce9ba3f1b592b8f3ca20eec770b2fa6bac.
+New T1 round failed on correction fixture trial3/110x35: /exit wait timed out,
+fixture exited1 and orphaned its disposable main after losing PTY ownership.
+Original native session, screen, effect, traceback and launch/results ledger are
+retained; final Python-memory terminal/endpoints were NOT saved. Explicit failed-
+fixture SIGTERM cleanup of exact pgid66725 observed all three pids absent; orphan
+exit statuses unavailable, never claimed exit0. No measurement replay. Strict
+report correctly refuses incomplete round. Separately labeled baseline-only
+analysis derives complete120-process deltas; no whole-round performance GREEN or
+physical latency claim. RUN chat-t1-02 owns exact final patch/inventory/archive,
+measurements, review failure/unknown disposition, STATUS and BLOCKED HANDOFF.
+Candidate remains uncommitted on c5048d2; no installation/restart or T2.

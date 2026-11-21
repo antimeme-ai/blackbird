@@ -1447,18 +1447,27 @@ void actual_terminal_queue(UiCut cut = UiCut::none) {
   }
   require(::write(master, "queued-input\r", 13) == 13, "actualnativequeuedsubmit");
   phase = "queued persistence";
-  auto saved = [&](const std::vector<std::string> &expected) {
+  std::string queued_id;
+  auto saved = [&](std::string_view expected) {
     try {
-      return load_terminal_state(directory + "/ui-state.bbm").queued == expected;
+      const auto state = load_terminal_state(directory + "/ui-state.bbm");
+      for (const auto &item : state.intentions.array()) {
+        if (queued_id.empty() &&
+            field(item, "revisions").array() == Value::Array{Value{"queued-input"}})
+          queued_id = string_field(item, "id");
+        if (!queued_id.empty() && string_field(item, "id") == queued_id)
+          return string_field(item, "state") == expected;
+      }
+      return false;
     } catch (const Error &) {
       return false;
     }
   };
-  while (!saved({"queued-input"}))
+  while (!saved("queued · next turn"))
     drain();
   require(::write(master, "/cancel\r", 8) == 8, "actualnativecancelcommand");
   phase = "cancel persistence";
-  while (!saved({}))
+  while (!saved("held"))
     drain();
   require(::write(gate[1], "R", 1) == 1, "nativeworkerreleaseaftercancel");
   phase = "worker output";
@@ -1472,6 +1481,7 @@ void actual_terminal_queue(UiCut cut = UiCut::none) {
   cleanup.joined = true;
   require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
           "actualTUIworkerqueuecancelquitcompletes");
+  require(saved("held"), "native exact pending intention still held after clean exit");
   const auto all = records(directory);
   bool queued = false, withdrawn = false, drained = false, applied = false,
        frames = false, keyboard = false, worker = false, complete = false;
@@ -1532,7 +1542,8 @@ void actual_terminal_queue(UiCut cut = UiCut::none) {
       for (const auto &[original, queue] : prompt_sources) {
         (void)original;
         if (source == queue) {
-          require(branch == 2, "actualcanceledpendingpromptwithdrawswithoutdequeue");
+          require(branch == 5,
+                  "legacy custody retires at exit; native item held without dequeue");
           withdrawn = true;
         }
       }

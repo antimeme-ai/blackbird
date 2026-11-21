@@ -164,7 +164,7 @@ if arguments.case in ('all', 'controls'):
             send(b"/help\r")
             wait_for(b"Keyboard: /keys")
             os.kill(pid, 0)  # Local help never waits for or cancels the active shell.
-            assert b"queued 1" not in observed, "help became a queued turn"
+            assert b"next 1" not in observed, "help became a queued turn"
             send(b'\x1b[200~draft contains \x03 literally\x1b[201~')
             wait_for(b"draft contains")
             wait_for(b"\\x03 literally")
@@ -172,11 +172,13 @@ if arguments.case in ('all', 'controls'):
             os.kill(pid, 0)  # Pasted control byte must not stop the running shell.
             os.write(master, b"\x15")
             send(b'/lua print("QUEUED_" .. "SHOULD_NOT_RUN")\r')
-            wait_for(b"queued 1")
+            wait_for(b"next 1")
             send(b"/queue\r")
+            wait_for(b"Next turns")
+            send(b"\x07")
             wait_for(b"Pending prompts: 1")
             os.kill(pid, 0)
-            assert b"queued 2" not in observed, "queue inspection queued itself"
+            assert b"next 2" not in observed, "queue inspection queued itself"
             send(b"UNSUBMITTED_DRAFT")
             wait_for(b"UNSUBMITTED_DRAFT")
             started = time.monotonic()
@@ -282,10 +284,10 @@ if arguments.case in ('all', 'palette'):
             wait_for(b'Commands / help_')
             send(b'\r')
             wait_for(b'Command loaded; Enter sends explicitly')
-            assert b'queued 1' not in observed, 'selection queued a turn'
+            assert b'next 1' not in observed, 'selection queued a turn'
             send(b'\r')
             wait_for(b'Keyboard: /keys') # Existing immediate local help, no busy queue.
-            send(b'\x14nomatch\x03') # Modal Ctrl-C backs out, not stop the worker.
+            send(b'\x14nomatch\x07') # Ctrl-G is local Back; keep worker alive.
             wait_for(b'Enter queue')
             os.kill(busy_pid, 0)
             send(b'\x14nomatch')
@@ -325,7 +327,8 @@ if arguments.case in ('all', 'palette-capacity'):
             assert child.wait(timeout=5) == 0
             saved = native_packet.read_packet((Path(work) / 'ui-state.bbm'))
             assert bytes.fromhex(saved['draft']) == b'KEEP_FULL' and saved['cursor'] == 3
-            assert len(saved['queued']) == 128
+            assert len(saved['independent_drafts']) == 128
+            assert all(row['text'] == 'recovered' for row in saved['independent_drafts'])
         finally:
             if child.poll() is None:
                 child.kill(); child.wait()
@@ -360,7 +363,7 @@ if arguments.case in ('all', 'editor'):
         observed = Observed()
         try:
             wait_for(b'Workflow reloads')
-            send(b'original\x07\r') # Pre-editor typeahead must not send the returned draft.
+            send(b'original\x1be\r') # Pre-editor typeahead must not send the returned draft.
             wait_for(b'Editor returned')
             # The startup frame's tail may arrive after send() cleared the buffer;
             # the suspend packet ends reporting and a frame after resume restores it.
@@ -377,14 +380,14 @@ if arguments.case in ('all', 'editor'):
             wait_for(b'EDIT_RUN')
             send(b'/lua arco.call("exec", {command="printf EDITOR_; printf BUSY; sleep 30"})\r')
             wait_for(b'EDITOR_BUSY')
-            send(b'BUSY_DRAFT\x07')
+            send(b'BUSY_DRAFT\x1be')
             wait_for(b'Editor waits for an idle turn')
             assert calls.read_text() == 'X', 'busy turn launched editor'
             send(b'\x03')
             wait_for(b'interrupted')
-            wait_for(b'Turn cancelled') # Settlement must finish before editor handoff.
+            wait_for(b'Turn interrupted locally') # Settlement must finish before editor handoff.
             action.write_text('fail')
-            send(b'\x15KEEP_CURSOR\x1b[D\x1b[D\x07')
+            send(b'\x15KEEP_CURSOR\x1b[D\x1b[D\x1be')
             wait_for(b'Editor cancelled or failed')
             saved = native_packet.read_packet((Path(work) / 'ui-state.bbm'))
             assert bytes.fromhex(saved['draft']) == b'KEEP_CURSOR' and saved['cursor'] == 9
@@ -546,9 +549,10 @@ if arguments.case in ('all', 'tools'):
             send(b'/lua arco.call("exec", {command="for i in 1 2 3; do echo BG_$i; sleep 0.15; done", yield_ms=0}); '
                  b'arco.call("exec", {command="for i in 1 2 3; do echo FG_$i; sleep 0.15; done"}); print("MIX_" .. "DONE")\r')
             wait_for(b"MIX_DONE")
-            time.sleep(0.6)
-            send(b"\x15")
-            wait_for(b"BG_3")
+            # BG_3 may already be in the completed frame. A no-op Ctrl-U on
+            # an empty composer need not emit another packet; do not discard
+            # its already observed evidence and wait for unrelated fresh bytes.
+            wait_for(b"BG_3", predicate=lambda: not observed.screen.synchronized_update)
             rows = transcript_rows()
             def owner(index):
                 while index > 0 and rows[index - 1] != "ACTIVITY":
@@ -615,7 +619,7 @@ if arguments.case in ('all', 'state'):
             wait_for(b'sleep 1')
             queued = '/lua arco.call("exec", {command=' + json.dumps("printf X >> '" + str(effect) + "'") + '}); print("RRC_RECOVERED_" .. "SETTLED")\r'
             send(queued.encode())
-            wait_for(b'queued 1')
+            wait_for(b'next 1')
             send(b'RRC_UNSENT')
             wait_for(b'RRC_UNSENT')
             assert exit_code() == 75
@@ -647,7 +651,7 @@ if arguments.case in ('all', 'state'):
             os.kill(busy_pid, 0)
             normal_queued = queued.replace('RRC_RECOVERED_', 'NORMAL_RECOVERED_')
             send(normal_queued.encode())
-            wait_for(b'queued 1')
+            wait_for(b'next 1')
             send(b'NORMAL_UNSENT')
             wait_for(b'NORMAL_UNSENT')
             quit_deadline = time.monotonic() + 5
@@ -749,7 +753,7 @@ if arguments.case in ('all', 'comfort'):
             send(b'\x15/lua arco.call("exec", {command="sleep 30"})\r')
             wait_frame(lambda f: b'Tool ' in f)
             send(b'\x03')
-            wait_frame(lambda f: b'Turn cancelled' in f)
+            wait_frame(lambda f: b'Turn interrupted locally' in f)
             send(b'/lua error("COMFORT_FAILURE")\r')
             wait_frame(lambda f: b'Turn failed' in f)
             send(b'\x11')

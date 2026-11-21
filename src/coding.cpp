@@ -4265,6 +4265,12 @@ Value CodingEngine::request(Value options) {
     assembly.stage(12);
     drain_workflows();
     auto items = context_.items();
+    std::vector<std::string> assembled_entries;
+    if (next_turns) {
+      const auto view = context_.view();
+      for (const auto &entry : field(view, "entries").array())
+        assembled_entries.push_back(string_field(entry, "id"));
+    }
     auto origin = context_.head();
     validate_protocol(items, assembly.reference());
     auto request = Value::object(
@@ -4499,6 +4505,7 @@ Value CodingEngine::request(Value options) {
         poll_commands();
         return cancelled && cancelled();
       };
+      const auto dispatch_generation = turn_dispatch ? turn_dispatch->current() : 0;
       Value response;
       unsigned delay_ms = std::min(base_ms, cap_ms);
       for (unsigned ordinal = 1;; ++ordinal) {
@@ -4583,6 +4590,16 @@ Value CodingEngine::request(Value options) {
                         &owner, attempt_phase.reference(), nullptr,
                         &operation_context.receipt};
                     attempt_phase.stage(23);
+                    // Commit only immediately before entering this transport.
+                    // The shared native generation orders admitted main stop
+                    // against a retry even if retention/assembly blocked earlier.
+                    if (cancelled && cancelled())
+                      throw Error{ErrorCode::interrupted};
+                    if (turn_dispatch && !turn_dispatch->commit(dispatch_generation))
+                      throw Error{ErrorCode::interrupted};
+                    if (next_turns)
+                      next_turns->request(origin, assembled_entries,
+                                          hex_identity(attempt.bytes()));
                     result = provider_.respond(
                         request,
                         [&](std::string_view raw) {
@@ -5462,6 +5479,37 @@ Value CodingEngine::call(std::string name, Value arguments) {
           const RawAdapterContext context{&owner, std::nullopt, nullptr, nullptr};
           return call_colleague(arguments, capture, transport, &context);
         }
+        if (name == "next_turns") {
+          if (!next_turns)
+            throw Error{ErrorCode::incomplete};
+          const auto op = string_field(arguments, "op");
+          if (op == "read")
+            return next_turns->view();
+          const auto id = string_field(arguments, "id");
+          const auto revision = budget_number(arguments, "revision");
+          if (op == "hold")
+            next_turns->hold(id, revision);
+          else if (op == "edit")
+            next_turns->edit(id, revision);
+          else if (op == "buffer")
+            next_turns->buffer(id, revision, string_field(arguments, "text"),
+                               budget_number(arguments, "edit_version"));
+          else if (op == "apply")
+            next_turns->apply(id,
+                              {.revision = revision,
+                               .version = budget_number(arguments, "edit_version")});
+          else if (op == "discard")
+            next_turns->discard(id,
+                                {.revision = revision,
+                                 .version = budget_number(arguments, "edit_version")});
+          else if (op == "release")
+            next_turns->release(id, revision);
+          else if (op == "withdraw")
+            next_turns->withdraw(id, revision);
+          else
+            throw Error{ErrorCode::invalid_range};
+          return next_turns->view();
+        }
         if (name == "tasks_read")
           return tasks_.read(arguments.find("query") ? field(arguments, "query")
                                                      : Value::object({}));
@@ -5929,11 +5977,19 @@ void CodingEngine::turn(TurnInput input) {
         throw;
       }
       root_source_length_ = input.program.size();
-      if (!input.prompt.empty())
+      if (!input.prompt.empty()) {
         context_.append(
             {Value::object({{"role", Value{"user"}},
                             {"content", Value{std::string{input.prompt}}}})},
             "operator", origin);
+        if (next_turns && !current_intention.empty()) {
+          const auto view = context_.view(origin);
+          const auto &entries = field(view, "entries").array();
+          next_turns->context(current_intention, string_field(entries.back(), "id"),
+                              context_.head());
+          next_turns->route(current_intention, "context objective + workflow");
+        }
+      }
       stage = 2;
       state(stage);
       runtime_ = std::make_unique<Runtime>(*this);

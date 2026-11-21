@@ -592,6 +592,27 @@ int main(int argc, char **argv) {
         const auto response = e.jobs.control(prior_background);
         require(field(response, "released") == Value{false},
                 "prior wait background cannot release newer wait for same job");
+        const auto stale_input =
+            Value::object({{"op", Value{"input"}},
+                           {"job_id", Value{f}},
+                           {"request_id", Value{"captured-old-keyboard-epoch"}},
+                           {"bytes", Value{"must-not-write"}},
+                           {"wait_epoch", field(prior_background, "wait_epoch")}});
+        bool refused_input = false;
+        try {
+          (void)e.jobs.control(stale_input);
+        } catch (const Error &error) {
+          refused_input = error.code == ErrorCode::conflict;
+        }
+        require(refused_input,
+                "old keyboard epoch refuses before new foreground consumption");
+        refused_input = false;
+        try {
+          e.jobs.request(stale_input);
+        } catch (const Error &error) {
+          refused_input = error.code == ErrorCode::conflict;
+        }
+        require(refused_input, "old keyboard epoch refuses mailbox admission too");
         stale_checked = true;
       } else if (!fresh_checked) {
         e.jobs.request(

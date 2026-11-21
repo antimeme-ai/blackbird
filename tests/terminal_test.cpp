@@ -26,6 +26,160 @@ InputResult feed(Composer &c, std::string_view bytes) {
 }
 int main() {
   {
+    NextTurns owner;
+    owner.acquire("first-returned-id", "equal", "chat");
+    owner.acquire("second-returned-id", "equal", "chat");
+    owner.queue("first-returned-id");
+    owner.queue("second-returned-id");
+    owner.hold_all();
+    owner.edit("first-returned-id", 1);
+    owner.buffer("first-returned-id", 1, "corrected",
+                 owner.get("first-returned-id").edit_version);
+    bool refused = false;
+    try {
+      owner.release("first-returned-id", 1);
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused && owner.get("first-returned-id").dirty());
+    owner.apply(
+        "first-returned-id",
+        {.revision = 1, .version = owner.get("first-returned-id").edit_version});
+    auto corrected = owner.get("first-returned-id");
+    check(corrected.revision() == 2 && *corrected.revisions[0].text == "equal" &&
+          *corrected.current().text == "corrected" &&
+          corrected.state == NextTurns::State::held);
+    refused = false;
+    try {
+      owner.release("first-returned-id", 1);
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused);
+    owner.release("first-returned-id", 2);
+    check(owner.get("second-returned-id").state == NextTurns::State::held);
+    const auto launched =
+        owner.launch("first-returned-id", {.revision = 2, .turn = 19});
+    check(launched.turn == 19);
+    refused = false;
+    try {
+      owner.edit("first-returned-id", 2);
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused && *owner.get("first-returned-id").current().text == "corrected");
+    NextTurns reopened;
+    reopened.restore(owner.saved());
+    check(reopened.get("first-returned-id").state == NextTurns::State::recovered);
+    check(reopened.get("first-returned-id").previous_state == "starting");
+    refused = false;
+    try {
+      (void)reopened.launch("first-returned-id", {.revision = 2, .turn = 20});
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused); // queue-removal/launch gap never auto-replays
+    owner.result("first-returned-id", NextTurns::State::completed);
+    reopened.restore(owner.saved());
+    check(reopened.get("first-returned-id").state == NextTurns::State::completed);
+    owner.withdraw("second-returned-id", 1);
+    check(*owner.get("second-returned-id").current().text == "equal");
+  }
+  {
+    NextTurns owner;
+    owner.acquire("save-race-id", "recoverable", "native terminal dispatch");
+    owner.queue("save-race-id");
+    const auto old = owner.checkpoint();
+    owner.hold("save-race-id", 1);
+    owner.release("save-race-id", 1);
+    owner.saved_generation(old.generation);
+    bool refused = false;
+    try {
+      (void)owner.launch("save-race-id",
+                         {.revision = 1, .turn = 1, .require_saved = true});
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused && *owner.get("save-race-id").current().text == "recoverable");
+    const auto saved = owner.checkpoint();
+    owner.saved_generation(saved.generation);
+    (void)owner.launch("save-race-id",
+                       {.revision = 1, .turn = 1, .require_saved = true});
+    owner.launch_refused("save-race-id");
+    check(owner.get("save-race-id").state == NextTurns::State::held);
+    owner.route("save-race-id", "inline Lua local execution");
+    check(owner.get("save-race-id").route == "native terminal dispatch" &&
+          owner.get("save-race-id").observed_route == "inline Lua local execution");
+    owner.context("save-race-id", "independent-entry-id", "context-at-append");
+    owner.request("request-origin", {}, "attempt-omitted");
+    check(!std::get<bool>(
+        field(owner.get("save-race-id").requests.back(), "included").value()));
+    owner.request("request-origin", {"independent-entry-id"}, "attempt-included");
+    check(std::get<bool>(
+        field(owner.get("save-race-id").requests.back(), "included").value()));
+    NextTurns recovered;
+    recovered.restore(owner.saved());
+    check(recovered.get("save-race-id").state == NextTurns::State::recovered);
+  }
+  {
+    NextTurns owner;
+    owner.acquire("large-admitted", std::string(600 * 1024, 'x'), "native dispatch");
+    owner.queue("large-admitted");
+    bool refused = false;
+    try {
+      (void)owner.edit("large-admitted", 1);
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::capacity;
+    }
+    check(refused && !owner.get("large-admitted").edit);
+    NextTurns reopened;
+    reopened.restore(owner.saved());
+    check(reopened.get("large-admitted").current().text->size() == 600 * 1024);
+    NextTurns edits;
+    edits.acquire("edit-race", "submitted", "native dispatch");
+    edits.queue("edit-race");
+    const auto v1 = edits.edit("edit-race", 1);
+    const auto v2 = edits.buffer("edit-race", 1, "model proposal", v1);
+    refused = false;
+    try {
+      (void)edits.buffer("edit-race", 1, "stale native proposal", v1);
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused && *edits.get("edit-race").edit == "model proposal");
+    edits.discard("edit-race", {.revision = 1, .version = v2});
+    refused = false;
+    try {
+      edits.apply("edit-race", {.revision = 1, .version = v2});
+    } catch (const Error &error) {
+      refused = error.code == ErrorCode::conflict;
+    }
+    check(refused && *edits.get("edit-race").current().text == "submitted");
+  }
+  {
+    TurnDispatch fence;
+    const auto t1 = fence.begin();
+    check(fence.commit(t1).has_value()); // dispatch won
+    check(fence.stop(t1) && fence.stop(t1));
+    check(!fence.commit(t1)); // admitted stop fences retry
+    const auto t2 = fence.begin();
+    check(!fence.stop(t1) && !fence.commit(t1));
+    check(fence.commit(t2).has_value()); // old stop cannot retarget
+    Composer active;
+    active.draft("preserved");
+    feed(active, "\x14");
+    check(feed(active, "\x03").action == InputAction::cancel);
+    check(active.palette_open());
+    feed(active, "\x1b");
+    const auto dispatch =
+        terminal_input_dispatch(active, std::chrono::steady_clock::time_point::max(),
+                                std::chrono::steady_clock::time_point{}, 0, true);
+    check(dispatch.stop && !dispatch.focus_editor && active.palette_open());
+    check(active.text() == "preserved");
+    check(feed(active, "\x07").action == InputAction::back);
+    check(!active.palette_open() && active.text() == "preserved");
+  }
+  {
     Composer picker;
     picker.draft("unsent draft");
     picker.choices({{"/resume /tmp/a", "", "/tmp/a", "Session", "Alpha"},
@@ -216,7 +370,9 @@ int main() {
     check(palette_key.palette_lines(4)[1].find("No matching") != std::string::npos);
     check(feed(palette_key, "\r").action == InputAction::none &&
           palette_key.palette_open());
-    feed(palette_key, "\x03");
+    check(feed(palette_key, "\x03").action == InputAction::cancel);
+    check(palette_key.palette_open()); // Stop is not Back.
+    feed(palette_key, "\x07");
     feed(palette_key, "\x14\x1b[200~stats\r\x07\x1b[201~");
     check(palette_key.palette_open() && palette_key.text() == "unsent draft");
     check(palette_key.palette_lines(1).size() == 1 &&

@@ -30,6 +30,7 @@ def main():
     paths.append("scripts/check-registered-responses")
     paths.append("scripts/check-session-startup")
     paths += ["scripts/tui-test", "scripts/check-tui-microsoft", "tooling/tui-test-profile.json"]
+    paths += ["scripts/check-next-turns", "scripts/check-main-provider-stop", "scripts/check-t1-recovery"]
     paths.append("scripts/check-terminal-blocked")
     paths.append("scripts/check-application")
     paths.append("scripts/check-display-text")

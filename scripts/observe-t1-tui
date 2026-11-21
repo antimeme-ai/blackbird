@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Serial matched unsubmitted PTY endpoints; optional isolated T1 fixture episodes.
+
+No live provider or runtime installation. --t1 deliberately submits only within
+the separate credential-free local/fake-provider fixtures and their owned files.
+
+Paired baseline scenarios follow the retained 2026-10-15 procedure, but this is a
+new observer identity and therefore requires a fresh before/after round. Raw
+parent clocks/offsets are recorded; no durations or percentiles in the recorder.
+"""
+import argparse
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import pty
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location('vt', ROOT/'scripts/terminal-screen-oracle.py')
+vt = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vt)
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('spec', type=Path)
+    parser.add_argument('artifacts', type=Path)
+    parser.add_argument('--count', type=int, default=30)
+    parser.add_argument('--t1', action='store_true', help='new candidate-only T1 baseline; no predecessor improvement claim')
+    parser.add_argument('--gate-file', type=Path, help='qualification-only startup gate, excluded from measurement rounds')
+    args = parser.parse_args()
+    assert args.count > 0
+    variants = json.loads(args.spec.read_text())
+    assert set(variants) == {'before','after'}
+    output = args.artifacts.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    observer = Path(__file__).resolve()
+    (output/'observer.py').write_bytes(observer.read_bytes())
+    metadata = {'observer_sha256':digest(observer),'oracle_sha256':digest(ROOT/'scripts/terminal-screen-oracle.py'),
+                'host':platform.uname()._asdict(),'python':sys.version,'trials':args.count,
+                'geometries':[[80,24],[110,35]],'variants':variants,'scenario_version':1,
+                'qualification_gate':bool(args.gate_file),'t1_new_baseline':bool(args.t1),'load_begin':os.getloadavg(),'start_clock_ns':time.monotonic_ns()}
+    for variant in variants.values():
+        executable = Path(variant['executable']).resolve()
+        variant['executable'] = str(executable)
+        variant['sha256'] = digest(executable)
+        variant['stat'] = [executable.stat().st_dev,executable.stat().st_ino,executable.stat().st_size,executable.stat().st_mtime_ns]
+    (output/'metadata.json').write_text(json.dumps(metadata,indent=2))
+    for trial in range(args.count):
+        for columns,rows in ((80,24),(110,35)):
+            # Alternate variant order, not thirty before followed by thirty after.
+            for label in (('before','after') if trial%2==0 else ('after','before')):
+                variant = variants[label]
+                executable = Path(variant['executable'])
+                work = output/f'{label}-{columns}x{rows}-{trial:03}'
+                work.mkdir()
+                workflow = work/'no-provider.lua'
+                workflow.write_text('error("observer must not submit work")\n')
+                record = {'variant':label,'trial':trial,'geometry':[columns,rows],
+                          'endpoints':[],'load':os.getloadavg()}
+                master,slave = pty.openpty()
+                fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',rows,columns,0,0))
+                env = dict(os.environ,BLACKBIRD_GRAPHICS='off',BLACKBIRD_MASCOT='0')
+                for key in ('BLACKBIRD_EXECUTABLE','ARCO_EXECUTABLE','BLACKBIRD_SPRITE_ASSET'):
+                    env.pop(key,None)
+                screen = vt.Screen()
+                raw = bytearray()
+                child = None
+                def stamp(name):
+                    record['endpoints'].append({'name':name,'clock_ns':time.monotonic_ns(),
+                                                'output_offset':len(raw)})
+                def wait(predicate):
+                    deadline = time.monotonic()+10
+                    while time.monotonic()<deadline:
+                        if select.select([master],[],[],.01)[0]:
+                            try:data = os.read(master,65536)
+                            except OSError:break
+                            if not data:break
+                            raw.extend(data)
+                            screen.feed(data)
+                        if predicate() and not screen.synchronized_update:return
+                        if child.poll() is not None:break
+                    raise AssertionError(screen.text())
+                def action(name,data,predicate):
+                    stamp(name+':write_begin')
+                    os.write(master,data)
+                    stamp(name+':write_return')
+                    wait(predicate)
+                    stamp(name+':frame_observed')
+                def interrupted(signum, _frame):
+                    raise InterruptedError(f'observer interrupted by signal {signum}')
+                signal.signal(signal.SIGTERM,interrupted)
+                signal.signal(signal.SIGINT,interrupted)
+                try:
+                    stamp('startup:spawn_begin')
+                    child = subprocess.Popen([str(executable),'--session',str(work/'session'),
+                                              '--workflow',str(workflow)],env=env,stdin=slave,
+                                             stdout=slave,stderr=slave,start_new_session=True)
+                    stamp('startup:spawn_return')
+                    wait(lambda:'Workflow reloads' in screen.text())
+                    stamp('startup:frame_observed')
+                    if args.gate_file:
+                        args.gate_file.with_suffix('.entered').write_text(str(child.pid))
+                        while not args.gate_file.exists():time.sleep(.02)
+                    action('typing',b'short OBSERVED_TAIL',lambda:'short OBSERVED_TAIL' in screen.text())
+                    payload = b'\x15\x1b[200~'+b'x'*4080+b'\nPASTE_VISIBLE_TAIL\x1b[201~'
+                    action('paste',payload,lambda:'PASTE_VISIBLE_TAIL' in screen.text())
+                    action('palette',b'\x15/',lambda:'> /help ' in screen.text())
+                    action('selection',b'\x1b[B',lambda:'> /keys ' in screen.text())
+                    action('resize_draft',b'\x1b',lambda:'> /keys ' not in screen.text())
+                    action('resize_text',b'\x15RESIZE_TAIL',lambda:'RESIZE_TAIL' in screen.text())
+                    new_columns,new_rows = (110,35) if columns==80 else (80,24)
+                    stamp('resize:ioctl_begin')
+                    fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',new_rows,new_columns,0,0))
+                    os.kill(child.pid,signal.SIGWINCH)
+                    stamp('resize:signal_return')
+                    wait(lambda:'RESIZE_TAIL' in ''.join(screen.cells.get((new_rows-3,c),' ') for c in range(new_columns))
+                         and screen.row==new_rows-3)
+                    stamp('resize:frame_observed')
+                    (work/'screen.txt').write_text(screen.text())
+                    # Deliberate local exit command, never submitted to workflow/provider.
+                    stamp('exit:write_begin')
+                    os.write(master,b'\x15/exit\r')
+                    stamp('exit:write_return')
+                    child.wait(timeout=10)
+                    record['returncode'] = child.returncode
+                    assert child.returncode==0
+                    assert [executable.stat().st_dev,executable.stat().st_ino,executable.stat().st_size,executable.stat().st_mtime_ns]==variant['stat']
+                    record['status']='completed'
+                except BaseException as error:
+                    record['status']='interrupted' if isinstance(error,(InterruptedError,KeyboardInterrupt)) else 'failed'
+                    record['error']=repr(error)
+                    raise
+                finally:
+                    # Interruption cleanup is protected from another signal, and
+                    # artifact finalization runs even if cleanup itself fails.
+                    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+                    signal.signal(signal.SIGINT,signal.SIG_IGN)
+                    try:
+                        if child is not None and child.poll() is None:
+                            # Escape is idle Back in BOTH matched source variants;
+                            # Ctrl-G launched the old external editor.
+                            os.write(master,b'\x1b')
+                            time.sleep(.05)
+                            os.write(master,b'\x15/exit\r')
+                            try:child.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                os.killpg(child.pid,signal.SIGTERM)
+                                try:child.wait(timeout=10)
+                                except subprocess.TimeoutExpired:
+                                    os.killpg(child.pid,signal.SIGKILL)
+                                    child.wait(timeout=10)
+                    except BaseException as error:
+                        record['cleanup_error']=repr(error)
+                        record['status']='failed'
+                    finally:
+                        if child is not None:record['process']={'pid':child.pid,'returncode':child.poll()}
+                        (work/'terminal.bin').write_bytes(raw)
+                        (work/'sample.json').write_text(json.dumps(record,indent=2))
+                        with (output/'samples.jsonl').open('a') as log:log.write(json.dumps(record)+'\n')
+                        os.close(master)
+                        os.close(slave)
+                        signal.signal(signal.SIGTERM,interrupted)
+                        signal.signal(signal.SIGINT,interrupted)
+                    if record.get('cleanup_error'):raise RuntimeError(record['cleanup_error'])
+    if args.t1:
+        # Exact new scenario sources and their produced native/parent originals
+        # are retained, rather than folding these into old unsubmitted timings.
+        sources = {}
+        for name in ('check-next-turns','check-main-provider-stop'):
+            source = ROOT/'scripts'/name
+            sources[name]=digest(source)
+            (output/(name+'.py')).write_bytes(source.read_bytes())
+        metadata['t1_sources']=sources
+        for trial in range(args.count):
+            for columns,rows in ((80,24),(110,35)):
+                work=output/f't1-after-{columns}x{rows}-{trial:03}'
+                work.mkdir()
+                for name in ('check-next-turns','check-main-provider-stop'):
+                    command=[sys.executable,str(ROOT/'scripts'/name),variants['after']['executable'],
+                             '--artifacts',str(work),'--columns',str(columns),'--rows',str(rows)]
+                    if name=='check-main-provider-stop':command+=['--mode','blocked']
+                    # Append launch intent before dispatch; retain failure outputs.
+                    record={'scenario':name,'geometry':[columns,rows],'trial':trial,
+                            'spawn_begin_clock_ns':time.monotonic_ns(),'command':command}
+                    with (output/'t1-attempts.jsonl').open('a') as log:log.write(json.dumps(record)+'\n')
+                    fixture=None
+                    stdout=stderr=b''
+                    interrupted_error=None
+                    try:
+                        fixture=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+                        record['pid']=fixture.pid
+                        stdout,stderr=fixture.communicate()
+                    except BaseException as error:
+                        interrupted_error=error
+                        record['interruption']=repr(error)
+                        if fixture is not None and fixture.poll() is None:
+                            fixture.send_signal(signal.SIGTERM)
+                            stdout,stderr=fixture.communicate()
+                    finally:
+                        record.update(returncode=fixture.poll() if fixture else None,settled_clock_ns=time.monotonic_ns())
+                        (work/(name+'.stdout')).write_bytes(stdout)
+                        (work/(name+'.stderr')).write_bytes(stderr)
+                        with (output/'t1-results.jsonl').open('a') as log:log.write(json.dumps(record)+'\n')
+                    if interrupted_error is not None:raise interrupted_error
+                    assert record['returncode']==0,(command,stderr)
+    for variant in variants.values():assert digest(Path(variant['executable']))==variant['sha256']
+    metadata['end_clock_ns']=time.monotonic_ns()
+    metadata['load_end']=os.getloadavg()
+    metadata['status']='qualification_only' if args.gate_file else 'completed'
+    (output/'metadata.json').write_text(json.dumps(metadata,indent=2))
+    print(output)
+
+if __name__=='__main__':main()

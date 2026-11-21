@@ -53,10 +53,14 @@ const std::array builtin_commands{
                 "View"},
     ChatCommand{
         "/edit", "",
-        "Open a blank draft in $VISUAL/$EDITOR; Ctrl-G edits current draft (idle TUI)",
+        "Open blank draft in $VISUAL/$EDITOR; Alt-E edits current draft (idle TUI)",
         "Chat"},
-    ChatCommand{"/queue", "", "Show pending prompts (TUI only)", "Chat"},
-    ChatCommand{"/cancel", "", "Request stop and clear pending queue (TUI only)",
+    ChatCommand{"/receipts", "",
+                "Inspect keyed native Send receipts and actual owner relations",
+                "Conversation"},
+    ChatCommand{"/queue", "", "Next turns shelf; Ctrl-R preserves composer (TUI only)",
+                "Chat"},
+    ChatCommand{"/cancel", "", "Request stop and hold pending queue (TUI only)",
                 "Chat"},
     ChatCommand{"/clear", "", "Clear display, not model context (TUI only)", "Chat"},
     ChatCommand{"/drafts", "", "List recovered drafts (TUI only)", "Chat"},
@@ -325,8 +329,9 @@ std::string terminal_key_help() {
          "  Alt-Enter    Insert newline (also Ctrl-J; Shift-Enter where the\n"
          "               terminal reports it, e.g. Ghostty)\n"
          "  Tab          Complete a slash-command name; ambiguity never submits\n"
-         "  Ctrl-G       Edit current draft in $VISUAL/$EDITOR (idle only)\n"
-         "  Ctrl-Space/T Search commands; arrows select, Enter loads, Esc backs out\n"
+         "  Ctrl-G       Local Back; keep drafts; Alt-E external editor (idle only)\n"
+         "  Ctrl-Space/T Search commands; arrows select, Enter loads, Ctrl-G backs "
+         "out\n"
          "  Up / Down    Move between draft lines; history at first/last line\n"
          "  Ctrl-P / N   Explicit history; restores your draft and cursor\n"
          "  Left / Right Move within the draft\n"
@@ -336,13 +341,13 @@ std::string terminal_key_help() {
          "  Ctrl-W       Delete previous word; Alt-D deletes next word\n"
          "  Ctrl-K / Y   Kill to line end / yank last deletion\n"
          "  Ctrl-U       Clear draft; Ctrl-Y restores it\n"
-         "  Ctrl-C       Request stop and clear pending queue; keep unsent draft\n"
+         "  Esc/Ctrl-C   Stop active main; hold queue; keep unsent draft\n"
          "  Ctrl-B       Background foreground command; preserve composer\n"
          "  Ctrl-O       Inspect command results; preserve draft/cursor\n"
          "  Ctrl-\\      View picker; switch views without replacing the draft\n"
          "  Ctrl-X       Current-session command center; preserve draft/cursor\n"
          "  Ctrl-]       Authored result lab; F6/F7 pin A/B; F8 request interrupt\n"
-         "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Esc draft\n"
+         "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Ctrl-G draft\n"
          "  Center       T tasks, P participants, J command runs; + means more\n"
          "               Ctrl-Left/Right: list pages or output pages by focus\n"
          "  PTY input    Keys and Ctrl-C reach selected command; Ctrl-B returns\n"
@@ -428,6 +433,16 @@ constexpr std::size_t ui_limit = 1024 * 1024;
 void validate_state(const TerminalState &state, std::size_t *history_bound = nullptr) {
   if (state.draft.size() > ui_limit || state.cursor > state.draft.size())
     throw Error{ErrorCode::capacity};
+  if (state.independent_drafts.array().size() > 128)
+    throw Error{ErrorCode::capacity};
+  std::size_t draft_bytes = 0;
+  for (const auto &draft : state.independent_drafts.array()) {
+    const auto &text = field(draft, "text").string();
+    const auto &predecessor = field(draft, "predecessor").string();
+    if (text.size() > ui_limit - draft_bytes || predecessor.size() > 512)
+      throw Error{ErrorCode::capacity};
+    draft_bytes += text.size();
+  }
   for (const auto *list : {&state.history, &state.queued}) {
     if (list->size() > 128)
       throw Error{ErrorCode::capacity};
@@ -577,6 +592,21 @@ TerminalState load_terminal_state(const std::filesystem::path &path, bool captur
       return std::pair{std::move(value), RawUiSource{body, 0, size}};
     };
     TerminalState state;
+    if (const auto *intentions = packet.find("intentions"))
+      state.intentions = *intentions;
+    if (const auto *parked = packet.find("parked_draft")) {
+      state.parked_draft = parked->string();
+      const auto text = field(packet, "parked_cursor").number().text();
+      const auto parsed =
+          std::from_chars(text.data(), text.data() + text.size(), state.parked_cursor);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          state.parked_cursor > state.parked_draft.size())
+        throw Error{ErrorCode::corrupt};
+    }
+    if (const auto *drafts = packet.find("independent_drafts"))
+      state.independent_drafts = *drafts;
+    if (const auto *predecessor = packet.find("draft_predecessor"))
+      state.draft_predecessor = predecessor->string();
     auto draft = decoded(string_field(packet, "draft"), 1, 0);
     state.draft = std::move(draft.first);
     state.draft_source = draft.second;
@@ -629,12 +659,17 @@ void save_terminal_state(const std::filesystem::path &path, const TerminalState 
         out.emplace_back(ui_hex(value));
       return Value{std::move(out)};
     };
-    const auto source = unwrap(
-        encode_packet_string(Value::object({{"encoding", Value{"hex-v1"}},
-                                            {"draft", Value{ui_hex(state.draft)}},
-                                            {"cursor", Value{Number{state.cursor}}},
-                                            {"history", encode(state.history)},
-                                            {"queued", encode(state.queued)}})));
+    const auto source = unwrap(encode_packet_string(
+        Value::object({{"encoding", Value{"hex-v1"}},
+                       {"draft", Value{ui_hex(state.draft)}},
+                       {"cursor", Value{Number{state.cursor}}},
+                       {"history", encode(state.history)},
+                       {"queued", encode(state.queued)},
+                       {"intentions", state.intentions},
+                       {"independent_drafts", state.independent_drafts},
+                       {"draft_predecessor", Value{state.draft_predecessor}},
+                       {"parked_draft", Value{state.parked_draft}},
+                       {"parked_cursor", Value{Number{state.parked_cursor}}}})));
     RawEventRef body{};
     if (source_credit) {
       const auto ref = trace.reference();
@@ -735,11 +770,11 @@ void Composer::palette_move(bool up) {
   else
     palette_selected_ = std::min(palette_selected_ + 1, matches.size() - 1);
 }
-bool Composer::flush_escape() {
+bool Composer::flush_escape(bool preserve_local) {
   // Paste contents and its terminator can span reads without a timing bound.
   if (escape_.empty() || pasted_)
     return false;
-  if (escape_ == "\x1b") {
+  if (escape_ == "\x1b" && !preserve_local) {
     palette_open_ = false;
     slash_open_ = false;
   }
@@ -755,10 +790,12 @@ bool Composer::flush_escape() {
 TerminalInputDispatch
 terminal_input_dispatch(Composer &composer, std::chrono::steady_clock::time_point now,
                         std::chrono::steady_clock::time_point escape_deadline,
-                        short events) {
+                        short events, bool active) {
   const bool palette = composer.palette_open();
-  const bool redraw = now >= escape_deadline && composer.flush_escape();
-  return {(events & (POLLIN | POLLHUP | POLLERR)) != 0, redraw, redraw && !palette};
+  const bool stop = active && now >= escape_deadline && composer.bare_escape_pending();
+  const bool redraw = now >= escape_deadline && composer.flush_escape(stop);
+  return {(events & (POLLIN | POLLHUP | POLLERR)) != 0, redraw,
+          redraw && !palette && !stop, stop};
 }
 std::vector<std::string> Composer::palette_lines(std::size_t rows) const {
   const auto catalog = choices_ && palette_open_ ? choices_ : command_catalog();
@@ -789,14 +826,18 @@ std::vector<std::string> Composer::palette_lines(std::size_t rows) const {
   }
   if (rows > 2)
     out.emplace_back(
-        slash_open_ ? "↑↓ select · Tab fill · Enter run/fill · Esc dismiss"
+        slash_open_
+            ? "↑↓ select · Tab fill · Enter run/fill · Ctrl-G Back; active Esc stops"
         : choices_ && std::any_of(choices_->begin(), choices_->end(),
                                   [](const auto &c) { return c.view.has_value(); })
-            ? "Type search · Up/Down select · Enter opens · Esc back"
+            ? "Type search · Up/Down select · Enter opens · Ctrl-G Back; active Esc "
+              "stops"
         : choices_ && std::any_of(choices_->begin(), choices_->end(),
                                   [](const auto &c) { return c.answer; })
-            ? "Type search · Up/Down select · Enter answers · Esc keeps draft"
-            : "Type search · Up/Down select · Enter loads · Esc back");
+            ? "Type search · Up/Down select · Enter answers · Ctrl-G Back; active Esc "
+              "stops"
+            : "Type search · Up/Down select · Enter loads · Ctrl-G Back; active Esc "
+              "stops");
   out.resize(rows);
   return out;
 }
@@ -963,6 +1004,11 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     }
     // Alt-Enter, plus Shift/Alt/Ctrl-Enter as xterm modifyOtherKeys (Ghostty's
     // default for Shift) and kitty CSI-u report them.
+    if (escape_ == "\x1b"
+                   "e") {
+      escape_.clear();
+      return {InputAction::edit, {}};
+    }
     if (escape_ == "\x1b\r" || escape_ == "\x1b\n" || escape_ == "\x1b[27;2;13~" ||
         escape_ == "\x1b[13;2u" || escape_ == "\x1b[27;3;13~" ||
         escape_ == "\x1b[13;3u" || escape_ == "\x1b[27;5;13~" ||
@@ -1125,6 +1171,14 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     palette_open_ = slash_open_ = false;
     return {InputAction::center_toggle, {}};
   }
+  if (c == 18)
+    return {InputAction::next_turns, {}};
+  if (c == 3)
+    return {InputAction::cancel, {}};
+  if (c == 7) {
+    palette_open_ = slash_open_ = false;
+    return {InputAction::back, {}};
+  }
   if (inspecting) {
     if (c == 9)
       return {InputAction::inspect_toggle_focus, {}};
@@ -1172,8 +1226,6 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       insert(byte);
     return {};
   }
-  if (c == 7)
-    return {InputAction::edit, {}};
   if (c == 16 || c == 14) {
     history(c == 16);
     return {};
@@ -1250,6 +1302,15 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
         throw Error{ErrorCode::audit_unavailable};
       raw->acquired = {ref, 0, length};
     }
+    std::string intention;
+    try {
+      if (acquire_send && !result.empty())
+        intention = acquire_send(result, raw ? raw->acquired : RawUiSource{});
+    } catch (const Error &error) {
+      if (error.code != ErrorCode::capacity)
+        throw;
+      return {InputAction::send_refused, result, raw ? raw->acquired : RawUiSource{}};
+    }
     if (!result.empty() && result != "/quit" && result != "/exit") {
       history_.push_back(result);
       history_capture_bound_ = trim_history(history_);
@@ -1260,8 +1321,11 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     draft_.clear();
     draft_cursor_ = 0;
     goal_column_.reset();
-    return {InputAction::submit, std::move(result),
-            raw ? raw->acquired : RawUiSource{}};
+    return {InputAction::submit,
+            std::move(result),
+            raw ? raw->acquired : RawUiSource{},
+            {},
+            intention};
   }
   if (c == 10) {
     insert('\n');
@@ -1489,6 +1553,9 @@ struct UiPrompt {
   std::string text;
   RawUiSource source{};
   RawEventRef enqueue{};
+  bool held = false;
+  std::string intention{};
+  bool independent = true;
 };
 void append_prompt_state(std::vector<std::string> &target,
                          const std::vector<UiPrompt> &prompts) {
@@ -1522,19 +1589,6 @@ RawEventRef enqueue_ui_prompt(bool enabled, std::vector<UiPrompt> &prompts,
     trace.close();
     return request;
   });
-}
-void withdraw_ui_prompts(bool enabled, std::vector<UiPrompt> &prompts,
-                         std::uint8_t branch, RawEventRef target,
-                         RawControlToken *borrowed = nullptr) {
-  RawUiBurst burst{borrowed};
-  auto credit = raw_ui_control(enabled, raw_ui_multiply(prompts.size(), 73));
-  for (std::size_t index = 0; index < prompts.size(); ++index)
-    (void)raw_ui_link(4015, prompts[index].enqueue,
-                      std::array{detail::raw_native_field(branch),
-                                 detail::raw_native_field(index), ByteView{target.lane},
-                                 detail::raw_native_field(target.ordinal)},
-                      credit ? &*credit : nullptr);
-  prompts.clear();
 }
 } // namespace
 TerminalUI::TerminalUI(std::string title) : title_(std::move(title)) {}
@@ -1667,6 +1721,7 @@ void TerminalUI::operation_completed(std::string_view value, Ink outcome) {
     trace.close();
   });
 }
+void TerminalUI::interrupted() { post(Kind::interrupted, {}); }
 void TerminalUI::failed() { post(Kind::failure, {}); }
 void TerminalUI::title(std::string_view value) { post(Kind::title, value); }
 void TerminalUI::tasks(const Value &publication, RawUiValueOrigin origin) {
@@ -1773,7 +1828,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                      const std::function<Result<void>()> &reset_interrupt,
                      RetainedState *raw_root,
                      std::optional<CommandCenterContext> center_context,
-                     std::optional<InstrumentSource> instrument_source) {
+                     std::optional<InstrumentSource> instrument_source,
+                     std::shared_ptr<TurnDispatch> turn_dispatch) {
   RawCaptureFailureScope ui_capture{raw_capture_ && raw_enabled()};
   const RawAdapterContext terminal_context{
       nullptr,
@@ -1809,6 +1865,29 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   };
   RawRegion first_frame{raw_regions::terminal_first_frame};
   Composer composer;
+  std::string latest_intention;
+  std::string draft_predecessor;
+  std::string editing_id;
+  std::size_t editing_revision = 0;
+  std::uint64_t editing_version = 0;
+  std::optional<TerminalState> suspended_composer;
+  static std::atomic_uint64_t local_send_serial{0};
+  composer.acquire_send = [&](const std::string &text, RawUiSource source) {
+    if (!editing_id.empty() || text == "/exit" || text == "/quit")
+      return std::string{}; // Enter applies this buffer, not a new Send.
+    // Production IDs use the independently allocated raw acquisition identity.
+    // The fallback is explicitly process-local for capture-disabled embeddings.
+    const auto id = raw_ui_source_valid(source.record)
+                        ? hex_identity(source.record.lane) + "-" +
+                              std::to_string(source.record.ordinal)
+                        : "local-" + std::to_string(++local_send_serial);
+    next_turns_->acquire(id, text, "native terminal dispatch", source,
+                         draft_predecessor);
+    draft_predecessor.clear();
+    latest_intention = id;
+    return id;
+  };
+  std::string active_intention;
   std::shared_ptr<const TerminalQuestion> question;
   std::unique_ptr<RawRetainedTransfer> transfer;
   std::jthread worker;
@@ -1874,7 +1953,38 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     try {
       const auto saved = load_terminal_state(state_path, raw_capture_);
       composer.restore(saved);
-      for (std::size_t index = 0; index < saved.queued.size(); ++index) {
+      draft_predecessor = saved.draft_predecessor;
+      if (!saved.parked_draft.empty()) {
+        auto parked = saved;
+        parked.draft = saved.parked_draft;
+        parked.cursor = saved.parked_cursor;
+        composer.restore(parked);
+      }
+      if (!std::holds_alternative<std::nullptr_t>(saved.intentions.value()))
+        next_turns_->restore(saved.intentions);
+      if (!std::holds_alternative<std::nullptr_t>(saved.intentions.value())) {
+        for (const auto &item : next_turns_->snapshot()) {
+          if ((item.state != NextTurns::State::recovered &&
+               item.state != NextTurns::State::withdrawn) ||
+              item.recovery_loaded)
+            continue;
+          auto text = item.edit ? *item.edit : *item.current().text;
+          // Native record is the recovery original; dispatch requires a fresh
+          // deliberate acquisition, which captures fresh source bytes.
+          (void)enqueue_ui_prompt(false, recovered, text, {}, 2, {});
+          recovered.back().intention = item.id;
+          recovered.back().independent = false;
+        }
+      }
+      for (const auto &draft : saved.independent_drafts.array()) {
+        auto text = string_field(draft, "text");
+        (void)enqueue_ui_prompt(false, recovered, text, {}, 2, {});
+        recovered.back().intention = string_field(draft, "predecessor");
+      }
+      for (std::size_t index = 0;
+           std::holds_alternative<std::nullptr_t>(saved.intentions.value()) &&
+           index < saved.queued.size();
+           ++index) {
         auto text = saved.queued[index];
         const auto source = index < saved.queued_sources.size()
                                 ? saved.queued_sources[index]
@@ -1891,14 +2001,57 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     text("Recovered drafts: " + std::to_string(recovered.size()) +
          " · /drafts lists; /draft N loads without submitting.\n");
   bool save_failed = false;
-  auto persist = [&] {
-    if (state_path.empty())
+  auto restore_composer = [&] {
+    editing_id.clear();
+    if (suspended_composer)
+      composer.restore(*suspended_composer);
+    suspended_composer.reset();
+  };
+  auto retain_edit_conflict = [&](const std::string &proposal) {
+    // A model/Lua correction won; this native proposal is a different recoverable
+    // draft, not an overwrite of the owner's newer buffer/revision.
+    auto text_copy = proposal;
+    (void)enqueue_ui_prompt(false, recovered, text_copy, {}, 2, {});
+    recovered.back().intention = editing_id;
+    restore_composer();
+    text("Next turn editor changed or capacity refused; local proposal in /drafts; "
+         "owner revision unchanged.\n");
+  };
+  auto sync_edit = [&] {
+    if (editing_id.empty())
       return true;
-    auto saved = composer.state();
-    append_prompt_state(saved.queued, recovered);
-    append_prompt_state(saved.queued, queued);
     try {
+      editing_version = next_turns_->buffer(editing_id, editing_revision,
+                                            composer.text(), editing_version);
+      return true;
+    } catch (const Error &) {
+      retain_edit_conflict(composer.text());
+      return false;
+    }
+  };
+  auto persist = [&] {
+    try {
+      (void)sync_edit(); // inside the recovery/save boundary
+      if (state_path.empty())
+        return true;
+      auto saved = composer.state();
+      const auto checkpoint = next_turns_->checkpoint();
+      saved.intentions = checkpoint.data;
+      saved.draft_predecessor = draft_predecessor;
+      if (suspended_composer) {
+        saved.parked_draft = suspended_composer->draft;
+        saved.parked_cursor = suspended_composer->cursor;
+      }
+      Value::Array drafts;
+      for (const auto &draft : recovered)
+        if (draft.independent)
+          drafts.push_back(Value::object(
+              {{"text", Value{draft.text}}, {"predecessor", Value{draft.intention}}}));
+      saved.independent_drafts = Value{std::move(drafts)};
+      // Keyed pending/recovered records are already in the native owner; never
+      // duplicate them into an ambiguous legacy queue projection.
       save_terminal_state(state_path, saved, raw_capture_);
+      next_turns_->saved_generation(checkpoint.generation);
       save_failed = false;
       return true;
     } catch (...) {
@@ -1907,6 +2060,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         text("UI state save failed; unsaved drafts retained in RAM. New work waits for "
              "a successful save.\n");
       save_failed = true;
+      next_turns_->hold_all();
       return false;
     }
   };
@@ -2042,6 +2196,92 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   auto center_refresh = std::chrono::steady_clock::time_point::min();
   auto inspector_refresh = std::chrono::steady_clock::time_point::min();
   ChatView transcript{raw_capture_};
+  auto open_next_turns = [&](bool receipts = false) {
+    std::vector<ComposerChoice> choices;
+    for (const auto &item : next_turns_->snapshot()) {
+      if (!receipts && item.state != NextTurns::State::queued &&
+          item.state != NextTurns::State::held &&
+          item.state != NextTurns::State::editing)
+        continue;
+      choices.push_back(
+          {"/next show " + item.id + " " + std::to_string(item.revision()), "",
+           std::string{NextTurns::label(item.state)} + " · " + *item.current().text,
+           "Next turns", item.id});
+    }
+    composer.choices(std::move(choices), "Next turns · Enter inspect · Ctrl-G Back");
+  };
+  auto next_action = [&](std::string_view command) {
+    auto rest = command.substr(6);
+    const auto first = rest.find(' ');
+    if (first == std::string_view::npos)
+      throw Error{ErrorCode::invalid_range};
+    const auto operation = rest.substr(0, first);
+    rest.remove_prefix(first + 1);
+    const auto second = rest.find(' ');
+    if (second == std::string_view::npos)
+      throw Error{ErrorCode::invalid_range};
+    const auto id = std::string{rest.substr(0, second)};
+    rest.remove_prefix(second + 1);
+    std::size_t revision = 0;
+    const auto parsed =
+        std::from_chars(rest.data(), rest.data() + rest.size(), revision);
+    if (parsed.ec != std::errc{} || parsed.ptr != rest.data() + rest.size())
+      throw Error{ErrorCode::invalid_range};
+    if (operation == "show") {
+      const auto item = next_turns_->get(id);
+      if (item.revision() != revision)
+        throw Error{ErrorCode::conflict};
+      for (const auto &row : next_turns_->view().array())
+        if (string_field(row, "id") == id)
+          transcript +=
+              "\nReceipt detail (point observation; later changes require refresh):\n" +
+              unwrap(format_value(row)) + "\n";
+      std::vector<ComposerChoice> actions;
+      if (item.state == NextTurns::State::queued ||
+          item.state == NextTurns::State::held ||
+          item.state == NextTurns::State::editing)
+        for (const auto *op : {"edit", "hold", "release", "discard", "withdraw"})
+          actions.push_back(
+              {"/next " + std::string{op} + " " + id + " " + std::to_string(revision),
+               "", std::string{op}, "Exact revision actions", op});
+      composer.choices(std::move(actions),
+                       "Receipt " + id + " · Enter action · Ctrl-G Back");
+      return;
+    }
+    if (operation == "edit") {
+      if (!editing_id.empty())
+        throw Error{ErrorCode::conflict};
+      auto prior = composer.state();
+      const auto edit_version = next_turns_->edit(id, revision);
+      if (!persist())
+        return; // Existing draft remains; item stays held, not runnable.
+      const auto item = next_turns_->get(id);
+      suspended_composer = std::move(prior);
+      editing_id = id;
+      editing_revision = revision;
+      editing_version = edit_version;
+      composer.draft(item.edit ? *item.edit : *item.current().text);
+      transcript += "\nEditing held next turn; Enter Apply—keep held; Ctrl-G Back "
+                    "keeps buffer.\n";
+    } else if (operation == "release")
+      next_turns_->release(id, revision);
+    else if (operation == "hold")
+      next_turns_->hold(id, revision);
+    else if (operation == "discard")
+      next_turns_->discard(
+          id, {.revision = revision, .version = next_turns_->get(id).edit_version});
+    else if (operation == "withdraw") {
+      next_turns_->withdraw(id, revision);
+      auto text_copy = *next_turns_->get(id).current().text;
+      (void)enqueue_ui_prompt(false, recovered, text_copy, {}, 2, {});
+      recovered.back().intention = id;
+      recovered.back().independent = false;
+    } else
+      throw Error{ErrorCode::invalid_range};
+    transcript += "\nNext turn " + id + " · " +
+                  std::string{NextTurns::label(next_turns_->get(id).state)} + "\n";
+  };
+
   bool welcoming = initial.empty();
   std::vector<std::string> welcome_lines;
   auto &grid = output.grid();
@@ -2054,13 +2294,46 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   bool live_provider = false;
   std::vector<bool> operations;
   bool busy = false, quitting = false, redraw = true, tool_active = false,
-       turn_failed = false, viewport_invalidated = false;
+       turn_failed = false, turn_interrupted = false, viewport_invalidated = false;
+  std::uint64_t turn_token = 0;
+  std::optional<std::uint64_t> stopped_turn;
+  auto hold_queue = [&] {
+    next_turns_->hold_all();
+    for (auto &prompt : queued)
+      prompt.held = true;
+  };
+  auto stop_main = [&] {
+    hold_queue();
+    if (busy && stopped_turn != turn_token) {
+      stopped_turn = turn_token;
+      if (turn_dispatch)
+        (void)turn_dispatch->stop(turn_token);
+      cancel_turn();
+      const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+      constexpr auto clock_num = std::chrono::steady_clock::period::num;
+      constexpr auto clock_den = std::chrono::steady_clock::period::den;
+      const std::uint8_t requested = 0;
+      RawUiTrace observation{
+          raw_capture_,
+          {4191, 4016},
+          std::array{
+              detail::raw_native_field(turn_token), detail::raw_native_field(ticks),
+              detail::raw_native_field(clock_num), detail::raw_native_field(clock_den),
+              detail::raw_native_field(requested),
+              detail::raw_string_field(active_intention)},
+          raw_ui_error_bytes + raw_envelope_size + sizeof(turn_token) + sizeof(ticks) +
+              sizeof(clock_num) + sizeof(clock_den) + sizeof(requested) +
+              active_intention.size()};
+      observation.finish();
+    }
+    return busy;
+  };
   std::size_t scroll = 0, previous_lines = 0;
   std::uint64_t display_generation = 0;
   auto escape_deadline = std::chrono::steady_clock::time_point::max();
   unsigned short old_rows = 0, old_columns = 0;
   std::string foreground_job, foreground_epoch, detached_epoch, child_escape,
-      child_input, child_input_job, command_error;
+      child_input, child_input_job, child_input_epoch, command_error;
   auto child_escape_deadline = std::chrono::steady_clock::time_point::max();
   bool foreground_pty = false, child_pasted = false;
   unsigned short child_rows = 0, child_columns = 0;
@@ -2069,8 +2342,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   auto append_child_input = [&](std::string_view bytes) {
     const auto job_size = foreground_job.size(), epoch_size = foreground_epoch.size(),
                byte_size = bytes.size();
-    const bool refused = (!child_input.empty() && child_input_job != foreground_job) ||
-                         bytes.size() > 4096 - child_input.size();
+    const bool refused =
+        (!child_input.empty() && (child_input_job != foreground_job ||
+                                  child_input_epoch != foreground_epoch)) ||
+        bytes.size() > 4096 - child_input.size();
     const std::uint8_t branch = refused ? 2 : 1;
     (void)raw_command_linked_data(
         2042, keyboard_read,
@@ -2083,13 +2358,16 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                    detail::raw_native_field(child_input.size())});
     // Keep admitted/pending bytes with their original job. Excess keyboard
     // bytes are explicitly refused; lifecycle keys must remain readable.
-    if ((!child_input.empty() && child_input_job != foreground_job) ||
+    if ((!child_input.empty() && (child_input_job != foreground_job ||
+                                  child_input_epoch != foreground_epoch)) ||
         bytes.size() > 4096 - child_input.size()) {
       refused_child_bytes += bytes.size();
       return;
     }
-    if (child_input.empty())
+    if (child_input.empty()) {
       child_input_job = foreground_job;
+      child_input_epoch = foreground_epoch;
+    }
     child_input += bytes;
   };
   auto report_refused_input = [&] {
@@ -2134,6 +2412,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     const bool accepted =
         command_request(Value::object({{"op", Value{"input"}},
                                        {"job_id", Value{child_input_job}},
+                                       {"wait_epoch", Value{Number{child_input_epoch}}},
                                        {"bytes", Value{child_input}}}));
     const Error error{};
     (void)raw_command_linked(2044, flush_request,
@@ -2141,9 +2420,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                         detail::raw_native_field(error.code),
                                         detail::raw_native_field(error.detail)},
                              flush_credit ? &*flush_credit : nullptr);
-    if (accepted) {
+    if (accepted || command_error == "conflict") {
+      if (!accepted)
+        transcript += "\nStale foreground keyboard lease refused; exact input "
+                      "originals retained.\n";
       child_input.clear();
       child_input_job.clear();
+      child_input_epoch.clear();
     }
     return accepted;
   };
@@ -2202,7 +2485,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   auto second = started, tool_started = started;
   bool wake_refused = false;
   RawEventRef last_launch{};
-  auto start = [&](const std::string &source, RawUiSource original) {
+  auto start = [&](const std::string &source, RawUiSource original,
+                   const std::string &intention = std::string{},
+                   std::size_t revision = 1) {
     RawUiTrace launch{raw_capture_,
                       {4018, 4016},
                       std::array{ByteView{original.record.lane},
@@ -2218,8 +2503,16 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     };
     return launch.run([&] {
       if (launch.enabled() &&
-          (!raw_ui_source_valid(original.record) || original.length != source.size()))
-        throw Error{ErrorCode::invalid_identity};
+          (!raw_ui_source_valid(original.record) || original.length != source.size())) {
+        RawUiTrace payload{raw_capture_,
+                           {4190, 4016},
+                           std::array{detail::raw_string_field(intention),
+                                      detail::raw_native_field(revision),
+                                      detail::raw_string_field(source)},
+                           raw_ui_error_bytes};
+        original = {payload.reference(), 0, source.size()};
+        payload.finish();
+      }
       launch.stage(1);
       welcoming = false;
       (void)custody.join();
@@ -2242,12 +2535,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                error_name(reset.error().code));
         return returned(false);
       }
-      std::string prompt;
+      std::shared_ptr<const std::string> prompt;
       RawThreadHandle context;
       RawWorkerDispatch dispatch{};
       launch.stage(3);
       try {
-        prompt = source;
+        prompt = intention.empty() ? std::make_shared<const std::string>(source)
+                                   : next_turns_->get(intention).current().text;
         context = unwrap(raw_prepare_thread());
         dispatch = raw_worker_dispatch();
         if (raw_root)
@@ -2261,17 +2555,37 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         return returned(false);
       }
       launch.stage(4);
-      transcript.append(ChatKind::user, prompt, false, original.record);
+      if (!intention.empty()) {
+        try {
+          const auto admitted =
+              next_turns_->launch(intention, {.revision = revision,
+                                              .turn = turn_token + 1,
+                                              .require_saved = !state_path.empty()});
+          prompt = admitted.current().text;
+        } catch (const Error &error) {
+          if (error.code != ErrorCode::conflict)
+            throw;
+          transfer.reset(); // never-started native custody rolls back
+          notice("Launch refused: next-turn revision or hold changed; text retained.");
+          return returned(false);
+        }
+      } else
+        transcript.append(ChatKind::user, *prompt, false, original.record);
+      active_intention = intention;
+      if (launching_intention)
+        launching_intention(intention);
       if (transfer)
         transfer->stage_before_launch();
       busy = true;
       tool_active = false;
       turn_failed = false;
+      turn_interrupted = false;
+      turn_token = turn_dispatch ? turn_dispatch->begin() : turn_token + 1;
       started = std::chrono::steady_clock::now();
       observed_usage.clear();
       operations.clear();
       scroll = 0;
-      activity = "Starting";
+      activity = "Worker active · phase unavailable";
       // Each worker owns a separately registered lane. Transfer facts reference
       // the UI lane and ordinal; neither producer nor region migrates threads.
       joined_rearm_credit = raw_ui_control(raw_capture_, raw_wake_lifecycle_credit +
@@ -2325,7 +2639,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   {raw_lane_epoch(), command.begin_ordinal()}};
               try {
                 execution->stage(2);
-                perform(prompt);
+                perform(*prompt);
               } catch (const Error &error) {
                 authority.error(error);
                 throw;
@@ -2357,7 +2671,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               paid_source = completion_data ? &*completion_data : nullptr;
             }
             if (perform_failed) {
-              post(Kind::failure, {}, paid_source);
+              post(perform_cancelled ? Kind::interrupted : Kind::failure, {},
+                   paid_source);
               post(Kind::text, perform_cancelled ? interrupted_notice : failed_notice,
                    paid_source);
             }
@@ -2396,7 +2711,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           launch.close();
           ui_capture.require();
         }
-        notice("Worker launch refused; prompt retained.");
+        if (!intention.empty())
+          next_turns_->launch_refused(intention);
+        active_intention.clear();
+        notice("Worker launch refused; prompt retained held, not started.");
         return returned(false);
       }
       return returned(true);
@@ -2437,9 +2755,21 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     redraw = true;
     return true;
   };
-  if (!initial.empty())
+  if (!initial.empty()) {
+    // A CLI objective/explicit restart continuation is fresh authorized work,
+    // not a replay of the recovered shelf or its parked composer predecessor.
+    const auto id = raw_ui_source_valid(initial_source_.record)
+                        ? hex_identity(initial_source_.record.lane) + "-" +
+                              std::to_string(initial_source_.record.ordinal)
+                        : "local-" + std::to_string(++local_send_serial);
+    next_turns_->acquire(id, initial, "native terminal dispatch", initial_source_);
+    next_turns_->queue(id);
+    latest_intention = id;
     (void)enqueue_ui_prompt(raw_capture_, queued, initial, initial_source_, 1,
                             initial_source_.record);
+    queued.back().intention = id;
+    queued.back().text.clear(); // native immutable payload is authoritative
+  }
   while (true) {
     std::exception_ptr publication_failure;
     std::optional<Error> capture_failure;
@@ -2595,6 +2925,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           }
           if (message.kind == Kind::failure)
             turn_failed = true;
+          if (message.kind == Kind::interrupted)
+            turn_interrupted = true;
           if (message.kind == Kind::title)
             title_ = message.text;
           if (message.kind == Kind::complete) {
@@ -2607,17 +2939,43 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             turn_cancel.retire();
             busy = false;
             tool_active = false;
-            activity = cancelled.load() ? "Turn cancelled"
+            activity = turn_interrupted ? "Turn interrupted locally"
                        : turn_failed    ? "Turn failed"
                                         : "Turn completed";
+            if (stopped_turn == turn_token && !turn_interrupted)
+              activity += " · stop request also recorded";
             activity += " · " +
                         std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
                                            std::chrono::steady_clock::now() - started)
                                            .count()) +
                         "s";
+            if (!active_intention.empty())
+              next_turns_->result(active_intention,
+                                  turn_interrupted ? NextTurns::State::interrupted
+                                  : turn_failed    ? NextTurns::State::failed
+                                                   : NextTurns::State::completed);
+            const auto result_ticks =
+                std::chrono::steady_clock::now().time_since_epoch().count();
+            constexpr auto clock_num = std::chrono::steady_clock::period::num;
+            constexpr auto clock_den = std::chrono::steady_clock::period::den;
+            const std::uint8_t result_kind = turn_interrupted ? 2 : turn_failed ? 1 : 0;
+            RawUiTrace observation{
+                raw_capture_,
+                {4192, 4016},
+                std::array{detail::raw_native_field(turn_token),
+                           detail::raw_native_field(result_ticks),
+                           detail::raw_native_field(clock_num),
+                           detail::raw_native_field(clock_den),
+                           detail::raw_native_field(result_kind),
+                           detail::raw_string_field(active_intention)},
+                raw_ui_error_bytes + raw_envelope_size + sizeof(turn_token) +
+                    sizeof(result_ticks) + sizeof(clock_num) + sizeof(clock_den) +
+                    sizeof(result_kind) + active_intention.size()};
+            observation.finish();
             transcript.append(
                 turn_failed ? ChatKind::error : ChatKind::summary,
                 activity + (observed_usage.empty() ? "" : " · " + observed_usage));
+            (void)persist();
           }
           redraw = true;
           apply.finish();
@@ -2697,37 +3055,21 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       break;
     if (!busy && quitting)
       break;
-    if (!busy && !question && !wake_refused && !queued.empty()) {
-      auto dispatch_credit = raw_ui_control(raw_capture_, 73);
-      if (persist()) {
-        if (start(queued.front().text, queued.front().source)) {
-          const std::uint8_t branch = 1;
-          const std::size_t index = 0;
-          const auto target = last_launch;
-          (void)raw_ui_link(4015, queued.front().enqueue,
-                            std::array{detail::raw_native_field(branch),
-                                       detail::raw_native_field(index),
-                                       ByteView{target.lane},
-                                       detail::raw_native_field(target.ordinal)},
-                            dispatch_credit ? &*dispatch_credit : nullptr);
-          queued.erase(queued.begin());
-        }
-      } else {
-        auto credit = raw_ui_control(raw_capture_, raw_ui_multiply(queued.size(), 73));
-        recovered.reserve(recovered.size() + queued.size());
-        for (std::size_t index = 0; index < queued.size(); ++index) {
-          const std::uint8_t branch = 3;
-          const auto target = queued[index].enqueue;
-          (void)raw_ui_link(4015, queued[index].enqueue,
-                            std::array{detail::raw_native_field(branch),
-                                       detail::raw_native_field(index),
-                                       ByteView{target.lane},
-                                       detail::raw_native_field(target.ordinal)},
-                            credit ? &*credit : nullptr);
-        }
-        recovered.insert(recovered.end(), std::make_move_iterator(queued.begin()),
-                         std::make_move_iterator(queued.end()));
-        queued.clear();
+    const auto owner_rows = next_turns_->snapshot();
+    const auto runnable =
+        std::find_if(owner_rows.begin(), owner_rows.end(), [](const auto &item) {
+          return item.state == NextTurns::State::queued;
+        });
+    if (!busy && !question && !wake_refused && runnable != owner_rows.end()) {
+      if (persist() && start(*runnable->current().text, runnable->current().source,
+                             runnable->id, runnable->revision())) {
+        // Legacy enqueue entries retain raw provenance only, not runnable authority.
+        const auto old =
+            std::find_if(queued.begin(), queued.end(), [&](const auto &prompt) {
+              return prompt.intention == runnable->id;
+            });
+        if (old != queued.end())
+          queued.erase(old);
       }
       redraw = true;
     }
@@ -2905,7 +3247,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                         std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
                                            now - started)
                                            .count()) +
-                        "s · ";
+                        "s · t" + std::to_string(turn_token) + " · ";
         if (tool_active)
           status_line +=
               "Tool " +
@@ -2913,11 +3255,30 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   std::chrono::duration_cast<std::chrono::seconds>(now - tool_started)
                       .count()) +
               "s · ";
-        if (!queued.empty())
-          status_line += "queued " + std::to_string(queued.size()) + " · ";
+        std::size_t next_count = 0, held_count = 0;
+        for (const auto &item : next_turns_->snapshot()) {
+          if (item.state == NextTurns::State::queued)
+            ++next_count;
+          if (item.state == NextTurns::State::held ||
+              item.state == NextTurns::State::editing)
+            ++held_count;
+        }
+        if (next_count || held_count)
+          status_line += "next " + std::to_string(next_count + held_count) +
+                         " · held " + std::to_string(held_count) + " · ";
         if (scroll > 0)
           status_line += "Up " + std::to_string(scroll) + " · ";
-        status_line += activity;
+        if (!latest_intention.empty()) {
+          const auto latest = next_turns_->get(latest_intention);
+          status_line +=
+              "receipt " +
+              latest.id.substr(latest.id.size() > 8 ? latest.id.size() - 8 : 0) +
+              " · " + std::string{NextTurns::label(latest.state)} + " · ";
+        }
+        if (!busy || stopped_turn == turn_token)
+          status_line = activity + " · " + status_line;
+        else
+          status_line += activity;
         constexpr std::array<std::string_view, 10> spinner{"⠋", "⠙", "⠹", "⠸", "⠼",
                                                            "⠴", "⠦", "⠧", "⠇", "⠏"};
         const auto phase =
@@ -3059,14 +3420,17 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                                                        : Ink::muted}});
           }
         }
-        std::string hint = composer.palette_open() ? " command palette "
-                           : composer.slash_open() ? " commands "
-                           : busy ? " Enter queue · Ctrl-C stop "
-                                  : " Enter send · / commands · Ctrl-G editor ";
+        std::string hint =
+            composer.palette_open() ? " command palette "
+            : composer.slash_open() ? " commands "
+            : busy                  ? " Enter queue · Ctrl-C stop "
+            : editing_id.empty()
+                ? " Enter send · Ctrl-R Next turns · Ctrl-G Back · Esc stop "
+                : " Enter Apply—keep held · Ctrl-G Back · Esc stop ";
         if (!foreground_job.empty())
           hint = std::string{foreground_pty ? " PTY input "
                                             : " Enter queue · Foreground command "} +
-                 foreground_job + " · Ctrl-B background ";
+                 foreground_job + " · Ctrl-B return; then Esc stop turn ";
         auto border = [&](std::pair<std::string_view, std::string_view> corners,
                           std::string_view label) {
           std::string out{corners.first};
@@ -3207,7 +3571,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     ui_capture.require();
     // Service the same deadline policy before either ready-input or idle dispatch.
     const auto dispatch = terminal_input_dispatch(
-        composer, std::chrono::steady_clock::now(), escape_deadline, inputs[0].revents);
+        composer, std::chrono::steady_clock::now(), escape_deadline, inputs[0].revents,
+        busy && !foreground_pty);
+    if (dispatch.stop) {
+      (void)stop_main();
+      activity = "Stop requested · t" + std::to_string(turn_token) + " · queue held";
+      (void)persist();
+    }
     redraw = redraw || dispatch.redraw;
     if (dispatch.focus_editor)
       visit_inspection([](auto &view) { view.focus_editor(); });
@@ -3475,6 +3845,21 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           } else if (question)
             composer.choices(question->choices, question->heading);
         }
+        if (result.action == InputAction::send_refused)
+          transcript += "\nSend not accepted: intention capacity full; draft and "
+                        "cursor retained.\n";
+        if (result.action == InputAction::next_turns)
+          open_next_turns();
+        if (result.action == InputAction::choose_command &&
+            result.text.starts_with("/next ")) {
+          try {
+            next_action(result.text);
+          } catch (const Error &error) {
+            transcript += "\nNext turn action refused; bytes retained · " +
+                          std::string{error_name(error.code)} + "\n";
+          }
+          result.action = InputAction::none;
+        }
         if (result.action == InputAction::choose_command) {
           bool load = true;
           if (!composer.text().empty()) {
@@ -3531,12 +3916,31 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           scroll -= std::min(scroll, std::size_t{3});
         if (result.action == InputAction::cancel) {
           action_branch = 5;
-          withdraw_ui_prompts(raw_capture_, queued, 2, result.source.record,
-                              session_control ? &*session_control : nullptr);
-          if (busy) {
-            cancel_turn();
-            activity = "Stopping";
+          if (stop_main())
+            activity =
+                "Stop requested · t" + std::to_string(turn_token) + " · queue held";
+        }
+        if (result.action == InputAction::back) {
+          if (!editing_id.empty()) {
+            if (sync_edit())
+              restore_composer();
           }
+          visit_inspection([](auto &view) { view.focus_editor(); });
+        }
+        if (result.action == InputAction::submit && !editing_id.empty()) {
+          try {
+            editing_version = next_turns_->buffer(editing_id, editing_revision,
+                                                  result.text, editing_version);
+            next_turns_->apply(
+                editing_id, {.revision = editing_revision, .version = editing_version},
+                result.source);
+            restore_composer();
+            transcript += "\nCorrection applied; remains held. Release exact ID and "
+                          "revision explicitly.\n";
+          } catch (const Error &) {
+            retain_edit_conflict(result.text);
+          }
+          result.action = InputAction::none;
         }
         if (result.action == InputAction::quit ||
             (result.action == InputAction::submit &&
@@ -3546,6 +3950,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           cancel_turn();
         }
         if (result.action == InputAction::submit && !result.text.empty() && !quitting) {
+          if (!result.intention.empty()) {
+            transcript.append(ChatKind::user, result.text, false, result.source.record);
+            next_turns_->local(result.intention);
+          }
           const auto requested_view = std::find_if(
               tui::view_descriptions.begin(), tui::view_descriptions.end(),
               [&](const auto &view) {
@@ -3630,23 +4038,42 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             transcript +=
                 "\n" + (result.text == "/help" ? terminal_help() : terminal_key_help());
             scroll = 0;
-          } else if (result.text == "/queue") {
-            transcript += "\nPending prompts: " + std::to_string(queued.size()) + "\n";
-            for (std::size_t n = 0; n < queued.size(); ++n)
-              transcript += std::to_string(n + 1) + ": " + queued[n].text + "\n";
+          } else if (result.text.starts_with("/next ")) {
+            try {
+              next_action(result.text);
+            } catch (const Error &error) {
+              transcript += "\nNext turn action refused; Apply or discard dirty edits "
+                            "first, and check ID/revision · " +
+                            std::string{error_name(error.code)} + "\n";
+            }
+          } else if (result.text == "/queue" || result.text == "/receipts") {
+            std::size_t pending_count = 0;
+            for (const auto &item : next_turns_->snapshot())
+              if (item.state == NextTurns::State::queued ||
+                  item.state == NextTurns::State::held ||
+                  item.state == NextTurns::State::editing)
+                ++pending_count;
+            transcript += "\nPending prompts: " + std::to_string(pending_count) +
+                          " (current owner; earlier transcript rows are historical)\n";
+            for (const auto &item : next_turns_->snapshot())
+              if (item.state == NextTurns::State::queued ||
+                  item.state == NextTurns::State::held ||
+                  item.state == NextTurns::State::editing)
+                transcript += "ID " + item.id + " revision " +
+                              std::to_string(item.revision()) + " · " +
+                              std::string{NextTurns::label(item.state)} + " · " +
+                              *item.current().text + "\n";
             transcript += "Recovered drafts: " + std::to_string(recovered.size()) +
                           " (use /drafts)\n";
+            open_next_turns(result.text == "/receipts");
             scroll = 0;
           } else if (result.text == "/cancel") {
             action_branch = 5;
-            withdraw_ui_prompts(raw_capture_, queued, 2, result.source.record,
-                                session_control ? &*session_control : nullptr);
-            if (busy) {
-              cancel_turn();
-              activity = "Stopping";
-            }
-            transcript += busy ? "\nStop requested; pending queue cleared.\n"
-                               : "\nNo active turn; pending queue cleared.\n";
+            if (stop_main())
+              activity =
+                  "Stop requested · t" + std::to_string(turn_token) + " · queue held";
+            transcript += busy ? "\nStop requested; pending queue held.\n"
+                               : "\nNo active turn; pending queue held.\n";
             scroll = 0;
           } else if (result.text == "/clear") {
             transcript.clear();
@@ -3665,6 +4092,20 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                 "scrolls the transcript.\n";
             scroll = 0;
           } else if (result.text == "/drafts") {
+            // Model/Lua withdrawal has the same native recovery route, even when
+            // it did not pass through a terminal action callback.
+            for (const auto &item : next_turns_->snapshot()) {
+              if (item.state != NextTurns::State::withdrawn || item.recovery_loaded ||
+                  std::any_of(recovered.begin(), recovered.end(),
+                              [&](const auto &draft) {
+                                return !draft.independent && draft.intention == item.id;
+                              }))
+                continue;
+              auto withdrawn_text = *item.current().text;
+              (void)enqueue_ui_prompt(false, recovered, withdrawn_text, {}, 2, {});
+              recovered.back().intention = item.id;
+              recovered.back().independent = false;
+            }
             transcript +=
                 "\nRecovered drafts: " + std::to_string(recovered.size()) + "\n";
             for (std::size_t n = 0; n < recovered.size(); ++n)
@@ -3689,6 +4130,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                 credit ? &*credit : nullptr);
               action_branch = 7;
               action_target = recovered[n - 1].enqueue;
+              draft_predecessor = recovered[n - 1].intention;
+              if (!recovered[n - 1].independent && !draft_predecessor.empty())
+                next_turns_->recovery_loaded(draft_predecessor);
               composer.draft(std::move(recovered[n - 1].text));
               recovered.erase(recovered.begin() + static_cast<std::ptrdiff_t>(n - 1));
               transcript += "\nLoaded recovered draft; Enter submits explicitly.\n";
@@ -3698,6 +4142,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 question->choices.begin(), question->choices.end(),
                 [&](const auto &choice) { return choice.name == result.text; });
             if (answer && !busy) {
+              if (!result.intention.empty())
+                next_turns_->queue(result.intention);
               if (persist()) {
                 saved_last_input = true;
                 input.outcome(RawRegionOutcome::dispatch);
@@ -3705,7 +4151,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 keyboard_burst.reset();
                 keyboard_data.reset();
                 keyboard_control.reset();
-                (void)start(result.text, result.source);
+                (void)start(result.text, result.source, result.intention);
                 action_target = last_launch;
                 action_branch = wake_refused ? 4 : 3;
               }
@@ -3726,6 +4172,15 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               action_target = enqueue_ui_prompt(
                   raw_capture_, queued, result.text, result.source, 1,
                   result.source.record, session_control ? &*session_control : nullptr);
+              queued.back().intention = result.intention;
+              if (!result.intention.empty())
+                std::string{}.swap(
+                    queued.back().text); // native immutable revision owns payload
+              if (!result.intention.empty()) {
+                // local() only marks the TUI route while dispatch is undecided.
+                // Queue acceptance is separately published by its native owner.
+                next_turns_->queue(result.intention);
+              }
               action_branch = 2;
             } catch (const Error &) {
               ui_capture.require();
@@ -3733,6 +4188,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               transcript += "\nQueue full; prompt retained in composer.\n";
             }
           } else {
+            if (!result.intention.empty())
+              next_turns_->queue(result.intention);
             if (persist()) {
               saved_last_input = true;
               input.outcome(RawRegionOutcome::dispatch);
@@ -3741,7 +4198,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               keyboard_data.reset();
               keyboard_control.reset();
               wake_refused = false;
-              if (!start(result.text, result.source))
+              if (!start(result.text, result.source, result.intention))
                 composer.draft(std::move(result.text));
               action_target = last_launch;
               action_branch = wake_refused ? 4 : 3;

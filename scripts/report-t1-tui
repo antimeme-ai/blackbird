@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Derive matched PTY observer durations outside production and the recorder."""
+import argparse
+import json
+import math
+from pathlib import Path
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('artifacts',type=Path)
+    args=parser.parse_args()
+    root=args.artifacts
+    metadata=json.loads((root/'metadata.json').read_text())
+    samples=[json.loads(line) for line in (root/'samples.jsonl').read_text().splitlines()]
+    assert metadata.get('status')=='completed','incomplete round; retain originals, no deltas'
+    variants=metadata['variants']
+    assert variants['before']['profile']==variants['after']['profile']
+    assert variants['before']['build_identity']==variants['after']['build_identity']
+    expected={(variant,trial,tuple(geometry)) for variant in ('before','after')
+              for trial in range(metadata['trials']) for geometry in metadata['geometries']}
+    found=set()
+    groups={}
+    for sample in samples:
+        key=(sample['variant'],sample['trial'],tuple(sample['geometry']))
+        assert key in expected and key not in found
+        found.add(key)
+        assert sample['status']=='completed' and sample['process']['returncode']==0
+        endpoints={endpoint['name']:endpoint for endpoint in sample['endpoints']}
+        assert len(endpoints)==len(sample['endpoints'])
+        for scenario in ('startup','typing','paste','palette','selection','resize'):
+            start='spawn_begin' if scenario=='startup' else 'ioctl_begin' if scenario=='resize' else 'write_begin'
+            begin=endpoints[f'{scenario}:{start}']['clock_ns']
+            end=endpoints[f'{scenario}:frame_observed']['clock_ns']
+            assert end>=begin
+            groups.setdefault((sample['variant'],tuple(sample['geometry']),scenario),[]).append(end-begin)
+    assert found==expected,'missing/extra trials; no deltas'
+    report={'scope':'parent endpoint timings, scheduling+PTY+parser; not physical display latency',
+            'trials':metadata['trials'],'observer_sha256':metadata['observer_sha256'],
+            'variants':variants,'deltas':[]}
+    def summary(values):
+        ordered=sorted(values)
+        return {name:ordered[max(0,math.ceil(len(ordered)*quantile)-1)]
+                for name,quantile in (('p50_ns',.5),('p95_ns',.95),('p99_ns',.99))}
+    for geometry in metadata['geometries']:
+        for scenario in ('startup','typing','paste','palette','selection','resize'):
+            before=summary(groups[('before',tuple(geometry),scenario)])
+            after=summary(groups[('after',tuple(geometry),scenario)])
+            report['deltas'].append({'geometry':geometry,'scenario':scenario,'before':before,'after':after,
+                                    'after_minus_before_ns':{key:after[key]-before[key] for key in before}})
+    if metadata.get('t1_new_baseline'):
+        results=[json.loads(line) for line in (root/'t1-results.jsonl').read_text().splitlines()]
+        expected_new={(name,trial,tuple(geometry)) for name in ('check-next-turns','check-main-provider-stop')
+                      for trial in range(metadata['trials']) for geometry in metadata['geometries']}
+        found_new=set()
+        for result in results:
+            key=(result['scenario'],result['trial'],tuple(result['geometry']))
+            assert key in expected_new and key not in found_new and result['returncode']==0
+            found_new.add(key)
+        assert found_new==expected_new
+        baselines=[]
+        for owners in sorted(root.glob('t1-after-*/*/native-owners.json')):
+            native=json.loads(owners.read_text())
+            admitted=[row for row in native if row['site']==4191]
+            for stop in admitted:
+                done=[row for row in native if row['site']==4192 and row['turn']==stop['turn'] and row['intention_id']==stop['intention_id']]
+                assert len(done)==1 and done[0]['outcome']==2
+                assert (done[0]['clock_num'],done[0]['clock_den'])==(stop['clock_num'],stop['clock_den'])
+                baselines.append({'artifact':str(owners.relative_to(root)),'turn':stop['turn'],
+                                  'intention_id':stop['intention_id'],'native_stop_to_local_result_ns':
+                                  (done[0]['ticks']-stop['ticks'])*stop['clock_num']*1000000000//stop['clock_den']})
+        assert len(baselines)==metadata['trials']*len(metadata['geometries'])
+        parent_groups={}
+        parent_samples=[]
+        pairs={'busy_send':('write_begin','local_receipt_observed'),
+               'stop':('write_begin','result_frame_observed'),
+               'dirty_release':('write_begin','refusal_observed'),
+               'correction':('write_begin','held_revision_observed'),
+               'release':('write_begin','independent_effect_observed')}
+        for path in sorted(root.glob('t1-after-*/*/endpoints.json')):
+            geometry=path.parents[1].name.split('-')[2]
+            endpoints={row['name']:row for row in json.loads(path.read_text())}
+            for scenario,(begin_name,end_name) in pairs.items():
+                begin=endpoints[scenario+':'+begin_name]
+                end=endpoints[scenario+':'+end_name]
+                duration=end['clock_ns']-begin['clock_ns']
+                assert duration>=0 and end['output_offset']>=begin['output_offset']
+                if 'id' in begin:assert begin['id']==end['id']
+                parent_groups.setdefault((geometry,scenario),[]).append(duration)
+                parent_samples.append({'artifact':str(path.relative_to(root)),'scenario':scenario,
+                                       'duration_ns':duration,'id':end.get('id'),'revision':end.get('revision')})
+        for path in sorted(root.glob('t1-after-*/*/blocked/blocked-endpoints.json')):
+            geometry=path.parents[2].name.split('-')[2]
+            endpoints=json.loads(path.read_text())
+            begin=endpoints['decoded_input_written_clock_ns']
+            native=endpoints['native_result_observed_clock_ns']
+            frame=endpoints['eventual_frame_observed_clock_ns']
+            assert begin<=native<=frame
+            for name,duration in (('blocked_stop_to_native_observation',native-begin),
+                                  ('blocked_stop_to_eventual_frame',frame-begin),
+                                  ('native_observation_to_eventual_frame',frame-native)):
+                parent_groups.setdefault((geometry,name),[]).append(duration)
+                parent_samples.append({'artifact':str(path.relative_to(root)),'scenario':name,'duration_ns':duration})
+        assert len(parent_groups)==len(metadata['geometries'])*8
+        for values in parent_groups.values():assert len(values)==metadata['trials']
+        report['new_t1_baselines']={'claim':'new scenarios only; no predecessor improvement claim',
+                                   'native_stop_results':baselines,'retained_episode_count':len(results),
+                                   'parent_endpoint_samples':parent_samples,
+                                   'parent_summaries':[{'geometry':g,'scenario':s,**summary(v)} for (g,s),v in sorted(parent_groups.items())],
+                                   'parent_receipt_correction_release_endpoints':'per-episode endpoints.json',
+                                   'before_drain_native_vs_eventual_frame':'blocked-endpoints.json; before-drain-native.*; native-eagain.json'}
+    print(json.dumps(report,indent=2))
+
+if __name__=='__main__':main()
