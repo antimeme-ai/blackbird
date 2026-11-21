@@ -35,6 +35,7 @@ if [ "$1" = --build ]; then
 #!/bin/sh
 set -eu
 case "${1:-}" in
+  --version|-V) printf 'blackbird fixture-version\\n'; exit 0 ;;
   --help) printf 'fixture help\\n'; exit 0 ;;
   auth) printf 'fixture safe auth\\n'; exit 0 ;;
 esac
@@ -85,7 +86,14 @@ exec /bin/mv "$@"
     assert (first / 'share/blackbird/profiles/providers/conservative.lua').read_text() == \
         'fixture profile', 'profiles were not shipped beside programs and assets'
     assert '-DBLACKBIRD_RESOURCE_ROOT=' + str(first / 'share/blackbird') in (root / 'configure').read_text()
-    assert str(first / 'build/release') in (root / 'configure').read_text()
+    assert str(first / '.build') in (root / 'configure').read_text()
+    assert not (first / '.build').exists(), 'intermediate build directory was not pruned'
+    assert (first / 'bin/blackbird').is_file() and (first / 'bin/blackbird-job-runner').is_file()
+    assert 'version=blackbird fixture-version' in (first / 'MANIFEST').read_text()
+    version_out = subprocess.run([str(prefix / 'bin/blackbird'), '--version'], cwd=root,
+                                 check=True, env=env, text=True, capture_output=True)
+    assert version_out.stdout.strip() == 'blackbird fixture-version', version_out.stdout
+    assert not (root / 'home/.local/state/blackbird').exists(), '--version created a session directory'
     capture = root / 'capture'
     subprocess.run([str(prefix / 'bin/blackbird'), '--session', 'named session',
                     '--once', "hello '$() world"], cwd=root, check=True,

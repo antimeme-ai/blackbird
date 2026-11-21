@@ -268,9 +268,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         switched_session = true;
         continue;
       }
+      if (arg == "--version" || arg == "-V") {
+        std::cout << BLACKBIRD_VERSION_STRING << '\n';
+        return 0;
+      }
       if (arg == "--help") {
         std::cout << "blackbird --application (native framed BBM2 interface)\n"
-                     "blackbird [--session DIRECTORY] [--provider ID] "
+                     "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
                      "[--model NAME] [--workflow FILE] "
                      "[--once "
                      "PROMPT] [--audit-last] [--effort low|medium|high|xhigh|max] "
@@ -2683,6 +2687,11 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && std::string_view{argv[1]} == "auth")
     return provider_auth_cli(argc - 1, argv + 1);
+  if (argc > 1 &&
+      (std::string_view{argv[1]} == "--version" || std::string_view{argv[1]} == "-V")) {
+    std::cout << BLACKBIRD_VERSION_STRING << '\n';
+    return 0;
+  }
   if (argc > 1 && std::string_view{argv[1]} == "--application") {
     ApplicationConnection application;
     std::string id;

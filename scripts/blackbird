@@ -15,14 +15,20 @@ if [ -z "${BLACKBIRD_EXECUTABLE:-}${ARCO_EXECUTABLE:-}" ] &&
    [ "$(sed -n '2p' "$HOME/.local/bin/blackbird")" = '# blackbird managed launcher v1' ]; then
   exec "$HOME/.local/bin/blackbird" "$@"
 fi
-blackbird_executable=${BLACKBIRD_EXECUTABLE:-${ARCO_EXECUTABLE:-"$blackbird_root/build/release/blackbird"}}
+if [ -n "${BLACKBIRD_EXECUTABLE:-${ARCO_EXECUTABLE:-}}" ]; then
+  blackbird_executable=${BLACKBIRD_EXECUTABLE:-${ARCO_EXECUTABLE}}
+elif [ -x "$blackbird_root/bin/blackbird" ]; then
+  blackbird_executable="$blackbird_root/bin/blackbird"
+else
+  blackbird_executable="$blackbird_root/build/release/blackbird"
+fi
 if [ ! -x "$blackbird_executable" ]; then
   printf 'Blackbird executable is not runnable: %s\nRun ./scripts/install-blackbird to install or update the harness.\n' "$blackbird_executable" >&2
   exit 127
 fi
 BLACKBIRD_SPRITE_ASSET=${BLACKBIRD_SPRITE_ASSET:-"$blackbird_root/assets/sr71.png"}
 export BLACKBIRD_SPRITE_ASSET
-if [ "${1:-}" = auth ]; then
+if [ "${1:-}" = auth ] || [ "${1:-}" = --version ] || [ "${1:-}" = -V ]; then
   exec "$blackbird_executable" "$@"
 fi
 blackbird_probe=false
@@ -42,7 +48,7 @@ for blackbird_argument in "$@"; do
     continue
   fi
   case "$blackbird_argument" in
-    --help|--list-sessions) blackbird_probe=true ;;
+    --help|--version|-V|--list-sessions) blackbird_probe=true ;;
     --audit-last|--expire-diagnostics|--rebuild-session|--recover-unknown-effects|--resume-continue)
       blackbird_existing_session=true ;;
     --session) blackbird_value=session ;;

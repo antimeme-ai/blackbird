@@ -146,6 +146,13 @@ try:
     if args.case == 'cli-pty':
         cli_pty('cli-pty')
     else:
+        version = subprocess.run([str(executable), '--version'], env=environment,
+                                 cwd=root, text=True, capture_output=True, timeout=15)
+        assert version.returncode == 0 and version.stdout.startswith('blackbird '), version
+        if os.uname().sysname == 'Darwin' and ', Release,' in version.stdout:
+            libs = subprocess.run(['otool', '-L', str(executable)], text=True,
+                                  capture_output=True, check=True, timeout=15).stdout
+            assert '/opt/homebrew/' not in libs and '/usr/local/' not in libs, libs
         application('default-open')
         if args.case == 'all':
             turn = resources/'programs/turn.lua'

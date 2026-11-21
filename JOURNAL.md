@@ -13357,3 +13357,26 @@ turn loop ceiling. Wrote `docs/STORAGE_AMPLIFICATION_SUBPLAN.md` and five RED or
    and added a deadline-timeout SIGTERM-trap regression oracle before running the full
    clean-slate pre-commit gate (`scripts/rigor check debug`: all 300 Debug tests + C++/Lua
    lint).
+
+## 2026-11-21 — Unit (5a): self-contained Release install, static Lua 5.5.1, and `--version`
+
+Hardened local installation and packaging before tackling TUI/chat UX so live
+dogfooding runs on current `master` without Homebrew dylib fragility:
+
+1. **Static Lua 5.5.1 in Release (`CMakeLists.txt`):** Added `BLACKBIRD_STATIC_LUA`
+   (default `auto`: `on` for Release / `BLACKBIRD_DEBUG=OFF`, `off` in Debug so
+   `raw_authored_test` and `bridge_module_raw_test` `dlsym(RTLD_NEXT)` Lua interposers
+   continue working). When enabled, links sibling `liblua.a` next to `LUA_LIBRARIES`,
+   leaving Release macOS binaries dependent only on Apple system libraries
+   (`/usr/lib/libc++.1.dylib`, `/usr/lib/libSystem.B.dylib`).
+2. **Build version & `--version` / `-V` (`CMakeLists.txt`, `src/main.cpp`,
+   `scripts/blackbird`):** Embedded `BLACKBIRD_VERSION_STRING` (git short SHA + dirty
+   marker, Lua 5.5.1, build type, compiler profile) and wired fast-path `--version`/`-V`
+   handling that exits immediately without creating a session directory.
+3. **Lean generations & verification (`scripts/install-blackbird`,
+   `scripts/check-install-blackbird`, `scripts/check-portable-runtime`):** Built in a
+   scratch `.build` dir, installed the 10 production binaries into `<generation>/bin/`,
+   pruned `.build` before activation, enforced macOS self-containment via `otool -L`,
+   verified `--version` + offline PTY smoke, and wrote `<generation>/MANIFEST`.
+   `scripts/blackbird` prefers `<root>/bin/blackbird` while keeping fallback to
+   `<root>/build/release/blackbird` for older generations and dev checkouts.

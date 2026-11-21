@@ -156,6 +156,62 @@ find_package(Lua 5.5 EXACT REQUIRED)
 if(NOT LUA_VERSION_STRING STREQUAL "5.5.1")
   message(FATAL_ERROR "Coding runtime requires pinned Lua 5.5.1")
 endif()
+set(BLACKBIRD_STATIC_LUA "auto" CACHE STRING "Link static liblua.a when available: auto (Release), on, off")
+set_property(CACHE BLACKBIRD_STATIC_LUA PROPERTY STRINGS auto on off)
+set(BLACKBIRD_USE_STATIC_LUA OFF)
+if(BLACKBIRD_STATIC_LUA STREQUAL "on" OR
+   (BLACKBIRD_STATIC_LUA STREQUAL "auto" AND NOT BLACKBIRD_DEBUG))
+  set(BLACKBIRD_USE_STATIC_LUA ON)
+elseif(NOT BLACKBIRD_STATIC_LUA STREQUAL "off" AND NOT BLACKBIRD_STATIC_LUA STREQUAL "auto")
+  message(FATAL_ERROR "BLACKBIRD_STATIC_LUA must be auto, on, or off")
+endif()
+set(BLACKBIRD_LUA_LIBRARIES ${LUA_LIBRARIES})
+if(BLACKBIRD_USE_STATIC_LUA AND LUA_LIBRARIES)
+  list(GET LUA_LIBRARIES 0 blackbird_lua_primary)
+  get_filename_component(blackbird_lua_dir "${blackbird_lua_primary}" DIRECTORY)
+  if(EXISTS "${blackbird_lua_dir}/liblua.a")
+    set(BLACKBIRD_LUA_LIBRARIES "${blackbird_lua_dir}/liblua.a")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+      list(APPEND BLACKBIRD_LUA_LIBRARIES ${CMAKE_DL_LIBS} m)
+    endif()
+  endif()
+endif()
+set(BLACKBIRD_GIT_COMMIT "unknown")
+find_package(Git QUIET)
+if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git/HEAD")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/.git/HEAD")
+  file(READ "${CMAKE_SOURCE_DIR}/.git/HEAD" blackbird_git_head)
+  string(STRIP "${blackbird_git_head}" blackbird_git_head)
+  if(blackbird_git_head MATCHES "^ref: (.+)$" AND
+     EXISTS "${CMAKE_SOURCE_DIR}/.git/${CMAKE_MATCH_1}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${CMAKE_SOURCE_DIR}/.git/${CMAKE_MATCH_1}")
+  endif()
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_SOURCE_DIR}" rev-parse --short=12 HEAD
+    OUTPUT_VARIABLE blackbird_git_sha
+    RESULT_VARIABLE blackbird_git_ok
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(blackbird_git_ok EQUAL 0 AND blackbird_git_sha)
+    set(BLACKBIRD_GIT_COMMIT "${blackbird_git_sha}")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_SOURCE_DIR}" status --porcelain --untracked-files=no
+      OUTPUT_VARIABLE blackbird_git_dirty
+      RESULT_VARIABLE blackbird_dirty_ok
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(blackbird_dirty_ok EQUAL 0 AND blackbird_git_dirty)
+      string(APPEND BLACKBIRD_GIT_COMMIT "-dirty")
+    endif()
+  endif()
+endif()
+set(BLACKBIRD_BUILD_LABEL "${CMAKE_BUILD_TYPE}")
+if(NOT BLACKBIRD_BUILD_LABEL)
+  set(BLACKBIRD_BUILD_LABEL "default")
+endif()
+set(BLACKBIRD_VERSION_STRING
+  "blackbird ${BLACKBIRD_GIT_COMMIT} (lua ${LUA_VERSION_STRING}, ${BLACKBIRD_BUILD_LABEL}, ${BLACKBIRD_COMPILER_PROFILE})")
 add_library(blackbird_coding src/coding.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
 target_sources(blackbird_coding PRIVATE src/openrouter.cpp src/responses_provider.cpp src/anthropic_provider.cpp src/application.cpp src/host_tools.cpp)
 add_executable(anthropic_provider_test tests/anthropic_provider_test.cpp)
@@ -182,7 +238,7 @@ add_executable(request_cache_test tests/request_cache_test.cpp)
 target_link_libraries(request_cache_test PRIVATE blackbird_coding)
 add_test(NAME request_cache COMMAND request_cache_test)
 target_include_directories(blackbird_coding SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(blackbird_coding PUBLIC blackbird_foundation blackbird_profiles Threads::Threads PRIVATE ${LUA_LIBRARIES})
+target_link_libraries(blackbird_coding PUBLIC blackbird_foundation blackbird_profiles Threads::Threads PRIVATE ${BLACKBIRD_LUA_LIBRARIES})
 add_executable(empty_exec_task_test tests/empty_exec_task_test.cpp)
 target_link_libraries(empty_exec_task_test PRIVATE blackbird_coding)
 add_test(NAME empty_exec_task COMMAND empty_exec_task_test)
@@ -203,6 +259,7 @@ target_link_libraries(blackbird PRIVATE blackbird_coding)
 set(BLACKBIRD_RESOURCE_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "Owned runtime programs and assets")
 target_compile_definitions(blackbird PRIVATE BLACKBIRD_WORKFLOW="${BLACKBIRD_RESOURCE_ROOT}/programs/turn.lua")
 target_compile_definitions(blackbird PRIVATE BLACKBIRD_PROFILE_DIRECTORY="${BLACKBIRD_RESOURCE_ROOT}/profiles/providers")
+target_compile_definitions(blackbird PRIVATE BLACKBIRD_VERSION_STRING="${BLACKBIRD_VERSION_STRING}")
 target_compile_definitions(blackbird_coding PRIVATE BLACKBIRD_SPRITE_ASSET="${BLACKBIRD_RESOURCE_ROOT}/assets/sr71.png")
 add_executable(terminal_edge_fixture tests/terminal_edge_fixture.cpp)
 target_link_libraries(terminal_edge_fixture PRIVATE blackbird_coding)
@@ -446,7 +503,7 @@ target_link_libraries(candidate_test PRIVATE blackbird_foundation Threads::Threa
 add_test(NAME candidate COMMAND candidate_test $<TARGET_FILE:blackbird-candidate>)
 add_executable(useful_work_test tests/useful_work_test.cpp)
 target_include_directories(useful_work_test SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(useful_work_test PRIVATE blackbird_build ${LUA_LIBRARIES})
+target_link_libraries(useful_work_test PRIVATE blackbird_build ${BLACKBIRD_LUA_LIBRARIES})
 add_test(NAME useful_work COMMAND useful_work_test ${CMAKE_SOURCE_DIR}/tests/useful_work_test.lua ${CMAKE_SOURCE_DIR}/programs/useful_work.lua)
 
 # Optional packages are Lua-only; reuse the existing embedded Lua runner.
@@ -526,7 +583,7 @@ add_test(NAME raw_sampler COMMAND raw_sampler_test)
 set_tests_properties(raw_sampler PROPERTIES TIMEOUT 60)
 add_executable(raw_authored_test tests/raw_authored_test.cpp)
 target_include_directories(raw_authored_test SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(raw_authored_test PRIVATE blackbird_coding Threads::Threads ${LUA_LIBRARIES} ${CMAKE_DL_LIBS})
+target_link_libraries(raw_authored_test PRIVATE blackbird_coding Threads::Threads ${BLACKBIRD_LUA_LIBRARIES} ${CMAKE_DL_LIBS})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_options(raw_authored_test PRIVATE
     "LINKER:--wrap=luaL_newstate"
@@ -860,7 +917,8 @@ set_tests_properties(main_input_raw PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 add_executable(main_input_native_test tests/main_input_native_test.cpp)
 target_link_libraries(main_input_native_test PRIVATE blackbird_coding ${CMAKE_DL_LIBS})
 target_compile_definitions(main_input_native_test PRIVATE BLACKBIRD_WORKFLOW="${CMAKE_SOURCE_DIR}/programs/turn.lua"
-  BLACKBIRD_PROFILE_DIRECTORY="${CMAKE_SOURCE_DIR}/profiles/providers")
+  BLACKBIRD_PROFILE_DIRECTORY="${CMAKE_SOURCE_DIR}/profiles/providers"
+  BLACKBIRD_VERSION_STRING="${BLACKBIRD_VERSION_STRING}")
 set_target_properties(main_input_native_test PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME main_input_native COMMAND main_input_native_test)
 set_tests_properties(main_input_native PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
@@ -882,7 +940,8 @@ set_tests_properties(station_main_raw PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 add_executable(station_main_raw_test tests/station_main_raw_test.cpp)
 target_link_libraries(station_main_raw_test PRIVATE blackbird_coding ${CMAKE_DL_LIBS})
 target_compile_definitions(station_main_raw_test PRIVATE BLACKBIRD_WORKFLOW="${CMAKE_SOURCE_DIR}/programs/turn.lua"
-  BLACKBIRD_PROFILE_DIRECTORY="${CMAKE_SOURCE_DIR}/profiles/providers")
+  BLACKBIRD_PROFILE_DIRECTORY="${CMAKE_SOURCE_DIR}/profiles/providers"
+  BLACKBIRD_VERSION_STRING="${BLACKBIRD_VERSION_STRING}")
 set_target_properties(station_main_raw_test PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME station_main_native COMMAND station_main_raw_test)
 set_tests_properties(station_main_native PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
@@ -1044,7 +1103,7 @@ target_link_libraries(blackbird_profiles PUBLIC blackbird_foundation)
 add_executable(profile_reader_test tests/profile_reader_test.cpp)
 # Lua 5.4 is the reference model oracle for accepted texts, in this test only.
 target_include_directories(profile_reader_test SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(profile_reader_test PRIVATE blackbird_profiles ${LUA_LIBRARIES})
+target_link_libraries(profile_reader_test PRIVATE blackbird_profiles ${BLACKBIRD_LUA_LIBRARIES})
 foreach(reader_case grammar roundtrip lua_model no_execution generated)
   add_test(NAME profile_reader_${reader_case} COMMAND profile_reader_test ${reader_case}
     ${CMAKE_SOURCE_DIR}/profiles/providers)

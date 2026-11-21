@@ -79,31 +79,50 @@ if [ -e "$blackbird_home/current" ] && [ ! -L "$blackbird_home/current" ]; then
   exit 1
 fi
 blackbird_generation=$(mktemp -d "$blackbird_home/releases/generation-XXXXXXXX")
-mkdir -p -- "$blackbird_generation/share/blackbird" "$blackbird_generation/scripts" "$blackbird_generation/build/release"
+mkdir -p -- "$blackbird_generation/bin" "$blackbird_generation/share/blackbird" "$blackbird_generation/scripts" "$blackbird_generation/.build"
 cp -R -- "$blackbird_source/programs" "$blackbird_source/assets" "$blackbird_source/profiles" "$blackbird_generation/share/blackbird/"
 cp -- "$blackbird_source/scripts/blackbird" "$blackbird_generation/scripts/blackbird"
 chmod 755 "$blackbird_generation/scripts/blackbird"
-# Build at the final path: compiled helper paths stay within this generation.
-"$blackbird_cmake" --preset release -S "$blackbird_source" -B "$blackbird_generation/build/release" \
+# Build into a scratch directory, copy the lean production binaries into bin/,
+# and discard intermediate object/library trees before activation.
+"$blackbird_cmake" --preset release -S "$blackbird_source" -B "$blackbird_generation/.build" \
   "-DBLACKBIRD_RESOURCE_ROOT=$blackbird_generation/share/blackbird"
-"$blackbird_cmake" --build "$blackbird_generation/build/release" --parallel "$blackbird_jobs" \
+"$blackbird_cmake" --build "$blackbird_generation/.build" --parallel "$blackbird_jobs" \
   --target blackbird blackbird-candidate blackbird-auth blackbird-workflow blackbird-colleague \
   blackbird-resource-sampler blackbird-raw-reader blackbird-token-usage
 for blackbird_tool in blackbird blackbird-candidate blackbird-auth blackbird-workflow blackbird-colleague blackbird-job-runner blackbird-archive blackbird-resource-sampler blackbird-raw-reader blackbird-token-usage; do
-  [ -x "$blackbird_generation/build/release/$blackbird_tool" ] || { printf 'Missing executable: %s\n' "$blackbird_tool" >&2; exit 1; }
+  [ -x "$blackbird_generation/.build/$blackbird_tool" ] || { printf 'Missing executable: %s\n' "$blackbird_tool" >&2; exit 1; }
+  cp -p -- "$blackbird_generation/.build/$blackbird_tool" "$blackbird_generation/bin/$blackbird_tool"
 done
+rm -rf -- "$blackbird_generation/.build"
+# On macOS, verify installed binaries do not depend on Homebrew/local dylibs.
+if [ "$(uname -s)" = Darwin ] && command -v otool >/dev/null 2>&1; then
+  for blackbird_tool in blackbird blackbird-candidate blackbird-auth blackbird-workflow blackbird-colleague blackbird-job-runner blackbird-archive blackbird-resource-sampler blackbird-raw-reader blackbird-token-usage; do
+    blackbird_dylibs=$(otool -L "$blackbird_generation/bin/$blackbird_tool" 2>/dev/null || :)
+    case "$blackbird_dylibs" in
+      */opt/homebrew/*|*/usr/local/*)
+        printf 'Refusing non-self-contained binary (%s) with external dylib dependency:\n%s\n' "$blackbird_tool" "$blackbird_dylibs" >&2
+        exit 1 ;;
+    esac
+  done
+fi
 # All smoke state is private and offline. Do not consult the operator's accounts.
 mkdir -m 700 "$blackbird_generation/.smoke"
-"$blackbird_generation/build/release/blackbird" --help > "$blackbird_generation/.smoke/help"
+blackbird_version=$("$blackbird_generation/bin/blackbird" --version)
+case "$blackbird_version" in
+  blackbird\ *) ;;
+  *) printf 'Unexpected --version output: %s\n' "$blackbird_version" >&2; exit 1 ;;
+esac
+"$blackbird_generation/bin/blackbird" --help > "$blackbird_generation/.smoke/help"
 BLACKBIRD_AUTH_HOME="$blackbird_generation/.smoke/auth" \
-  "$blackbird_generation/build/release/blackbird" auth providers > "$blackbird_generation/.smoke/providers"
+  "$blackbird_generation/bin/blackbird" auth providers > "$blackbird_generation/.smoke/providers"
 cat > "$blackbird_generation/.smoke/local.lua" <<'LUA'
 local result = blackbird.call('exec', {argv={'/bin/sh', '-c', 'exit 0'}, pty=true})
 assert(result.exit_code == 0, 'Installed PTY helper failed')
 print('BLACKBIRD_INSTALL_SMOKE')
 LUA
 if BLACKBIRD_AUTH_HOME="$blackbird_generation/.smoke/auth" \
-  "$blackbird_generation/build/release/blackbird" --plain \
+  "$blackbird_generation/bin/blackbird" --plain \
   --session "$blackbird_generation/.smoke/session" \
   --workflow "$blackbird_generation/.smoke/local.lua" --once offline-install-smoke \
   > "$blackbird_generation/.smoke/local-output"; then
@@ -117,6 +136,13 @@ case "$(cat "$blackbird_generation/.smoke/local-output")" in
   *) printf 'Installed local workflow smoke did not complete.\n' >&2; exit 1 ;;
 esac
 rm -rf -- "$blackbird_generation/.smoke"
+blackbird_commit=$(git -C "$blackbird_source" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+{
+  printf 'version=%s\n' "$blackbird_version"
+  printf 'commit=%s\n' "$blackbird_commit"
+  printf 'source=%s\n' "$blackbird_source"
+  printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$blackbird_generation/MANIFEST"
 # A quoted absolute prefix handles spaces and shell metacharacters literally.
 blackbird_quoted_home=$(printf '%s' "$blackbird_home" | sed "s/'/'\\\\''/g")
 blackbird_launcher=$(mktemp "$blackbird_prefix/bin/.blackbird-XXXXXXXX")
@@ -151,8 +177,8 @@ case "$(uname -s)" in
 esac
 blackbird_link=''
 blackbird_activated=true
-printf 'Installed Blackbird: %s/bin/blackbird\nGeneration: %s\nUpdate: %s/scripts/install-blackbird --update --prefix %s\n' \
-  "$blackbird_prefix" "$blackbird_generation" "$blackbird_source" "$blackbird_prefix"
+printf 'Installed Blackbird: %s/bin/blackbird\nVersion: %s\nGeneration: %s\nUpdate: %s/scripts/install-blackbird --update --prefix %s\n' \
+  "$blackbird_prefix" "$blackbird_version" "$blackbird_generation" "$blackbird_source" "$blackbird_prefix"
 case ":${PATH:-}:" in
   *":$blackbird_prefix/bin:"*) ;;
   *) printf 'Add %s/bin to PATH to invoke blackbird directly.\n' "$blackbird_prefix" ;;
