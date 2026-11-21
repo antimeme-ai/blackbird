@@ -606,7 +606,8 @@ Result<void> validate_chapter_section(const Value &value) noexcept {
     return Result<void>::failure({ErrorCode::corrupt});
   }
 }
-std::optional<ChapterStep> chapter_step(const ChapterState &state, const CutFrame &frame) {
+std::optional<ChapterStep> chapter_step(const ChapterState &state,
+                                        const CutFrame &frame) {
   if (!frame.accepted || frame.op != CutOp::cut ||
       std::holds_alternative<std::nullptr_t>(frame.chapter.value()))
     return std::nullopt;
@@ -858,11 +859,14 @@ std::string joined_ids(const std::vector<std::string> &ids) {
 }
 // The encoded bytes of an array of items (measure_entries' counting): BBM2 header,
 // array tag and count, then each item.
-std::uint64_t array_bytes(std::uint64_t count, std::uint64_t items) {
+struct ArrayItems {
+  std::uint64_t count, bytes;
+};
+std::uint64_t array_bytes(ArrayItems items) {
   std::uint64_t total = 4 + 1;
-  for (auto n = count; n >= 128; n >>= 7)
+  for (auto n = items.count; n >= 128; n >>= 7)
     ++total;
-  return total + 1 + items;
+  return total + 1 + items.bytes;
 }
 } // namespace
 
@@ -923,8 +927,9 @@ std::string boundary_text(std::string_view request, std::string_view note) {
          "unchanged: continue from where you were.";
   if (!request.empty()) {
     out += " The operator's request is " + std::string{request};
-    out +=
-        note.empty() ? "." : "; the archive note " + std::string{note} + " lists what left.";
+    out += note.empty()
+               ? "."
+               : "; the archive note " + std::string{note} + " lists what left.";
   } else if (!note.empty())
     out += " The archive note " + std::string{note} + " lists what left.";
   out += " No reply to this note is needed.";
@@ -1013,8 +1018,8 @@ std::vector<std::size_t> sweep(const CutInput &input, std::size_t p,
                                const std::vector<bool> &removed, bool notes,
                                bool boundary) {
   const auto &entries = input.entries;
-  const bool retaining =
-      profile_text(input.profile, {"request_state", "placement"}) == "retained_in_place";
+  const bool retaining = profile_text(input.profile, {"request_state", "placement"}) ==
+                         "retained_in_place";
   // The newest live boundary stays unless this cut writes a newer one. A cut never
   // removes it (it is never selectable), so it is the newest of all entries.
   std::size_t newest = npos;
@@ -1052,7 +1057,8 @@ std::vector<std::size_t> sweep(const CutInput &input, std::size_t p,
         const auto *arguments = item.find("arguments");
         reads = reads && name &&
                 (*name == "context_view" || *name == "context_stats" ||
-                 (*name == "context_budget" && !(arguments && arguments->find("proposal"))));
+                 (*name == "context_budget" &&
+                  !(arguments && arguments->find("proposal"))));
       }
       swept = any && reads;
     }
@@ -1071,7 +1077,8 @@ CutFrame frame_for(const CutInput &input, CutKind kind, const ChapterBinding &bi
   frame.revision = identity_text(input.revision);
   frame.base = input.head;
   frame.observed = input.head;
-  const auto ordinal = input.chapter.started() ? input.chapter.table.back().ordinal + 1 : 1;
+  const auto ordinal =
+      input.chapter.started() ? input.chapter.table.back().ordinal + 1 : 1;
   frame.chapter = Value::object(
       {{"ordinal", number(ordinal)},
        {"previous",
@@ -1088,7 +1095,8 @@ std::uint64_t sum_before(const std::vector<std::uint64_t> &sizes, std::size_t en
     total += sizes[i];
   return total;
 }
-void fill_sizes(CutFrame &frame, const std::vector<std::uint64_t> &sizes, std::size_t p) {
+void fill_sizes(CutFrame &frame, const std::vector<std::uint64_t> &sizes,
+                std::size_t p) {
   frame.sizes = {sum_before(sizes, sizes.size()), sum_before(sizes, p)};
 }
 // The family a reasoning item belongs to, against a target protocol.
@@ -1118,8 +1126,9 @@ ComposeResult harness_cut(const CutInput &input, CutKind kind,
   if (rules.at_cut == "must_keep" &&
       std::find(dropped.begin(), dropped.end(), true) != dropped.end())
     return std::unexpected(refusal("must-keep-reasoning"));
-  auto frame = frame_for(input, kind, binding,
-                         kind == CutKind::rebind ? CutSource::rebind : CutSource::prefix);
+  auto frame =
+      frame_for(input, kind, binding,
+                kind == CutKind::rebind ? CutSource::rebind : CutSource::prefix);
   frame.cause.forced = forced;
   const auto sizes = sizes_of(entries);
   std::vector<ContextRef> order;
@@ -1132,7 +1141,8 @@ ComposeResult harness_cut(const CutInput &input, CutKind kind,
       order.push_back(entry_ref(entries[i]));
       kept += sizes[i];
     }
-  frame.result = CutResult{order.size(), refs_crc(order), array_bytes(order.size(), kept)};
+  frame.result = CutResult{order.size(), refs_crc(order),
+                           array_bytes({.count = order.size(), .bytes = kept})};
   fill_sizes(frame, sizes, p);
   return Composed{std::move(frame), p, std::nullopt};
 }
@@ -1147,8 +1157,9 @@ ComposeResult compose_start(const CutInput &input, const ChapterBinding &binding
   order.reserve(input.entries.size());
   for (const auto &entry : input.entries)
     order.push_back(entry_ref(entry));
-  frame.result = CutResult{order.size(), refs_crc(order),
-                           array_bytes(order.size(), sum_before(sizes, sizes.size()))};
+  frame.result = CutResult{
+      order.size(), refs_crc(order),
+      array_bytes({.count = order.size(), .bytes = sum_before(sizes, sizes.size())})};
   fill_sizes(frame, sizes, input.entries.size());
   return Composed{std::move(frame), input.entries.size(), std::nullopt};
 }
@@ -1216,7 +1227,7 @@ struct Plan {
   std::optional<std::size_t> after;
   std::pair<std::size_t, int> key;
   std::variant<std::uint32_t, std::size_t> entry; // fresh original, or input position
-  bool placed = false;                             // after is already a surviving entry
+  bool placed = false;                            // after is already a surviving entry
 };
 } // namespace
 
@@ -1228,8 +1239,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     return std::unexpected(refusal("chapter-not-started"));
   if (request.kind != CutKind::archival && request.kind != CutKind::recovery)
     throw Error{ErrorCode::invalid_range};
-  if (request.archive.empty() && request.summaries.empty() && request.restores.empty() &&
-      request.edits.empty() && !request.boundary)
+  if (request.archive.empty() && request.summaries.empty() &&
+      request.restores.empty() && request.edits.empty() && !request.boundary)
     return std::unexpected(refusal("empty"));
   const auto rules = rules_of(input.profile);
   std::vector<std::size_t> unit_of(n, npos);
@@ -1272,8 +1283,9 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
       throw Error{ErrorCode::invalid_range};
     // Under drop_after_change a restored unit's reasoning is not restored; a unit that
     // is only reasoning would come back as nothing while its row disappeared.
-    if (drop && std::all_of(restore.items.begin(), restore.items.end(),
-                            [](const Value &item) { return type_is(item, "reasoning"); }))
+    if (drop &&
+        std::all_of(restore.items.begin(), restore.items.end(),
+                    [](const Value &item) { return type_is(item, "reasoning"); }))
       return std::unexpected(refusal("restore-reasoning-only", restore.handle));
   }
 
@@ -1290,8 +1302,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
       return refusal("ambiguous", unit.handle);
     if (request.protect && protected_unit(unit))
       return refusal("protected", unit.handle);
-    if (newest != npos &&
-        std::find(unit.entries.begin(), unit.entries.end(), newest) != unit.entries.end())
+    if (newest != npos && std::find(unit.entries.begin(), unit.entries.end(), newest) !=
+                              unit.entries.end())
       return refusal("protected", unit.handle);
     for (const auto position : unit.entries) {
       if (state[position] != 0)
@@ -1329,6 +1341,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
       const auto &unit = units[unit_of[position]];
       if (request.protect && protected_unit(unit))
         return std::unexpected(refusal("protected", unit.handle));
+      if (position == newest)
+        return std::unexpected(refusal("protected", unit.handle));
       const auto &old = item_at(entries, position);
       if (type_is(old, "reasoning"))
         return std::unexpected(refusal("reasoning-edit", unit.handle));
@@ -1343,7 +1357,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
                    *text_field(edit.item, "call_id") != *call))
         return std::unexpected(refusal("replace-call-id", unit.handle));
       // Provider-native fields are never edited: an item that keeps one is unchanged.
-      if ((edit.item.find("anthropic_content") || edit.item.find("encrypted_content")) &&
+      if ((edit.item.find("anthropic_content") ||
+           edit.item.find("encrypted_content")) &&
           !(edit.item == old))
         return std::unexpected(refusal("provider-native-field", unit.handle));
       if (!replaced.emplace(position, edit.item).second)
@@ -1379,6 +1394,10 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
             note = i;
             break;
           }
+    // Restoring owns the note row rewrite; an explicit replacement of that same
+    // note cannot override it and claim a live unit is still archived.
+    if (note != npos && replaced.contains(note))
+      return std::unexpected(refusal("restore-note-conflict", restore.handle));
     restore_note.push_back(note);
     p = std::min(p, note == npos ? n : note);
   }
@@ -1418,10 +1437,10 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     for (const auto &[key, value] : item.object())
       if (key != "content")
         fields.emplace_back(key, value);
-    fields.emplace_back("content",
-                        Value{Value::Array{Value::object(
-                            {{"type", Value{"input_text"}},
-                             {"text", Value{archive_note_text({}, rows)}}})}});
+    fields.emplace_back(
+        "content", Value{Value::Array{
+                       Value::object({{"type", Value{"input_text"}},
+                                      {"text", Value{archive_note_text({}, rows)}}})}});
     replaced.emplace(note, Value{std::move(fields)});
   }
   // Reasoning (design §6.2): at or after p, re-inserted entries included.
@@ -1449,7 +1468,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
   constexpr auto own = std::numeric_limits<std::uint32_t>::max();
   const auto add = [&](Value item, UnitClass entry_class, std::uint32_t key) {
     const auto index = static_cast<std::uint32_t>(frame.originals.size());
-    classes.push_back(entry_class == UnitClass::by_role ? role_class(item) : entry_class);
+    classes.push_back(entry_class == UnitClass::by_role ? role_class(item)
+                                                        : entry_class);
     frame.originals.push_back(
         {std::move(item), static_cast<std::uint8_t>(entry_class), std::nullopt});
     wanted.push_back(key == own ? index : key);
@@ -1481,9 +1501,10 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     return place;
   };
   for (const auto &summary : request.summaries) {
-    const auto index = add(note_item(role, summary_text(units[summary.unit].handle,
-                                                        ids_of(summary.unit), summary.text)),
-                           UnitClass::summary, own);
+    const auto index =
+        add(note_item(role, summary_text(units[summary.unit].handle,
+                                         ids_of(summary.unit), summary.text)),
+            UnitClass::summary, own);
     const auto place = placed(first_of(summary.unit));
     if (!place)
       return std::unexpected(refusal("note-placement", units[summary.unit].handle));
@@ -1580,9 +1601,9 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     if (rules.boundary_form == "request_local_user")
       request_local = std::string{}; // its text is filled with the handles below
     else {
-      boundary_index =
-          add(note_item(rules.boundary_form == "system_message" ? "system" : "user", {}),
-              UnitClass::note, own);
+      boundary_index = add(
+          note_item(rules.boundary_form == "system_message" ? "system" : "user", {}),
+          UnitClass::note, own);
       // The boundary is the last entry (design §7.3): chained after everything else
       // on the last surviving entry.
       plans.push_back({place_boundary(gone), {n + 1, 4}, *boundary_index, true});
@@ -1616,7 +1637,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
           role_is(item_at(entries, unit.entries.front()), "user"))
         asked = unit.handle;
     }
-    auto text = boundary_text(asked, note_index ? handle_of(*note_index) : std::string{});
+    auto text =
+        boundary_text(asked, note_index ? handle_of(*note_index) : std::string{});
     if (boundary_index)
       frame.originals[*boundary_index].item = note_item(
           rules.boundary_form == "system_message" ? "system" : "user", std::move(text));
@@ -1636,7 +1658,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     const auto open = open_groups(entries, gone);
     const auto waiting = first_unanswered(entries, gone);
     for (const auto &plan : plans)
-      if (plan.after && (open[*plan.after] || (waiting != npos && *plan.after >= waiting)))
+      if (plan.after &&
+          (open[*plan.after] || (waiting != npos && *plan.after >= waiting)))
         return std::unexpected(refusal("inside-tool-group"));
   }
   // Chain the inserts: per anchor, in key order.
@@ -1723,8 +1746,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
       before.push_back(&item_at(entries, i));
     const auto [had_bad, had_open] = faults(before);
     const auto [has_bad, has_open] = faults(order);
-    if (has_bad > had_bad ||
-        !std::includes(had_open.begin(), had_open.end(), has_open.begin(), has_open.end()))
+    if (has_bad > had_bad || !std::includes(had_open.begin(), had_open.end(),
+                                            has_open.begin(), has_open.end()))
       return std::unexpected(refusal("invalid-tool-protocol"));
     if (input.validate) {
       Value::Array items;
@@ -1759,7 +1782,8 @@ ComposeResult compose_cut(const CutInput &input, const CutRequest &request) {
     frame.changes |= cut_edit;
   if (request.boundary)
     frame.changes |= cut_boundary;
-  frame.result = CutResult{refs.size(), refs_crc(refs), array_bytes(refs.size(), bytes)};
+  frame.result = CutResult{refs.size(), refs_crc(refs),
+                           array_bytes({.count = refs.size(), .bytes = bytes})};
   fill_sizes(frame, sizes, p);
   return Composed{std::move(frame), p, std::move(request_local)};
 }

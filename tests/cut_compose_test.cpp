@@ -31,16 +31,61 @@
 #include "blackbird/saved_state.hpp"
 #include "blackbird/turn_state.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <new>
 #include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+
+// Observe only chapter-buffer-sized allocations during the writer call. Calibrate
+// the occurrence from the actual published table pointer; inject that allocation
+// on an equivalent fresh store, without a production fault hook.
+namespace {
+thread_local std::size_t watched_size = 0, allocation_count = 0, fail_at = 0;
+thread_local std::array<void *, 128> allocations{};
+} // namespace
+void *operator new(std::size_t size) {
+  const bool watched = watched_size && size == watched_size;
+  if (watched && ++allocation_count == fail_at)
+    throw std::bad_alloc{};
+  void *memory = std::malloc(size ? size : 1);
+  if (!memory)
+    throw std::bad_alloc{};
+  if (watched && allocation_count <= allocations.size())
+    allocations[allocation_count - 1] = memory;
+  return memory;
+}
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  try {
+    return ::operator new(size);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+}
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { ::operator delete(memory); }
+void operator delete(void *memory, const std::nothrow_t &) noexcept {
+  ::operator delete(memory);
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void *operator new[](std::size_t size, const std::nothrow_t &mode) noexcept {
+  return ::operator new(size, mode);
+}
+void operator delete[](void *memory) noexcept { ::operator delete(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  ::operator delete(memory);
+}
+void operator delete[](void *memory, const std::nothrow_t &) noexcept {
+  ::operator delete(memory);
+}
 
 using namespace blackbird;
 namespace {
@@ -405,8 +450,8 @@ bool splits_group(const Value::Array &entries, const std::vector<std::size_t> &a
 // Design §5.5 placement over the survivors; returns the survivor index the note goes
 // after (-1: head), or empty when it cannot be placed.
 std::optional<long> ref_place(const Value::Array &entries,
-                              const std::vector<std::size_t> &alive, std::size_t natural,
-                              std::string_view placement) {
+                              const std::vector<std::size_t> &alive,
+                              std::size_t natural, std::string_view placement) {
   long k = -1;
   while (k + 1 < static_cast<long>(alive.size()) &&
          alive[static_cast<std::size_t>(k + 1)] < natural)
@@ -501,7 +546,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
         }))
       return refuse("restore-reasoning-only");
   std::vector<bool> gone(n, false);
-  std::vector<std::size_t> chosen, moved; // shared: refusal order archive, summary, edits
+  std::vector<std::size_t> chosen,
+      moved; // shared: refusal order archive, summary, edits
   std::size_t p = n;
   const auto take = [&](std::size_t u) -> std::optional<std::string> {
     const auto &unit = units[u];
@@ -547,6 +593,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
         return refuse("absent");
       if (request.protect && protected_unit(units[unit_of[pos]]))
         return refuse("protected");
+      if (newest && pos == *newest)
+        return refuse("protected");
       if (type_is(item_at(entries, pos), "reasoning"))
         return refuse("reasoning-edit");
       if (replaced.contains(pos))
@@ -565,8 +613,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     std::size_t start = 0, line = 0;
     while (start <= text.size()) {
       const auto end = text.find('\n', start);
-      const auto piece =
-          text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+      const auto piece = text.substr(start, end == std::string::npos ? std::string::npos
+                                                                     : end - start);
       if (line++ >= 2 && !piece.empty())
         rows.push_back(piece);
       if (end == std::string::npos)
@@ -575,9 +623,12 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     }
     return rows;
   };
-  const auto row_handle = [](const std::string &row) { return row.substr(0, row.find(' ')); };
+  const auto row_handle = [](const std::string &row) {
+    return row.substr(0, row.find(' '));
+  };
   const auto archive_note_at = [&](std::size_t i) {
-    return class_at(i) == UnitClass::note && is_note(item_at(entries, i), archive_note_marker);
+    return class_at(i) == UnitClass::note &&
+           is_note(item_at(entries, i), archive_note_marker);
   };
   std::vector<std::optional<std::size_t>> restore_note;
   for (const auto &r : restores) {
@@ -587,6 +638,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
         for (const auto &row : rows_of(i))
           if (row_handle(row) == r.handle)
             note = i;
+    if (note && replaced.contains(*note))
+      return refuse("restore-note-conflict");
     restore_note.push_back(note);
     p = std::min(p, note ? *note : n);
   }
@@ -600,14 +653,16 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     for (std::size_t u = 0; u < units.size(); ++u) {
       const auto &unit = units[u];
       if (unit.pinned || unit.open || first_of(u) < p ||
-          std::any_of(unit.entries.begin(), unit.entries.end(),
-                      [&](std::size_t pos) { return gone[pos] || replaced.contains(pos); }))
+          std::any_of(unit.entries.begin(), unit.entries.end(), [&](std::size_t pos) {
+            return gone[pos] || replaced.contains(pos);
+          }))
         continue;
       bool sweep = false;
       const auto &first = item_at(entries, first_of(u));
       if (unit.unit_class == UnitClass::state)
         sweep = true;
-      else if (unit.unit_class == UnitClass::note && is_note(first, archive_note_marker))
+      else if (unit.unit_class == UnitClass::note &&
+               is_note(first, archive_note_marker))
         sweep = writes_note;
       else if (unit.unit_class == UnitClass::note && is_note(first, boundary_marker))
         sweep = request.boundary || first_of(u) != newest;
@@ -620,8 +675,9 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
           any = true;
           const auto &name = *text_member(item, "name");
           const auto *args = item.find("arguments");
-          only = only && (name == "context_view" || name == "context_stats" ||
-                          (name == "context_budget" && !(args && args->find("proposal"))));
+          only =
+              only && (name == "context_view" || name == "context_stats" ||
+                       (name == "context_budget" && !(args && args->find("proposal"))));
         }
         sweep = any && only;
       }
@@ -639,7 +695,7 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     restored_handles.insert(r.handle);
   for (std::size_t k = 0; k < restores.size(); ++k) {
     const auto note = restore_note[k];
-    // shared: a note the same frame's edit replaces keeps the edit.
+    // A restore/replacement conflict was refused above.
     if (!note || gone[*note] || replaced.contains(*note) ||
         out.rewritten_notes.contains(ref_at(entries, *note)))
       continue;
@@ -700,9 +756,10 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     const long after = note ? at_or_before(*note) : static_cast<long>(alive.size()) - 1;
     for (std::size_t j = 0; j < restores[k].items.size(); ++j)
       if (!(drop && type_is(restores[k].items[j], "reasoning")))
-        placed.push_back({after,
-                          {note ? *note + 1 : n, 0},
-                          "new:restore:" + restores[k].handle + ":" + std::to_string(j)});
+        placed.push_back(
+            {after,
+             {note ? *note + 1 : n, 0},
+             "new:restore:" + restores[k].handle + ":" + std::to_string(j)});
   }
   for (const auto &s : request.summaries) {
     const auto at = ref_place(entries, alive, first_of(s.unit), placement);
@@ -751,7 +808,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
   const bool boundary_entry =
       request.boundary &&
       text_at(profile, {"turn", "boundary", "form"}) != "request_local_user";
-  if (boundary_entry && splits_group(entries, alive, static_cast<long>(alive.size()) - 1))
+  if (boundary_entry &&
+      splits_group(entries, alive, static_cast<long>(alive.size()) - 1))
     return refuse("inside-tool-group");
   std::stable_sort(placed.begin(), placed.end(),
                    [](const Placed &a, const Placed &b) { return a.key < b.key; });
@@ -785,8 +843,9 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
   // Blackbird's own placements never break it on a context that starts with one.
   {
     const auto note_role_text = text_at(profile, {"note", "role"});
-    const auto role = note_role_text == "developer_as_user_text" ? std::string{"developer"}
-                                                                 : note_role_text;
+    const auto role = note_role_text == "developer_as_user_text"
+                          ? std::string{"developer"}
+                          : note_role_text;
     const auto placeholder = [](std::string r) {
       return Value::object({{"type", Value{"message"}},
                             {"role", Value{std::move(r)}},
@@ -794,8 +853,8 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
     };
     std::map<std::string, Value> by_id;
     for (std::size_t i = 0; i < n; ++i)
-      by_id.emplace(id_at(entries, i), replaced.contains(i) ? replaced.at(i)
-                                                             : item_at(entries, i));
+      by_id.emplace(id_at(entries, i),
+                    replaced.contains(i) ? replaced.at(i) : item_at(entries, i));
     std::vector<const Value *> insert_items;
     for (const auto &edit : request.edits)
       if (edit.op == CutEdit::Op::insert)
@@ -807,9 +866,10 @@ Expectation reference(const Fixture &fixture, const std::vector<Unit> &units,
       else if (token == "new:note" || token == "new:summary")
         items.push_back(placeholder(role));
       else if (token == "new:boundary")
-        items.push_back(placeholder(
-            text_at(profile, {"turn", "boundary", "form"}) == "system_message" ? "system"
-                                                                               : "user"));
+        items.push_back(placeholder(text_at(profile, {"turn", "boundary", "form"}) ==
+                                            "system_message"
+                                        ? "system"
+                                        : "user"));
       else if (token.starts_with("new:insert:"))
         items.push_back(*insert_items[std::stoul(token.substr(11))]);
       else {
@@ -1168,7 +1228,8 @@ void generated(const Row &row, Family family, unsigned seed, Tally &tally) {
         restores.push_back({source.handle, source.items, source.classes, false});
         restored_index = k;
       }
-      for (auto e = (mix & 8U) ? 1 + random() % 2 : 0; e > 0 && !selectable.empty(); --e) {
+      for (auto e = (mix & 8U) ? 1 + random() % 2 : 0; e > 0 && !selectable.empty();
+           --e) {
         CutEdit edit;
         const auto op = random() % 4;
         const auto u = selectable[random() % selectable.size()];
@@ -1241,9 +1302,11 @@ void generated(const Row &row, Family family, unsigned seed, Tally &tally) {
       const auto at_cut = text_at(profile, {"reasoning", "at_cut"});
       const auto at_rebind = text_at(profile, {"reasoning", "at_rebind"});
       const auto &old = chapter.binding;
-      const bool same_route = next.provider == old.provider && next.base_url == old.base_url;
-      const bool own_kept =
-          at_rebind == "keep_in_family" ? same_route : same_route && next.account == old.account;
+      const bool same_route =
+          next.provider == old.provider && next.base_url == old.base_url;
+      const bool own_kept = at_rebind == "keep_in_family"
+                                ? same_route
+                                : same_route && next.account == old.account;
       expected.p = kind == 9 ? 0 : fixture.entries.size();
       std::vector<bool> dropped(fixture.entries.size(), false);
       for (std::size_t i = 0; i < fixture.entries.size(); ++i) {
@@ -1377,7 +1440,8 @@ void generated(const Row &row, Family family, unsigned seed, Tally &tally) {
           continue;
         }
         const auto found = expected.rewritten_notes.find(r.ref);
-        check(found != expected.rewritten_notes.end(), what + ": an unexpected replace");
+        check(found != expected.rewritten_notes.end(),
+              what + ": an unexpected replace");
         ++notes_rewritten;
         check(note_rows(r.item) == found->second,
               what + ": a rewritten note's rows differ\n" + item_text(r.item));
@@ -1386,10 +1450,12 @@ void generated(const Row &row, Family family, unsigned seed, Tally &tally) {
         bool named = false;
         for (const auto &line : found->second)
           if (const auto at = line.find("  ids "); at != std::string::npos)
-            named = named || header.find("\"" + line.substr(at + 6, line.find(' ', at + 6) -
-                                                                        (at + 6)) +
-                                         "\"") != std::string::npos;
-        check(named, what + ": the rewritten note's header names no listed entry\n" + text);
+            named = named ||
+                    header.find("\"" +
+                                line.substr(at + 6, line.find(' ', at + 6) - (at + 6)) +
+                                "\"") != std::string::npos;
+        check(named,
+              what + ": the rewritten note's header names no listed entry\n" + text);
       }
       check(notes_rewritten + expected.replaced_items.size() == frame.replace.size() &&
                 notes_rewritten == expected.rewritten_notes.size(),
@@ -1731,7 +1797,8 @@ void reasoning_spec(const fs::path &directory) {
       (field_name == std::string_view{"provider"} ? route.provider : route.base_url) +=
           "-other";
       auto moved = compose_rebind(
-          input_for(h3.fixture, units3, older, h3.chapter, h3.fixture.next_record()), route);
+          input_for(h3.fixture, units3, older, h3.chapter, h3.fixture.next_record()),
+          route);
       check(moved.has_value() &&
                 reasoning_items(apply_frame(moved->frame, h3.fixture.entries)) == 0,
             std::string{"keep_in_family drops reasoning under another "} + field_name);
@@ -1739,7 +1806,8 @@ void reasoning_spec(const fs::path &directory) {
     auto account3 = h3.chapter.binding;
     account3.account = "second";
     auto same_route = compose_rebind(
-        input_for(h3.fixture, units3, older, h3.chapter, h3.fixture.next_record()), account3);
+        input_for(h3.fixture, units3, older, h3.chapter, h3.fixture.next_record()),
+        account3);
     check(same_route.has_value() &&
               reasoning_items(apply_frame(same_route->frame, h3.fixture.entries)) == 3,
           "keep_in_family keeps its reasoning under another account");
@@ -1902,7 +1970,12 @@ void templates(const fs::path &directory) {
             size_text(1258291) == "1.2M",
         "size text as the design's examples");
   const auto note = archive_note_text(
-      {{"r4821", "exec", "cmake --build build/debug", "exit=0", 8192, 1258291,
+      {{"r4821",
+        "exec",
+        "cmake --build build/debug",
+        "exit=0",
+        8192,
+        1258291,
         {"aa.1", "bb.0"}},
        {"r4902", "message", "The replay loop", "", 600, std::nullopt, {"cc.2"}}});
   // The read-back call is today's context_inspect with its required query (layer 1,
@@ -1910,11 +1983,12 @@ void templates(const fs::path &directory) {
   const std::string expected_call =
       "context_inspect {\"query\": {\"kind\": \"originals\", \"entry\": \"aa.1\", "
       "\"format\": \"json\"}}";
-  check(note.starts_with(std::string{archive_note_marker} +
-                         " These units left your live context; nothing was summarised.\n"
-                         "Read one with " +
-                         expected_call + ", giving an entry ID from its row.\n"),
-        "the archive note header: " + note);
+  check(
+      note.starts_with(std::string{archive_note_marker} +
+                       " These units left your live context; nothing was summarised.\n"
+                       "Read one with " +
+                       expected_call + ", giving an entry ID from its row.\n"),
+      "the archive note header: " + note);
   check(note.find("ids aa.1 bb.0") != std::string::npos &&
             note.find("ids cc.2") != std::string::npos,
         "each row lists its entry IDs: " + note);
@@ -2195,7 +2269,8 @@ void set_head(CutInput &input, const std::string &head) {
 std::string unhex(std::string_view hex) {
   std::string out;
   for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
-    out.push_back(static_cast<char>(std::stoi(std::string{hex.substr(i, 2)}, nullptr, 16)));
+    out.push_back(
+        static_cast<char>(std::stoi(std::string{hex.substr(i, 2)}, nullptr, 16)));
   return out;
 }
 // Runs the read-back call a note or summary names, with its own query, once for every
@@ -2339,7 +2414,8 @@ void persistence(const fs::path &directory) {
       for (const auto &e : field(session.context->view(), "entries").array())
         if (item_text(field(e, "item")).starts_with(archive_note_marker))
           note = item_text(field(e, "item"));
-      check(run_inspect_call(*session.context, note, archived_items) == archived_items.size(),
+      check(run_inspect_call(*session.context, note, archived_items) ==
+                archived_items.size(),
             row.name + ": the note's calls read back every archived entry\n" + note);
     }
     session.reopen();
@@ -2425,6 +2501,303 @@ void persistence(const fs::path &directory) {
   std::cout << "  persistence: " << compared << " three-way comparisons\n";
 }
 
+// Layer-2 counterexamples use direct outcomes, not the removal reference.
+Value named_profile(const fs::path &directory, std::string_view name) {
+  for (const auto &row : profile_rows(directory))
+    if (row.name == name)
+      return row.profile;
+  throw std::runtime_error("missing profile");
+}
+void restore_replace(const fs::path &directory) {
+  const auto profile = named_profile(directory, "openai-chatgpt-responses");
+  auto h = hand(Family::responses, profile);
+  auto units = h.fixture.live_units();
+  CutRestore restore{units[1].handle, {}, {}, false};
+  for (const auto pos : units[1].entries) {
+    restore.items.push_back(item_at(h.fixture.entries, pos));
+    restore.classes.push_back(type_is(restore.items.back(), "function_call_output")
+                                  ? UnitClass::result
+                                  : UnitClass::round);
+  }
+  auto archived = compose_archive(
+      input_for(h.fixture, units, profile, h.chapter, h.fixture.next_record()), {1});
+  check(archived.has_value(), "archive before restore/replace");
+  apply_into(h.fixture, h.chapter, archived->frame);
+  units = h.fixture.live_units();
+  CutEdit edit;
+  edit.op = CutEdit::Op::replace;
+  for (const auto &unit : units)
+    if (unit.unit_class == UnitClass::note) {
+      edit.entry = ref_at(h.fixture.entries, unit.entries.front());
+      edit.item = item_at(h.fixture.entries, unit.entries.front());
+    }
+  CutRequest request;
+  request.restores = {restore};
+  request.edits = {edit};
+  const auto cut = compose_cut(
+      input_for(h.fixture, units, profile, h.chapter, h.fixture.next_record()),
+      request);
+  check(!cut && cut.error().reason == "restore-note-conflict",
+        "restore and explicit replacement of its note must be refused");
+}
+void boundary_replace(const fs::path &directory) {
+  const auto profile = with(named_profile(directory, "openai-chatgpt-responses"),
+                            {"turn", "boundary", "enabled"}, Value{true});
+  auto h = hand(Family::responses, profile);
+  auto units = h.fixture.live_units();
+  auto boundary = compose_archive(
+      input_for(h.fixture, units, profile, h.chapter, h.fixture.next_record()), {1},
+      true);
+  check(boundary.has_value(), "boundary setup");
+  apply_into(h.fixture, h.chapter, boundary->frame);
+  units = h.fixture.live_units();
+  CutEdit edit;
+  edit.op = CutEdit::Op::replace;
+  edit.entry = ref_at(h.fixture.entries, h.fixture.entries.size() - 1);
+  edit.item = h.fixture.developer("not a boundary");
+  const auto cut = compose_edit(
+      input_for(h.fixture, units, profile, h.chapter, h.fixture.next_record()), {edit});
+  check(!cut && cut.error().reason == "protected",
+        "newest boundary replacement is protected");
+}
+void chapter_allocation(const fs::path &directory) {
+  const auto profile = named_profile(directory, "openai-chatgpt-responses");
+  const auto base = scratch();
+  for (const bool growing : {false, true}) {
+    std::size_t occurrence = 0;
+    for (const bool inject : {false, true}) {
+      Session session{base / (std::string{growing ? "grow" : "start"} +
+                              (inject ? "fail" : "observe"))};
+      Fixture items;
+      session.context->append({items.prompt()}, "operator");
+      auto binding = binding_for(items, profile);
+      const auto compose = [&](const ApplicationRecordId &id, bool start) {
+        const auto entries = field(session.context->view(), "entries").array();
+        const auto units = session.context->units();
+        CutInput in{entries,    units,
+                    profile,    session.context->chapter(),
+                    id.bytes(), CutSource::model,
+                    {},         {},
+                    {},         {},
+                    {}};
+        set_head(in, session.context->head());
+        return start ? compose_start(in, binding) : compose_prefix(in, binding);
+      };
+      if (growing) {
+        const auto id = session.log->issue();
+        const auto first = compose(id, true);
+        check(first.has_value(), "allocation setup start");
+        (void)session.context->cut(first->frame, id);
+        binding.tools_digest += "-changed";
+      }
+      const auto id = session.log->issue();
+      const auto cut = compose(id, !growing);
+      check(cut.has_value(), "allocation case composes");
+      const auto before = Session::state(*session.context);
+      check(session.context->chapter().table.size() ==
+                session.context->chapter().table.capacity(),
+            "exercise a chapter growth boundary");
+      watched_size = sizeof(ChapterRow) * (growing ? 2 : 1);
+      allocation_count = 0;
+      allocations.fill(nullptr);
+      fail_at = inject ? occurrence : 0;
+      bool failed = false;
+      try {
+        (void)session.context->cut(cut->frame, id);
+      } catch (const std::bad_alloc &) {
+        failed = true;
+      }
+      watched_size = fail_at = 0;
+      if (!inject) {
+        for (std::size_t i = 0; i < std::min(allocation_count, allocations.size()); ++i)
+          if (allocations[i] == session.context->chapter().table.data())
+            occurrence = i + 1;
+        check(occurrence != 0, "observed actual chapter buffer allocation");
+      } else {
+        check(failed, "chapter allocation injection fired");
+        check(Session::state(*session.context) == before,
+              "allocation failure preserves live state");
+        check(session.probe(true) == before, "allocation failure records no cut");
+        session.reopen();
+        check(Session::state(*session.context) == before,
+              "allocation failure survives reopen unchanged");
+      }
+    }
+  }
+  std::error_code ignored;
+  fs::remove_all(base, ignored);
+}
+
+void stale_writer(const fs::path &directory) {
+  const auto profile = named_profile(directory, "openai-chatgpt-responses");
+  const auto base = scratch();
+  {
+    Session session{base};
+    Fixture items;
+    session.context->append({items.prompt()}, "operator");
+    auto binding = binding_for(items, profile);
+    const auto compose = [&](const ApplicationRecordId &id, bool start) {
+      const auto entries = field(session.context->view(), "entries").array();
+      const auto units = session.context->units();
+      CutInput in{entries,    units,
+                  profile,    session.context->chapter(),
+                  id.bytes(), CutSource::model,
+                  {},         {},
+                  {},         {},
+                  {}};
+      set_head(in, session.context->head());
+      return start ? compose_start(in, binding) : compose_prefix(in, binding);
+    };
+    const auto start_id = session.log->issue();
+    const auto start = compose(start_id, true);
+    check(start.has_value(), "writer start composes");
+    (void)session.context->cut(start->frame, start_id);
+    binding.tools_digest += "-changed";
+    const auto stale_id = session.log->issue();
+    const auto stale = compose(stale_id, false);
+    check(stale.has_value(), "stale prefix composes before append");
+    session.context->append({items.answer("a concurrent append")}, "provider.branch:x");
+    const auto before = Session::state(*session.context);
+    const auto conflict = [&](const CutFrame &frame, const ApplicationRecordId &id) {
+      bool refused = false;
+      try {
+        (void)session.context->cut(frame, id);
+      } catch (const Error &error) {
+        refused = error.code == ErrorCode::conflict;
+      }
+      check(refused, "writer refuses stale head/chapter as conflict, not corruption");
+      check(Session::state(*session.context) == before && session.probe(true) == before,
+            "refused write changes neither live state nor recorded history");
+    };
+    conflict(stale->frame, stale_id);
+    const auto wrong_id = session.log->issue();
+    auto wrong = compose(wrong_id, false);
+    check(wrong.has_value(), "current prefix composes");
+    for (auto &[key, value] : wrong->frame.chapter.object())
+      if (key == "ordinal")
+        value = Value{Number{99}};
+    conflict(wrong->frame, wrong_id);
+    session.reopen();
+    check(Session::state(*session.context) == before,
+          "refusals survive reopen unchanged");
+  }
+  std::error_code ignored;
+  fs::remove_all(base, ignored);
+}
+void oauth_prefix(const fs::path &directory) {
+  const auto profile = named_profile(directory, "anthropic-messages-prefix-checked");
+  auto h = hand(Family::anthropic, profile);
+  const auto request = h.fixture.request(h.fixture.entries);
+  const auto instructions = string_field(request, "instructions");
+  for (const bool oauth : {false, true})
+    check(field(export_anthropic_request(request, 16384, oauth), "system") ==
+              Value{anthropic_system_text(instructions, oauth)},
+          "system-text helper is the exported prefix");
+  auto binding = h.chapter.binding;
+  binding.instructions_digest =
+      instructions_digest(anthropic_system_text(instructions, false));
+  h.chapter.binding = binding;
+  binding.instructions_digest =
+      instructions_digest(anthropic_system_text(instructions, true));
+  check(binding.instructions_digest != h.chapter.binding.instructions_digest,
+        "OAuth changes the actual instruction digest");
+  const auto units = h.fixture.live_units();
+  const auto cut = compose_rebind(
+      input_for(h.fixture, units, profile, h.chapter, h.fixture.next_record()),
+      binding);
+  check(cut.has_value() && cut->p == 0 && cut->frame.reasoning.size() == h.r.size(),
+        "OAuth prefix change drops all prefix-checked reasoning from p=0");
+}
+void mixed_anchors(const fs::path &directory) {
+  const auto keep = named_profile(directory, "openai-chatgpt-responses");
+  const auto dropping = with(keep, {"reasoning", "at_cut"}, Value{"drop_after_change"});
+  // Archive A; insert or move B after reasoning-only U, which the rule drops.
+  for (const bool move : {false, true}) {
+    Fixture f;
+    ChapterState chapter;
+    f.add_prompt();
+    f.add_round(false, true, {});
+    ++f.groups;
+    f.add({f.reasoning()}, {UnitClass::round});
+    f.add_round(false, true, {});
+    auto units = f.live_units();
+    auto start = compose_start(input_for(f, units, dropping, chapter, f.next_record()),
+                               binding_for(f, dropping));
+    check(start.has_value(), "anchor setup");
+    apply_into(f, chapter, start->frame);
+    units = f.live_units();
+    CutEdit edit;
+    edit.op = move ? CutEdit::Op::move : CutEdit::Op::insert;
+    edit.unit = 3;
+    edit.after = 2;
+    edit.item = f.developer("the requested insertion");
+    const auto wanted = move ? item_at(f.entries, units[3].entries.front()) : edit.item;
+    CutRequest request;
+    request.archive = {1};
+    request.edits = {edit};
+    const auto cut =
+        compose_cut(input_for(f, units, dropping, chapter, f.next_record()), request);
+    check(cut.has_value(), "removed reasoning anchor composes");
+    const auto after = apply_frame(cut->frame, f.entries);
+    check(std::count_if(after.begin(), after.end(),
+                        [&](const Value &e) { return field(e, "item") == wanted; }) ==
+              1,
+          "requested insertion/move survives removed reasoning anchor exactly once");
+    (void)export_wire(f, after);
+  }
+  // Restore after its emptied note, with a second insert on that note.
+  auto h = hand(Family::responses, keep);
+  auto units = h.fixture.live_units();
+  CutRestore restore{units[1].handle, {}, {}, false};
+  for (const auto pos : units[1].entries) {
+    restore.items.push_back(item_at(h.fixture.entries, pos));
+    restore.classes.push_back(type_is(restore.items.back(), "function_call_output")
+                                  ? UnitClass::result
+                                  : UnitClass::round);
+  }
+  auto archive = compose_archive(
+      input_for(h.fixture, units, keep, h.chapter, h.fixture.next_record()), {1});
+  check(archive.has_value(), "mixed restore setup");
+  apply_into(h.fixture, h.chapter, archive->frame);
+  units = h.fixture.live_units();
+  CutEdit insert;
+  insert.op = CutEdit::Op::insert;
+  insert.item = h.fixture.developer("after emptied note");
+  for (std::size_t u = 0; u < units.size(); ++u)
+    if (units[u].unit_class == UnitClass::note)
+      insert.after = u;
+  CutRequest request;
+  request.restores = {restore};
+  request.edits = {insert};
+  const auto cut = compose_cut(
+      input_for(h.fixture, units, keep, h.chapter, h.fixture.next_record()), request);
+  check(cut.has_value(), "restore plus insert at emptied note composes");
+  const auto after = apply_frame(cut->frame, h.fixture.entries);
+  check(std::any_of(after.begin(), after.end(),
+                    [&](const Value &e) { return field(e, "item") == insert.item; }),
+        "insert at emptied note remains");
+  (void)export_wire(h.fixture, after);
+  // No-note restore plus boundary: restored items precede the physical/wire tail.
+  const auto enabled = with(keep, {"turn", "boundary", "enabled"}, Value{true});
+  auto tail = hand(Family::responses, enabled);
+  units = tail.fixture.live_units();
+  request.edits.clear();
+  request.restores = {
+      {"r999999", {tail.fixture.answer("restored tail")}, {UnitClass::round}, false}};
+  request.boundary = true;
+  const auto bounded = compose_cut(
+      input_for(tail.fixture, units, enabled, tail.chapter, tail.fixture.next_record()),
+      request);
+  check(bounded.has_value(), "tail restore plus boundary composes");
+  const auto bounded_after = apply_frame(bounded->frame, tail.fixture.entries);
+  check(is_note(item_at(bounded_after, bounded_after.size() - 1), boundary_marker),
+        "boundary physically follows tail restore");
+  const auto wire = export_wire(tail.fixture, bounded_after);
+  check(turn_start(wire.rendered.back(), "user_text") &&
+            turn_state(wire.rendered, enabled).closed,
+        "tail boundary starts a closed provider-visible turn");
+}
+
 // ---- Cost: composing over a large context holds refs, not copies.
 void measure(const fs::path &directory) {
   const auto rows = profile_rows(directory);
@@ -2494,10 +2867,20 @@ int main(int argc, char **argv) {
   const std::string_view which = argv[1];
   const fs::path directory = argv[2];
   const std::map<std::string_view, std::function<void(const fs::path &)>> cases{
-      {"turn_state", turn_states},   {"removal", removal_and_prefix},
-      {"reasoning", reasoning_spec}, {"templates", templates},
-      {"unit_keys", unit_keys},      {"chapter", chapter_section_case},
-      {"persistence", persistence},  {"measure", measure}};
+      {"restore_replace", restore_replace},
+      {"boundary_replace", boundary_replace},
+      {"allocation", chapter_allocation},
+      {"stale_writer", stale_writer},
+      {"oauth_prefix", oauth_prefix},
+      {"mixed_anchors", mixed_anchors},
+      {"turn_state", turn_states},
+      {"removal", removal_and_prefix},
+      {"reasoning", reasoning_spec},
+      {"templates", templates},
+      {"unit_keys", unit_keys},
+      {"chapter", chapter_section_case},
+      {"persistence", persistence},
+      {"measure", measure}};
   const auto found = cases.find(which);
   if (found == cases.end()) {
     std::cerr << "unknown case\n";

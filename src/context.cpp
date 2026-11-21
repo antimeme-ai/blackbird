@@ -888,6 +888,8 @@ void ContextStore::play_frame(const RetainedFact &fact,
         made.set(record.identity.bytes(), derive_classes(packet));
         // The chapter the frame starts must follow the current one (S3a).
         chapter_next = chapter_step(chapter_, frame);
+        if (chapter_next)
+          reserve_append(chapter_.table, 1);
         for (const auto &original : captured) {
           originals_.emplace(original.id, original);
           inserted.push_back(original.id);
@@ -2664,6 +2666,10 @@ Value ContextStore::cut(CutFrame frame, const ApplicationRecordId &identity,
     ClassMap made;
     made.set(identity.bytes(), derive_classes(packet));
     reserve_append(captured_, captured.size());
+    // All chapter growth precedes durable publication; installing the owned step
+    // afterwards must not allocate (layer-2 R1).
+    if (chapter_next)
+      reserve_append(chapter_.table, 1);
     if (protect)
       trace.protection([&](const RawEventRef &request) {
         protect(next, pending_proposal(trace.child()), request);

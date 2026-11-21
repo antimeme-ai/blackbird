@@ -12,6 +12,7 @@
 // - the format-level record is written once, and a higher level is refused;
 // - units and their classes (unit S2) agree live, restored and played back.
 #include "blackbird/context.hpp"
+#include "blackbird/context_compose.hpp"
 #include "blackbird/context_cut.hpp"
 #include "blackbird/context_units.hpp"
 #include "blackbird/journal.hpp"
@@ -434,6 +435,16 @@ void refusals() {
       copy.object().emplace_back(std::string{key}, value);
     return copy;
   };
+  const ChapterBinding binding{"openai",   "responses", "https://api.openai.com",
+                               "default",  "gpt-6",     "conservative",
+                               1,          "sha256:aa", "sha256:bb",
+                               "sha256:cc"};
+  const auto chapter = [&](unsigned ordinal) {
+    return mutate("chapter", Value::object({{"ordinal", Value{Number{ordinal}}},
+                                            {"previous", Value{}},
+                                            {"binding", encode_binding(binding)}}));
+  };
+  (void)decode_cut_frame(chapter(1)); // valid binding and ordinal positive control
   const std::vector<std::pair<const char *, Value>> malformed{
       {"unknown op", mutate("op", Value{"splice"})},
       {"wrong format", mutate("format", Value{"cut-delta-v0"})},
@@ -465,10 +476,7 @@ void refusals() {
               Value{Value::Array{Value::object({{"anchor", Value{"start"}},
                                                 {"fresh", Value{Number{0}}},
                                                 {"existing", encode_ref(c)}})}})},
-      {"chapter ordinal zero",
-       mutate("chapter", Value::object({{"ordinal", Value{Number{0}}},
-                                        {"previous", Value{}},
-                                        {"binding", Value::object({})}}))},
+      {"chapter ordinal zero", chapter(0)},
   };
   for (const auto &[name, bad] : malformed)
     check(refused([&] { (void)decode_cut_frame(bad); }),

@@ -61,7 +61,8 @@ struct ChapterStep {
   ChapterRow row;
   ChapterBinding binding;
 };
-std::optional<ChapterStep> chapter_step(const ChapterState &state, const CutFrame &frame);
+std::optional<ChapterStep> chapter_step(const ChapterState &state,
+                                        const CutFrame &frame);
 // chapter_step, then appends the row and takes the binding.
 void advance_chapter(ChapterState &state, const CutFrame &frame);
 

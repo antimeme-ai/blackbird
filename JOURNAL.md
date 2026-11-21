@@ -12362,3 +12362,112 @@ declared call_id to the ultracode source, which became v4. A recorded v3 is now 
 **Review.** One review in two halves and one recheck in two halves. The notes are in
 `context/clm-rd7-notes/T1*.md`. Not done: an allocation-injection test for the shape parameter, since no
 armed state remains.
+
+## 2026-10-26 — S3a checkpoint completion (arconaut-rd7.10)
+
+Resumed the archival `9df54fe` checkpoint on `work/autodev-composition-2026-10-26`.
+This remains a pure composition library with **no production callers**; S3b is not
+implemented. The design and S3a dependency/downgrade contracts remain unchanged.
+Historical Mac/Linux logs do not qualify this exact source.
+
+**Bound and subplan.** Finish the existing A/B remediation, one fresh-context native
+recheck and its fixes, direct composition/persistence oracles, then the ordinary
+source hook and scoped Linux debug/ASan checks. No new design, dependencies,
+fuzz/mutation campaign, performance campaign or third review. No installed runtime
+replacement. The continuity sibling owns interrupted-write/SIGTERM/8zr fixes; any
+blocking source-gate result is retained for orchestration rather than merged here.
+
+**Existing findings.** Inspection confirms checkpoint fixes for A-H1 (resolve anchors
+after all removal), A-M1 (boundary after tail restores), A-M2 (both templates use
+supported entry-original queries), A-M3 (`must_keep` refuses forced and unforced
+drops), A-M4 (mixed generation, reasoning-ending units, replacement contents),
+A-L1 through L6 (reasoning-only restore refusal, fresh note header, empty refusal,
+route-aware family, safe note placement and unanswered-call insertion refusal).
+B1 fences every chapter at format level 2, B2 stamps/rejects stale heads in the
+identity-bound writer, B3 reports writer conflicts, B4 avoids chapter-table copies,
+B5 shares exported Anthropic system text with the digest contract, and B7 reuses
+composition sizes. B6's invalid-binding ordinal test was still vacuous: now it uses
+a valid binding and an ordinal-one positive control. This is an oracle repair,
+not a claim that previously accepted zero ordinals are newly refused.
+
+**Layer 2.** The sole independent recheck used the pinned native generation with
+OpenAI `gpt-6.1-sol`, medium effort, fresh private session, source-only. Report:
+[papers/2026-10-26-s3a-recheck.md](papers/2026-10-26-s3a-recheck.md). Its three
+consequential findings were reproduced on the checkpoint before implementation:
+- chapter-vector allocation after recording: `FAIL allocation: allocation failure records no cut`;
+- restore plus explicit note replacement: `FAIL restore_replace`;
+- newest boundary replacement bypass: `FAIL boundary_replace`.
+
+The writer now reserves chapter growth before recording, and playback reserves
+before publishing state. The allocation oracle identifies the actual table buffer
+in an equivalent successful call and fails that allocation on first-start and
+later-growth cases; it checks unchanged live state, no recorded cut and reopen.
+Restore plus replacement of its live note is refused `restore-note-conflict` rather
+than silently keeping a false row. Replacement of the newest boundary is refused
+`protected`, even for operator edits, matching the existing selection rule.
+
+Added direct non-reference oracles for stale append/cut and chapter conflicts,
+removed reasoning/emptied-note anchors, no-note restore plus boundary tail, and
+OAuth system export/digest/rebind at p=0. These exercise checkpoint remediation;
+they are not new production behavior or a claimed RED against the checkpoint.
+The first OAuth/tail-restore fixtures were wrong (bool passed as max_tokens;
+restore duplicated live call IDs); corrected without changing implementation or
+weakening any expected outcome. Existing model/reference generation remains a
+useful differential oracle, not independent proof of every design interpretation.
+
+**Checks/evidence.** Logs and fresh-session recheck are retained in the campaign
+`composition-run` directory; final direct/gate outcomes are recorded in HANDOFF.md.
+Initial fresh debug targeted checks passed 10/10. All three new defect regressions
+failed before their fixes and passed after. The valid-binding ordinal control,
+stale writer and other unchanged composition checks passed. Final delivery is
+conditional on the exact-tree source gate and required host checks, not this note.
+Linux's runner uses only an ignored copy with explicit worktree ROOT and the
+existing qualified Lua archive at its canonical workspace path; hash/profile,
+targets, assertions and deadlines are unchanged. No old generated database reused.
+
+Qualification also exposed checkpoint formatting in `context_compose.hpp` and the
+Anthropic system-text call, plus easily-swapped count/byte parameters in the new
+array sizing helper. Formatting is repaired; that helper now receives a named
+count/bytes aggregate, with no check suppression and unchanged sizing arithmetic.
+The full owned lint pass reported no other diagnostics in the unit's new tests.
+
+**Successor qualification.** The predecessor's native session stopped at its
+resident-tail capacity before qualification finished; it did not commit. The
+fresh `composition-followup-01` session preserved the old audit and interrupted
+Linux run, verified staged tree `4ceef3bacdafc11ef6be2b6c2eec1f7b4a2ab356`
+on `9df54fe`, and inspected the retained direct RED/GREEN and corrected-fixture
+results rather than repeating them. A genuinely new scoped Linux debug and
+ASan+UBSan operation passed on Neuroses (Clang/libc++ 23.1.4); capture
+`context/linux/run-2jmazopa/checks.log`, runner result in the successor's
+`linux.log`. This completes the missing host check, not a third review.
+Release target and the mandatory full source hook remain delivery gates; their
+actual results and the pushed ref will be recorded in the successor HANDOFF.md.
+No S3b callers, sibling merge, main update or installed-runtime replacement.
+
+The first successor source hook blocked the commit: 309/310 debug tests passed,
+`install_blackbird` failed at its packaged-launcher fixture, and lint was not
+reached. The campaign exports `BLACKBIRD_EXECUTABLE` and
+`BLACKBIRD_SPRITE_ASSET`; `scripts/blackbird` explicitly honors them, while this
+fixture inherits the parent environment and expects its own fake executable and
+sprite. Qualification must remove these launch-only overrides, not change the
+fixture or bypass the hook. A proposed captured-stderr diagnostic timed out
+waiting for the shared build slot (its log contains only waiting; no diagnostic
+started); its retained result is not a test result. The next normal source hook
+runs with launch overrides removed, keeping every check enabled.
+
+**Qualification blocked, candidate inactive.** Removing launch-only overrides
+made `install_blackbird` pass. The second mandatory hook still refused the
+commit: 309/310 passed; `terminal_pty_composer` failed at
+`scripts/check-terminal-pty:416`, waiting for `COMPOSER_HISTORY` after `/lua`
+while the terminal remained in `Starting`. Retained fixture:
+`/var/folders/nr/8bhjl__j67bbctrbn87yjt7w0000gn/T/arco-composer-vj9anzi4`.
+The read-only `--audit-last` output ends with the correct print program source;
+it does not establish execution or settlement. Exact source-hook logs and that
+inspection are in `composition-followup-01`. No flakiness or continuity-product
+cause is assumed. Requested orchestrator routing to the continuity/8zr owner if
+applicable, with an exact qualified prerequisite rather than a sibling merge.
+The independent missing final `scripts/rigor lint` operation then passed, including
+C++/Lua diagnostics. Release and Linux results remain settled; source gate is
+**not GREEN**, no source commit or push occurred, no runtime was replaced.
+No further full-suite retry or additional review was launched. See successor
+HANDOFF.md for precise results and the remaining delivery blocker.

@@ -481,7 +481,8 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
     tools.push_back(std::move(native));
   }
   auto messages = render_messages(field(request, "input").array(), nullptr);
-  auto instructions = anthropic_system_text(string_field(request, "instructions"), oauth);
+  auto instructions =
+      anthropic_system_text(string_field(request, "instructions"), oauth);
   auto result = Value::object(
       {{"model", Value{model}},
        {"system", Value{std::move(instructions)}},

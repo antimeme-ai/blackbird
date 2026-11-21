@@ -1047,7 +1047,7 @@ endforeach()
 # state on the codecs' renders, chapters and unit keys, against the shipped profiles.
 add_executable(cut_compose_test tests/cut_compose_test.cpp)
 target_link_libraries(cut_compose_test PRIVATE blackbird_profiles blackbird_coding)
-foreach(compose_case turn_state removal reasoning templates unit_keys chapter persistence)
+foreach(compose_case turn_state removal reasoning templates unit_keys chapter persistence restore_replace boundary_replace allocation stale_writer oauth_prefix mixed_anchors)
   add_test(NAME cut_compose_${compose_case} COMMAND cut_compose_test ${compose_case}
     ${CMAKE_SOURCE_DIR}/profiles/providers)
   set_tests_properties(cut_compose_${compose_case} PROPERTIES TIMEOUT 120)
