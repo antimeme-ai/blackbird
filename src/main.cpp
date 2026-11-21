@@ -1347,19 +1347,25 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       else
         emit(text);
     };
-    engine.observed_usage = [&](const Value &usage) {
+    engine.observed_telemetry = [&](const SessionTelemetry &t) {
       if (!tui)
         return;
-      std::string summary;
-      for (const auto &[key, suffix] :
-           {std::pair{"input_tokens", " in"}, std::pair{"output_tokens", " out"}}) {
-        if (const auto *value = usage.find(key)) {
-          if (!summary.empty())
-            summary += " · ";
-          summary += value->number().text() + suffix;
-        }
-      }
-      ui.usage(summary);
+      const TelemetrySnapshot snap{.requests = t.requests,
+                                   .last_input = t.last_input_tokens,
+                                   .last_output = t.last_output_tokens,
+                                   .last_cached = t.last_cached_tokens,
+                                   .last_reasoning = t.last_reasoning_tokens,
+                                   .total_input = t.input_tokens,
+                                   .total_output = t.output_tokens,
+                                   .total_cached = t.cached_tokens,
+                                   .last_duration_ms = t.last_duration_ms,
+                                   .last_ttft_ms = t.last_ttft_ms,
+                                   .upstream_epoch = t.upstream_epoch,
+                                   .context_window = t.context_window_tokens,
+                                   .last_cost_usd = t.last_cost_usd,
+                                   .cost_usd = t.session_cost_usd};
+      ui.telemetry(snap);
+      ui.usage(terminal_usage_summary(snap));
     };
     engine.status = [&](std::string_view text) {
       if (tui) {

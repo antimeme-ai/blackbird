@@ -109,6 +109,29 @@ struct TurnInput {
   std::string_view prompt;
   std::string_view program;
 };
+struct SessionTelemetry {
+  std::uint64_t requests = 0;
+  std::uint64_t input_tokens = 0;
+  std::uint64_t output_tokens = 0;
+  std::uint64_t cached_tokens = 0;
+  std::uint64_t cache_write_tokens = 0;
+  std::uint64_t reasoning_tokens = 0;
+  std::uint64_t last_input_tokens = 0;
+  std::uint64_t last_output_tokens = 0;
+  std::uint64_t last_cached_tokens = 0;
+  std::uint64_t last_cache_write_tokens = 0;
+  std::uint64_t last_reasoning_tokens = 0;
+  std::uint64_t last_duration_ms = 0;
+  std::uint64_t last_ttft_ms = 0;
+  std::uint64_t upstream_epoch = 0;
+  std::optional<std::uint64_t> context_window_tokens;
+  std::optional<double> last_cost_usd;
+  std::optional<double> session_cost_usd;
+  std::string model;
+};
+// Known context window sizes for explicitly matched models; nullopt when unknown.
+std::optional<std::uint64_t>
+known_context_window_tokens(std::string_view model) noexcept;
 class CodingEngine {
 public:
   CodingEngine(AuditLog &log, ContextStore &context, CodingProvider &provider,
@@ -153,6 +176,8 @@ public:
   std::function<void(std::string_view)> diagnostic;
   std::function<void(std::string_view)> notice;
   std::function<void(const Value &)> observed_usage;
+  std::function<void(const SessionTelemetry &)> observed_telemetry;
+  const SessionTelemetry &telemetry() const noexcept { return telemetry_; }
   std::function<void(std::string_view)> operation_started;
   std::function<void(const Value &)> task_activity;
   std::function<void(const Value &, RawTaskPresentation)> task_activity_native;
@@ -321,6 +346,7 @@ private:
   std::chrono::seconds cache_ttl_{300};
   std::string last_provider_model_;
   std::string last_provider_identity_;
+  SessionTelemetry telemetry_;
   bool has_open_tool_calls() const;
   Value format_context_units() const;
   Value commit_pending_context();

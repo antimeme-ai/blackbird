@@ -13490,3 +13490,42 @@ epochs and hardened provider error recovery and Lua ergonomics
    via `tail_facts()`, `lua_error` consumption/reset, OpenRouter `response.incomplete`
    metadata/output_item/duplicate-terminal handling, `context_pin` `r1-r4` syntax
    help, and raw bridge role 6 docs.
+
+
+## 2026-11-21 — Unit (2): Live Visuals & Token Telemetry
+
+Built the live avionics telemetry HUD and cumulative session accounting
+(`docs/VISUALS_TELEMETRY_UNIT2_SUBPLAN.md`), verified with
+`tests/visuals_telemetry_unit2_test.cpp`:
+
+1. **Cumulative session telemetry & request timing (`include/blackbird/coding.hpp`,
+   `src/coding.cpp`, `src/anthropic_provider.cpp`):**
+   - Added `SessionTelemetry` and `known_context_window_tokens()` (explicitly
+     matched model families with token-boundary matching; honest `nullopt` for
+     unknown models).
+   - Measured per-attempt `last_duration_ms` and time to first streamed text delta
+     (`last_ttft_ms`), normalized Responses/Chat-Completions/Anthropic usage
+     (summing uncached + cache read + cache creation on raw Anthropic usage,
+     forwarding `cache_write_tokens` from `AnthropicCodingProvider`, separating
+     per-request `last_cost_usd` from cumulative `session_cost_usd`), accumulated
+     totals with saturating arithmetic, fired `observed_telemetry`, and exposed
+     `session_usage` and `upstream_epoch` in `CodingEngine::stats()`.
+2. **Avionics bottom rail & live streaming feedback (`include/blackbird/terminal.hpp`,
+   `src/terminal.cpp`, `src/main.cpp`):**
+   - Added `TelemetrySnapshot`, `terminal_format_tokens()`,
+     `terminal_usage_summary()`, `terminal_avionics_rail()`, and
+     `TerminalUI::telemetry()`.
+   - Painted the color-coded Avionics Telemetry Rail (`ctx`, gauge bar, `cache %`,
+     `tok/s`, cumulative `Σ` totals/cost, `eN` epoch) inside the composer's bottom
+     border (`╰ ... ╯`) with zero vertical rows stolen, progressive narrow-width
+     degradation, `LC_CTYPE=C` ASCII fallback, and overflow-safe 128-bit ratio math.
+   - Kept `live_telemetry` visible across turns and added live streamed byte
+     progress (`Streaming <size>`) in the status bar while streaming.
+3. **Adversarial review & hardening (layer 1):** Guarded `format_usd()` against
+   non-finite/oversized doubles, fixed raw Anthropic uncached-only `input_tokens`
+   and `AnthropicCodingProvider` `cache_write_tokens`, eliminated duplicate
+   `input_tokens_details` keys and `null` fallback shadowing, used 128-bit
+   overflow-safe ratio math and saturating accumulators, added `LC_CTYPE=C` ASCII
+   fallback, fixed `gpt-4o` (128k) and boundary-matched `o3`/`kimi-k2`, separated
+   `last_cost_usd` from cumulative `session_cost_usd`, and cleaned all `clang-tidy`
+   parameter warnings.

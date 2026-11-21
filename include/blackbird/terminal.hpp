@@ -83,6 +83,26 @@ std::optional<std::string_view> terminal_process_join(TerminalProcessJoin chunks
 std::string terminal_key_help();
 std::string terminal_command_hint(std::string_view draft);
 std::string terminal_osc52_copy(std::string_view text);
+struct TelemetrySnapshot {
+  std::uint64_t requests = 0;
+  std::uint64_t last_input = 0;
+  std::uint64_t last_output = 0;
+  std::uint64_t last_cached = 0;
+  std::uint64_t last_reasoning = 0;
+  std::uint64_t total_input = 0;
+  std::uint64_t total_output = 0;
+  std::uint64_t total_cached = 0;
+  std::uint64_t last_duration_ms = 0;
+  std::uint64_t last_ttft_ms = 0;
+  std::uint64_t upstream_epoch = 0;
+  std::optional<std::uint64_t> context_window;
+  std::optional<double> last_cost_usd;
+  std::optional<double> cost_usd;
+};
+std::string terminal_format_tokens(std::uint64_t count);
+std::string terminal_usage_summary(const TelemetrySnapshot &telemetry);
+ChatRow terminal_avionics_rail(const TelemetrySnapshot &telemetry,
+                               std::size_t max_cells);
 TerminalState load_terminal_state(const std::filesystem::path &path,
                                   bool capture = false);
 void save_terminal_state(const std::filesystem::path &path, const TerminalState &state,
@@ -185,6 +205,7 @@ public:
   void process_output(std::string_view text);
   void restore_message(ChatKind kind, std::string_view text);
   void usage(std::string_view text);
+  void telemetry(const TelemetrySnapshot &snapshot);
   void operation_started(bool provider);
   void status(std::string_view text);
   // A published context revision (a1v): kind label, e.g. "compacted", and the
@@ -230,7 +251,8 @@ private:
     failure,
     instrument_source,
     question,
-    context_change
+    context_change,
+    telemetry
   };
   struct Message {
     Kind kind;
@@ -241,6 +263,7 @@ private:
     RawUiValueOrigin origin{};
     std::optional<InstrumentSource> instrument{};
     std::shared_ptr<const TerminalQuestion> question{};
+    std::shared_ptr<const TelemetrySnapshot> telemetry{};
   };
   bool raw_capture_ = false;
   RawUiSource initial_source_{};
@@ -261,6 +284,7 @@ private:
   std::size_t task_offset_ = 0;
   std::string task_anchor_;
   void post(Kind kind, std::string_view text, RawCapacityClaim *preheld_data = nullptr,
-            std::shared_ptr<const TerminalQuestion> question = {});
+            std::shared_ptr<const TerminalQuestion> question = {},
+            std::shared_ptr<const TelemetrySnapshot> telemetry = {});
 };
 } // namespace blackbird

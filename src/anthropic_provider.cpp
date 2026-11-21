@@ -235,7 +235,7 @@ public:
       ++index;
     }
     Value::Object normalized;
-    std::uint64_t input = 0, cached = 0, output_tokens = 0;
+    std::uint64_t input = 0, cached = 0, cache_write = 0, output_tokens = 0;
     for (const auto key :
          {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"})
       if (const auto *value = usage_.find(key)) {
@@ -245,6 +245,8 @@ public:
         input += tokens;
         if (std::string_view{key} == "cache_read_input_tokens")
           cached = tokens;
+        if (std::string_view{key} == "cache_creation_input_tokens")
+          cache_write = tokens;
       }
     if (const auto *value = usage_.find("output_tokens"))
       output_tokens = natural(*value);
@@ -256,10 +258,14 @@ public:
       normalized.emplace_back("output_tokens", Value{Number{output_tokens}});
     if (usage_.find("input_tokens") && usage_.find("output_tokens"))
       normalized.emplace_back("total_tokens", Value{Number{input + output_tokens}});
+    Value::Object details;
     if (usage_.find("cache_read_input_tokens"))
-      normalized.emplace_back(
-          "input_tokens_details",
-          Value::object({{"cached_tokens", Value{Number{cached}}}}));
+      details.emplace_back("cached_tokens", Value{Number{cached}});
+    if (usage_.find("cache_creation_input_tokens"))
+      details.emplace_back("cache_write_tokens", Value{Number{cache_write}});
+    if (!details.empty())
+      normalized.emplace_back("input_tokens_details",
+                              Value::object(std::move(details)));
     return Value::object({{"id", Value{id}},
                           {"model", field(message_, "model")},
                           {"output", Value{std::move(output)}},

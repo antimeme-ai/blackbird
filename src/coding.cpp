@@ -25,6 +25,7 @@ extern "C" {
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <thread>
@@ -4707,6 +4708,77 @@ void CodingEngine::drain_workflows() {
     }
   });
 }
+std::optional<std::uint64_t>
+known_context_window_tokens(std::string_view model) noexcept {
+  if (model.empty())
+    return std::nullopt;
+  auto has_icase = [](std::string_view hay, std::string_view needle) noexcept {
+    if (needle.empty() || hay.size() < needle.size())
+      return false;
+    for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+      bool ok = true;
+      for (std::size_t j = 0; j < needle.size(); ++j) {
+        auto a = static_cast<unsigned char>(hay[i + j]);
+        auto b = static_cast<unsigned char>(needle[j]);
+        if (a >= 'A' && a <= 'Z')
+          a = static_cast<unsigned char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+          b = static_cast<unsigned char>(b - 'A' + 'a');
+        if (a != b) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok)
+        return true;
+    }
+    return false;
+  };
+  auto has_token_icase = [](std::string_view hay, std::string_view needle) noexcept {
+    if (needle.empty() || hay.size() < needle.size())
+      return false;
+    auto boundary = [](char ch) noexcept {
+      return ch == '/' || ch == '-' || ch == ':' || ch == '@' || ch == '_';
+    };
+    for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+      if (i > 0 && !boundary(hay[i - 1]))
+        continue;
+      if (i + needle.size() < hay.size() && !boundary(hay[i + needle.size()]))
+        continue;
+      bool ok = true;
+      for (std::size_t j = 0; j < needle.size(); ++j) {
+        auto a = static_cast<unsigned char>(hay[i + j]);
+        auto b = static_cast<unsigned char>(needle[j]);
+        if (a >= 'A' && a <= 'Z')
+          a = static_cast<unsigned char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+          b = static_cast<unsigned char>(b - 'A' + 'a');
+        if (a != b) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok)
+        return true;
+    }
+    return false;
+  };
+  if (has_icase(model, "gemini-2.5") || has_icase(model, "gemini-3"))
+    return 1048576ULL;
+  if (has_icase(model, "claude-opus-4") || has_icase(model, "claude-sonnet-4") ||
+      has_icase(model, "claude-haiku-4") || has_icase(model, "claude-3-7") ||
+      has_icase(model, "claude-3.7") || has_icase(model, "claude-3-5") ||
+      has_icase(model, "claude-3.5"))
+    return 200000ULL;
+  if (has_icase(model, "gpt-6") || has_icase(model, "gpt-5") ||
+      has_icase(model, "kimi-k2"))
+    return 256000ULL;
+  if (has_token_icase(model, "o3") || has_token_icase(model, "o4-mini"))
+    return 200000ULL;
+  if (has_icase(model, "gpt-4o") || has_icase(model, "deepseek"))
+    return 128000ULL;
+  return std::nullopt;
+}
 namespace {
 Value::Array project_input_for_provider(Value::Array items,
                                         std::string_view provider_identity) {
@@ -5288,7 +5360,11 @@ Value CodingEngine::request_impl(Value options) {
       };
       Value response;
       unsigned delay_ms = std::min(base_ms, cap_ms);
+      auto attempt_started = std::chrono::steady_clock::now();
+      std::optional<std::chrono::steady_clock::time_point> first_delta_at;
       for (unsigned ordinal = 1;; ++ordinal) {
+        attempt_started = std::chrono::steady_clock::now();
+        first_delta_at.reset();
         RawProviderPhase attempt_phase{2 * provider_link_credit};
         RawProviderOperationContext operation_context;
         operation_context.attempt_phase = &attempt_phase;
@@ -5378,6 +5454,8 @@ Value CodingEngine::request_impl(Value options) {
                           // Preview follows transport delivery, not diagnostic flush
                           // cadence.
                           for (const auto &delta : preview.feed(raw, &source_context)) {
+                            if (!first_delta_at && !delta.text.empty())
+                              first_delta_at = std::chrono::steady_clock::now();
                             RawProviderPhase presentation;
                             presentation.run([&] {
                               presentation.start(8, &source_context);
@@ -5516,33 +5594,154 @@ Value CodingEngine::request_impl(Value options) {
         }
       }
       group.stage(29);
+      const auto completed_at = std::chrono::steady_clock::now();
+      const auto duration_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
+          0, std::chrono::duration_cast<std::chrono::milliseconds>(completed_at -
+                                                                   attempt_started)
+                 .count()));
+      const auto ttft_ms =
+          first_delta_at ? static_cast<std::uint64_t>(std::max<std::int64_t>(
+                               0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      *first_delta_at - attempt_started)
+                                      .count()))
+                         : std::uint64_t{0};
       if (const auto *usage = response.find("usage");
           usage && std::holds_alternative<Value::Object>(usage->value())) {
         Value::Object selected;
-        auto select = [](const Value &source, std::string_view key,
-                         Value::Object &dest) {
-          const auto *v = source.find(key);
+        auto parse_u64 = [](const Value *v) -> std::optional<std::uint64_t> {
           if (!v || !std::holds_alternative<Number>(v->value()))
-            return;
+            return std::nullopt;
           const auto &n = v->number().text();
-          if (!n.empty() && std::all_of(n.begin(), n.end(),
+          if (n.empty() || !std::all_of(n.begin(), n.end(),
                                         [](char c) { return c >= '0' && c <= '9'; }))
-            dest.emplace_back(std::string{key}, *v);
+            return std::nullopt;
+          std::uint64_t out = 0;
+          const auto parsed = std::from_chars(n.data(), n.data() + n.size(), out);
+          if (parsed.ec != std::errc{} || parsed.ptr != n.data() + n.size())
+            return std::nullopt;
+          return out;
         };
-        for (const auto key : {"input_tokens", "output_tokens", "total_tokens"})
-          select(*usage, key, selected);
-        for (const auto &[usage_group, key] :
-             {std::pair{"input_tokens_details", "cached_tokens"},
-              std::pair{"output_tokens_details", "reasoning_tokens"}}) {
-          if (const auto *details = usage->find(usage_group)) {
-            Value::Object kept;
-            select(*details, key, kept);
-            if (!kept.empty())
-              selected.emplace_back(usage_group, Value::object(std::move(kept)));
-          }
+        auto parse_double = [](const Value *v) -> std::optional<double> {
+          if (!v || !std::holds_alternative<Number>(v->value()))
+            return std::nullopt;
+          const auto &n = v->number().text();
+          double out = 0.0;
+          const auto parsed = std::from_chars(n.data(), n.data() + n.size(), out);
+          if (parsed.ec != std::errc{} || parsed.ptr != n.data() + n.size() ||
+              !std::isfinite(out) || out < 0.0)
+            return std::nullopt;
+          return out;
+        };
+        auto sat_add = [](std::uint64_t a, std::uint64_t b) noexcept {
+          return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+        };
+        auto object_field = [](const Value &source,
+                               std::string_view key) -> const Value * {
+          const auto *v = source.find(key);
+          return v && std::holds_alternative<Value::Object>(v->value()) ? v : nullptr;
+        };
+        auto select = [&](const Value &source, std::string_view key,
+                          Value::Object &dest) -> std::optional<std::uint64_t> {
+          const auto *v = source.find(key);
+          const auto parsed = parse_u64(v);
+          if (parsed)
+            dest.emplace_back(std::string{key}, *v);
+          return parsed;
+        };
+        const bool has_prompt_tokens =
+            parse_u64(usage->find("prompt_tokens")).has_value();
+        auto in_tok = parse_u64(usage->find("input_tokens"));
+        if (!in_tok)
+          in_tok = parse_u64(usage->find("prompt_tokens"));
+        auto out_tok = parse_u64(usage->find("output_tokens"));
+        if (!out_tok)
+          out_tok = parse_u64(usage->find("completion_tokens"));
+        const auto *in_details = object_field(*usage, "input_tokens_details");
+        if (!in_details)
+          in_details = object_field(*usage, "prompt_tokens_details");
+        std::optional<std::uint64_t> cached_opt;
+        std::optional<std::uint64_t> cache_write_opt;
+        if (in_details) {
+          cached_opt = parse_u64(in_details->find("cached_tokens"));
+          cache_write_opt = parse_u64(in_details->find("cache_write_tokens"));
         }
+        const auto raw_anth_read = parse_u64(usage->find("cache_read_input_tokens"));
+        const auto raw_anth_write =
+            parse_u64(usage->find("cache_creation_input_tokens"));
+        if (!cached_opt && raw_anth_read)
+          cached_opt = raw_anth_read;
+        if (!cache_write_opt && raw_anth_write)
+          cache_write_opt = raw_anth_write;
+        // Raw Anthropic Messages API reports input_tokens as uncached-only; include
+        // cache read/creation tokens in total input_tokens when not already normalized.
+        const bool raw_anthropic_usage =
+            in_tok.has_value() && !has_prompt_tokens && in_details == nullptr &&
+            (raw_anth_read.has_value() || raw_anth_write.has_value());
+        if (raw_anthropic_usage) {
+          in_tok = sat_add(*in_tok, raw_anth_read.value_or(0));
+          in_tok = sat_add(*in_tok, raw_anth_write.value_or(0));
+        }
+        if (in_tok)
+          selected.emplace_back("input_tokens", Value{Number{*in_tok}});
+        if (out_tok)
+          selected.emplace_back("output_tokens", Value{Number{*out_tok}});
+        (void)select(*usage, "total_tokens", selected);
+        Value::Object kept_input_details;
+        if (cached_opt)
+          kept_input_details.emplace_back("cached_tokens", Value{Number{*cached_opt}});
+        if (cache_write_opt)
+          kept_input_details.emplace_back("cache_write_tokens",
+                                          Value{Number{*cache_write_opt}});
+        if (!kept_input_details.empty())
+          selected.emplace_back("input_tokens_details",
+                                Value::object(std::move(kept_input_details)));
+        const std::uint64_t cached_tok = cached_opt.value_or(0);
+        const std::uint64_t cache_write_tok = cache_write_opt.value_or(0);
+        std::uint64_t reasoning_tok = 0;
+        const auto *out_details = object_field(*usage, "output_tokens_details");
+        if (!out_details)
+          out_details = object_field(*usage, "completion_tokens_details");
+        if (out_details) {
+          Value::Object kept;
+          if (const auto r = select(*out_details, "reasoning_tokens", kept))
+            reasoning_tok = *r;
+          if (!kept.empty())
+            selected.emplace_back("output_tokens_details",
+                                  Value::object(std::move(kept)));
+        }
+        const auto cost = parse_double(usage->find("cost"));
         if (!selected.empty()) {
           usage_ = Value::object(std::move(selected));
+          telemetry_.requests = sat_add(telemetry_.requests, 1);
+          telemetry_.last_input_tokens = in_tok.value_or(0);
+          telemetry_.last_output_tokens = out_tok.value_or(0);
+          telemetry_.last_cached_tokens = cached_tok;
+          telemetry_.last_cache_write_tokens = cache_write_tok;
+          telemetry_.last_reasoning_tokens = reasoning_tok;
+          telemetry_.input_tokens =
+              sat_add(telemetry_.input_tokens, telemetry_.last_input_tokens);
+          telemetry_.output_tokens =
+              sat_add(telemetry_.output_tokens, telemetry_.last_output_tokens);
+          telemetry_.cached_tokens =
+              sat_add(telemetry_.cached_tokens, telemetry_.last_cached_tokens);
+          telemetry_.cache_write_tokens = sat_add(telemetry_.cache_write_tokens,
+                                                  telemetry_.last_cache_write_tokens);
+          telemetry_.reasoning_tokens =
+              sat_add(telemetry_.reasoning_tokens, telemetry_.last_reasoning_tokens);
+          telemetry_.last_duration_ms = duration_ms;
+          telemetry_.last_ttft_ms = ttft_ms;
+          telemetry_.upstream_epoch = upstream_epoch_;
+          telemetry_.model = string_field(request, "model");
+          telemetry_.context_window_tokens =
+              known_context_window_tokens(telemetry_.model);
+          telemetry_.last_cost_usd = cost;
+          if (cost) {
+            const double next = telemetry_.session_cost_usd.value_or(0.0) + *cost;
+            if (std::isfinite(next))
+              telemetry_.session_cost_usd = next;
+          }
+          if (observed_telemetry)
+            observed_telemetry(telemetry_);
           if (observed_usage)
             observed_usage(usage_);
           if (diagnostic || display)
@@ -6674,6 +6873,24 @@ Value CodingEngine::stats() const {
                   unwrap(encode_packet_string(Value{context_.items()})).size()));
   result.object().emplace_back("last_request_bytes", last_request_bytes_);
   result.object().emplace_back("usage", usage_);
+  result.object().emplace_back("upstream_epoch", number(upstream_epoch_));
+  Value::Object session_usage{
+      {"requests", number(telemetry_.requests)},
+      {"input_tokens", number(telemetry_.input_tokens)},
+      {"output_tokens", number(telemetry_.output_tokens)},
+      {"cached_tokens", number(telemetry_.cached_tokens)},
+      {"cache_write_tokens", number(telemetry_.cache_write_tokens)},
+      {"reasoning_tokens", number(telemetry_.reasoning_tokens)},
+      {"last_duration_ms", number(telemetry_.last_duration_ms)},
+      {"last_ttft_ms", number(telemetry_.last_ttft_ms)},
+      {"context_window_tokens", telemetry_.context_window_tokens
+                                    ? number(*telemetry_.context_window_tokens)
+                                    : Value{}}};
+  if (telemetry_.session_cost_usd && std::isfinite(*telemetry_.session_cost_usd))
+    session_usage.emplace_back("session_cost_usd",
+                               Value{Number{*telemetry_.session_cost_usd}});
+  result.object().emplace_back("session_usage",
+                               Value::object(std::move(session_usage)));
   result.object().emplace_back("uncontained_exec_recovery",
                                Value{uncontained_exec_recovery_});
   result.object().emplace_back(

@@ -1181,3 +1181,7 @@ add_executable(context_lifecycle_unit3_test tests/context_lifecycle_unit3_test.c
 target_link_libraries(context_lifecycle_unit3_test PRIVATE blackbird_coding)
 add_test(NAME context_lifecycle_unit3 COMMAND context_lifecycle_unit3_test)
 set_tests_properties(context_lifecycle_unit3 PROPERTIES TIMEOUT 30)
+add_executable(visuals_telemetry_unit2_test tests/visuals_telemetry_unit2_test.cpp)
+target_link_libraries(visuals_telemetry_unit2_test PRIVATE blackbird_coding)
+add_test(NAME visuals_telemetry_unit2 COMMAND visuals_telemetry_unit2_test)
+set_tests_properties(visuals_telemetry_unit2 PROPERTIES TIMEOUT 30)

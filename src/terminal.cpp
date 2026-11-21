@@ -20,6 +20,7 @@
 #include <charconv>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -338,6 +339,223 @@ std::string terminal_context_badge(std::string_view kind,
                                  : std::to_string((delta + 512) / 1024) + " KiB";
   const auto sign = delta == 0 ? "±" : bytes_after > bytes_before ? "+" : "−";
   return "◆ CONTEXT " + std::string{kind} + " " + sign + size;
+}
+std::string terminal_format_tokens(std::uint64_t count) {
+  if (count < 1000ULL)
+    return std::to_string(count);
+  if (count < 100000ULL) {
+    const auto tenths = (count + 50ULL) / 100ULL;
+    if (tenths >= 1000ULL)
+      return "100k";
+    std::string out = std::to_string(tenths / 10ULL);
+    if (tenths % 10ULL != 0ULL)
+      out += "." + std::to_string(tenths % 10ULL);
+    return out + "k";
+  }
+  if (count < 1000000ULL) {
+    const auto k = (count + 500ULL) / 1000ULL;
+    if (k >= 1000ULL)
+      return "1M";
+    return std::to_string(k) + "k";
+  }
+  const auto tenths = count / 100000ULL + (count % 100000ULL >= 50000ULL ? 1ULL : 0ULL);
+  std::string out = std::to_string(tenths / 10ULL);
+  if (tenths % 10ULL != 0ULL)
+    out += "." + std::to_string(tenths % 10ULL);
+  return out + "M";
+}
+namespace {
+struct RatioInput {
+  std::uint64_t num, scale, den;
+};
+std::uint64_t rounded_ratio(RatioInput r) noexcept {
+  if (r.den == 0)
+    return 0;
+  const unsigned __int128 scaled =
+      static_cast<unsigned __int128>(r.num) * static_cast<unsigned __int128>(r.scale);
+  const unsigned __int128 half = static_cast<unsigned __int128>(r.den / 2ULL);
+  const unsigned __int128 result =
+      (scaled + half) / static_cast<unsigned __int128>(r.den);
+  return result > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(result);
+}
+std::string format_usd(double amount) {
+  if (!std::isfinite(amount) || amount < 0.0)
+    return {};
+  if (amount >= 1e12)
+    return "$1T+";
+  const auto cents = static_cast<std::uint64_t>(amount * 100.0 + 0.5);
+  if (cents == 0 && amount > 0.0)
+    return "<$0.01";
+  const auto whole = cents / 100ULL;
+  const auto frac = cents % 100ULL;
+  return "$" + std::to_string(whole) + "." + (frac < 10ULL ? "0" : "") +
+         std::to_string(frac);
+}
+std::string format_stream_bytes(std::size_t bytes) {
+  if (bytes < 1024U)
+    return std::to_string(bytes) + " B";
+  if (bytes < 1024U * 1024U) {
+    const auto whole = bytes / 1024U;
+    const auto rem = bytes % 1024U;
+    const auto tenths = whole * 10U + (rem * 10U + 512U) / 1024U;
+    if (tenths >= 10240U)
+      return "1 MiB";
+    std::string out = std::to_string(tenths / 10U);
+    if (tenths % 10U != 0U)
+      out += "." + std::to_string(tenths % 10U);
+    return out + " KiB";
+  }
+  const auto whole = bytes / (1024U * 1024U);
+  const auto rem = bytes % (1024U * 1024U);
+  const auto extra = (rem * 10U + 524288U) / (1024U * 1024U);
+  const auto m_whole = whole + (extra >= 10U ? 1U : 0U);
+  const auto m_frac = extra >= 10U ? 0U : extra;
+  std::string out = std::to_string(m_whole);
+  if (m_frac != 0U)
+    out += "." + std::to_string(m_frac);
+  return out + " MiB";
+}
+std::string context_gauge_bar(std::uint64_t pct, bool utf8_locale) {
+  constexpr std::size_t width = 8;
+  const auto clamped = std::min<std::uint64_t>(pct, 100ULL);
+  const auto filled = static_cast<std::size_t>(
+      (clamped * static_cast<std::uint64_t>(width) + 50ULL) / 100ULL);
+  std::string bar;
+  bar.reserve(width * (utf8_locale ? 3U : 1U));
+  for (std::size_t i = 0; i < width; ++i)
+    bar += i < filled ? (utf8_locale ? "▓" : "#") : (utf8_locale ? "░" : "-");
+  return bar;
+}
+} // namespace
+std::string terminal_usage_summary(const TelemetrySnapshot &t) {
+  std::string out;
+  auto add = [&](std::string_view part) {
+    if (part.empty())
+      return;
+    if (!out.empty())
+      out += " · ";
+    out.append(part);
+  };
+  if (t.last_input > 0) {
+    std::string in_part = terminal_format_tokens(t.last_input) + " in";
+    if (t.last_cached > 0) {
+      const auto pct = std::min<std::uint64_t>(
+          100ULL,
+          rounded_ratio({.num = t.last_cached, .scale = 100ULL, .den = t.last_input}));
+      in_part += " (" + std::to_string(pct) + "% cached)";
+    }
+    add(in_part);
+  }
+  if (t.last_output > 0)
+    add(terminal_format_tokens(t.last_output) + " out");
+  if (t.last_output > 0 && t.last_duration_ms >= 50ULL) {
+    const auto tok_s = rounded_ratio(
+        {.num = t.last_output, .scale = 1000ULL, .den = t.last_duration_ms});
+    if (tok_s > 0)
+      add(std::to_string(tok_s) + " tok/s");
+  }
+  if (t.last_reasoning > 0)
+    add(terminal_format_tokens(t.last_reasoning) + " reason");
+  if (t.last_cost_usd)
+    add(format_usd(*t.last_cost_usd));
+  return out;
+}
+ChatRow terminal_avionics_rail(const TelemetrySnapshot &t, std::size_t max_cells) {
+  if (t.requests == 0 || max_cells < 10)
+    return {};
+  const bool utf8_locale =
+      display_width("·") > 0 && display_width("▓") > 0 && display_width("Σ") > 0;
+  const std::string_view sep = utf8_locale ? " · " : " | ";
+  struct Segment {
+    std::string text;
+    Ink ink;
+  };
+  struct RailOptions {
+    bool bar;
+    bool cache;
+    bool rate;
+    bool totals;
+    bool epoch;
+  };
+  const auto render_segments = [&](const std::vector<Segment> &segs) -> ChatRow {
+    ChatRow row;
+    for (std::size_t i = 0; i < segs.size(); ++i) {
+      if (i > 0)
+        row.push_back({std::string{sep}, Ink::border});
+      row.push_back({segs[i].text, segs[i].ink});
+    }
+    return row;
+  };
+  const auto row_cells = [](const ChatRow &row) {
+    std::size_t cells = 0;
+    for (const auto &s : row)
+      cells += display_width(s.text);
+    return cells;
+  };
+  const auto build = [&](const RailOptions &opts) -> ChatRow {
+    std::vector<Segment> segs;
+    if (t.context_window && *t.context_window > 0 && t.last_input > 0) {
+      const auto pct = rounded_ratio(
+          {.num = t.last_input, .scale = 100ULL, .den = *t.context_window});
+      const Ink ink = pct >= 90ULL   ? Ink::failure
+                      : pct >= 70ULL ? Ink::user
+                                     : Ink::success;
+      std::string text = "ctx " + terminal_format_tokens(t.last_input) + "/" +
+                         terminal_format_tokens(*t.context_window) + " " +
+                         std::to_string(pct) + "%";
+      if (opts.bar)
+        text += " " + context_gauge_bar(pct, utf8_locale);
+      segs.push_back({std::move(text), ink});
+    } else if (t.last_input > 0) {
+      segs.push_back({"ctx " + terminal_format_tokens(t.last_input), Ink::muted});
+    }
+    if (opts.cache && t.last_input > 0 && t.last_cached > 0) {
+      const auto pct = std::min<std::uint64_t>(
+          100ULL,
+          rounded_ratio({.num = t.last_cached, .scale = 100ULL, .den = t.last_input}));
+      segs.push_back({"cache " + std::to_string(pct) + "%",
+                      pct >= 50ULL ? Ink::success : Ink::user});
+    }
+    if (opts.rate && t.last_output > 0 && t.last_duration_ms >= 50ULL) {
+      const auto tok_s = rounded_ratio(
+          {.num = t.last_output, .scale = 1000ULL, .den = t.last_duration_ms});
+      if (tok_s > 0)
+        segs.push_back({std::to_string(tok_s) + " tok/s", Ink::assistant});
+    }
+    if (opts.totals && (t.requests > 1 || t.total_input > t.last_input || t.cost_usd)) {
+      std::string tot = std::string{utf8_locale ? "Σ " : "tot "} +
+                        terminal_format_tokens(t.total_input) + "/" +
+                        terminal_format_tokens(t.total_output);
+      if (t.cost_usd) {
+        const auto usd = format_usd(*t.cost_usd);
+        if (!usd.empty())
+          tot += " " + usd;
+      }
+      segs.push_back({std::move(tot), Ink::muted});
+    }
+    if (opts.epoch && t.upstream_epoch > 0)
+      segs.push_back({"e" + std::to_string(t.upstream_epoch), Ink::assistant});
+    return render_segments(segs);
+  };
+  // Progressively shed lower-priority avionics segments so narrow viewports never clip.
+  constexpr std::array<RailOptions, 6> tiers{{
+      {true, true, true, true, true},
+      {true, true, true, true, false},
+      {true, true, true, false, false},
+      {false, true, true, false, false},
+      {false, true, false, false, false},
+      {false, false, false, false, false},
+  }};
+  for (const auto &tier : tiers) {
+    auto candidate = build(tier);
+    if (!candidate.empty() && row_cells(candidate) <= max_cells)
+      return candidate;
+  }
+  auto minimal = build({false, false, false, false, false});
+  if (minimal.empty())
+    return {};
+  const auto clipped = terminal_lines(chat_plain(minimal), max_cells)[0];
+  return {{clipped, minimal.front().ink}};
 }
 std::string terminal_key_help() {
   return "Keyboard\n"
@@ -1620,7 +1838,8 @@ void withdraw_ui_prompts(bool enabled, std::vector<UiPrompt> &prompts,
 TerminalUI::TerminalUI(std::string title) : title_(std::move(title)) {}
 TerminalUI::~TerminalUI() = default;
 void TerminalUI::post(Kind kind, std::string_view text, RawCapacityClaim *preheld_data,
-                      std::shared_ptr<const TerminalQuestion> question) {
+                      std::shared_ptr<const TerminalQuestion> question,
+                      std::shared_ptr<const TelemetrySnapshot> telemetry) {
   const auto size = text.size();
   const Ink outcome = Ink::muted;
   RawUiTrace trace{
@@ -1654,7 +1873,8 @@ void TerminalUI::post(Kind kind, std::string_view text, RawCapacityClaim *prehel
                            trace.reference(),
                            {},
                            {},
-                           std::move(question)});
+                           std::move(question),
+                           std::move(telemetry)});
     }
     const auto &message = messages_.back();
     const auto current = message.text.size();
@@ -1713,6 +1933,10 @@ void TerminalUI::restore_message(ChatKind kind, std::string_view value) {
   post(kind == ChatKind::user ? Kind::user : Kind::assistant, value);
 }
 void TerminalUI::usage(std::string_view value) { post(Kind::usage, value); }
+void TerminalUI::telemetry(const TelemetrySnapshot &snapshot) {
+  post(Kind::telemetry, terminal_usage_summary(snapshot), nullptr, {},
+       std::make_shared<const TelemetrySnapshot>(snapshot));
+}
 void TerminalUI::operation_started(bool provider) {
   post(provider ? Kind::provider_start : Kind::tool_start, {});
 }
@@ -2140,6 +2364,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   std::vector<std::string> welcome_lines;
   auto &grid = output.grid();
   std::string activity = "Ready", observed_usage;
+  TelemetrySnapshot live_telemetry;
+  std::size_t stream_bytes = 0;
   Value task_page;
   std::map<std::string, Value> task_activity;
   std::vector<ChatRow> task_rows;
@@ -2392,6 +2618,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       turn_failed = false;
       started = std::chrono::steady_clock::now();
       observed_usage.clear();
+      stream_bytes = 0;
       operations.clear();
       scroll = 0;
       activity = "Starting";
@@ -2678,9 +2905,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               message.kind == Kind::failure || message.kind == Kind::user ||
               message.kind == Kind::assistant)
             welcoming = false;
-          if (message.kind == Kind::text)
+          if (message.kind == Kind::text) {
+            if (busy && live_provider)
+              stream_bytes += message.text.size();
             transcript.append(turn_failed ? ChatKind::error : ChatKind::assistant,
                               message.text, true, message.enqueue);
+          }
           if (message.kind == Kind::notice)
             transcript.append(ChatKind::notice, message.text, true, message.enqueue);
           if (message.kind == Kind::process)
@@ -2691,9 +2921,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                               message.text, false, message.enqueue);
           if (message.kind == Kind::usage)
             observed_usage = message.text;
+          if (message.kind == Kind::telemetry && message.telemetry)
+            live_telemetry = *message.telemetry;
           if (message.kind == Kind::provider_start ||
               message.kind == Kind::tool_start) {
             live_provider = message.kind == Kind::provider_start;
+            if (live_provider)
+              stream_bytes = 0;
             operations.push_back(live_provider);
           }
           if (message.kind == Kind::status) {
@@ -3045,6 +3279,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   std::chrono::duration_cast<std::chrono::seconds>(now - tool_started)
                       .count()) +
               "s · ";
+        else if (busy && live_provider && stream_bytes > 0)
+          status_line += "Streaming " + format_stream_bytes(stream_bytes) + " · ";
         if (!queued.empty())
           status_line += "queued " + std::to_string(queued.size()) + " · ";
         if (scroll > 0)
@@ -3243,7 +3479,29 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                Ink::border});
           grid.line(menu_row++, content);
         }
-        grid.line(menu_row, {{border({"╰", "╯"}, ""), Ink::border}});
+        if (!welcoming && !inspecting && live_telemetry.requests > 0 &&
+            main_width >= 20) {
+          const auto rail = terminal_avionics_rail(live_telemetry, main_width - 5);
+          if (!rail.empty()) {
+            ChatRow bottom{{"╰ ", Ink::border}};
+            std::size_t used = 2;
+            for (const auto &seg : rail) {
+              used += display_width(seg.text);
+              bottom.push_back(seg);
+            }
+            std::string trail = " ";
+            ++used;
+            for (; used + 1 < main_width; ++used)
+              trail += "─";
+            trail += "╯";
+            bottom.push_back({std::move(trail), Ink::border});
+            grid.line(menu_row, std::move(bottom));
+          } else {
+            grid.line(menu_row, {{border({"╰", "╯"}, ""), Ink::border}});
+          }
+        } else {
+          grid.line(menu_row, {{border({"╰", "╯"}, ""), Ink::border}});
+        }
         const auto cursor_line = height + palette.size() + 4 + cursor_row - draft_begin;
         const auto cells = caret.column.value;
         const auto display_cursor_line =
