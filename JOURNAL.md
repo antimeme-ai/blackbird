@@ -12604,3 +12604,472 @@ a Git-index/tar recovery snapshot was preserved but no second checkout created.
 Named-path source now passes its exact clang-tidy check and the same full
 model-free relocated process fixture with both private origins absent. The final
 mandatory commit-hook run records the complete current-source result separately.
+
+## 2026-10-23 — orientation and Oxcart handoff
+
+Read current doctrine, foundation/core contracts, testing/implementation plans,
+recent journal and Oxcart's operator-requested `OXCART-HANDOFF-2026-10-23.md`.
+Checked the application connection/tool catalog and Oxcart event decoder against
+the handoff: host-provided native tools and correlated call/result messages are
+still missing. Coordinate the extension before implementation, keep controls
+responsive during outstanding calls, and start with actual state/reading artifacts.
+Oxcart owns browser operations; Blackbird owns provider/tool continuation.
+
+The active checkout is work/text-bugs-2026-10-19 at 168bb26; local/origin master
+is a94d094, newer than the handoff's inspected revision. CURRENT_STATE's October
+19 front line is historical. Oxcart's retained runtime still records source
+74a42f4 and tree a741c587; source publication does not activate that executable.
+No implementation, runtime activation, browser operation or colleague call was
+requested in this orientation. Preserve existing backup/artwork/research/handoff
+files and worktrees. Only this journal entry changes.
+
+Both `bd list --json --limit 0` and required `bd backup` fail: database
+`arconaut` is absent from the Dolt server at 127.0.0.1:13308. Preserve existing
+backups; do not initialize a replacement database during orientation. Issue access
+and supported backup remain unresolved. Check this text-only diff before its
+journal checkpoint; no source checks apply.
+
+## 2026-10-26 — repository and unfinished-branch orientation
+
+Read workspace/repository doctrine, source, recent journal, retained unit reports
+and worktree handoffs; fetch origin and compare every local head with master.
+Three independent read-only lanes map execution ownership, CLM, and campaign/UI/
+research work. Save the synthesis in
+papers/2026-10-26-repository-orientation.md.
+
+Master is a94d094, not CURRENT_STATE's older f4bd931. Startup, text input/folding,
+cache affinity and compact observations are integrated. CLM rd7 is a substantial
+unmerged program; S3a and 8zr are sibling, unqualified archival checkpoints.
+The latter's notes identify a real interrupted-write/SIGTERM livelock, separately
+from host-load failures. Campaign integration includes only C++26/j1l/vv6;
+three formerly staged repairs now have explicitly unqualified checkpoint commits.
+Oxcart native host tools are implemented and checked on their own branch; the
+untracked handoff predates them. Live Oxcart integration remains separate.
+
+All auxiliary worktrees are clean. Preserve the active checkout's existing
+modified backup files, untracked artwork, research and handoff. No product edits,
+tests, provider calls, branch integration, cleanup or runtime activation. Inspect
+managed current-generation path without inferring its source parity.
+
+bd onboard/ready refuse the legacy 0.58.0 workspace under the current CLI. Leave
+storage unchanged and read the saved backup only; no migration or replacement
+initialization. Later Oxcart records say the operator regards Dolt as unused.
+Backup statuses lag implementation and are not used as authoritative completion.
+Check and publish only this report and journal under the text-only exception.
+
+## 2026-10-26 — launch native Blackbird autodev with Hermes oversight
+
+Patrick asks for Blackbirds using gpt-6.1-sol medium to burn outstanding work down
+to BLACKBIRD.md standard, with Hermes orchestrating and overseeing. Record scope,
+first conceptual owners and integration/resource rules in
+papers/2026-10-26-autodev-campaign.md. This is execution authorization, not merely
+a proposed roster; no implicit master promotion or operator-runtime replacement.
+
+Live discovery finds the sixteen auxiliary worktrees retired since orientation.
+Their branch tips remain. Observe retirement archive/index, then discover that
+its directory disappears as preparation proceeds; do not infer its new location.
+Keep shared clm-rd7-notes available and initially tell workers not to depend on
+the vanished staging locator. The concurrent retirement journal subsequently
+identifies ~/archives/blackbird-worktrees-2026-10-26/; verify that directory and
+preserve its payloads. Restore only two bounded worktree slots in context/autodev-2026-10-26:
+continuity based on 5b1ff1d and composition based on 9df54fe, each on a fresh
+work/autodev-* branch. Workspace doctrine resolves through their parent symlink.
+
+Use existing arco-campaign provider-only transport supervision, pinned to selected
+managed generation-6QI9PQx9. Qualify actual OpenAI/Sol/medium native read_file and
+write_file; read back its artifact and session metadata. Initialize both worker
+sessions explicitly with provider/model/effort and their own Lua program. Launch
+persistent terminal jobs, then read back exact supervisor commands, child metadata
+and real mission tool activity. Composition writes its initial unit status.
+The first composition command had a mistyped run path and refused before native
+dispatch; correct it once, retaining the failed handle. No unknown effect replay.
+
+Continuity owns the interrupted-write/SIGTERM invariant and directly relevant 8zr
+findings. Composition owns completing S3a's existing remediation/recheck and
+exact-tree qualification, without S3b. Neither edits its sibling or shared master.
+Serialize all builds/tests/lint/Linux checks and source commit hooks with a small
+development-only lock wrapper. Direct concurrent-holder and exit-7 cases verify
+serialization and error propagation, not process containment. Native workers must
+retain grounding, RED/GREEN, consequential independent review, one recheck/fixes,
+required source gates and normal branch pushes. No third hardening layer, source
+hook bypass, new dependencies, laptop mutation/fuzz or blanket recertification.
+
+Schedule and read back Hermes oversight job 2dc91a5ccf63 every 15m, with explicit
+acceptance, safe continuation, subsequent-unit dispatch and material-result
+reporting instructions. Initial terminal handles, PIDs, qualification and failure
+are in ignored context/autodev-2026-10-26/LAUNCH.md. Oversight requires the Mac awake
+and Hermes gateway running; persistent workers are not reboot-resumable. No work
+unit is complete merely because this launch or a future worker exit succeeds.
+Preserve pre-existing backups/artwork/research. No bd/Dolt storage operations.
+Only campaign documentation and this journal change in the primary checkout.
+
+### Composition saved-state failure and deliberate successor — 23:05 EDT
+
+Composition's original native session stops at 23:00:22 with external_unknown (0)
+and saved-state maintenance capacity. This is not a provider outage or completed
+unit. Source remains staged on 9df54fe. Preserve old audit and result. Inspect
+actual queued commands: source-commit log only records waiting for the build slot;
+Linux run-992kc9y9 ends during compile, before tests. No local composition command
+remains. Its remote /tmp/arconaut-linux-bOVaKiqb tree persists, but an SSH /proc cwd
+census finds no owner, and no matching compiler/test runner is observed. These
+checks do not certify old effects; old results remain incomplete/unknown.
+
+Do not reopen/acknowledge/replay the failed session. Launch composition-followup-01
+as a fresh OpenAI/Sol/medium session in the same worktree, retaining explicit
+lineage and the staged source. Its mission is finishing qualification, source
+gate, commit/push, not restarting design/review. Existing three recheck findings
+and direct RED/GREEN results are retained, not a third assurance layer. Verify
+new session configuration, exact supervisor command and actual mission tool reads.
+Terminal proc_399cc152075c, launch PID 1489; retain precise run map in ignored
+context/autodev-2026-10-26/OVERSIGHT.md. Continuity remains running independently.
+Update scheduled oversight to discover current successor runs and avoid duplicate
+recovery. The primary checkout still changes only documentation; no unit accepted,
+master merge, runtime activation or source-check success is inferred here.
+
+### Operator corrections — five-minute oversight and no turn-count ceiling
+
+Operator requests oversight every five minutes, then objects that the 64-step
+budget was supposed to be gone. Change and read back the existing cron job rather
+than adding another. Inspect actual selected Lua source and read-only continuity
+audit: the exact retained failure is "Workflow reached its configured 64-step
+budget". The launcher selected ordinary programs/turn.lua; this was an orchestration
+mistake, not a newly diagnosed journal regression.
+
+Write the short runtime-policy plan in ignored campaign context. Direct Lua oracle
+against old source fails at round 64; select a campaign autodev.lua that removes
+the finite bound entirely while preserving dispatcher/T1 result links/defaults,
+restart and cancellation/errors. Actual selected-source checks pass 130 tool
+rounds plus final, restart, cancellation and unsupported-call refusal; syntax and
+exact policy-only delta checks pass. Independent narrow runtime-policy review is
+requested, not a review of either product's reviews. No native/product code edit
+is hidden in this runtime configuration; repository default's obsolete ceiling
+remains a separate source-delivery unit.
+
+Continuity's old source and incomplete direct/Linux results remain retained.
+Its remote tree has no /proc cwd owners. Launch continuity-followup-01 with explicit
+OpenAI/Sol/medium and the uncapped Lua workflow, same worktree and existing layer 2;
+read back settings, exact supervisor and actual tool activity. Terminal
+proc_5b444f9fd662, initial PID 8226. Composition successor is already live on retained
+older source; do not interrupt its gate to swap programs, and require the uncapped
+program at its next clean boundary. Update OVERSIGHT.md/current cron instructions
+so later dispatch cannot silently restore the ceiling. Native storage safety and
+two-layer hardening rules remain; no larger numerical mission budget substitutes
+for the removed limit. Keep user source/backup/artwork untouched.
+
+The independent narrow runtime-policy review returns no consequential defects
+within its scope and independently repeats the old-source RED and selected-source
+long/restart/cancel/unsupported-call GREENs. Retain its returned scope/results in
+papers/2026-10-26-autodev-workflow-review.md. It does not qualify native storage,
+provider behavior, the product unit implementations or live workflow selection;
+those claims have their own direct mechanisms. No additional review layer.
+
+### Operator next program — chat usability, polish, and stop-embarassing-ourselves
+
+Operator requests a Beads issue under the exact title "blackbird chat usability,
+polish, and stop-embarassing-ourselves". Actual complaints: confusing UI; Escape
+cannot interrupt the turn; sent state so unclear that four/five similar messages
+were sent; tool-call chat output needs pretty printing and automatic collapse
+with an inspection mechanism. This is a broader usability program, not the whole
+list and not isolated cosmetic fixes.
+
+Retain the full operator scope and intended P1 epic payload in
+papers/2026-10-26-chat-usability-program-brief.md. After currently in-flight
+continuity/composition units conclude and are safely settled, this is NEXT,
+superseding automatic S3b/linker/provider/general-backlog continuation. Start with
+reference implementation review, UX/HCI/design study, actual runtime/task-state
+inspection, holistic design and pressure-tested delivery plan before code. Existing
+TUI theory/research is input, not proof present usability is adequate. Leave live
+owners undisturbed; do not postpone this until the entire old backlog finishes.
+
+Actually invoke bd 1.3.1 create with the exact title, epic/P1/open, brief body and
+chat-usability/ux/tui/next-program labels. CLI refuses the preserved legacy 0.58.0
+Dolt-server workspace and requires explicit migration. No bead ID is created;
+do not edit backups or initialize/migrate the store by implication. The brief is
+not a replacement tracker or a successful issue filing. Record the specific block
+for operator direction.
+
+Update the primary campaign note, ignored OVERSIGHT.md priority override and
+existing five-minute cron mission so the new sequencing survives the current chat.
+Read back the scheduled job. No additional worker, source mutation, interruption,
+branch integration or runtime replacement is performed for this planning request.
+
+### S3a blocked handoff routed to a focused diagnostic successor
+
+Composition-followup-01 returns normally at 23:45:01, explicitly BLOCKED rather
+than complete: Linux debug/ASan 25/25 each, Release build and final lint passed,
+but clean-environment source hook failed terminal_pty_composer (309/310). Retain
+HANDOFF/STATUS, exact failure fixture and logs. Verify HEAD remains 9df54fe,
+staged tree 8db2e5af5902ffa134ae5a172e6d1c1b4447bb26 and no unstaged changes.
+No commit or push exists; normal worker exit does not change that disposition.
+
+Reserve the composition slot in OVERSIGHT.md, verify no matching old native or
+supervisor owner, then launch composition-gate-diagnostic-01 in the same worktree
+with explicit OpenAI/Sol/medium and uncapped autodev.lua. This owner must diagnose
+the exact missing COMPOSER_HISTORY/workflow-Starting symptom before changing any
+code, preserve the existing oracle, avoid sleeps/deadline relaxation or confidence
+reruns, and request an exact qualified dependency if needed rather than merge the
+live continuity sibling. Scope is current S3a settlement, not a new general TUI
+campaign or a third review. Both live owners retain the shared heavy-work lock.
+
+Terminal handle proc_111bfc43ea5b, initial supervisor PID 46000. Verify native
+session settings, actual supervisor command and real mission activity before
+claiming launch. Preserve old sessions/results and staged source. Next program
+remains the operator's source-grounded chat usability study/design after current
+safe settlement; no S3b/general backlog advancement, master merge or installed
+runtime activation is inferred from this diagnostic dispatch.
+
+### 2026-10-27 — bounded S3a settlement and chat-usability study dispatch
+
+Scheduled oversight verifies continuity's exact published remote38a82ea and clean
+slot. Composition's diagnostic returns at00:04:19 EDT, explicitly BLOCKED with
+all owned commands settled. Inspect actual retained native projection: source
+retention wrote343 bytes then semantic-audit fd12 F_FULLFSYNC request3013, no
+retained return3014/evaluation, while UI frames continue about4.96s. No original
+native stack distinguishes kernel latency from scheduling. One unchanged targeted
+composer pass is not a causal repair or a clean mandatory gate. Verify exact
+staged tree8db2e5af5902ffa134ae5a172e6d1c1b4447bb26 on9df54fe; nine staged files,
+no unstaged source, commit or remote branch publication. Retain candidate and all
+old results inactive. Do not speculate a continuity prerequisite, weaken deadline,
+rerun until green or start a third assurance layer. Broader native-sync contract
+question stays recorded, not falsely certified or expanded into another campaign.
+
+The operator explicitly says unsafe candidates may remain inactive and the next
+program must be chat usability. Reuse ONLY the clean completed continuity slot
+on work/autodev-chat-study-2026-10-27 from primaryb7c082e. Preserve continuity's
+branch and all run evidence, leave composition untouched. Reserve map before
+launch; initialize NEW chat-study-01 with explicit openai/gpt-6.1-sol/medium and
+uncapped ROOT/autodev.lua. Launch pinned managed native executable through the
+existing provider-only supervisor, persistent across chat release, terminal
+proc_fd68d0c1e00b, initial supervisor60661. Cron cannot receive async notifications;
+future scheduled oversight must inspect actual run state. No reboot guarantee.
+
+This first conceptual unit is substantive reference/source and UX/HCI study,
+actual installed/running identity and safe private-session task walkthroughs,
+full task/state/control/failure mapping and design requirements. No product/test
+coding, main integration, dependency adoption, operator-terminal input or runtime
+replacement. Existing theory/reference corpus must be read and challenged; retain
+source provenance and actual captures. Holistic reviewed design and plan follow
+before implementation. No unrelated backlog work or issue-store mutation. Update
+OVERSIGHT.md as current map, superseding its historical live-owner observations.
+
+### 2026-10-27 — continuity source delivery verified
+
+Continuity-followup-01 returns COMPLETE at 00:00:44 EDT. Inspect its HANDOFF,
+production delta, retained independent review and direct/host logs, clean Git
+state and the actual remote ref. Delivered source is
+38a82ea64c95b83496c020ef755f05e206df8f39 on
+work/autodev-continuity-2026-10-26; remote returns that exact hash. Mandatory
+source-commit-fixed.log contains 297/297 Debug passes, completed owned C++/Lua
+lint and the resulting commit. Native direct and scoped Linux debug/ASan results
+are retained; initial failures remain recorded. No hook bypass or added suppression.
+
+Accept this journal/SIGTERM source unit as delivered on its work branch, not as
+master integration or managed-install/runtime activation. Failed-sync-under-
+cancellation injection remains explicitly absent; no complete syscall-cut or
+power-loss claim. Existing review/recheck scope closes without another assurance
+round. No live Beads closure is claimed while project storage is incompatible.
+
+Update campaign stock and current run map. Leave the clean continuity slot idle
+while composition's focused diagnostic remains active. Its unchanged targeted
+composer oracle now passes once, but that alone does not explain the historical
+Starting timeout; do not assume flakiness or merge continuity speculatively.
+No new source unit starts ahead of the operator's next chat-usability program.
+
+### 2026-10-27 — S3a safely inactive; chat-usability study running
+
+Composition's focused diagnostic returns BLOCKED at 00:04:19, with the exact
+staged source unchanged and its full source gate still 309/310. Read its native
+projection: worker starts, the exact inline print program reaches retention, a
+343-byte audit write returns, then full-sync request3013 on audit fd12 has no
+retained return3014 or Lua-evaluation transition. UI rendering continues. This
+narrows the progress frontier, not kernel/scheduling causation or a qualified
+repair. One unchanged targeted composer pass is not a fix. Retain the full
+returned report in papers/2026-10-27-s3a-gate-diagnostic.md.
+
+Close the bounded diagnostic pass without another assurance/commit attempt.
+Keep S3a inactive and uncommitted in its existing slot. Additionally preserve
+its exact staged diff/HEAD/tree and both handoffs under
+~/archives/blackbird-autodev-blocked-2026-10-27/. The recovered binary-format Git
+patch reverse-checks against the unchanged staged index; no source apply/reset
+or publication bypass. An initially truncated tool capture was rejected before
+writing; use its complete retained output for the recovery patch.
+
+Proceed to the operator's next program. Live discovery finds the scheduled
+orchestrator already launched chat-study-01 on work/autodev-chat-study-2026-10-27,
+from primary b7c082e, reusing the clean former continuity slot. Parent's expected-
+HEAD guard stops before any duplicate branch switch/launch. Independently read
+its mission, supervisor/child state, exact native command and actual primary-
+literature/source-reading activity; no duplicate is launched. Provider/model/
+effort/workflow remain OpenAI/Sol/medium/uncapped. The mission is the whole
+reference/UX/actual-use study feeding holistic reviewed design/plan, no coding,
+layout selection, storage-policy change, S3b or unrelated backlog work.
+
+Prose run-map claims did not exclude the two controller sessions. Introduce one
+shared atomic .orchestrator-claim directory before controller mutations, with
+unique owner/scope and explicit own-claim release, never timeout/steal. A direct
+two-contender probe yields one winner/one refusal. Parent holds its claim while
+updating primary records and verifies/releases after publication; scheduled
+oversight is updated to obey the same mechanism. Read-only observation/native
+study work remains unaffected. Current map supersedes old active-run observations.
+No failed gate is reclassified as success, and no main merge or runtime activation.
+
+### 2026-10-27 — holistic design/plan accepted; T1 source owner commissioned
+
+Chat-design-01 returned at01:42:11 EDT, COMPLETE documentation. Inspect actual
+contracts C1–C9, owner map, readable labeled storyboards, sequenced T1–T6 plan,
+original final review and final fixes. Exact published remote matches
+ e99a4fdb4918a7421286bfc44fc2600b4e84718f on
+work/autodev-chat-design-2026-10-27. Six first-layer findings fixed before
+planning; final layer resolved those and raised two valid integration blockers.
+Owner fixed shared stop/queued-definition fence and provider response/retry/
+partial-stream local-oracle obligations within final allowance. Original final
+BLOCKED-pending-fixes recommendation remains unchanged, no third review or
+independent certification of final fixes. Text-only ten-path delta, clean tree,
+base whitespace and UTF-8/fence/local-link checks pass. Accept design/plan as
+completed documentation, not implemented behavior or observed improvement.
+
+Acquire atomic controller claim, recheck live owners, exact clean HEAD and
+finished prior session before reusing same slot. Create
+work/autodev-chat-t1-2026-10-27 from accepted e99a4fd. Initialize chat-t1-01 with
+explicit OpenAI/Sol/medium and uncapped ROOT/autodev.lua, pinned installed native
+generation unchanged; launch existing provider-only supervisor, terminal
+proc_f266a4e5ec95, initial supervisor90736. Preserve study/design originals,
+blocked inactive composition and separate continuity source. No additional slot,
+main integration, installation, operator-session input or issue-store operation.
+
+Commission whole PLAN T1 send/receipt/queue-correction/captured-turn-stop episode,
+truthful request relations, draft/reopen preservation, decoder/PTY priority and
+provider response/retry/partial-stream cancellation fixtures. Require genuine
+old-behavior REDs and relevant direct GREEN/PTY/readable-screen/source gates,
+clean lint, appropriate Release/Linux and matched performance. All expensive
+work stays synchronous through build slot. Two source layers only; no study/
+design re-review. Future T5 definition editor is not commissioned; shared fence
+must cover present dispatch routes and retain explicit future integration.
+No T2 auto-continuation or runtime activation. Actual expert tasks and live
+remote/physical/accessibility evidence stay unqualified. Update primary campaign
+and authoritative run map under matching controller claim.
+
+### 2026-10-27 — research accepted; holistic chat design/plan dispatched
+
+Chat-study-01 returned at 00:38:11 EDT. Inspect its actual handoff, task/state/
+control requirements, independent review/recheck and final categorical-wording
+correction. Exact published remote is d8dc2af667b2029345ee150ae94950995cfc06f0
+on work/autodev-chat-study-2026-10-27. Clean worktree; 16 changed documentation
+paths only. Base diff whitespace, local document links and JSON checks pass.
+Accept the research with its explicit source/runtime, provider, child-exit and
+operator-observation limits. Six review findings remediated, one focused recheck
+and final narrow fix, no third assurance. Not a claim chat is fixed.
+
+Acquire atomic controller claim before any mutation, recheck clean exact HEAD
+and absent prior native worker, create work/autodev-chat-design-2026-10-27 from
+accepted study in the same bounded slot. Preserve all old ignored evidence.
+Initialize fresh chat-design-01 explicitly openai/gpt-6.1-sol/medium with uncapped
+ROOT/autodev.lua; launch existing pinned native runtime via provider-only
+supervisor. Terminal proc_08e347d915b4, supervisor73480/native73493; actual commands,
+session settings, running metadata and initial native request observed.
+
+Commission whole coherent interaction design with source-linked behavioral
+contracts and labeled readable mockups, design pressure testing, then delivery
+plan and final bounded review/fixes. No product/test/config coding, builds or
+source gates in this unit. Implementation awaits orchestrator acceptance and
+separate commission. No merge, activation, bd/Dolt operations or sibling changes;
+composition remains blocked/inactive and continuity remains separate source.
+Update current coordination map and campaign note under the controller claim.
+
+
+
+
+
+
+
+
+
+## 2026-10-26 — retire auxiliary worktrees
+
+The operator requests one primary local checkout and retirement material outside
+`~/projects`. Removed all 16 auxiliary Blackbird worktrees with `git worktree
+remove`. Each was clean and its exact branch head was already pushed to origin.
+Local branch refs remain unchanged; the main checkout remains at
+`~/projects/blackbird` on `work/text-bugs-2026-10-19`.
+
+Ignored research, experiment files and noncompiled test records are preserved in
+`~/archives/blackbird-worktrees-2026-10-26/ignored-files-and-results.tar.zst`
+(31.6 MiB), with SQLite/Parquet indexes identifying branches, commits and original
+paths. The archive was decoded and every retained payload checked against its
+SHA-256 before the worktrees were removed. Compiler products were discarded.
+The retired directories occupied 34.30 GiB. The original branch refs and main
+checkout's existing issue-backup, artwork, research and handoff changes were
+checked unchanged before this journal update.
+
+Immediately after retirement, Git listed only the primary checkout. A separate
+session subsequently created two new autodev campaign worktrees; their removal
+needs coordination with the operator because that campaign is being launched.
+Validation is archive readback, branch identity, worktree registration and text
+diff checking; product code was unchanged. The current `bd backup` command prints
+subcommand help rather than performing the legacy backup. Existing issue storage
+and backups remain intact, with no migration attempted.
+
+
+### 2026-10-27 — T1 final return blocked; preserve inactive candidate
+
+At04:10:22 EDT chat-t1-02 returned normally with a BLOCKED handoff, not qualified
+source. Independently inspect actual supervisor/result/handoff, absent matching
+workers, exact local and remote c5048d28b0d9045ef732f7a35617d7fdd0e29e37, uncommitted
+candidate and empty staged diff. Linux Debug33/36, unanswered final focused review
+(provider overload/native external_unknown), and incomplete new T1 performance
+round remain blockers. macOS Debug268/268 and full owned lint stay settled.
+Original two layers consumed; no successor, third review, T2, merge or activation.
+
+Under own atomic controller claim, match all30 final inventory hashes against
+working files and tar members. Copy complete patch/inventory/tar and final
+handoffs/dispositions to ~/archives/blackbird-autodev-blocked-2026-10-27/chat-t1-02;
+read back bytes and successfully reverse-check complete patch against unchanged
+working source without applying it. Preserve original audits/results and parked
+composition; no source staging/reset or issue-store changes. Update authoritative
+map and campaign note. All authorized lanes now require Patrick's direction;
+pause existing oversight job2dc91a5ccf63, no new schedule. Text-only record checks
+only; no rerun of settled native diagnostics or source-hook bypass. Primary user
+backup/artwork/research/handoff files remain untouched.
+
+### 2026-10-27 — T1 initial owner returned incomplete; explicit source successor
+
+Initial chat-t1-01 returned normally at01:54:11 EDT without a product change or
+concrete external/source-gate blocker. Independently verify exact local/remote
+c5048d28b0d9045ef732f7a35617d7fdd0e29e37, JOURNAL-only delta and clean checkout.
+Its initial Release build/tool provisioning and actual-main PTY REDs establish
+active ESC, palette ESC and Ctrl-C queue-loss regressions, not T1 delivery.
+All old audit/results/captures remain retained; no GREEN, source review, source
+gate or performance comparison completed. Do not treat exit0 as acceptance.
+
+Acquire atomic controller claim, recheck exact clean checkout/absent predecessor
+owners, preserve original session and issue explicit chat-t1-02 successor in same
+bounded slot/branch. Continue original T1 scope/subplan/two source layers without
+reset, new timer or T2. Reuse retained initial source/binary/REDs; proceed with
+implementation rather than another preparation-only return. Fresh explicit
+OpenAI/Sol/medium/uncapped session, pinned generation unchanged. Terminal
+proc_06d04430b8bc, supervisor95447/native95460 family; actual commands/settings
+and source-reading activity independently observed. Cron has no async completion
+notifications; scheduled reads remain required. No unknown queued effects replay,
+sibling merge, primary-user-file edits, issue-store writes, install or activation.
+Publish checked text-only coordination update under own matching claim.
+
+## 2026-11-20 — restore Ultramarine startup on macOS
+
+The report for PID 30031 faults in `lua_tointegerx` from the Lua TUI composition
+worker. The active generation `generation-6QI9PQx9` was linked against Lua 5.4.8
+through Homebrew's unversioned `opt/lua` path. That path now resolves to Lua
+5.5.1. The qualified 5.4.8 library was still present in the local Cellar.
+
+Copied Lua 5.4.8 into the active generation and rebound its two affected
+executables, `blackbird` and `arco`, to the generation-local library. Verified the
+ad hoc signatures and ran the tiny-terminal PTY check on the staged executable
+before replacing the binaries. The originals are in the generation's
+`pre-lua-repair/` directory. This repair is specific to the installed generation.
+Future installs still need a way to preserve the qualified runtime independently
+of Homebrew's active Lua version.
+
+The managed launcher opened two temporary `paper/ultramarine-1-flash` sessions
+from the operator's working directory. At medium effort it displayed the
+expected effort question and exited cleanly. At high effort it executed a local
+Lua command, rendered its result and exited cleanly. No inference was submitted
+and the saved conversations were left intact.
