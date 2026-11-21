@@ -17,6 +17,7 @@
 #include "blackbird/raw_storage.hpp"
 #include "blackbird/responses_provider.hpp"
 #include "blackbird/runtime_paths.hpp"
+#include "blackbird/saved_state.hpp"
 #include "blackbird/sprite.hpp"
 #include "blackbird/station.hpp"
 #include "blackbird/terminal.hpp"
@@ -26,9 +27,11 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <expected>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <poll.h>
 #include <stdexcept>
 #include <sys/random.h>
@@ -40,6 +43,16 @@ using namespace blackbird;
 namespace {
 std::atomic_bool interrupted{false};
 static_assert(std::atomic_bool::is_always_lock_free);
+// 128 + SIGTERM, the status a shell reports for a SIGTERM death. Exiting with
+// it, rather than re-raising, keeps run-one and scripts/blackbird reading the
+// same value as before while a C parent can still tell the clean stop
+// (WIFEXITED) from the second SIGTERM's kill (WIFSIGNALED).
+constexpr int terminated_status = 128 + SIGTERM;
+// Set by the first SIGTERM and never cleared (raw_terminate_requested): the
+// process was asked to stop. A session that sees it leaves through its clean
+// exit, or through the interrupt the SIGTERM raised, with terminated_status, and
+// main() starts no successor session.
+bool termination_requested() noexcept { return raw_terminate_requested(); }
 template <class T> T random_id() {
   IdentityBytes bytes{};
   if (getentropy(bytes.data(), bytes.size()) != 0)
@@ -69,10 +82,157 @@ std::string safe(std::string_view text) {
   }
   return out;
 }
+// A pending session.restart: a recorded handoff whose successor (a --resume*
+// open) plays back the tail after the last snapshot.
+bool restart_handoff_pending(const RetainedState &root) {
+  for (const auto &program : root.current_programs())
+    if (string_field(program, "label") == "session.restart" &&
+        string_field(program, "state") == "pending")
+      return true;
+  return false;
+}
+// The directory /new made for its successor, recorded in this process: a refused
+// successor start removes exactly that directory, still empty, and nothing named only
+// by a command-line flag.
+std::filesystem::path successor_directory_created;
+// A refused start's own fresh directory: only the one this process made, only while it
+// is still an empty real directory (never a file or a symbolic link).
+void discard_created_directory(const std::filesystem::path &created,
+                               const std::filesystem::path &session) {
+  if (created.empty() || created.lexically_normal() != session.lexically_normal())
+    return;
+  std::error_code error;
+  if (std::filesystem::symlink_status(session, error).type() !=
+          std::filesystem::file_type::directory ||
+      error || !std::filesystem::is_empty(session, error) || error)
+    return;
+  std::filesystem::remove(session, error);
+}
+// The model the session's requests use when nothing overrides it per request: an
+// activated program-config model, else the session's launch model
+// (CodingEngine::definition_model, read before the engine exists).
+std::string definition_model_of(const Value::Array &programs,
+                                const std::string &launch_model) {
+  for (const auto &packet : programs) {
+    const auto *label = packet.find("label");
+    if (!label || *label != Value{"workflow-config-effective-v1"})
+      continue;
+    const auto *config = packet.find("program_config");
+    const auto *model = config ? config->find("model") : nullptr;
+    if (model && std::holds_alternative<std::string>(model->value()) &&
+        !model->string().empty())
+      return model->string();
+  }
+  return launch_model;
+}
 struct SessionSuccessorOutputs {
   std::vector<std::string> &next;
   std::vector<std::string> &fallback;
 };
+// The provider profile set a session start loads (docs/CONTEXT_LIFECYCLE.md §15.4):
+// BLACKBIRD_PROFILES or this generation's profiles, and the operator's overrides.
+struct LoadedProfiles {
+  std::shared_ptr<const ProfileSet> set;
+  ProfileDirectories directories;
+  // Set when BLACKBIRD_PROFILE_SET_DIGEST names another content digest.
+  std::string pin_refusal;
+};
+std::expected<LoadedProfiles, std::string> load_profiles(const char *home) {
+  LoadedProfiles loaded;
+  loaded.directories.shipped = BLACKBIRD_PROFILE_DIRECTORY;
+  loaded.directories.operator_overrides =
+      std::filesystem::path{home} / ".local/share/blackbird/profiles";
+  if (const char *chosen = std::getenv("BLACKBIRD_PROFILES")) {
+    if (*chosen == '\0')
+      return std::unexpected(
+          "Provider profiles refused: BLACKBIRD_PROFILES is set but empty. Name a "
+          "profile directory, or unset it to use this Blackbird's profiles; no session "
+          "was opened.\n");
+    loaded.directories.shipped = std::filesystem::absolute(chosen).lexically_normal();
+  }
+  auto set = load_profile_set(loaded.directories);
+  if (!set.has_value())
+    return std::unexpected(
+        "Provider profiles refused: " + set.error().message() +
+        "\nShipped profiles: " + loaded.directories.shipped.string() +
+        "; operator overrides: " + loaded.directories.operator_overrides->string() +
+        ". Set BLACKBIRD_PROFILES to a profile directory, or reinstall Blackbird; no "
+        "session was opened.\n");
+  loaded.set = std::make_shared<const ProfileSet>(std::move(set).value());
+  if (const char *pin = std::getenv("BLACKBIRD_PROFILE_SET_DIGEST")) {
+    if (*pin == '\0')
+      loaded.pin_refusal = "Provider profiles refused: BLACKBIRD_PROFILE_SET_DIGEST is "
+                           "set but empty; no session was opened.\n";
+    else if (loaded.set->content_digest != pin)
+      loaded.pin_refusal =
+          "Provider profiles refused: the loaded set's content digest " +
+          loaded.set->content_digest + " differs from BLACKBIRD_PROFILE_SET_DIGEST " +
+          pin + " (shipped profiles " + loaded.directories.shipped.string() +
+          "); no session was opened.\n";
+  }
+  return loaded;
+}
+template <class T> T unwrap_profile(ProfileResult<T> result) {
+  if (!result.has_value())
+    throw std::runtime_error{"provider profile: " + result.error().message()};
+  return std::move(result).value();
+}
+// The set lines shared by /profile and --profile-digests. `pin` names exactly what
+// BLACKBIRD_PROFILE_SET_DIGEST must equal: the content digest.
+std::string profile_set_lines(const LoadedProfiles &loaded) {
+  const auto &set = *loaded.set;
+  return "set-digest " + set.digest + "\nset-content-digest " + set.content_digest +
+         "\npin " + set.content_digest + "\nset-shipped " +
+         loaded.directories.shipped.string() + "\nset-operator " +
+         loaded.directories.operator_overrides.value_or(std::filesystem::path{})
+             .string() +
+         " (" + std::to_string(set.operator_overrides.size()) + " overrides)\n";
+}
+std::string joined_layers(const EffectiveProfile &profile, std::string_view separator) {
+  std::string out;
+  for (const auto &layer : profile.layers)
+    out += (out.empty() ? "" : std::string{separator}) + layer;
+  return out;
+}
+// The route binding a profile query reads, as the provider would bind it: one
+// auth-store open. A store that cannot be read defers it to the first provider request
+// (owner decision 2026-10-20), so a session that never calls a provider runs as before.
+struct StartBinding {
+  std::optional<Value> binding;
+  std::string deferral;
+};
+Value profile_binding(std::string_view provider, const RawAuthParent *parent) {
+  if (provider == "openai")
+    return openai_profile_binding(OpenAiConfig{}, parent);
+  return ProviderAuth{}.binding(provider, parent);
+}
+StartBinding start_binding(std::string_view provider, const RawAuthParent *parent) {
+  try {
+    return {profile_binding(provider, parent), {}};
+  } catch (const Error &error) {
+    return {std::nullopt, std::string{"the auth store could not be read at start ("} +
+                              error_name(error.code) + ", " +
+                              std::to_string(error.detail) + ")"};
+  }
+}
+std::string describe_profile(const LoadedProfiles &loaded,
+                             const EffectiveProfile &profile, const RouteQuery &route) {
+  const auto &query = route.query;
+  std::string out = "profile " + profile.id + " revision " +
+                    std::to_string(profile.revision) + " digest " + profile.digest +
+                    " (behavioural; each provider.request records it)\nlayers " +
+                    joined_layers(profile, " < ") +
+                    "\nquery provider=" + query.provider +
+                    " protocol=" + query.protocol + " base_url=" + query.base_url +
+                    " account_kind=" + query.account_kind + " model=" + query.model +
+                    "\nbinding " + binding_digest(query) + "\n" +
+                    (profile.fallback.empty() ? std::string{}
+                                              : "fallback " + profile.fallback + "\n");
+  for (const auto &leaf : profile_leaves(profile.profile))
+    out += "  " + leaf.path + " = " + unwrap(format_value(leaf.value)) + " · basis " +
+           (leaf.basis.empty() ? std::string{"none"} : leaf.basis) + "\n";
+  return out + profile_set_lines(loaded);
+}
 } // namespace
 int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 RawSuccessorHandoff *selected_handoff = nullptr,
@@ -93,7 +253,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     std::string model = "gpt-6.1-sol", once, seed_path, backstop_path, station_path;
     Value backstop_mission;
     bool one = false, inspect = false, plain = false, rebuild_session = false,
-         expire_diagnostics = false, recover_unknown_effects = false;
+         expire_diagnostics = false, recover_unknown_effects = false,
+         profile_digests = false;
     std::string effort = "medium";
     std::string provider_name = "openai";
     bool provider_option = false, session_option = false;
@@ -115,13 +276,14 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                      "[--plain] [--list-sessions [ROOT]] [--seed-session JSON] "
                      "[--backstop MISSION_JSON (requires --once)] "
                      "[--resume-continue|--resume-once] [--rebuild-session] "
-                     "[--expire-diagnostics] [--recover-unknown-effects]\n"
+                     "[--expire-diagnostics] [--recover-unknown-effects] "
+                     "[--profile-digests]\n"
                      "Without --session, start a fresh conversation. Reopen an "
                      "existing conversation with --session DIRECTORY.\nInteractive: "
                      "/context, "
                      "/originals, /restore "
                      "ENTRY, /lua CODE, /model NAME, /effort LEVEL, /workflow FILE, "
-                     "/session, /new, "
+                     "/session, /profile, /new, "
                      "/restart NOTE, /paste (until /send), /quit or /exit\n";
         return 0;
       }
@@ -139,6 +301,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       }
       if (arg == "--expire-diagnostics") {
         expire_diagnostics = true;
+        continue;
+      }
+      if (arg == "--profile-digests") {
+        profile_digests = true;
         continue;
       }
       if (arg == "--rebuild-session") {
@@ -208,13 +374,60 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       std::cout << unwrap(dump_json(list_sessions(discovery_root))) << '\n';
       return 0;
     }
-    if (!session_option) {
-      if (inspect || expire_diagnostics || rebuild_session || recover_unknown_effects ||
-          resume_requested) {
-        std::cerr << "Select an existing session with --session DIRECTORY for "
-                     "inspection, recovery, continuation or maintenance.\n";
+    // Usage errors come before any profile load or route check.
+    if (!session_option && (inspect || expire_diagnostics || rebuild_session ||
+                            recover_unknown_effects || resume_requested)) {
+      std::cerr << "Select an existing session with --session DIRECTORY for "
+                   "inspection, recovery, continuation or maintenance.\n";
+      return 1;
+    }
+    // Provider profiles load once per session start, before any session file is
+    // created or opened, so a refusal writes nothing. Inspection and diagnostic
+    // expiry make no provider request and need none. A refused successor start
+    // removes the still-empty directory its predecessor's /new made for it.
+    const auto created_for_this_start = std::exchange(successor_directory_created, {});
+    const auto refuse_start = [&](const std::string &text) {
+      std::cerr << text;
+      if (switched_session && session_option)
+        discard_created_directory(created_for_this_start, session);
+      return 1;
+    };
+    LoadedProfiles profiles;
+    if (profile_digests || (!inspect && !expire_diagnostics)) {
+      auto loaded = load_profiles(home);
+      if (!loaded.has_value())
+        return refuse_start(loaded.error());
+      profiles = std::move(loaded).value();
+    }
+    if (profile_digests) {
+      std::cout << profile_set_lines(profiles);
+      for (const auto &effective : unwrap_profile(effective_profiles(*profiles.set)))
+        std::cout << "effective " << effective.id << " revision " << effective.revision
+                  << " digest " << effective.digest << " layers "
+                  << joined_layers(effective, ",") << '\n';
+      if (!profiles.pin_refusal.empty()) {
+        std::cerr << profiles.pin_refusal;
         return 1;
       }
+      return 0;
+    }
+    if (!profiles.pin_refusal.empty())
+      return refuse_start(profiles.pin_refusal);
+    // A new session resolves its route now, before mkdtemp or RetainedState::create.
+    // An existing one resolves after its settings are read, before settings writes.
+    std::optional<StartBinding> early_binding;
+    if (profiles.set && !inspect && !expire_diagnostics &&
+        (!session_option || !std::filesystem::exists(session / "audit"))) {
+      early_binding = start_binding(provider_name, nullptr);
+      if (early_binding->binding)
+        if (const auto resolved =
+                resolve_binding(*profiles.set, *early_binding->binding, model);
+            !resolved.has_value())
+          return refuse_start("Provider profile refused for " + provider_name +
+                              " model " + model + ": " + resolved.error().message() +
+                              "; no session was opened.\n");
+    }
+    if (!session_option) {
       std::filesystem::create_directories(session_root);
       auto directory_template = (session_root / "session-XXXXXX").string();
       if (::mkdtemp(directory_template.data()) == nullptr)
@@ -258,6 +471,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                              : "work bound reached; rerun to continue.\n");
       return 0;
     }
+    // A session loop follows (the maintenance and listing modes have returned;
+    // --audit-last returns after its scan). From here a SIGTERM during the open,
+    // between sessions or in teardown is recorded and read, not fatal. The
+    // inspection and application paths keep the default action: no loop there
+    // reads the flag.
+    if (!inspect && application == nullptr)
+      raw_terminate_install();
     std::filesystem::create_directories(session);
     if (::chmod(session.c_str(), 0700) != 0)
       throw Error{ErrorCode::io, errno};
@@ -292,6 +512,16 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           unwrap(NativeJournalDirectory::open(session.string(), raw_storage_owner)));
     };
     std::unique_ptr<RetainedState> root;
+    // What this open observes after the saved boundary, before it writes. A
+    // clean stop leaves no frames, bytes or torn tail (S0).
+    struct ReopenSuffix {
+      std::uint64_t frames = 0, bytes = 0, torn_bytes = 0;
+      const char *snapshot = "absent";
+    };
+    std::optional<ReopenSuffix> reopen_suffix;
+    // Automatic whole-history context playback after a refused snapshot follows the
+    // launcher's full-replay bound.
+    std::uint64_t whole_history_limit = 64ULL * 1024 * 1024;
     if (std::filesystem::exists(path)) {
       if (!seed_path.empty())
         throw Error{ErrorCode::conflict};
@@ -327,10 +557,50 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         return 1;
       }
       root = unwrap(std::move(opened));
+      whole_history_limit = replay_limit;
+      {
+        const auto end = root->cursor();
+        const auto available = root->recovery_report().available_end;
+        ReopenSuffix suffix;
+        suffix.torn_bytes = available > end.end_offset ? available - end.end_offset : 0;
+        if (const auto *saved = root->saved_state()) {
+          suffix.frames = end.sequence - saved->boundary.sequence;
+          suffix.bytes = end.end_offset - saved->boundary.end_offset;
+          suffix.snapshot = "accepted";
+        } else {
+          suffix.frames = end.sequence;
+          suffix.bytes = end.end_offset - journal_header_size;
+          for (const auto *slot : {"audit.state.0", "audit.state.1"})
+            if (std::filesystem::exists(session / slot))
+              suffix.snapshot = "rejected";
+        }
+        if (suffix.frames || suffix.bytes || suffix.torn_bytes)
+          reopen_suffix = suffix;
+      }
       if (!root->compact_recovery())
         warning("Session recovery: rebuilding from audit; uncertain operations "
                 "will not be retried.\n");
       unwrap(root->confirm_recovery());
+      // A session written at a higher context-format-level than this binary reads
+      // is refused here, before recover_coding_session reconciles or writes
+      // anything (confirm_recovery makes the scanned tail current). --audit-last
+      // only reads, so it inspects a newer session too.
+      for (const auto &program : inspect ? Value::Array{} : root->current_programs())
+        if (string_field(program, "label") == "context-format-level") {
+          const auto &level = field(program, "level");
+          const auto *number = std::get_if<Number>(&level.value());
+          if (!number || number->text().empty() || number->text()[0] == '-' ||
+              number->text().size() > 19 ||
+              number->text().find_first_not_of("0123456789") != std::string::npos ||
+              std::stoull(number->text()) > ContextStore::format_level) {
+            warning("Session was written by a newer Blackbird (context format level " +
+                    (number ? number->text() : std::string{"unknown"}) +
+                    "; this binary reads up to " +
+                    std::to_string(ContextStore::format_level) +
+                    "). Open it with that Blackbird. Session files left intact.\n");
+            return 1;
+          }
+        }
       if (!inspect) {
         RawCaptureFailureScope recovery_capture{session_capture.parent.has_value()};
         try {
@@ -421,7 +691,111 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       return 0;
     }
     AuditLog log{*root};
-    ContextStore context{log};
+    std::optional<ContextStore> opened_context;
+    try {
+      opened_context.emplace(log,
+                             ContextOpen{.defer_checkpoint = true,
+                                         .whole_history_limit = whole_history_limit});
+    } catch (const Error &error) {
+      if (error.code != ErrorCode::unsupported ||
+          error.detail != ContextStore::whole_history_refused || rebuild_session)
+        throw;
+      warning("Session context needs whole-history playback: its snapshot was "
+              "refused. Automatic playback stops at 64 MiB. Reopen with "
+              "--rebuild-session for the bounded slow path. Recovery may have "
+              "recorded abandoned operations; the context was not changed.\n");
+      return 1;
+    }
+    ContextStore &context = *opened_context;
+    // A read-only open writes only bounded records, and every one of them, through
+    // the engine's construction, goes outside the resident-tail cap: the withheld
+    // snapshot cannot clear the tail, and /repair must stay reachable.
+    struct ReservedOpen {
+      AuditLog &log;
+      bool held = false;
+      void release() noexcept {
+        if (held)
+          log.end_reserved();
+        held = false;
+      }
+      ~ReservedOpen() { release(); }
+    } reserved_open{log};
+    if (context.read_only()) {
+      log.begin_reserved();
+      reserved_open.held = true;
+    }
+    // Set once this process records a restart: that exit is a handoff.
+    std::atomic_bool restart_pending{false};
+    // Every clean return arms this guard with arm(); an exception after the
+    // open's first write marks it with orderly_error() (OrderlyErrors below).
+    // Declared before the engine, the participant and command shutdown and the
+    // UI, it runs after their teardown records, so the snapshot is the last
+    // journal write. It writes only into a quiescent journal with no unresolved
+    // attempt, and never after this process recorded a restart, which its
+    // successor plays back. A failed snapshot is reported and keeps the status.
+    struct CleanStop {
+      RetainedState &root;
+      ContextStore &context;
+      const RawAdapterContext &capture;
+      const std::atomic_bool &restart_recorded;
+      const decltype(warning) &report;
+      const int exceptions = std::uncaught_exceptions();
+      enum class Mode : std::uint8_t { none, clean, orderly_error } mode = Mode::none;
+      int arm(int status) noexcept {
+        mode = Mode::clean;
+        return status;
+      }
+      void orderly_error() noexcept { mode = Mode::orderly_error; }
+      ~CleanStop() {
+        if (mode == Mode::none ||
+            (mode == Mode::clean && std::uncaught_exceptions() > exceptions))
+          return;
+        try {
+          // An unresolved attempt would leave the snapshot without semantic
+          // coverage and force a full replay; recovery settles it from the tail.
+          // A read-only context writes no snapshot until a repair is accepted.
+          if (!root.quiescent() || restart_recorded.load() || context.read_only())
+            return;
+          // An interrupt during the TUI worker join's owner admission refuses
+          // it and leaves joined-child debt (the root's raw origin then admits
+          // no new input). That wait scope is gone here; settle the debt as the
+          // next launch would, or report and skip.
+          if (const auto resumed = root.resume_raw_owner(); !resumed.has_value()) {
+            report(std::string{"Clean-stop snapshot skipped (raw owner "} +
+                   error_name(resumed.error().code) +
+                   "); the next open plays back the journal tail.\n");
+            return;
+          }
+          if (!unwrap(root.unresolved_attempts()).empty())
+            return;
+          const auto *saved = root.saved_state();
+          const auto end = root.cursor();
+          if (saved && saved->boundary.sequence == end.sequence &&
+              saved->boundary.end_offset == end.end_offset)
+            return; // the current snapshot already ends the journal
+          const auto result = context.checkpoint(
+              RawContextOrigin{capture.parent.value_or(RawEventRef{})});
+          if (!result.has_value())
+            report(std::string{"Clean-stop snapshot failed ("} +
+                   error_name(result.error().code) +
+                   "); the next open plays back the journal tail.\n");
+        } catch (...) {
+          constexpr std::string_view fallback =
+              "blackbird: clean-stop snapshot failed\n";
+          (void)!::write(STDERR_FILENO, fallback.data(), fallback.size());
+        }
+      }
+    } clean_stop{*root, context, session_capture, restart_pending, warning};
+    // Marks an exception leaving its scope as an orderly failure: the exception
+    // still leaves, and the guard snapshots a quiescent journal first.
+    struct OrderlyErrors {
+      CleanStop &stop;
+      const int exceptions = std::uncaught_exceptions();
+      ~OrderlyErrors() {
+        if (std::uncaught_exceptions() > exceptions)
+          stop.orderly_error();
+      }
+    };
     if (!seed_path.empty())
       context.seed_successor(
           seed, RawContextOrigin{session_capture.parent.value_or(RawEventRef{})});
@@ -436,14 +810,6 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       }
     if (!station_path.empty() && one)
       throw Error{ErrorCode::conflict};
-    log.record(
-        ApplicationChannel::program,
-        Value::object({{"label", Value{"station.profile"}},
-                       {"adapter", Value{station_path.empty()
-                                             ? ""
-                                             : std::filesystem::absolute(station_path)
-                                                   .lexically_normal()
-                                                   .string()}}}));
     SessionStore session_store{log, &session_capture};
 
     auto settings = session_store.settings();
@@ -514,16 +880,278 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       warning("). Open an interactive harness to answer there.\n");
       throw Error{ErrorCode::unsupported};
     }
+    // The start route and model of an existing session, resolved before its first
+    // settings-dependent write; only recovery's own records (an unclean stop's
+    // abandonment records) can precede a refusal here. A new session was resolved
+    // before its directory existed. A binding the auth store cannot give is deferred.
+    const RawAuthParent profile_parent{session_capture.parent.value_or(RawEventRef{})};
+    auto begun = early_binding && settings.provider == provider_name
+                     ? std::move(*early_binding)
+                     : start_binding(settings.provider, &profile_parent);
+    SessionProfiles session_profiles;
+    session_profiles.set = profiles.set;
+    session_profiles.binding = std::move(begun.binding);
+    session_profiles.deferral = std::move(begun.deferral);
+    session_profiles.bind = [provider =
+                                 settings.provider](const RawAuthParent *parent) {
+      return profile_binding(provider, parent);
+    };
+    session_profiles.auth_store = ProviderAuth{}.directory() / "credentials.bbm";
+    {
+      auto layer = session_override(root->current_programs());
+      if (!layer.has_value()) {
+        warning("Provider profile refused: " + layer.error().message() + "\n");
+        throw Error{ErrorCode::invalid_range};
+      }
+      session_profiles.session_override = std::move(layer).value();
+      // The model the engine will pin: an activated program-config model wins.
+      const auto pinned_model =
+          definition_model_of(root->current_programs(), settings.model);
+      const auto resolved =
+          session_profiles.binding
+              ? resolve_binding(*profiles.set, *session_profiles.binding, pinned_model,
+                                session_profiles.session_override
+                                    ? &*session_profiles.session_override
+                                    : nullptr)
+              : ProfileResult<EffectiveProfile>{};
+      if (!resolved.has_value()) {
+        warning("Provider profile refused for " + settings.provider + " model " +
+                pinned_model + ": " + resolved.error().message() + "\n");
+        throw Error{ErrorCode::invalid_range};
+      }
+    }
+    // Before this point the open writes only what recovery requires: the
+    // abandonment records of recover_coding_session after an unclean stop, and a
+    // validated --seed-session for a new session. Every option- and
+    // settings-dependent write, and the open-time snapshot, follow here.
+    // From the first of them on, an exception leaving run_session is an orderly
+    // failure, so the guard snapshots a quiescent journal.
+    OrderlyErrors orderly{clean_stop};
+    // Recovered programs are current here, so a pending restart is visible. Only
+    // a resuming open is its successor; any other open reports the restart left
+    // pending, and a torn tail is reported either way.
+    std::string reopen_notice;
+    const bool pending_restart = restart_handoff_pending(*root);
+    const auto &report = context.open_report();
+    const bool read_only = report.read_only;
+    // How the context was established, when it was not simply the selected
+    // snapshot plus its suffix: a refused slot or snapshot, a catalogue that does
+    // not open, or the read-only state. Every error is kept with its detail.
+    Value::Object observation;
+    std::string recovery_notice;
+    if (report.recovery()) {
+      const auto slot_list = [&](const std::vector<std::pair<unsigned, Error>> &list,
+                                 bool catalogue) {
+        Value::Array out;
+        for (const auto &[slot, error] : list) {
+          Value::Object one{{"slot", Value{Number{slot}}},
+                            {"error", Value{error_name(error.code)}},
+                            {"detail", Value{Number{error.detail}}}};
+          if (catalogue)
+            one.emplace_back("slot_used", Value{report.restored_slot == slot});
+          out.push_back(Value{std::move(one)});
+        }
+        return Value{std::move(out)};
+      };
+      const auto describe = [](const Error &error) {
+        return std::string{error_name(error.code)} + " " + std::to_string(error.detail);
+      };
+      observation = {
+          {"playback",
+           Value{report.playback == ContextOpenReport::Playback::whole_history
+                     ? "whole-history"
+                 : report.playback == ContextOpenReport::Playback::suffix
+                     ? (report.older_slot ? "older-snapshot-suffix" : "snapshot-suffix")
+                     : "journal"}},
+          {"frames", Value{Number{report.frames}}},
+          {"skipped", Value{Number{report.skipped}}},
+          {"read_only", Value{report.read_only}},
+          {"torn_bytes", Value{Number{reopen_suffix ? reopen_suffix->torn_bytes : 0}}}};
+      if (!report.slot_refusals.empty())
+        observation.emplace_back("slot_refusals",
+                                 slot_list(report.slot_refusals, false));
+      if (!report.store_refusals.empty())
+        observation.emplace_back("store_refusals",
+                                 slot_list(report.store_refusals, false));
+      if (!report.catalogue_faults.empty())
+        observation.emplace_back("catalogue_faults",
+                                 slot_list(report.catalogue_faults, true));
+      for (const auto &[slot, error] : report.slot_refusals)
+        recovery_notice += "Snapshot slot " + std::to_string(slot) + " refused (" +
+                           describe(error) + ").\n";
+      for (const auto &[slot, error] : report.store_refusals)
+        recovery_notice += "Snapshot slot " + std::to_string(slot) +
+                           " refused when restored (" + describe(error) + ").\n";
+      for (const auto &[slot, error] : report.catalogue_faults)
+        recovery_notice +=
+            "Snapshot slot " + std::to_string(slot) +
+            "'s archive catalogue does not open (" + describe(error) +
+            (report.restored_slot == slot ? "); the slot was used.\n"
+                                          : "); the slot was not used.\n");
+      if (report.snapshot_refusal) {
+        observation.emplace_back(
+            "snapshot_refusal",
+            Value{std::string{error_name(report.snapshot_refusal->code)}});
+        observation.emplace_back("snapshot_fault",
+                                 Value{Number{report.snapshot_refusal->detail}});
+        observation.emplace_back("refused_by",
+                                 Value{report.refused_by_store ? "store" : "loader"});
+      }
+      if (report.older_slot)
+        recovery_notice += "The context was restored from the older snapshot and the " +
+                           std::to_string(report.frames) + " frames after it.\n";
+      else if (report.playback == ContextOpenReport::Playback::whole_history)
+        recovery_notice += "The context was played back from the whole history (" +
+                           std::to_string(report.frames) + " frames).\n";
+      if (report.read_only) {
+        observation.emplace_back("bad_revision", Value{report.bad_revision});
+        observation.emplace_back("bad_error",
+                                 Value{std::string{error_name(report.bad_error.code)}});
+        observation.emplace_back("bad_detail", Value{Number{report.bad_error.detail}});
+        observation.emplace_back("after_bad", Value{Number{report.after_bad}});
+        recovery_notice += "Context frame " + report.bad_revision +
+                           " does not apply (" + describe(report.bad_error) +
+                           "): the session is read-only, with " +
+                           std::to_string(report.after_bad) +
+                           " later context frames set aside. No request, context write "
+                           "or snapshot happens until /repair [ENTRY...] approves a "
+                           "repair frame; /repair --list shows what it skips and "
+                           "keeps.\n";
+      }
+    }
+    // A read-only session withholds every snapshot, so each open would repeat its
+    // records. An open records them only when its observation (the bad frame, a
+    // torn tail, the refused slots and catalogues) differs from the last one
+    // recorded; any new observation is recorded once.
+    const auto observed = [](const Value::Object &metadata) {
+      Value::Object out;
+      for (const auto &[key, value] : metadata)
+        if (key == "bad_revision" || key == "torn_bytes" || key == "slot_refusals" ||
+            key == "store_refusals" || key == "catalogue_faults" ||
+            key == "snapshot_refusal" || key == "snapshot_fault")
+          out.emplace_back(key, value);
+      return Value{std::move(out)};
+    };
+    const bool repeated = read_only && [&] {
+      std::optional<Value> last;
+      for (const auto &fact : root->tail_facts()) {
+        const auto *record = std::get_if<ApplicationRecordEvent>(&fact.event.body);
+        if (!record || record->channel != ApplicationChannel::log)
+          continue;
+        auto packet = read_packet(record->payload);
+        if (!packet.has_value())
+          continue;
+        const auto *label = packet.value().find("label");
+        const auto *metadata = packet.value().find("metadata");
+        if (label && *label == Value{"context.recovery"} && metadata &&
+            std::holds_alternative<Value::Object>(metadata->value()))
+          last = observed(metadata->object());
+      }
+      return last && *last == observed(observation);
+    }();
+    if (reopen_suffix &&
+        !(resume_requested && pending_restart && reopen_suffix->torn_bytes == 0)) {
+      const bool accepted = reopen_suffix->snapshot == std::string_view{"accepted"};
+      Value::Object metadata{{"saved_state", Value{accepted}},
+                             {"snapshot", Value{reopen_suffix->snapshot}},
+                             {"suffix_frames", Value{Number{reopen_suffix->frames}}},
+                             {"suffix_bytes", Value{Number{reopen_suffix->bytes}}},
+                             {"torn_bytes", Value{Number{reopen_suffix->torn_bytes}}}};
+      if (pending_restart)
+        metadata.emplace_back("pending_restart", Value{true});
+      if (read_only)
+        metadata.emplace_back("read_only", Value{true});
+      if (!repeated)
+        log.record(ApplicationChannel::log,
+                   Value::object({{"label", Value{"session.reopen-suffix"}},
+                                  {"metadata", Value{std::move(metadata)}}}));
+      reopen_notice =
+          std::to_string(reopen_suffix->frames) + " journal frames (" +
+          std::to_string(reopen_suffix->bytes) + " bytes)" +
+          (reopen_suffix->torn_bytes
+               ? " and " + std::to_string(reopen_suffix->torn_bytes) + " torn bytes"
+               : std::string{}) +
+          (accepted ? " after the last snapshot"
+           : reopen_suffix->snapshot == std::string_view{"rejected"}
+               ? " after a rejected snapshot"
+               : " with no snapshot") +
+          (read_only ? ": snapshots are withheld while the session is read-only.\n"
+           : pending_restart
+               ? ": a restart was left pending and not resumed, or the last stop was "
+                 "not clean.\n"
+               : ": the last stop was not clean, or the session predates this "
+                 "Blackbird.\n");
+      if (!tui)
+        warning(reopen_notice);
+    }
+    {
+      if (report.recovery()) {
+        if (!repeated)
+          log.record(ApplicationChannel::log,
+                     Value::object({{"label", Value{"context.recovery"}},
+                                    {"metadata", Value{std::move(observation)}}}));
+        reopen_notice += recovery_notice;
+        if (!tui)
+          warning(recovery_notice);
+      }
+      if (report.read_only && (one || application || !station_path.empty())) {
+        warning("A read-only session cannot run unattended; open it interactively "
+                "to review and /repair.\n");
+        throw Error{ErrorCode::audit_unavailable};
+      }
+    }
+    {
+      auto station =
+          Value::object({{"label", Value{"station.profile"}},
+                         {"adapter", Value{station_path.empty()
+                                               ? ""
+                                               : std::filesystem::absolute(station_path)
+                                                     .lexically_normal()
+                                                     .string()}}});
+      bool unchanged = false;
+      if (read_only)
+        for (const auto &program : root->current_programs())
+          if (string_field(program, "label") == "station.profile")
+            unchanged = program == station;
+      if (!unchanged)
+        log.record(ApplicationChannel::program, std::move(station));
+    }
+    // The loaded set, latest wins; an unchanged set (a clean reopen) adds nothing.
+    {
+      auto record = profile_set_record(*profiles.set, profiles.directories);
+      // The start route: its binding digest, a conservative fallback's reason, or why
+      // reading it was deferred.
+      Value::Object start;
+      if (session_profiles.binding) {
+        if (const auto route = route_query(*session_profiles.binding, settings.model);
+            route.has_value()) {
+          start.emplace_back("binding", Value{binding_digest(route.value().query)});
+          if (!route.value().fallback.empty())
+            start.emplace_back("fallback", Value{route.value().fallback});
+        }
+      } else
+        start.emplace_back("deferral", Value{session_profiles.deferral});
+      record.object().emplace_back("start_route", Value{std::move(start)});
+      session_profiles.set_record = record;
+      bool recorded = false;
+      for (const auto &program : root->current_programs())
+        if (string_field(program, "label") == profile_set_record_label)
+          recorded = program == record;
+      if (!recorded)
+        log.record(ApplicationChannel::program, std::move(record));
+    }
+    context.finish_open(
+        RawContextOrigin{session_capture.parent.value_or(RawEventRef{})});
     session_store.save(settings, &session_capture);
     model = settings.model;
     provider_name = settings.provider;
     effort = settings.effort;
     workflow = settings.workflow;
     bool resume_turn = resume_requested && !settings.effort_pending &&
+                       !context.read_only() &&
                        session_store.resume(context, &session_capture);
     if (resume_requested && !resume_turn && one)
-      return 0;
-    std::atomic_bool restart_pending{false};
+      return clean_stop.arm(0);
     std::atomic_bool new_pending{false};
     RawAdapterContext restart_capture;
     std::unique_ptr<CodingProvider> provider;
@@ -546,12 +1174,17 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     } else
       provider = std::make_unique<OpenAiCodingProvider>();
     CodingEngine engine{log, context, *provider, model};
+    if (const auto pinned = engine.profiles(session_profiles); !pinned.has_value()) {
+      warning("Provider profile refused for model " + engine.definition_model() + ": " +
+              pinned.error().message() + "\n");
+      throw Error{ErrorCode::invalid_range};
+    }
     if (engine.uncontained_command_custody())
       warning("Prior command custody remains unknown; restart and automatic "
               "backstop stay fenced. No old PID adopted or effect replayed.\n");
     // Convert an old derived state once, after the effective identity exists.
     // Unsupported station/restart states remain on independent full recovery.
-    if (!root->compact_recovery()) {
+    if (!root->compact_recovery() && !context.read_only()) {
       bool supported = unwrap(root->unresolved_attempts()).empty();
       for (const auto &packet : root->current_programs()) {
         const auto &label = string_field(packet, "label");
@@ -573,9 +1206,14 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         startup->outcome(RawRegionOutcome::ready);
         startup->finish();
       }
+      // The application close attempts its own snapshot (application.cpp), so
+      // the guard is not armed here and never retries it.
       return application->run(engine, log, settings, session);
     }
-    RawCommandInterrupt interrupt_owner{interrupted};
+    // From here until the owner is destroyed the first SIGTERM also interrupts
+    // a running turn, as SIGINT does. Before and after, main()'s flag-only
+    // handler records it and the loops and main() read the flag.
+    RawCommandInterrupt interrupt_owner{interrupted, true};
     auto &interrupt_wake = interrupt_owner.wake();
     RawWaitScope interrupt_wait{{{interrupt_wake.read_fd(), -1}, {}}};
     std::atomic_bool cancelled{false};
@@ -585,9 +1223,18 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     TerminalUI ui{"Blackbird · " + model + " · " + effort +
                   (settings.effort_pending ? " (choose effort)" : "") + " · " +
                   session.string()};
+    // After a SIGTERM the loops have decided to stop. Rearm the interrupt so the
+    // teardown, and any stop record, runs as on /quit: under the notified wake
+    // every raw claim in this scope is refused (check_wait_control).
+    const auto settle_termination = [&] {
+      if (termination_requested())
+        (void)interrupt_owner.reset();
+    };
     struct ParticipantShutdown {
       CodingEngine &engine;
+      const std::function<void()> settle;
       ~ParticipantShutdown() {
+        settle();
         try {
           engine.shutdown_commands();
         } catch (...) {
@@ -597,7 +1244,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         } catch (...) {
         }
       }
-    } participant_shutdown{engine}; // Before UI destruction, on every exit path.
+    } participant_shutdown{engine, settle_termination}; // Before UI destruction.
     ui.raw_capture(tui);
     const RawAdapterContext *output_context = &session_capture;
     auto emit = [&](std::string_view text) {
@@ -657,6 +1304,19 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         ui.tasks(packet, {3, origin.source, origin.fact, origin.revision});
       }
     };
+    // Only the TUI presents changes; headless runs attach no listener, so the
+    // store measures no sizes for them.
+    if (tui)
+      engine.context().changed = [&](const ContextChange &change) {
+        const std::string kind =
+            change.kind == ContextChangeKind::edited ? "edited"
+            : change.kind == ContextChangeKind::restored || change.mode == "restore"
+                ? "restored"
+            : change.mode == "summarize" || change.mode == "archive" ? "compacted"
+            : change.mode == "select"                                ? "selected"
+                                                                     : change.mode;
+        ui.context_changed(kind, change.bytes_before, change.bytes_after);
+      };
     engine.task_activity_native = [&, tui](const Value &event,
                                            RawTaskPresentation origin) {
       if (tui)
@@ -718,8 +1378,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     auto perform = [&](std::string_view prompt) {
       // Plain dispatch is synchronous: the previous foreground owner has
       // returned. Rearm its signal wake before this input's first admission.
-      if (!tui)
+      if (!tui) {
         unwrap(interrupt_owner.reset());
+        // A SIGTERM that arrived after the loop's check was just cleared from
+        // the interrupt; it still stops the session, so nothing is performed.
+        if (termination_requested())
+          return;
+      }
       const auto kind = (resume_turn || resume_requested) && prompt == "continue"
                             ? RawMainInputKind::resume
                         : one ? RawMainInputKind::once
@@ -745,7 +1410,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           dispatch.run([&] {
             if (session_store.settings().effort_pending &&
                 !prompt.starts_with("/effort ") && !prompt.starts_with("/model ") &&
-                prompt != "/session" && prompt != "/help" && prompt != "/context") {
+                prompt != "/session" && prompt != "/help" && prompt != "/context" &&
+                prompt != "/profile") {
               ask_effort(session_store.settings(),
                          route_efforts(session_store.settings(), command_context));
               return;
@@ -973,6 +1639,20 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                          Value{session_store.settings().effort_pending}},
                         {"workflow", Value{workflow.string()}}}))) +
                    "\n");
+            } else if (prompt == "/profile") {
+              raw_main_branch(dispatch, 42);
+              // A refusal is shown, as the next request would show it; the session
+              // continues.
+              const RawAuthParent command_parent{
+                  command_context.parent.value_or(RawEventRef{})};
+              const auto view = engine.effective_profile(&command_parent);
+              if (!view.has_value())
+                emit("Provider profile refused for model " + engine.definition_model() +
+                     ": " + view.error().message() + "\n" +
+                     profile_set_lines(profiles));
+              else
+                emit(describe_profile(profiles, *view.value().profile,
+                                      view.value().route));
             } else if (prompt == "/name" || prompt.starts_with("/name ")) {
               raw_main_branch(dispatch, 22);
               auto candidate = session_store.settings();
@@ -1007,7 +1687,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   emit("Already in this session.\n");
                 } else {
                   engine.validate_session_switch(&parent);
-                  unwrap(context.checkpoint());
+                  if (!context.read_only())
+                    unwrap(context.checkpoint());
                   handoff.select(selection);
                   const auto destination_text =
                       raw_restart_path(selection, destination);
@@ -1056,7 +1737,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 (void)raw_restart_source(selection, 6, session.native());
                 const auto parent = selection.context();
                 engine.validate_session_switch(&parent);
-                unwrap(context.checkpoint());
+                if (!context.read_only())
+                  unwrap(context.checkpoint());
                 const auto parent_path = session.parent_path();
                 auto template_credit = selection.source_credit(
                     raw_session_bound(parent_path.native().size(), 16));
@@ -1065,6 +1747,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                          template_credit);
                 raw_restart_directory(selection, directory_template);
                 const std::filesystem::path directory{directory_template};
+                successor_directory_created = directory;
                 handoff.select(selection);
                 const auto directory_text = raw_restart_path(selection, directory);
                 const auto workflow_text = raw_restart_path(selection, workflow);
@@ -1124,8 +1807,80 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 emit(unwrap(dump_json(listing)) + "\n");
             } else if (prompt == "/checkpoint") {
               raw_main_branch(dispatch, 29);
-              unwrap(context.checkpoint());
-              emit("Session checkpoint saved.\n");
+              if (context.read_only())
+                emit("The session is read-only after a context frame that does not "
+                     "apply; no snapshot is written until /repair is accepted.\n");
+              else {
+                unwrap(context.checkpoint());
+                emit("Session checkpoint saved.\n");
+              }
+            } else if (prompt == "/repair" || prompt.starts_with("/repair ")) {
+              raw_main_branch(dispatch, 43);
+              // The operator's approval of a repair frame: skip the bad frame and
+              // every later context frame, keeping the picked originals.
+              Value::Array picks;
+              for (std::size_t at = 7; at < prompt.size();) {
+                const auto start = prompt.find_first_not_of(' ', at);
+                if (start == std::string_view::npos)
+                  break;
+                const auto end = std::min(prompt.find(' ', start), prompt.size());
+                picks.push_back(Value{std::string{prompt.substr(start, end - start)}});
+                at = end;
+              }
+              if (!context.read_only())
+                emit("Nothing to repair: the context is not read-only.\n");
+              else if (picks.size() == 1 && picks.front() == Value{"--list"}) {
+                // The preview: the frames a repair skips, and what it may keep.
+                const auto preview = context.repair_preview();
+                std::string text =
+                    "Context frame " + string_field(preview, "bad_revision") +
+                    " does not apply (" + string_field(preview, "bad_error") + " " +
+                    unwrap(format_value(field(preview, "bad_detail"))) +
+                    "). /repair skips these context frames:\n";
+                for (const auto &revision : field(preview, "skipped").array())
+                  text += "  " + revision.string() + "\n";
+                const auto &offered = field(preview, "originals").array();
+                if (const auto &held = field(preview, "head_faults").array();
+                    !held.empty()) {
+                  text += "The context before the bad frame already has these "
+                          "unpaired calls or outputs; /repair keeps them as they "
+                          "are:\n";
+                  for (const auto &fault : held)
+                    text += "  " + fault.string() + "\n";
+                }
+                text += offered.empty()
+                            ? "They created no entry a repair can keep.\n"
+                            : "It may keep these entries (/repair ID ...):\n";
+                for (const auto &original : offered)
+                  text += "  " + string_field(original, "id") +
+                          (field(original, "pairs") == Value{true}
+                               ? ""
+                               : " (on its own it leaves a call or output unpaired)") +
+                          " " + unwrap(format_value(field(original, "item"))) + "\n";
+                emit(text);
+              } else {
+                const auto outcome = [&] {
+                  try {
+                    return context.repair(
+                        picks, RawContextOrigin{
+                                   command_context.parent.value_or(RawEventRef{})});
+                  } catch (const Error &error) {
+                    if (error.code == ErrorCode::conflict &&
+                        error.detail == ContextStore::repair_unpaired)
+                      emit("Repair refused: the picks would leave a function call "
+                           "without its output, or an output without its call, that "
+                           "the context did not already have. /repair --list marks "
+                           "the picks that do on their own.\n");
+                    else if (error.code == ErrorCode::invalid_identity)
+                      emit("Repair refused: a pick is not an original of the skipped "
+                           "frames, or is named twice. /repair --list shows them.\n");
+                    throw;
+                  }
+                }();
+                emit("Repair frame " + string_field(outcome, "revision") +
+                     " accepted; " + unwrap(format_value(field(outcome, "skipped"))) +
+                     " context frames skipped. The session is writable again.\n");
+              }
             } else if (prompt == "/stats") {
               raw_main_branch(dispatch, 30);
               emit(unwrap(dump_json(engine.stats())) + "\n");
@@ -1152,6 +1907,18 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               auto candidate = session_store.settings();
               candidate.model = prompt.substr(7);
               const auto levels = prepare_route(candidate, command_context);
+              // A model the profiles cannot resolve is refused before it is saved.
+              if (const auto *pinned = engine.session_profiles();
+                  pinned && pinned->binding)
+                if (const auto resolved = resolve_binding(
+                        *pinned->set, *pinned->binding, candidate.model,
+                        pinned->session_override ? &*pinned->session_override
+                                                 : nullptr);
+                    !resolved.has_value()) {
+                  emit("Provider profile refused for model " + candidate.model + ": " +
+                       resolved.error().message() + "\n");
+                  throw Error{ErrorCode::invalid_range};
+                }
               session_store.save(candidate, &command_context);
               engine.model(candidate.model);
               model = candidate.model;
@@ -1250,6 +2017,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             ui.failed();
           emit("\n" + std::string{error_name(e.code)} + " (" +
                std::to_string(e.detail) + "); context/audit retained\n");
+          if (context.read_only())
+            emit("The session is read-only after context frame " +
+                 context.open_report().bad_revision +
+                 " did not apply. /repair [ENTRY...] approves a repair frame.\n");
           if (root->maintenance_error())
             emit("Saved-state maintenance failed (" +
                  std::string{error_name(root->maintenance_error()->code)} +
@@ -1280,7 +2051,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       startup->outcome(RawRegionOutcome::ready);
       startup->finish();
     }
+    // A requested termination outranks a restart handoff: no successor runs. A
+    // restart this process recorded stays pending (the guard takes no snapshot),
+    // and the next open reports it.
     auto finish_interactive = [&] {
+      if (termination_requested())
+        return terminated_status;
       if (!restart_pending.load())
         return 0;
       if (!switched_session)
@@ -1314,9 +2090,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       return 75;
     };
     if (!station_path.empty()) {
+      constexpr std::string_view supervisor_stop_reason = "stopped: SIGTERM";
       // Explicit local file adapter; the existing synchronous owner/cadence stays.
       RawSessionCall station_call{4620, 4621, &session_capture};
-      return station_call.run([&] {
+      const auto station_status = station_call.run([&] {
         const auto station_context = station_call.context();
         station_call.stage(1);
         std::error_code absolute_error;
@@ -1484,8 +2261,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         };
         // A station never performs the ordinary implicit restart continue turn.
         resume_turn = false;
+        // An event admitted and not yet finished, or finished without a return,
+        // stays "unknown": the reopen pauses on it, so a stop publishes "blocked".
+        bool event_open = false, event_left_unknown = false;
         try {
-          while (!interrupted.load(std::memory_order_relaxed)) {
+          while (!interrupted.load(std::memory_order_relaxed) &&
+                 !termination_requested()) {
             station_call.stage(4);
             const auto control_path = native_path(adapter, "control.json", 6);
             if (filesystem(control_path, false)) {
@@ -1522,6 +2303,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   RawEventRef admission{};
                   if (!station.admit(event, &parsed.second, &admission))
                     continue;
+                  event_open = true;
                   log.original(
                       {"station.file-input", bytes,
                        Value::object({{"path", Value{path_text(station_call,
@@ -1557,6 +2339,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   }
                   station_call.stage(14);
                   station.finish(event, returned, &station_context);
+                  event_open = false;
+                  event_left_unknown = event_left_unknown || !returned;
                   station_call.stage(15);
                   refresh_info(session_capture);
                   if (returned)
@@ -1579,29 +2363,60 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         } catch (...) {
           station_call.require_capture();
           if (root->state() == JournalWriterState::live) {
-            station.pause("native-stop: operator interrupt or adapter failure",
-                          &station_context);
-            publish("blocked");
+            // The interrupt a SIGTERM raised is a supervisor stop, not an
+            // operator interrupt: recorded, no pause, so the station resumes on
+            // reopen. Any other failure keeps its own outcome, a pause.
+            bool supervisor = false;
+            try {
+              std::rethrow_exception(std::current_exception());
+            } catch (const Error &error) {
+              supervisor =
+                  error.code == ErrorCode::interrupted && termination_requested();
+            } catch (...) {
+            }
+            if (supervisor) {
+              settle_termination();
+              station.supervisor_stop(supervisor_stop_reason, &station_context);
+              publish(event_open || event_left_unknown ? "blocked" : "stopped");
+            } else {
+              station.pause("native-stop: operator interrupt or adapter failure",
+                            &station_context);
+              publish("blocked");
+            }
           }
           throw;
         }
-        if (interrupted.load(std::memory_order_relaxed))
+        if (termination_requested()) {
+          settle_termination();
+          station.supervisor_stop(supervisor_stop_reason, &station_context);
+        } else if (interrupted.load(std::memory_order_relaxed))
           station.pause("native-stop: operator interrupt or adapter failure",
                         &station_context);
         station_call.stage(18);
-        publish(restart_pending.load() ? "restart" : "stopped");
+        publish(restart_pending.load()                          ? "restart"
+                : termination_requested() && event_left_unknown ? "blocked"
+                                                                : "stopped");
         return restart_pending.load() ? 75 : 0;
       });
+      // SIGTERM ends the station loop as SIGINT does (the interrupt is set).
+      return clean_stop.arm(termination_requested() ? terminated_status
+                                                    : station_status);
     }
     if (one) {
       perform(resume_turn ? "continue" : once);
       write_plain_output(STDOUT_FILENO, PlainOutputKind::newline,
                          std::array<std::string_view, 1>{"\n"}, &session_capture);
-      return restart_pending.load() ? 75 : 0;
+      return clean_stop.arm(termination_requested()  ? terminated_status
+                            : restart_pending.load() ? 75
+                                                     : 0);
     }
+    // The open is over: commands while read-only are ordinary writes.
+    reserved_open.release();
     bool participant_retention_failed = false, command_retention_failed = false;
     if (tui) {
       ui.notice("/help lists commands. Workflow reloads each turn.\n");
+      if (!reopen_notice.empty())
+        ui.notice(reopen_notice);
       for (const auto &item : context.items()) {
         const auto *role = item.find("role");
         if (!role || !std::holds_alternative<std::string>(role->value()))
@@ -1664,7 +2479,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         } joined{handoff};
         ui.run(
             perform, cancelled,
-            [&] { return restart_pending.load() || new_pending.load(); },
+            [&] {
+              return restart_pending.load() || new_pending.load() ||
+                     termination_requested();
+            },
             std::string{initial}, session / "ui-state.bbm",
             [&] {
               try {
@@ -1689,7 +2507,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             [&] { return interrupt_owner.reset(); }, root.get(), center_context,
             std::move(instrument_source));
       });
-      return finish_interactive();
+      return clean_stop.arm(finish_interactive());
     }
     if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
       for (const auto &line : blackbird_startup(80, 24, false))
@@ -1705,8 +2523,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     bool deferred_resume = resume_requested && settings.effort_pending;
     if (resume_turn)
       perform("continue");
-    if (restart_pending.load() || new_pending.load())
-      return finish_interactive();
+    if (restart_pending.load() || new_pending.load() || termination_requested())
+      return clean_stop.arm(finish_interactive());
     std::string pending_input;
     bool input_eof = false;
     auto read_line = [&](std::string &result) {
@@ -1715,6 +2533,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           unwrap(interrupt_owner.reset());
       };
       for (;;) {
+        // After SIGTERM the loop reads nothing more, buffered or not.
+        if (termination_requested())
+          return false;
         // This reader owns no foreground work. An idle SIGINT retires its old
         // wake incarnation before acquiring another input or buffered command.
         rearm_idle();
@@ -1811,21 +2632,28 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         if (part == "/send")
           raw_main_control(&session_capture, 4, part);
       }
+      if (termination_requested())
+        break;
       cancelled.store(false);
       perform(line);
-      if (restart_pending.load() || new_pending.load())
+      if (restart_pending.load() || new_pending.load() || termination_requested())
         break;
       if (deferred_resume && !session_store.settings().effort_pending) {
         deferred_resume = false;
         perform("continue");
-        if (restart_pending.load() || new_pending.load())
+        if (restart_pending.load() || new_pending.load() || termination_requested())
           break;
       }
     }
-    return finish_interactive();
+    return clean_stop.arm(finish_interactive());
 
   } catch (const Error &e) {
     std::cerr << "blackbird: " << error_name(e.code) << " (" << e.detail << ").\n";
+    // The interrupt SIGTERM raised, unwinding a turn or the TUI loop as SIGINT's
+    // does, is the stop itself. OrderlyErrors marked it, so the guard has
+    // already run under the same rules as for a clean return.
+    if (e.code == ErrorCode::interrupted && termination_requested())
+      return terminated_status;
     return 1;
   } catch (const std::exception &e) {
     std::cerr << "blackbird: " << safe(e.what()) << '\n';
@@ -1834,6 +2662,24 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
 }
 
 int main(int argc, char **argv) {
+  // scripts/blackbird starts this process as an asynchronous child, which POSIX
+  // shells start with SIGINT and SIGQUIT ignored. The wrapper marks that child;
+  // undo exactly that, so Ctrl-C and Ctrl-\ act as without the wrapper and no
+  // spawned program inherits the ignore. An ignore from any other parent stays.
+  // The marker is not passed on.
+  if (std::getenv("BLACKBIRD_WRAPPED_CHILD") != nullptr) {
+    (void)::unsetenv("BLACKBIRD_WRAPPED_CHILD");
+    for (const int number : {SIGINT, SIGQUIT}) {
+      struct sigaction current{};
+      if (::sigaction(number, nullptr, &current) == 0 &&
+          current.sa_handler == SIG_IGN) {
+        struct sigaction fallback{};
+        fallback.sa_handler = SIG_DFL;
+        sigemptyset(&fallback.sa_mask);
+        (void)::sigaction(number, &fallback, nullptr);
+      }
+    }
+  }
   if (argc > 1 && std::string_view{argv[1]} == "auth")
     return provider_auth_cli(argc - 1, argv + 1);
   if (argc > 1 && std::string_view{argv[1]} == "--application") {
@@ -1878,6 +2724,14 @@ int main(int argc, char **argv) {
       RawSuccessorHandoff handoff;
       const auto status = run_session(
           argc, argv, {.next = next_session, .fallback = fallback_session}, &handoff);
+      // A SIGTERM'd session ends the process: no return to a previous session
+      // and no successor. A clean or restart status means the session finished
+      // before or during the stop; either way the process exits terminated, so
+      // a wrapper never relaunches after a SIGTERM.
+      if (termination_requested()) {
+        std::cerr << "blackbird: stopped by SIGTERM.\n";
+        return status == 0 || status == 75 ? terminated_status : status;
+      }
       if (status != 0 && status != 75) {
         if (return_session.empty())
           return status;
@@ -1895,6 +2749,11 @@ int main(int argc, char **argv) {
         arguments.push_back(argument.data());
       arguments.push_back(nullptr);
       if (status == 75) {
+        // A SIGTERM after the check above still prevents the successor.
+        if (termination_requested()) {
+          std::cerr << "blackbird: stopped by SIGTERM.\n";
+          return terminated_status;
+        }
         // Use the current directory even after /new, and load the published binary.
         (void)handoff.execute(arguments);
         std::cerr << "blackbird: cannot restart current session (" << errno << ")\n";

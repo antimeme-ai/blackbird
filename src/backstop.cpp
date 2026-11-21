@@ -5,6 +5,7 @@
 #include "blackbird/raw_session.hpp"
 #include "blackbird/raw_storage.hpp"
 #include <limits.h>
+#include <map>
 
 #include <set>
 #include <sys/random.h>
@@ -140,7 +141,7 @@ bool filesystem_predicate(RawSessionCall &owner, std::uint8_t method,
   });
 }
 constexpr std::string_view assessment = R"lua(
-local response = blackbird.request({tools=blackbird.array({}), retry_policy={max_attempts=1}})
+local response = blackbird.request({tools=blackbird.array({}), state_context='omit', retry_policy={max_attempts=1}})
 local text = ''
 for _, item in ipairs(response.output) do
   if item.type == 'function_call' then error('Assessment must not dispatch tools') end
@@ -278,6 +279,23 @@ Value run_backstop(CodingEngine &source_engine, AuditLog &source_log,
                           "inherited admissions"}}});
     Value::Array selected;
     const auto view = source_engine.context().view(RawContextOrigin{whole.reference()});
+    // Each selected entry carries its source unit, so the successor keeps the
+    // predecessor's units (unit S2) whatever records they now share.
+    std::map<std::string, std::string> unit_of;
+    {
+      const auto &live = field(view, "entries").array();
+      for (const auto &unit :
+           source_engine.context().units(RawContextOrigin{whole.reference()}))
+        for (const auto position : unit.entries)
+          unit_of.emplace(string_field(live[position], "id"), entry_id(unit.key));
+    }
+    const auto with_unit = [&](const Value &entry) {
+      auto copy = entry;
+      if (const auto found = unit_of.find(string_field(entry, "id"));
+          found != unit_of.end())
+        copy.object().emplace_back("unit", Value{found->second});
+      return copy;
+    };
     // Preserve all governing messages and the latest operator prompt, not the huge
     // predecessor working presentation. Refuse oversized authority, never truncate.
     const auto &entries = field(view, "entries").array();
@@ -291,12 +309,12 @@ Value run_backstop(CodingEngine &source_engine, AuditLog &source_log,
         continue;
       (void)source(whole, 15, role->string());
       if (role->string() == "system" || role->string() == "developer")
-        selected.push_back(entry);
+        selected.push_back(with_unit(entry));
       if (role->string() == "user")
         last_user = &entry;
     }
     if (predicate(whole, 44, [&] { return last_user != nullptr; }))
-      selected.push_back(*last_user);
+      selected.push_back(with_unit(*last_user));
     if (predicate(whole, 5, [&] { return selected.empty(); }) ||
         predicate(whole, 6,
                   [&] { return encoded(whole, 4, Value{selected}).size() > 65536; }))
@@ -404,6 +422,18 @@ Value run_backstop(CodingEngine &source_engine, AuditLog &source_log,
                            std::move(restore_credit)};
     CodingEngine engine{log, context, assessor, settings.model};
     engine.effort(settings.effort);
+    // The backstop's journal records the session's profile set, and its requests the
+    // profile each resolves to; a refusal is reported, not only its error code.
+    if (const auto *profiles = source_engine.session_profiles()) {
+      if (profiles->set_record != Value{})
+        log.record(ApplicationChannel::program, profiles->set_record);
+      if (const auto pinned = engine.profiles(*profiles); !pinned.has_value()) {
+        if (display)
+          display("\n[backstop: provider profile refused: " + pinned.error().message() +
+                  "]\n");
+        throw Error{ErrorCode::invalid_range};
+      }
+    }
     // Bound even a selected Lua action that loops without making progress. The
     // ordinary VM interrupt hook and transport cancellation consume this deadline.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);

@@ -1,4 +1,5 @@
 #include "blackbird/tools.hpp"
+#include "blackbird/json.hpp"
 #include "blackbird/raw_file.hpp"
 #include "native_process.hpp"
 #include <charconv>
@@ -228,6 +229,164 @@ std::size_t observation_prefix_size(std::string_view raw, std::size_t budget) {
   }
   return end;
 }
+namespace {
+// Where a tail of tail_budget bytes starts (tail_budget <= raw.size()): on a character
+// boundary, and at a line start when one is within 256 bytes and keeps half the tail.
+std::size_t observation_tail_start(std::string_view raw, std::size_t tail_budget) {
+  auto start = raw.size() - tail_budget;
+  auto boundary = start;
+  while (boundary < raw.size() &&
+         (static_cast<unsigned char>(raw[boundary]) & 0xc0U) == 0x80U)
+    ++boundary;
+  if (!valid_utf8(raw.substr(boundary)))
+    return start; // Actual binary, not a split leading character.
+  start = boundary;
+  const auto lf = raw.find('\n', start);
+  if (lf != std::string_view::npos && lf + 1 - start <= 256 &&
+      raw.size() - (lf + 1) >= tail_budget / 2)
+    start = lf + 1;
+  return start;
+}
+// JSON text from dump_json escapes only \" \\ and \u00XX. A cut inside one of them
+// would split one character of the represented string. Returns the half-open escape
+// that position falls strictly inside, or position twice.
+std::pair<std::size_t, std::size_t> json_escape_around(std::string_view text,
+                                                       std::size_t position) {
+  for (auto at = position > 5 ? position - 5 : std::size_t{0}; at < position; ++at) {
+    if (text[at] != '\\')
+      continue;
+    std::size_t run = 0; // Backslashes before at: an odd run makes at an escaped one.
+    while (run < at && text[at - 1 - run] == '\\')
+      ++run;
+    if (run % 2 != 0)
+      continue;
+    const std::size_t length = at + 1 < text.size() && text[at + 1] == 'u' ? 6 : 2;
+    if (at + length > position)
+      return {at, std::min(at + length, text.size())};
+  }
+  return {position, position};
+}
+} // namespace
+ResultShape result_shape(const Value &keys) {
+  constexpr std::size_t limit = 16 * 1024 * 1024, tail = 12288;
+  const auto number = [&](std::string_view key) {
+    const auto value = range_index(keys, key, 0);
+    if (value > limit)
+      throw Error{ErrorCode::invalid_range};
+    return value;
+  };
+  ResultShape shape;
+  const bool max = keys.find("output_max_bytes") != nullptr;
+  if (max) {
+    shape.max_bytes = number("output_max_bytes");
+    shape.head_bytes.reset();
+  }
+  if (keys.find("output_head_bytes")) {
+    const auto head = number("output_head_bytes");
+    if (max ? head > shape.max_bytes : head > limit - tail)
+      throw Error{ErrorCode::invalid_range};
+    // A head alone keeps the default tail after it, as exec's does.
+    if (!max)
+      shape.max_bytes = std::max(ResultShape{}.max_bytes, head + tail);
+    shape.head_bytes = head;
+  }
+  return shape;
+}
+std::string result_text(const Value &result) {
+  if (const auto *text = std::get_if<std::string>(&result.value());
+      text && valid_utf8(*text))
+    return *text;
+  return unwrap(dump_json(result, result_text_limits));
+}
+namespace {
+// The half-open omitted range of a text over its budget: the head ends and the tail
+// starts on character boundaries (preferring a nearby LF) and, in JSON text, never
+// inside an escape sequence.
+std::pair<std::size_t, std::size_t> generic_cut(std::string_view text, bool json,
+                                                const ResultShape &shape) {
+  auto head_end =
+      observation_prefix_size(text, shape.head_bytes.value_or(shape.max_bytes));
+  auto tail_start = text.size();
+  if (shape.head_bytes && shape.max_bytes > *shape.head_bytes)
+    tail_start = observation_tail_start(text, shape.max_bytes - *shape.head_bytes);
+  if (json) {
+    head_end = json_escape_around(text, head_end).first;
+    tail_start = json_escape_around(text, tail_start).second;
+  }
+  return {head_end, tail_start};
+}
+std::string generic_compose(std::string_view text, std::size_t head_end,
+                            std::size_t tail_start, std::string_view result_ref) {
+  const auto from = std::to_string(head_end), to = std::to_string(tail_start);
+  std::string shaped;
+  shaped.reserve(head_end + (text.size() - tail_start) + 224 + result_ref.size());
+  shaped.append(text.substr(0, head_end));
+  shaped.append("\n[... bytes [" + from + "," + to + ") of " +
+                std::to_string(text.size()) +
+                " omitted; read_process_output with result_ref ");
+  shaped.append(result_ref);
+  shaped.append(" and range {mode: bytes, start: " + from + ", end: " + to +
+                "} pages them, 8192 bytes each with next_read ...]\n");
+  shaped.append(text.substr(tail_start));
+  return shaped;
+}
+} // namespace
+std::string generic_presentation(std::string_view text, bool json,
+                                 const ResultShape &shape,
+                                 std::string_view result_ref) {
+  if (text.size() <= shape.max_bytes)
+    return std::string{text};
+  const auto [head_end, tail_start] = generic_cut(text, json, shape);
+  return generic_compose(text, head_end, tail_start, result_ref);
+}
+ShapedResult shape_result(const Value &result, const ResultShape &shape,
+                          std::string_view result_ref) {
+  auto summary = Value::object({{"max_bytes", Value{Number{shape.max_bytes}}}});
+  if (shape.head_bytes)
+    summary.object().emplace_back("head_bytes", Value{Number{*shape.head_bytes}});
+  summary.object().emplace_back(
+      "tail_bytes", Value{Number{shape.head_bytes ? shape.max_bytes - *shape.head_bytes
+                                                  : std::size_t{0}}});
+  const auto finish = [&](const std::string_view text, bool json) -> ShapedResult {
+    summary.object().emplace_back("text_bytes", Value{Number{text.size()}});
+    std::string cut;
+    std::pair<std::size_t, std::size_t> omitted{};
+    if (text.size() > shape.max_bytes) {
+      omitted = generic_cut(text, json, shape);
+      cut = generic_compose(text, omitted.first, omitted.second, result_ref);
+    }
+    // A cut no shorter than the text it replaces saves nothing (marker included).
+    if (cut.empty() || cut.size() >= text.size()) {
+      summary.object().emplace_back("whole", Value{true});
+      return {result, std::move(summary)};
+    }
+    summary.object().emplace_back(
+        "omitted", Value::object({{"start", Value{Number{omitted.first}}},
+                                  {"end", Value{Number{omitted.second}}}}));
+    summary.object().emplace_back("result_ref", Value{std::string{result_ref}});
+    return {Value{std::move(cut)}, std::move(summary)};
+  };
+  if (const auto *text = std::get_if<std::string>(&result.value());
+      text && valid_utf8(*text))
+    return finish(*text, false);
+  auto json = dump_json(result, result_text_limits);
+  if (json.has_value())
+    return finish(json.value(), true);
+  // No provider text exists for it: the provider export would refuse it on every
+  // later request. The model gets the reason; the original stays retained.
+  const auto reason = std::string{error_name(json.error().code)};
+  return {Value::object(
+              {{"error", Value{"result_text_unavailable"}},
+               {"reason", Value{reason}},
+               {"result_ref", Value{std::string{result_ref}}},
+               {"detail", Value{"This result has no text form within the provider "
+                                "limits (" +
+                                std::to_string(result_text_limits.bytes) + " bytes, " +
+                                std::to_string(result_text_limits.nodes) +
+                                " JSON nodes); its original is retained under "
+                                "result_ref for audit_inspect."}}}),
+          Value::object({{"error", Value{reason}}})};
+}
 Value file_content_presentation(const std::string &raw, const Value &args,
                                 RawFileToolTrace *trace) {
   const auto budget = range_index(args, "output_max_bytes", SIZE_MAX);
@@ -273,19 +432,7 @@ Value process_output_presentation(const std::string &raw, const Value &args) {
   auto tail_start = selected.size();
   if (args.find("output_head_bytes") && selected.size() > budget) {
     head_end = observation_prefix_size(selected, head_budget);
-    const auto tail_budget = budget - head_budget;
-    tail_start = selected.size() - tail_budget;
-    auto boundary = tail_start;
-    while (boundary < selected.size() &&
-           (static_cast<unsigned char>(selected[boundary]) & 0xc0U) == 0x80U)
-      ++boundary;
-    if (valid_utf8(selected.substr(boundary))) {
-      tail_start = boundary;
-      const auto lf = selected.find('\n', tail_start);
-      if (lf != std::string_view::npos && lf + 1 - tail_start <= 256 &&
-          selected.size() - (lf + 1) >= tail_budget / 2)
-        tail_start = lf + 1;
-    }
+    tail_start = observation_tail_start(selected, budget - head_budget);
   }
   const auto head = selected.substr(0, head_end);
   const auto tail = selected.substr(tail_start);
@@ -320,9 +467,14 @@ Value process_output_presentation(const std::string &raw, const Value &args) {
         "omitted_range", Value::object({{"start", Value{Number{first + head_end}}},
                                         {"end", Value{Number{first + tail_start}}}}));
   }
-  if (const auto *reference = args.find("output_ref")) {
-    result.object().emplace_back("output_ref", *reference);
-    if (head_end < tail_start || first + selected.size() < raw.size()) {
+  // A shaped result's original pages exactly like a process output (T1).
+  const auto *reference_key = args.find("result_ref") ? "result_ref" : "output_ref";
+  if (const auto *reference = args.find(reference_key)) {
+    result.object().emplace_back(reference_key, *reference);
+    // A result_ref read pages only its selection: the marker's range ends where the
+    // tail the model already holds begins.
+    const bool within = std::string_view{reference_key} == "result_ref";
+    if (head_end < tail_start || (!within && first + selected.size() < raw.size())) {
       const auto next = first + head_end;
       const auto stop = head_end < tail_start ? first + tail_start : raw.size();
       const auto page_size = observation_prefix_size(
@@ -332,7 +484,7 @@ Value process_output_presentation(const std::string &raw, const Value &args) {
           Value::object(
               {{"tool", Value{"read_process_output"}},
                {"arguments",
-                Value::object({{"output_ref", *reference},
+                Value::object({{reference_key, *reference},
                                {"byte_start", Value{Number{next}}},
                                {"byte_end", Value{Number{next + page_size}}}})}}));
     }
@@ -499,7 +651,7 @@ Value LocalTools::run(std::string_view name, const Value &args,
   throw Error{ErrorCode::unsupported};
 }
 Value tool_definitions() {
-  return Value{Value::Array{
+  auto tools = Value{Value::Array{
       Value::object(
           {{"type", Value{"function"}},
            {"name", Value{"participant_read"}},
@@ -864,7 +1016,14 @@ Value tool_definitions() {
                   "parameters, source function body with args). Activates only on "
                   "successful workflow boundary; failed/invalid definitions preserve "
                   "effective registry. No native name replacement. Optional base binds "
-                  "effective registry revision."}},
+                  "effective registry revision. Optional definition.shape "
+                  "{output_max_bytes, output_head_bytes} cuts the tool's result when "
+                  "it answers your own call (default 16384 text bytes: 4096 head + "
+                  "12288 tail with result_ref, whole when the cut would not be "
+                  "shorter; budgets at most 16777216 text bytes, a head alone keeping "
+                  "a tail of max(12288, 16384 minus head), as read_process_output "
+                  "describes); argument names never shape and calls from programs "
+                  "return whole results."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
@@ -888,9 +1047,9 @@ Value tool_definitions() {
            {"description",
             Value{"Read exactly one of path (current disk) or snapshot (retained "
                   "original from a prior read; no disk access). Full originals are "
-                  "retained. Default coding workflow returns at most16384 raw bytes "
-                  "unless a range or output_max_bytes is explicit; custom Lua defaults "
-                  "to full content. Budget cuts respect UTF-8 and nearby newlines; "
+                  "retained. Returns at most 16384 raw bytes unless a range or "
+                  "output_max_bytes is explicit. Budget cuts respect UTF-8 and nearby "
+                  "newlines; "
                   "byte_start/byte_end are actual half-open offsets. "
                   "output_max_bytes limits the selected range; "
                   "file_bytes/selected_bytes/returned_bytes/omitted_bytes describe "
@@ -1050,8 +1209,9 @@ Value tool_definitions() {
                 "deadline returns timed_out=true and effect_outcome=unknown after "
                 "local child-group cleanup, with output_ref for partial output; "
                 "inspect it and choose a distinct retry or another approach. Operator "
-                "cancellation stops the turn. Default workflow: 8192 raw bytes, "
-                "2048 head + 6144 tail. Explicit output_max_bytes keeps head-first "
+                "cancellation stops the turn. Default: 8192 raw bytes, "
+                "2048 head + 6144 tail; output_head_bytes alone keeps the 6144-byte "
+                "tail after a larger head. Explicit output_max_bytes keeps head-first "
                 "paging unless output_head_bytes selects a head/tail split. Cuts "
                 "respect UTF-8/nearby newlines; "
                 "byte_start/byte_end report actual offsets. Full originals remain "
@@ -1097,7 +1257,10 @@ Value tool_definitions() {
            {"description",
             Value{"Inspect/control the original command job. op read lists jobs or "
                   "reads a bounded absolute byte cursor; foreground waits without "
-                  "relaunch or deadline renewal, optional yield_ms. background "
+                  "relaunch or deadline renewal, optional yield_ms, and returns "
+                  "output shaped like exec (default 8192 bytes; for foreground only, "
+                  "output_max_bytes and output_head_bytes select more or a split). "
+                  "background "
                   "releases only its current wait. input requires PTY, exact bytes and "
                   "request_id; the same identity/content is never written twice, "
                   "conflicting reuse fails. resize uses rows/columns. signal names "
@@ -1120,6 +1283,10 @@ Value tool_definitions() {
                        {"bytes", Value::object({{"type", Value{"string"}}})},
                        {"signal", Value::object({{"type", Value{"string"}}})},
                        {"yield_ms", Value::object({{"type", Value{"integer"}}})},
+                       {"output_max_bytes",
+                        Value::object({{"type", Value{"integer"}}})},
+                       {"output_head_bytes",
+                        Value::object({{"type", Value{"integer"}}})},
                        {"offset", Value::object({{"type", Value{"integer"}}})},
                        {"count", Value::object({{"type", Value{"integer"}}})},
                        {"rows", Value::object({{"type", Value{"integer"}}})},
@@ -1137,10 +1304,30 @@ Value tool_definitions() {
                 "output_ref from exec identifies audited attempt, also after reopen. "
                 "Use range {mode:lines,start:1,end:20} (one-based inclusive) or "
                 "{mode:bytes,start:0,end:256} (half-open); legacy byte_start/byte_end "
-                "still work, never mix selectors. Missing end means EOF. "
+                "still work, never mix selectors. Missing end means EOF. Without a "
+                "range or output_max_bytes it returns 8192 raw bytes, 2048 head + "
+                "6144 tail; next_read appears whenever bytes are omitted. "
                 "Optional output_max_bytes pages on UTF-8/nearby line boundaries. "
                 "Results report actual byte offsets and next_read. Explicit byte "
-                "slices stay exact, including hex for binary/split UTF-8."}},
+                "slices stay exact, including hex for binary/split UTF-8. Your own "
+                "call's result is shaped once: exec, process, read_process_output "
+                "and read_file shape as described; write_file, edit_file, "
+                "context_inspect, audit_inspect, trajectory_read, variables_read, "
+                "tasks_read and git_observe bound their own output; every other "
+                "tool's result whose text (a string as is, else its JSON) exceeds "
+                "16384 bytes returns its first 4096 and last 12288 bytes around a "
+                "marker naming the omitted range and result_ref (a Lua-defined "
+                "tool by its definition's shape), unless that cut would not be "
+                "shorter, when it comes back whole. On those tools output_max_bytes "
+                "(at most 16777216 text bytes) alone keeps a head, output_head_bytes "
+                "splits it with a tail of the rest, and alone keeps a tail of "
+                "16384 minus the head for a head under 4096, else 12288. Called "
+                "inside lua code or a workflow, these tools return whole results. "
+                "Pass result_ref instead of output_ref to page that original text "
+                "like output_ref: 8192 bytes per page from range start (a head alone "
+                "keeps a 6144-byte tail) unless output_max_bytes (at most 16777216) "
+                "asks for more; next_read pages within the range only. A result "
+                "with no text form has no pages (unsupported)."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
@@ -1167,12 +1354,16 @@ Value tool_definitions() {
                        {"output_max_bytes",
                         Value::object({{"type", Value{"integer"}},
                                        {"minimum", Value{Number{0}}}})},
+                       {"output_head_bytes",
+                        Value::object({{"type", Value{"integer"}},
+                                       {"minimum", Value{Number{0}}}})},
                        {"output_ref", Value::object({{"type", Value{"string"}}})},
+                       {"result_ref", Value::object({{"type", Value{"string"}}})},
                        {"byte_start", Value::object({{"type", Value{"integer"}},
                                                      {"minimum", Value{Number{0}}}})},
                        {"byte_end", Value::object({{"type", Value{"integer"}},
                                                    {"minimum", Value{Number{0}}}})}})},
-                 {"required", Value{Value::Array{Value{"output_ref"}}}}})}}),
+                 {"required", Value{Value::Array{}}}})}}),
       Value::object(
           {{"type", Value{"function"}},
            {"name", Value{"variables_read"}},
@@ -1369,9 +1560,11 @@ Value tool_definitions() {
           {{"type", Value{"function"}},
            {"name", Value{"context_edit"}},
            {"description",
-            Value{"Publish candidate {base,entries:[{id,item}]} with CAS. Reorder, "
-                  "replace or remove entries. Retained originals are immutable. Keep "
-                  "active tool call/result pairs in context."}},
+            Value{"Publish candidate {base,entries:[{id,item[,ancestry]}]} with CAS. "
+                  "Reorder, replace or remove entries. A new or changed entry has only "
+                  "id, item and an array ancestry; an entry identical to the current "
+                  "one passes as it is. Retained originals are immutable. Keep active "
+                  "tool call/result pairs in context."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
@@ -1386,9 +1579,20 @@ Value tool_definitions() {
             Value{
                 "Explicit managed summarize/select/archive/restore. Proposal: optional "
                 "base (omitted explicitly binds invocation snapshot; supplied is "
-                "strict CAS), mode, ids (complete tool groups), reason, source; "
+                "strict CAS), mode, ids (whole units), reason, source; "
                 "summarize also summary {role:assistant or developer,content}. "
-                "Preserves all live user/system/developer instructions. Stages until "
+                "Never archives, summarizes or leaves out instructions (operator "
+                "prompts, restart notes, the built-in ultracode brief, appends "
+                "declared class instruction, and user/system/developer entries of "
+                "Lua appends from before units) or pinned units, except that an "
+                "older byte-identical copy of an instruction repeated later may be "
+                "archived or left out by select; other workflow briefs, external "
+                "data and tool results are not instructions. ids "
+                "cover whole units: a response round (reasoning, messages, calls and "
+                "the outputs that answer them, wherever those sit) goes together. "
+                "A refusal names partial-tool-group or partial-round, else the first "
+                "unit in context order that is protected-unit, pinned-unit or "
+                "partial-unit. Stages until "
                 "successful workflow completion; appended current tool exchange is "
                 "retained. One pending; failed/interrupted workflows cancel. "
                 "Structural acceptance does not certify accuracy."}},
@@ -1475,10 +1679,29 @@ Value tool_definitions() {
            {"name", Value{"lua"}},
            {"description",
             Value{"Run a Lua transformation or experiment in the current workflow. "
-                  "blackbird.context(), blackbird.stats(), blackbird.edit(candidate), "
+                  "blackbird.context(), blackbird.stats(), blackbird.edit(candidate) "
+                  "(entries as context_edit), "
                   "blackbird.originals(), blackbird.restore(id), "
-                  "blackbird.append(items), blackbird.json.encode/decode, "
-                  "blackbird.call(name,args) are available. Return a native value. "
+                  "blackbird.append(items[, {class='instruction'}]) (context_manage "
+                  "never archives an instruction, except that an older copy of one "
+                  "repeated byte-identically later may be archived or left out by "
+                  "select; messages default to class "
+                  "result; an append of function calls or reasoning takes no class "
+                  "and is a round, atomic with the outputs answering its calls), "
+                  "blackbird.json.encode/decode, "
+                  "blackbird.live_instruction(item) (true when a live entry whose "
+                  "creating record makes it an instruction holds an item equal to "
+                  "item, object key order ignored at every depth; a result entry "
+                  "does not count), "
+                  "blackbird.call(name,args[, {call_id=ID}]) are available; calls "
+                  "inside the code get whole results (exec, process and file reads "
+                  "keep their own defaults), only this tool's own result is shaped. "
+                  "A program relaying a model function call declares its call_id: "
+                  "the result is then shaped as the model's own (an unknown or "
+                  "answered call_id is refused, not run). Undeclared, a relayed call "
+                  "is shaped only if its name and arguments equal an undispatched "
+                  "model call, and only until the turn's first declaration; "
+                  "otherwise its whole result enters context. Return a native value. "
                   "JSON encode/decode is explicit interchange only. Governing workflow "
                   "file changes activate next turn."}},
            {"parameters",
@@ -1488,5 +1711,28 @@ Value tool_definitions() {
                   Value::object(
                       {{"code", Value::object({{"type", Value{"string"}}})}})},
                  {"required", Value{Value::Array{Value{"code"}}}}})}})}};
+  // Budget properties only where a long answer is expected (T1, measured bytes in
+  // the journal); every generic tool honours the keys when they are supplied.
+  for (auto &tool : tools.array()) {
+    const auto &name = string_field(tool, "name");
+    if (name != "colleague" && name != "participant_read" &&
+        name != "participant_await" && name != "participant_join" &&
+        name != "workflow_invoke" && name != "lua")
+      continue;
+    for (auto &[key, value] : tool.object()) {
+      if (key == "description")
+        value = Value{value.string() +
+                      " Over 16384 bytes: 4096 head + 12288 tail with result_ref; "
+                      "budget keys as read_process_output describes."};
+      else if (key == "parameters")
+        for (auto &[part, schema] : value.object())
+          if (part == "properties")
+            for (const auto *budget : {"output_max_bytes", "output_head_bytes"})
+              schema.object().emplace_back(
+                  budget, Value::object({{"type", Value{"integer"}},
+                                         {"minimum", Value{Number{0}}}}));
+    }
+  }
+  return tools;
 }
 } // namespace blackbird

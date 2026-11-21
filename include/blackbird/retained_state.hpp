@@ -9,6 +9,7 @@
 
 namespace blackbird {
 struct SavedState;
+struct SavedStateLoad;
 struct RawEventRef;
 class RawCapacityClaim;
 class ArchiveCatalog;
@@ -77,6 +78,12 @@ public:
       return Result<void>::failure({ErrorCode::audit_unavailable});
     return journal_->publish_scan_checkpoint();
   }
+  // Live, reconciled, and no transaction or prepared state open: a derived
+  // snapshot taken now covers exactly the committed journal.
+  bool quiescent() const noexcept {
+    return state() == JournalWriterState::live && !in_transaction_ && !prepared_ &&
+           reconciled_;
+  }
   bool used_scan_checkpoint() const noexcept {
     return journal_->used_scan_checkpoint();
   }
@@ -85,12 +92,20 @@ public:
   // Current projection only. Full ledger replay remains the safe fallback until
   // archive-locator migration covers all semantic predicates.
   const SavedState *saved_state() const noexcept { return saved_.get(); }
+  // What the open's slot load found besides the selected slot: every refused slot
+  // with its reason (a catalogue that does not open included), and the older
+  // accepted slot until the next save overwrites it.
+  const SavedStateLoad &saved_load() const noexcept { return *saved_load_; }
   Result<void> save_current_state(const Value &context);
   RawStorageSelection raw_storage_selection() const noexcept;
   Result<std::unique_ptr<RawRetainedTransfer>>
   prepare_raw_transfer(const RawThreadHandle &child, RawWorkerDispatch dispatch);
   RawRetainedStopBundle *raw_stop_bundle() noexcept { return raw_stop_.get(); }
   bool raw_owner_blocked() const noexcept { return raw_owner_blocked_; }
+  // On the owner thread: settles joined-child debt that a refused owner
+  // admission left (RawRetainedTransfer::joined), as the next
+  // prepare_raw_transfer would. Succeeds at once when the owner is not blocked.
+  Result<void> resume_raw_owner();
 
   Result<void> store_diagnostic(std::string_view name, ByteView bytes,
                                 std::uint64_t now) {
@@ -242,6 +257,7 @@ private:
   friend class RetainedEnvironment;
   friend class CodingEngine;
   friend class ContextStore;
+  friend class AuditLog;
   class MaintenanceScope {
   public:
     explicit MaintenanceScope(RetainedState &owner)
@@ -331,6 +347,8 @@ private:
   Result<IdentityBytes> reserve_identity();
   std::string journal_name_;
   std::unique_ptr<SavedState> saved_;
+  std::unique_ptr<SavedStateLoad> saved_load_;
+  void note_catalogue_fault(unsigned slot, Error error);
   std::shared_ptr<ArchiveCatalog> archive_;
   std::unique_ptr<JournalDirectory> directory_;
   std::vector<std::unique_ptr<FramedJournal>> historical_;

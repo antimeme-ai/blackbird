@@ -11582,6 +11582,225 @@ passes and clang-tidy is clean on src/terminal.cpp. The operator authorized
 stopping the rerun of the whole gate for this mechanical change and committing
 with the per-command hook override; the settled suite is not repeated.
 
+## 2026-10-19 — rebuilt installation; a1v model-managed context begins
+
+Installed generation-0BmneCkH from master 168bb26 with `scripts/install-blackbird
+--update`; its packaging smoke checks pass. `a1v` runs on work/clm-a1v-2026-10-19
+in context/clm-a1v, with a beads redirect to the main database and the pinned
+tui-test tool installed explicitly. Plan: papers/clm-a1v-2026-10-19/PLAN.md.
+
+Findings:
+- The CLM mechanism is intact. Engine tests drive model tool calls into
+  `context_manage`, and a real-executable `/lua` managed summarize activates at
+  workflow completion.
+- It is never used. The context budget is off by default, and none of the 39
+  autonomous runs of 2026-10-17 called a context tool.
+- Nothing handles provider overflow.
+- The guide's inspect example would return hex of binary BBM2 pages.
+
+The operator chose C1 (budget on by default), C2 (context size every request), C4
+(compact on overflow) and C5 (a live check on luna). Two read-only research
+passes:
+- REQUEST_SIZES.md measures 762 campaign requests and grounds the C1 defaults at
+  384/192 KiB.
+- OVERFLOW_STUDY.md surveys ten reference agents and recommends option B for C4.
+
+Unit A, the indicator:
+- `ContextStore::changed` reports edits, restores and activated managed
+  proposals, with non-throwing sizes measured around the publication.
+- The TUI badge `◆ CONTEXT compacted −N KiB` blinks for 2 s, holds steady, and
+  clears when the next turn launches.
+
+The review found:
+- a high-severity ordering defect: a size computation that could throw between
+  the journal record and the in-memory swap;
+- chrono overflow from `time_point::min()`;
+- listener cost on headless runs;
+- the badge clearing even when a launch failed;
+- a weak blink oracle;
+- label and width nits.
+All are fixed, and the recheck found none in the fixes.
+
+RED on the old code: the PTY context episode on generation-0BmneCkH. Unit B
+corrects the guide's inspect section and its stale `include/arconaut` anchor;
+`a1v.1` tracks the hex-page ergonomics.
+
+The unit-2 tools episode read rows mid-paint, which showed as a duplicated,
+headerless FG_1 block. Settled reads make it pass 10/10, and it still fails on
+the pre-fold executable. One `tui_retained_result` failure under parallel load is
+noted on `9h5`; it showed two polls in a 4 s wait. The `e8n` note: the size pass
+found HTTP 200 for its 15 requests.
+
+C2 and C1:
+- Every request now carries a `CONTEXT_SIZE` line in its developer operational
+  state. A provider that retains request state gets the line only with the
+  trigger.
+- The budget is enabled by default at 384/192 KiB, from the measured campaign
+  requests.
+
+The review found:
+- **Recorded defaults froze.** The built-in default was snapshotted into
+  boundary records as a session choice, which would have frozen old sessions at
+  "disabled" and new ones at today's numbers. Fixed with a `builtin-default`
+  revision that resolves, along with legacy `initial-disabled`, to the current
+  default on reopen.
+- **Retained size lines.** Stale size lines would ride in retained Anthropic
+  state. Fixed by riding only with the trigger. The older per-request
+  accumulation of tasks and guidance is filed as `arconaut-2o9`.
+- **Backstop.** The backstop assessor was told about tools it lacks; it now omits
+  state.
+- **Test gaps** are closed. The recheck found only a docs wording point.
+
+Exact-request mocks now require the state item through
+`tests/request_state.hpp`; on the old code they raise corrupt. The retention and
+legacy-restore oracles were observed RED with their fixes disabled. Under full
+`-j6` runs in this worktree, `command_jobs`, `turn_raw` and `tui_retained_result`
+each timed out once; each passes alone. Same class as `9h5`.
+
+C4 depends on provider error surfacing that `5st` already built, which is staged
+but unmerged on the campaign-defects line. Proposed order: C5, merge a1v, land
+campaign-defects, then C4. Operator 2026-10-19: a fired overflow recovery is
+audited as a critical error that requires investigation, through the existing
+rageshake complaint.
+
+## 2026-10-19 — C5 live check: luna ignores the budget guidance
+
+Ran C5 on gpt-6-luna (high effort) through the campaign runner, sandboxed, against
+this worktree's Release build at `1f28945`.
+- The runner gained an optional `PRELUDE` launch, which staged a 60/30 KiB policy.
+- The first attempt invoked the runner by a relative path, broke its sandbox
+  profile lookup, and failed in 0 s before any request was made. It was removed
+  and relaunched by absolute path.
+
+The task, a read-heavy trace through a read-only copy of the source, completed
+with FLOW.md written in two launches of 19 requests. The site-1301 wire bodies
+show:
+- the CONTEXT_SIZE line on every request;
+- the trigger guidance on 16 consecutive requests;
+- input growing to 787 KB, 26× the target;
+- no context tool call.
+
+This matches the zero uses across the 39-run campaign: advisory guidance does not
+move this model. Evidence in papers/clm-a1v-2026-10-19/C5_LIVE.md.
+
+Operator decisions:
+- C6 is a harness-initiated, model-authored compaction step, run between tool
+  rounds and especially during tool waits.
+- Per-model-strength briefs are a follow-up (`a1v.2`).
+
+Provider errors are to be consumed and audited in full (`nls.16`, P0), after
+campaign-defects lands. Raw provider bytes need only one copy in a space-bounded
+rolling window. The audit-record shorthand (`nls.17`) is deferred as possibly
+unmotivated. A C6 source study is in progress.
+
+## 2026-10-19 — C6 design reviewed; C6a unit 1: response rounds are atomic
+
+C6 design (papers/clm-a1v-2026-10-19/C6_DESIGN.md) is built from a read-only source
+map (C6_SOURCE_MAP.md) and one adversarial design review. Verdict: proceed with C6a
+and the listed changes; redesign C6b, the compactor during tool waits, separately.
+Operator decisions:
+- C6a now, then C6b with live timing data.
+- Keep the main tool palette only where the provider can grey out other tools
+  natively. Otherwise offer only `context_manage`. Never offer choices that won't be
+  honored.
+
+C6a unit 1 fixes a latent CLM defect the design review found: `manage` kept call
+groups whole but could orphan an OpenAI reasoning item (or Anthropic thinking) from
+its call or message.
+- `whole_rounds` binds a reasoning item to every later entry of its append,
+  rejected as `partial-round`.
+- `publish_managed` keeps an open call's whole round under a staged `select`.
+
+RED: the two-item case on the old rule, the three-item case on the next-entry rule,
+and the staged `select` with walk-back disabled. One review and a clean recheck;
+low findings are filed as `a1v.3`. The unit-2 tools episode's `BG_3` wait, after
+`^U` on an idle screen, waited for bytes that never come; it now waits on the
+content first.
+
+## 2026-10-19 — Jev triage pilot; C5 conclusion corrected
+
+The operator questioned the C6 premise: the model deciding what to cut is the same
+expensive model being sent the oversized context. They suggested Jev as a cheap
+judge. Pilot on C5's final 787 KB input, 18 rounds, papers/clm-a1v-2026-10-19/
+JEV_PILOT.md:
+- Jev scored every round for relevance at the moment FLOW.md was written, at
+  7.8k tokens (~$0.0003) and about 0.4 s per call.
+- Two runs were stable to within 0.08.
+- It kept every cited source read verbatim and rated the trivial rounds as drop.
+
+The pilot also exposed my error. Two of those rounds are luna's own `context_view`
+calls, made after the trigger guidance appeared, each returning the whole context:
+204,752 and 441,167 bytes, 80% of the final context. My C5 count of "no context tool
+calls" was wrong; it came from grepping stdout for a marker format the plain log
+does not use. C5_LIVE.md now carries the correction.
+
+The real finding: the guidance does move the model to inspect, but `context_view`
+returns full bodies and its output fattens the context it describes, so the model
+never reaches `context_manage`. Filed as `arconaut-a1v.4` (P1). It blocks the C6
+step's working map. The operator notes Jev may not fit this particular job but is
+very useful generally, and wants it used much more, in Claude Code too (memory
+saved).
+
+## 2026-10-19 — correction: 5st stays in campaign-defects
+
+I wrongly recorded 5st as excluded from the campaign-defects merge. The operator
+corrects this: 5st stays in that phase, campaign-defects does not move until 5st is
+complete (reworked on the arconaut-rd7 provider-profile mechanism), and nothing is
+moving campaign-defects now. Phase membership is the operator's decision, not mine.
+
+## 2026-10-19 — archival, not compaction; tool-output research; context surfaces
+
+Two operator definitions govern context work from here on.
+- **Compaction in the traditional sense is a failure mode.** Replacing history with a summary is something
+  Blackbird refuses to delegate to providers, and when its own backstop does it (C4), that is audited as a
+  critical error.
+- **The nominal mechanism is selective archival.** Whole rounds, about 5–30% of hot context, are removed,
+  their originals stay fetchable by locator, the rest carries verbatim, and a compact archive index lists what
+  was removed.
+
+Renames of existing "compaction" names are proposed in PLAN.md for the operator to decide.
+
+**The tool-output lifecycle report** is in `papers/tool-output-lifecycle-2026-10-19/reports/`. It draws on
+eight notes files covering the harnesses, the literature and all major providers, including xAI, Mistral,
+Bedrock, Azure, Meta and the open-weight hosts. Its conclusions:
+- shape each tool output at creation and keep the original outside the context;
+- start a context generation at each archival cut;
+- treat the handling of retained reasoning at a cut as shipped profile data;
+- refuse every provider's server compaction.
+
+It raises two questions for the operator:
+- C4's option A versus option B under archival;
+- C1's 384→192 KiB target, which halves the context and so exceeds the 5–30% range.
+
+The cache arithmetic favours later or larger cuts, or cutting once the cache is cold.
+
+**Context-surface catalogue:** three of six sweeps are written under `papers/clm-a1v-2026-10-19/context-surfaces/`.
+- `a1v.4` is wider than `context_view`: `context_restore`, `context_originals` and `context_edit` also copy
+  the whole context into context.
+- Anthropic gets no prompt caching at all (`arconaut-bvu`).
+- No route classifies a context overflow, and Anthropic 529 errors are not retried (noted on `nls.16`).
+- Three docs were stale and are now fixed: CONTEXT_BUDGET measures native packet bytes, not JSON;
+  USING_BLACKBIRD's "no automatic thresholds" predates the default budget; and TOKENOMICS missed that
+  Anthropic accumulates request-state items in context.
+
+**Replay** means playing back recorded frames. I checked that it never fires commands again: restart records
+abandoned operations as outcome-unknown, and interrupted calls get placeholders that say "no automatic retry".
+The operator considers replay reconstruction a safe mode after a bad problem, so a normal resume should
+restore directly from the snapshot. A clean `/quit` currently takes no snapshot (`arconaut-7c8`). The
+proposed durable-workflow design, which resumes by re-running Lua, needs the operator's decision.
+
+## 2026-10-19 — size line informs only; CLM serves effectiveness
+
+The operator directs that context management stay available to the model's judgment at all times, with a nudge
+at the trigger and a direction only later. CLM is not imposed every round, because the model needs enough
+context to understand what it can drop. Nor is it a fetish for sizes: never compacting, or holding a target, is
+not the aim; the model's effectiveness for the work at hand is.
+
+The C2 `CONTEXT_SIZE` line therefore stops inviting `context_view`/`context_manage` on every request. Its
+extended test failed on the old code (`external_unknown` from the oracle) and passes on the new code. My
+suggestion to retune the C1 target is withdrawn. Rewording the triggered guidance away from "toward
+target_bytes" is noted for the a1v.4/C6 brief work.
+
 ## 2026-10-19 — prompt-cache affinity on OpenAI routes
 
 The operator asks for an immediate investigation of the Sol runs' cache use, on
@@ -11690,6 +11909,558 @@ process reports Terminated: 15). No cause is established; Git remains at 2b80669
 and the 47k tree is staged, not committed. Retained output is
 context/47k-commit.log. Retry the required gate with BLACKBIRD_HOOK_LANES=1;
 this is recovery from an interrupted check, not a pass or another review layer.
+
+## 2026-10-19 — merge master into the a1v branch
+
+Master gained the OpenAI prompt-cache affinity, q4n and 47k (2 KiB head plus 6 KiB tail exec observations
+with exact continuation) while a1v was in progress. The merge resolved three conflicts:
+- `check-terminal-pty`: both sides fixed the same repaint race; kept `settle()`, which raises if painting never
+  stops.
+- `coding_test.cpp`: kept both includes.
+- `JOURNAL.md`: kept both sets of entries.
+
+The tool-output report and the request-path catalogue were written at `f7a79b1` and predate 47k and the cache
+affinity. Their `exec` 16 MiB finding and their cache allowlist picture need correcting against the merged tree.
+
+## 2026-10-19 — o17: every program gets shaped observations
+
+The post-merge recheck found that since 47k, `exec` with no `output_max_bytes` returns up to 16 MiB into model
+context, because it now reads from the stored originals instead of the 1 MiB in-memory tail. Only `turn.lua`
+set a default, and `ultracode` passes model arguments straight through. The operator approved a bounded native
+default.
+
+`CodingEngine::call` now gives any program call that names no budget the default workflow's shape:
+- `exec`, `process op=foreground` and an unranged `read_process_output`: 8192 bytes, 2048 head plus 6144 tail,
+  with `next_read`;
+- unranged `read_file`: 16384 bytes.
+
+Explicit ranges and limits stay exact, and operator `/call` inspection stays complete. Foreground now shares
+exec's shaping from the retained originals, and its schema lists `output_max_bytes` and `output_head_bytes`.
+
+Tests:
+- The new `observation_budget_test` failed on the old code at the `exec` size check (line 82). It passes now.
+- `economical_defaults_test` pinned the old "custom Lua read remains complete" behaviour. Its updated call-9
+  expectation failed on the old code (line 116) and passes now.
+
+ECONOMICAL_DEFAULTS, USING_BLACKBIRD and the tool descriptions are updated.
+
+## 2026-10-20 — tool-output references recorded; Kimi unavailable
+
+The SWE-agent and OpenHands trees acquired for the tool-output research are now in QUARANTINE.md, with their
+exact commits, licences and restoration commands (a6w). The acquisition kept no intact archive, so the
+exact-commit codeload ZIPs were captured to `../quarantine_proj/archives/` with SHA-256 identities.
+
+Kimi review now fails with HTTP 429 ("Your current subscription does not have access to Kimi Code right
+now"), tracked in its own bead. A fresh-context independent reviewer stands in for the tribunal on d786c1d and
+870ec8c. The JSMNTL review step had been skipped for both commits; it is now running.
+
+## 2026-10-20 — 5z4: clipped participant metadata is marked
+
+The command-center participant detail showed the 256-byte observation copies of the request ID, provider,
+model, task and result status with no sign of clipping. A legal 300-byte request ID appeared as an unmarked
+prefix. Each of those fields now goes through `observed()`, which appends `[clipped: N of TOTAL bytes]` when
+the copy is truncated. Catalogue rows keep their deliberate 12-byte label.
+
+The new `command_center_test` case seeds a 300-byte request ID and requires every shown 256-byte prefix to
+carry the marker. It failed on the old code ("clipped participant metadata carries a visible marker") and
+passes now.
+
+## 2026-10-20 — o17 tribunal review and fixes
+
+Kimi was unavailable (HTTP 429), so an independent fresh-context reviewer attacked d786c1d and 870ec8c. It
+raised nine findings.
+
+**Fixed:**
+1. A head with no budget failed with `invalid_range`. A head alone now keeps the default 6144-byte tail after
+   it: budget = max(8192, head + 6144).
+2. The test oracles were upper bounds. `observation_budget_test` now checks exact specification values for
+   exec, bare `read_process_output`, `read_file`, foreground (default, explicit split, explicit 0, wait keys
+   kept), the head-only rule and the explicit-more case.
+3. The operator exemption covered the whole operator turn. Only the operator's own outermost call
+   (`operation_depth_ == 0`) stays exact now; calls nested in an operator `/lua` program or workflow are shaped.
+4. Built-in programs read Lua source and BBM2 steer files with unranged `read_file`, so they would be silently
+   cut past 16 KiB. They now ask explicitly for the whole file (`range = {mode="bytes", start=0}`).
+5. The audit could not tell supplied defaults from the program's own arguments. Each operation's decision
+   continuation now lists `native_defaults`.
+7. Schema and description honesty: the process output keys are documented as foreground-only;
+   `output_head_bytes` is in the foreground allow-list; `next_read` is described as appearing only when bytes
+   are omitted; the docs name `/exec`, `/process` and `/fg`, not a non-existent `/call`; "omit range for the
+   whole file" is corrected.
+9. `operator_arguments_` is set only after the program string is built.
+
+**Not changed:**
+- 6: foreground `output_bytes` reports the retained original that `next_read` pages; `received_bytes` keeps
+  the count actually received.
+
+**Regression guard:**
+- 8: `context_budget_test` now also requires that the triggered guidance names `context_manage`. That
+  behaviour is unchanged, so the check passes on the old code.
+
+**Old-code failures:**
+- The strengthened `observation_budget_test` fails on 870ec8c: the head-only exec makes the turn throw.
+- Given an explicit budget for that call, it then fails at the `native_defaults` check (line 146).
+
+On the new code it passes. A segfault in my first draft was the test holding a reference to
+`workflow_result_` across operator calls; it now copies the result.
+
+## 2026-10-20 — k9r: the startup benchmark names the binary it launches
+
+`scripts/benchmark-startup` hashed `build/release/blackbird-ui`, but it launched `scripts/blackbird`, which
+follows the managed installed generation. It now needs `--executable PATH`. It launches the launcher with
+`BLACKBIRD_EXECUTABLE` set to that file; the launcher's rule is that an explicit development executable always
+wins (scripts/blackbird:9-18). It records that exact file's path and SHA-256 in `metadata.json`.
+
+A bad path fails before any output directory is created. I checked the argument handling directly. No
+timing was run, so the script makes no measurement claim, and the bead's precondition ("before using it
+again") is met by the next real use.
+
+## 2026-10-20 — tnn: End follows inspector content that arrives later
+
+`tnn` left a product question open: should End stay at the bottom while inspector content grows
+asynchronously, as the transcript follows output? Yes, decided under the operator's direction to act. End on
+the detail pane now sets `detail_follow_`. While it is set, re-measuring keeps the viewport at the newest rows
+when content grows or the page height changes. Any other movement, or a different source target, clears it.
+
+The `tui_retained_result` PTY check had worked around the race by pressing End repeatedly. It now presses End
+once and requires the pinned window to appear.
+
+Both checks failed on the old code:
+- the new `tui_inspector_test` case, with "End did not follow content that grew after it";
+- `tui_retained_result`, with "pin B exact source window".
+
+Both pass now.
+
+## 2026-10-20 — e8n: no raw loss; an analyzer ordering bug
+
+The 15 campaign requests "missing" 1302/1303 records have them all: status 200, terminal branch 1. The raw
+losslessness contract holds:
+- every lane's ordinals are contiguous;
+- no failure-partition fence exists;
+- the 1301 and 1612 records prove each trace held its terminal credit.
+
+The fault was the stream-timing analyzer. Its 1300 handler replaced the request's entry. The recorder drains
+the control partition before the data partition on each pass (src/raw_runtime.cpp:972-992). Each request's
+80-170 KB body and its stdout fill the data partition, so that partition lags. Sometimes it lags far enough
+that a request's 1302/1303 reach disk before its 1300, and the late 1300 wiped those fields.
+
+**Red test:** a synthetic stream with the control partition first. It failed on the old analyzer (`http`
+null) and passes after the one-line merge fix. On real data, the restored a-t08-luna run went from 14 good
+rows plus 9 null rows to 23 rows of `(200, 1)`.
+
+**Recorded:**
+- STREAM_TIMING.md carries a dated correction; the census is now 718 at 200.
+- RAW_READER.md now states that one lane's partitions interleave, so consumers must merge by lane and ordinal.
+- Evidence is in `papers/e8n-2026-10-20/ROOT_CAUSE.md`.
+
+## 2026-10-20 — rd7.1 context lifecycle design final (revision 3)
+
+`docs/CONTEXT_LIFECYCLE.md` is the reviewed design for context chapters (context generations), selective
+archival, shaped tool output, inspection, the inform/nudge/direct/fail sequence, the C6a/C6b archival step, C4
+recovery (option A, then B), shipped provider profiles, cache economics, the TUI and the trial signals.
+
+**Review history.** Kimi was unavailable, so three independent fresh-context reviewers formed the tribunal:
+provider and protocol truth against primary documentation; state, replay and concurrency against the source;
+doctrine, model ergonomics and waste. They raised 76 findings, all dispositioned in Appendix A. The single
+recheck found 40 of the 44 high and medium dispositions held and 4 partial, and found 1 high and 11 medium
+defects introduced by the revision. All are fixed in revision 3 ("Recheck fixes"). Per BOUNDED_HARDENING there
+is no further review layer on the design. The plan and its review come next.
+
+**Owner decisions recorded in §23/§24:**
+- C4 runs option A, then option B.
+- The model may archive an older byte-identical copy of an instruction.
+- There is no pin ceiling.
+- A pending cut survives a failed turn, a crash and an operator interrupt.
+- The renames from compaction to archival.
+- The Anthropic archival step ships `palette_only`. Each model switches to `appended_removal` once rd7.3 shows
+  that removed tools cannot be called and thinking survives.
+
+The papers are in `papers/clm-a1v-2026-10-19/design-tribunal/`.
+
+## 2026-10-20 — 4by: real file-tool dispatch emits File raw surfaces
+
+`CodingEngine::call` passed no RawAdapterContext to `LocalTools::run`, so the File raw surfaces (3400-3448 and
+3490) were never emitted for operator, authored-Lua and model `read_file`/`write_file`/`edit_file` calls. Only
+direct native calls emitted them. The dispatch now passes the live operation as parent, as `git_observe`,
+`decision_model` and `beads` already do. That adds no new issuer or transport: the File code prepays its own
+claims, and failures flow through the operation's capture scope.
+
+`coding_file_raw_test` has seven cases: operator, nested (an operator `lua` calling `read_file`, which
+parents under the inner operation), missing directory, overwrite, authored Lua, model, and cancelled. Each
+checks:
+- exact argument, proposal and native read/write bytes against fixture literals;
+- mkstemp/realpath/rename names;
+- parent links and request/result pairing;
+- observer counts;
+- error branches.
+
+A parity case runs the same sequence with raw disabled and requires identical business results and disk
+bytes. Every case failed on the old code ("one File tool per … dispatch") and passes in debug and ASan.
+
+An independent review found:
+- a 3407 field-order misparse in the first test draft, which was UB under ASan; fixed;
+- missing cases; added.
+
+It also measured that raw volume per file call roughly doubles. That is recorded on `ulx` for measurement
+before any change. A failed edit search records `find()`'s exact `npos` as present: raw records the exact value,
+so this is kept.
+
+## 2026-10-20 — rd7.1 delivery plan final (revision 3)
+
+`docs/CONTEXT_LIFECYCLE_PLAN.md` delivers the reviewed design. Two independent reviewers attacked it: one on
+sequencing, dependencies and resources, one on tests, migration and risk. All 45 findings were accepted. The
+single recheck found 9 dispositions partly held and 12 new medium defects, all fixed in revision 3. There is no
+further layer.
+
+**Shape:**
+- One serial lane for every unit touching the hot files: coding, context, retained_state, tools and the
+  Anthropic adapter.
+- Parallel lanes only on disjoint files.
+- Every merge goes through the hook, with master merged in at each unit boundary.
+- One gate at a time, with a sampler logging overlaps.
+
+**Critical path:** S0/S0b (clean-stop snapshots and SIGTERM), P1b, S1, S2, T1, S3a, S3b, Q1, B, V1, E1, c3f,
+A1, R1, then the R0 audit, calibration, pilot and batch.
+
+**Probes:**
+- rd7.2 runs on the ChatGPT route only; OpenRouter is dropped because there is no account.
+- rd7.3 waits for an Anthropic account. The Anthropic-only paths inside units being built ship with
+  `basis = "unobserved"`; P3 and K1's Anthropic part wait at the tail.
+
+**Integration proposal 1** comes right after P1b. It gives 5st's rework a master base. 5st stays in the
+operator's campaign-defects phase and waits for the operator's acceptance.
+
+**Resources:** about 98 commits and about 241 gate attempts, roughly 40 hours of serialized gate time. Provider
+spend outside trials is 6M-20M tokens of ChatGPT quota, plus a metered Paper probe that needs approval. The
+first trial batch answers one question (does the step settle mid-run cuts on luna without lowering task
+completion) with paired arms that differ only in the step.
+
+Implementation starts with S0.
+
+## 2026-10-20 — S0: snapshot at every clean stop (7c8)
+
+S0 is the first unit of the context lifecycle program, and runs in the serial lane, on branch `work/clm-rd7`.
+
+**Clean exits snapshot.** Every clean exit now writes a context snapshot as its last journal write, so a
+clean reopen has an empty suffix. The clean exits are `/quit`, `/exit`, EOF, TUI exit, `--once`,
+`--resume-once`, station stop, application close, and orderly error exits on a quiescent journal. A guard
+declared after the context store runs after participant and command teardown, which write after `return`.
+
+**No snapshot is taken:**
+- while an attempt is unresolved, which would lose coverage;
+- for a restart this process recorded, which is a handoff.
+
+**Reopen record.** A reopen that finds frames after the last snapshot writes one `session.reopen-suffix`
+record with these metadata fields:
+- `saved_state`;
+- `snapshot: accepted|absent|rejected`;
+- `suffix_frames`, `suffix_bytes`, `torn_bytes`;
+- `pending_restart`, set when a stale restart is found by a non-resuming open; it is reported, not settled.
+
+The record shows a neutral notice. The context store's open-time snapshot is deferred until after the
+record, so a refused invocation cannot erase the evidence of an unclean stop.
+
+**Tests.** `clean_stop_test` has 22 cases, 20 of which fail on the old code. It passes on Mac and on Linux
+debug and ASan. `check-session-startup` gained a wait that fixes its own race; the slower `/effort` return
+behind that race is still unexplained (`arconaut-0ad`).
+
+**Review.** One review and one recheck, per BOUNDED_HARDENING. The notes, red records and both review
+reports are in `context/clm-rd7-notes/`.
+
+**Measured.**
+
+| Context size | Quit snapshot bytes | Extra quit time |
+| --- | --- | --- |
+| 384 KiB | about 0.8 MB | +53 ms |
+| 6 MiB | about 12.6 MB | +308 ms |
+
+**Found.** Contexts over about 8 MiB cannot be snapshotted at all; this is pre-existing (`arconaut-yc4`,
+owned by S1).
+
+## 2026-10-20 — P1a: provider profile mechanism core
+
+P1a lands provider rules as shipped data, the core of the rd7 program's profile lane. It runs in a parallel
+lane, on new files only.
+
+**Reader and schema.**
+- A native reader for the data-only Lua table-constructor subset executes nothing and links no Lua.
+- Refusals name the file, line, column, construct and reason.
+- Schema `blackbird.provider-profile/1` records a basis (`cited`, `probed`, `conservative` or `unobserved`)
+  for every behavioural field, and validates cross-field consistency.
+
+**Layering and selection.**
+- Layers run conservative base, then the selected shipped profile, then operator, then session.
+- Overrides are sparse. An operator override of conservative applies at the base under every profile.
+- The most specific match wins, and ties are refused.
+- Queries come from real bindings, with URLs normalised.
+
+**Anthropic default.** Anthropic Messages defaults to the prefix-checked rules (`drop_after_change`, which is
+valid on every Anthropic model). Only the listed older families keep reasoning at a cut. A `models` entry
+matches exactly or as a `-suffix` family.
+
+**Digests.** An owned SHA-256 gives two digests: a behavioural digest, for rebinds, and a content digest,
+which includes provenance and is used for trial pinning.
+
+**Installation.** Profiles install with Blackbird and ship to the Linux checks.
+
+**Fuzzing.** The fuzz profile was requalified on Neuroses with a planted crash, found in about a minute with
+the artifact fetched back. A 1,000,000-run budget then ran clean.
+
+**Review.** One review and one recheck. The recheck's high finding was that dated 5.x model variants fell to
+keep-reasoning; it is fixed by making prefix-checked the default.
+
+**Deviation.** The early behaviour rows ship now, recorded in the plan; P2 owns the regression comparison.
+Notes are in `context/clm-rd7-notes/P1a*.md`.
+
+## 2026-10-20 — S0b: SIGTERM is a clean stop
+
+S0b is a serial-lane unit, on branch `work/clm-rd7`.
+
+**The stop.**
+- The first SIGTERM sets a process-lifetime flag and interrupts any running turn, as SIGINT does.
+- The session then leaves through its normal clean exits with status 143, so S0's snapshot runs.
+- A second SIGTERM within 2 s is coalesced, so senders like GNU timeout that signal the pid and then the group
+  stop cleanly. A SIGTERM after the window kills.
+- A flag-only handler covers session open and teardown. An inherited ignored SIGTERM stays ignored.
+
+**The wrapper.** `scripts/blackbird` forwards SIGTERM to the session. It keeps stdin, never relaunches on 75
+after SIGTERM, and marks its child so the session restores default SIGINT and SIGQUIT.
+
+**Station and recorder.**
+- A SIGTERM'd station records `station.supervisor-stop` and is not paused on reopen.
+- The raw recorder now obeys only its supervisor's SIGTERM. Before, a group SIGTERM killed it mid-stop.
+
+**Found along the way.**
+- The clean-stop snapshot failed when a stop landed during the TUI worker-custody join: `block_raw_owner`
+  left the owner blocked. The guard now resumes the owner first.
+- Two beads, `arconaut-mze` and `arconaut-8zr`:
+  - plain-mode Ctrl-C kills the raw supervisor and recorder (pre-existing);
+  - Linux parallel raw and PTY tests time out under shared load.
+
+**Tests.** `clean_stop` has 41 cases and `raw_command_wake` gains the signal mechanics. The changed tests failed
+on the old code. They pass on Mac and on Linux debug and ASan.
+
+**Review.** One review and one recheck. The notes are in `context/clm-rd7-notes/S0b*.md`.
+
+## 2026-10-20 — P1b: provider profiles wired into sessions and requests
+
+P1b is a serial-lane unit, on branch `work/clm-rd7`.
+
+**Loading.** Profiles load once at session start, before any write. They come from the shipped directory or
+`BLACKBIRD_PROFILES`, with operator overrides from `~/.local/share/blackbird/profiles`. They never reload
+mid-session; that is an owner decision, stricter than the plan text.
+
+**Records.**
+- The loaded set is recorded as the latest-wins program record `provider-profile-set-v1`.
+- Every `provider.request` records `profile {id, revision, digest, layers, model, binding}`. That is the
+  behavioural digest of the profile its own final model and actual request-group binding resolved to.
+
+**Refusals and pinning.**
+- A missing or invalid set refuses startup visibly, before any session directory is created.
+- `BLACKBIRD_PROFILE_SET_DIGEST` pins a run to the content digest.
+- `/profile` and `--profile-digests` show the effective profile, its basis and the digests.
+
+**Fallbacks.**
+- Registered routes whose URL cannot be normalised run under conservative, with the reason recorded.
+- An unreadable auth store defers resolution to the first provider request, which fails naming the store.
+  Local workflows run as before.
+
+**Checks.** An installed release build, the source build and Linux debug and ASan all agree on every digest.
+
+**Review.** One review and one recheck. `tui_retained_result` failed once in the first gate with r5n's
+intermittent message, with no overlap and a load of 7. It passed alone 3/3 and in the rerun gate; this is
+recorded on r5n.
+
+Integration proposal 1 follows: S0, S0b, P1a, P1b and the a1v branch's units.
+
+## 2026-10-21 — S1: context persistence (rd7.7, yc4)
+
+S1 is a serial-lane unit, on branch `work/clm-rd7`.
+
+**Cut frames.** Every context change is recorded as a delta cut frame carrying the entry count, a CRC32C and
+the byte size. One shared routine applies it on the live, restore and playback paths.
+
+**Snapshot v2.**
+- A snapshot references originals instead of holding the live context inline, so contexts over 8 MiB now
+  snapshot (yc4). An entry whose bytes differ from its original is written inline; "equals" is exact
+  encoded-byte equality.
+- Restore decodes only the originals field of each creating record; a checkpoint decodes nothing.
+- Refused slots are reported with their slot number. The older slot is tried before whole history, and
+  state-file errors keep their class: only malformed bytes are `corrupt`.
+
+**Read-only safe mode.**
+- A frame that fails to apply opens the session read-only, with `/repair` and `/repair --list`.
+- A repair may not add an unpaired call or output, honours its saved skip set, is written outside the
+  resident-tail cap, and raises the format level.
+- Every open-time write of a read-only open goes outside the cap, so `/repair` is always reachable.
+  Open-time records repeat only for a new observation.
+
+**Entries.** One entry rule for the store and both validators. New edits refuse unknown keys; an unchanged
+entry passes through with its legacy keys. The model-facing descriptions say exactly this.
+
+**Measured.**
+- A 32 MiB all-inline checkpoint: peak 33.8 MB and 158 ms, down from 67.4 MB and 498 ms at layer 1.
+- Reopen still reads the whole creating record: 112 ms for 10 summaries over 10.3 MB of records, against
+  28.6 ms for the old inline snapshot. That is `arconaut-4m5`, to measure on natural sessions first.
+
+**Checks.** Every new or changed test failed on the old code (layer 1 against e5ffa6e, layer 2 against the
+layer-1 tree, saved as `context/clm-rd7-notes/S1-layer1.patch`). Mac gate; Linux debug and ASan on the
+touched suites. The context_cut and saved_payload fuzzers each ran 1,000,000 executions on Neuroses with no
+artifact.
+
+**Review.** One review in two halves and one recheck in two halves. The notes are in
+`context/clm-rd7-notes/S1*.md`.
+
+**Beads.**
+- `arconaut-x0g`: a torn tail shorter than a frame header fails every open (pre-existing).
+- `arconaut-8zr`: storage_raw and clean_stop's `tui` case are load-sensitive under parallel Linux runs.
+- `arconaut-r5n`: one more no-overlap failure of `tui_retained_result` in the first S1 gate.
+
+## 2026-10-21 — c6d and gjf: two fuzzer findings fixed
+
+The rerun of check-linux's fuzz profile against S1 found two faults, each fixed on `work/clm-rd7-c6d`.
+
+- **c6d (P1a's profile reader).** The 128-character numeral bound counted only the spelling, but
+  `format_value` can present a number in more characters: `e-NN` for a dropped point, zeros for an
+  exponent up to 16. An accepted 126-character numeral printed in 129, so the re-read refused it. The
+  reader now also bounds the presented form, so every accepted number reads back. Shared value code was
+  correct and is unchanged; no other caller has a per-numeral bound.
+- **gjf (S1's state-file parser).** S1 layer 2 kept every decode error that was not `corrupt`, so a packet
+  that decodes to `invalid_range` (malformed bytes) refused its slot under that name. Only allocation,
+  capacity and unsupported keep their own class now; the fuzzed body is a regression case.
+
+**Checks.** Each regression case failed on the old code. Both commits passed the Mac gate (the first with
+S2's build overlapping, peak load 26). On Neuroses, debug and ASan pass on the touched suites
+(run-wdamqv1k), and all three fuzzers ran 1,000,000 executions with no artifact (run-814ksad0):
+profile_reader 935 s, context_cut 362 s, saved_payload 211 s. This also completes S1's fuzz check on its
+final code. Notes: `context/clm-rd7-notes/c6d.md`.
+
+## 2026-10-21 — S2: units and classes (rd7.8)
+
+S2 is a serial-lane unit, on branch `work/clm-rd7`.
+
+**Classes.** Every entry's class comes from its creating record and is not editable: instruction, round,
+result, and the rest of design §5.2. The map is built at append and at playback and saved in the
+snapshot's `classes` section. Sessions written before S2 derive it, and a `lua.synthetic` record with no
+class field is classed by role, so an older ultracode brief stays protected. Every S2 Lua append records
+its class.
+
+**Units.** Entries group into units by round, with handles `r<counter>[.k]`, a selection grammar and
+`expand`. Manage refuses protected, pinned and partial units, reporting the first unit in context order
+with a problem. Pins are the latest-wins `context-pins-v1` record, rechecked when a staged proposal
+settles. Seeds carry each source entry's unit. Before S2, a repaired round was refused as
+`partial-tool-group` and `operator.beads` as `mandatory-entry`; both are now selectable.
+
+**Built-in ultracode.** It declares `instruction` for its brief and is now `builtin-ultracode-v2`. At open,
+any other recorded built-in revision is replaced by this binary's, recorded as `builtin-current` with the
+replaced revision. Supplied sources are kept.
+
+**Model-facing text.** The `context_manage` and `lua` descriptions and `docs/USING_BLACKBIRD.md` state
+exactly what is protected, archivable and refused.
+
+**Measured.**
+- Manage at 6560 entries: 5.1 ms before S2, 7.2-7.5 ms at layer 0. A journal sync of about 4 ms
+  dominates every write.
+- Unreadable records were classed in quadratic time at layer 1, linear at layer 2. At 8000 such
+  records: open 2178 → 30 ms, `units()` 4323 → 9.7 ms.
+
+**Checks.** Every new or changed test failed on the code before it, except the plan's RRC case: its
+premise does not occur on the old code, so it stays as a check of the new path. Mac gate;
+`scripts/check-rrc`; Linux debug and ASan on the touched suites, with storage_raw and clean_stop alone.
+`coding_capacity` failed once under parallel ASan load and passed alone; that is recorded on
+`arconaut-8zr`.
+
+**Review.** One review in two halves and one recheck in two halves. The notes are in
+`context/clm-rd7-notes/S2*.md`. Left for S3a: repair and cut originals carry no unit key (a format
+change). Left for V1: protection on model and Lua edits, and a pin entry point.
+
+## 2026-10-21 — c3f: the ultracode brief once per revision
+
+c3f is a parallel-lane unit after S2, on branch `work/clm-rd7`.
+
+Ultracode appended its developer brief on every run, so protected copies accumulated for the life of a
+session. A new read-only Lua query, `blackbird.live_instruction(item)`, answers whether a live
+instruction entry holds an equal item, ignoring object key order at every depth. Only this query ignores
+key order; S1's and S2's comparisons stay exact bytes. Ultracode appends its brief only when the query is
+false, and the built-in revision is now `builtin-ultracode-v3`: S2's open-time rule replaces v1 and v2.
+
+- Ten runs leave one brief, where they left ten. A brief that is no longer live is appended once again.
+- The query scans entries by cached class, with no live units: about 190 µs at 6000 entries, against
+  1.3 ms at layer 0. Its raw trace (site 1828) records the queried item's size and CRC32C.
+- The first Linux ASan run caught an alloc/dealloc mismatch from `std::stable_sort`'s temporary buffer
+  against the test binaries' replaced `operator delete`; the sort now uses an index vector.
+
+**Checks.** Each new test failed on the code before it. Mac gate; Linux debug and ASan on the touched
+suites. One review and one recheck, notes in `context/clm-rd7-notes/c3f*.md`. The `lua` tool description
+does not yet name the query; that follows T1, which owns `src/tools.cpp`.
+
+## 2026-10-21 — T1: shaping at creation (rd7.9)
+
+T1 is a serial-lane unit, on branch `work/clm-rd7`.
+
+**The boundary.** A result is shaped once, where it becomes visible to the model: the output of the model's
+own tool call (generic tools, `lua`, Lua-defined tools, `workflow_invoke`), a drained continuation, or a host
+observation. Calls a program makes inside its own execution return whole results, so programs keep their
+tables and the documented CAS recipes keep their base. o17's native defaults for exec, process and
+read_file are unchanged. `blackbird.append` content is the program's own and is not shaped.
+
+**Which call is the model's.** A relay declares it: `blackbird.call(name, args, {call_id = ...})`. An unknown
+or already-answered call_id is refused and the call is not run. The four shipped relays declare, and the
+built-in ultracode is `builtin-ultracode-v4`. The name-and-arguments match remains only for undeclared calls,
+and it switches off after a turn's first declaration. The first attempt used that match alone; the recheck
+showed a relay that changes arguments or retries would flood context, and that a program's identical call
+could steal the match.
+
+**Shape.** Within 16384 bytes a result is whole. Over that it becomes the first 4096 bytes, one marker naming
+the omitted range and `result_ref`, and the last 12288 bytes. A cut never splits a UTF-8 character or a JSON
+escape; a sweep of 177,444 cuts found none. A cut that would not be shorter returns the result whole. A single
+shaped result passed straight through is not cut again. `read_process_output {result_ref}` pages the retained
+original 8 KiB at a time (design §5.7), even with a range. Every shaped result records the shape applied. A
+result with no text form becomes an error result naming the reason.
+
+**Measured.**
+- The `tools` wire bytes went from 27690 to 31275 (+12.9%), mostly the `lua` and `read_process_output`
+  descriptions.
+- The first `pin failed` over 9842 facts took about 910 ms at layer 1 and about 5 ms at layer 2: an indexed
+  lookup replaced a history scan.
+- A `result_ref` page costs about 32 ms whatever the original's size. Reading back a 16 MiB exec capture
+  takes 37-54 ms, a path T1 does not change.
+
+**Checks.** Every new or changed test failed on the code before it. Mac gate; Linux debug and ASan+UBSan on
+the touched suites. The merge with c3f resolved three hunks, keeping c3f's brief check and adding T1's
+declared call_id to the ultracode source, which became v4. A recorded v3 is now replaced too.
+
+**Review.** One review in two halves and one recheck in two halves. The notes are in
+`context/clm-rd7-notes/T1*.md`. Not done: an allocation-injection test for the shape parameter, since no
+armed state remains.
+
+## 2026-10-26 — journal SIGTERM settlement continuity (8zr)
+
+Ordinary native journal appends prepay physical extent/write/sync capture using the
+existing finite raw storage settlement loan. Cancellation before funding leaves a
+live untouched writer; after funding the batch finishes without clearing sticky
+cancellation. Native EINTR alone is retryable, with bounded consecutive retries;
+ordinary appends fund eight extra finite continuation calls. Failure/exhaustion
+poisons the uncertain tail and cannot publish a successful cursor. Existing outer
+stop/exec loans keep their limits, and retained suffixes reference original input.
+
+Baseline REDs, initial stop/restart GREENs, the one completed independent Sol
+review and the existing layer-2 native/provenance additions are documented in
+papers/2026-10-26-journal-stop-continuity.md and its linked review. The successor
+collected exit 0 for the unfinished native selector and journal batch suite, then
+Linux debug/ASan passed both owning suites. A transport-order test-oracle mistake
+was corrected using producer ordinals; failed logs remain preserved. The old
+64-step workflow stop was operational, not a source failure or qualification.
+No third review, sibling merge, old-session reopen, dependency adoption, runtime
+installation, or unrelated command-jobs repair. Final full source-hook, release
+build and normal push results are retained in continuity-followup-01/HANDOFF.md.
+
+The first full hook blocked publication: retained-storage scope-count oracles
+needed to distinguish ordinary append grants from actual stop/receipt grants;
+corrected tests link actual prior same-issuer grants and retain exact single
+stop/receipt bounds. Their failed hook RED and focused GREEN remain in successor
+logs. Provisioned the already-adopted pinned TUI driver and cleared inherited
+session launcher overrides only for qualification. The unchanged PTY command-jobs
+case also passed its focused disposition. No product repair outside this unit.
 
 
 ## 2026-10-23 — Oxcart native host tools

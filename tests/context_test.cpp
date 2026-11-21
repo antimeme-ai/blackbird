@@ -1,5 +1,6 @@
 #include "blackbird/context.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/saved_state.hpp"
 #include <filesystem>
 #include <iostream>
 #include <source_location>
@@ -118,13 +119,47 @@ int main() {
     AuditLog replay{*root};
     ContextStore restored{replay};
     check(restored.head() == head && restored.items()[0] == original);
+    // Every published revision reports its kind and encoded input size; rejected
+    // and staged changes report nothing (a1v indicator source).
+    std::vector<ContextChange> changes;
+    std::size_t bytes_now = 6;
+    restored.changed = [&](const ContextChange &change) {
+      check(change.revision == restored.head() && change.bytes_before == bytes_now &&
+            change.bytes_after ==
+                std::stoul(field(restored.stats(), "input_bytes").number().text()));
+      bytes_now = *change.bytes_after;
+      changes.push_back(change);
+    };
+    bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
+    const auto kinds = [&] {
+      std::string out;
+      for (const auto &change : changes)
+        out += change.kind == ContextChangeKind::edited     ? "E"
+               : change.kind == ContextChangeKind::restored ? "R"
+                                                            : "M:" + change.mode;
+      return out;
+    };
     restored.edit(
         Value::object({{"base", Value{head}}, {"entries", Value{Value::Array{}}}}));
     restored.restore(entry);
     check(restored.items()[0] == original);
+    check(kinds() == "ER");
     auto ok = [](const Value &out) {
       return std::get<bool>(field(out, "accepted").value());
     };
+    // A rejected edit reports nothing; a throwing listener cannot undo a publish.
+    check(!ok(restored.edit(Value::object(
+        {{"base", Value{"stale"}}, {"entries", Value{Value::Array{}}}}))));
+    check(kinds() == "ER");
+    {
+      auto recorder = std::move(restored.changed);
+      restored.changed = [](const ContextChange &) {
+        throw Error{ErrorCode::capacity};
+      };
+      const auto published = restored.edit(restored.view());
+      check(ok(published) && restored.head() == string_field(published, "revision"));
+      restored.changed = std::move(recorder);
+    }
     auto proposal = [&](std::string mode, Value::Array ids) {
       return Value::object({{"base", Value{restored.head()}},
                             {"mode", Value{std::move(mode)}},
@@ -152,11 +187,21 @@ int main() {
     summarize.object().emplace_back(
         "summary", Value::object({{"role", Value{"developer"}},
                                   {"content", Value{"tool completed"}}}));
+    bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
     check(ok(restored.manage(summarize)));
     check(!ok(restored.manage(summarize))); // stale
+    check(kinds() == "ERM:summarize");
     const auto summarized = restored.view();
-    check(!ok(restored.manage(proposal(
-        "archive", {field(field(summarized, "entries").array().back(), "id")}))));
+    // A summary is class summary (unit S2), not an instruction: it may be archived,
+    // shown here by staging the archive and cancelling it. The old role rule pinned
+    // it as a developer entry (mandatory-entry).
+    restored.begin_workflow();
+    check(field(restored.manage(proposal(
+                    "archive",
+                    {field(field(summarized, "entries").array().back(), "id")})),
+                "staged") == Value{true});
+    (void)restored.finish_workflow(false);
+    check(restored.view() == summarized);
     check(field(field(summarized, "entries").array().back(), "ancestry") ==
           Value{Value::Array{call, output}});
     check(ok(restored.manage(proposal("restore", {call, output}))));
@@ -168,12 +213,14 @@ int main() {
     check(ok(restored.edit(reordered))); // generic CLM is still available
     check(ok(restored.manage(proposal("restore", {call, output}))));
     check(restored.items()[2] == field(all[2], "item"));
+    check(kinds() == "ERM:summarizeM:restoreEM:restore");
     const auto before_stage = restored.view();
     restored.begin_workflow();
     check(field(restored.manage(proposal("archive", {call, output})), "staged") ==
           Value{true});
     check(restored.view() == before_stage);
     check(!ok(restored.manage(proposal("archive", {call, output})))); // overlap
+    check(kinds() == "ERM:summarizeM:restoreEM:restore"); // Staged reports nothing.
     restored.append({Value::object({{"type", Value{"function_call"}},
                                     {"call_id", Value{"active"}}})},
                     "active");
@@ -181,7 +228,9 @@ int main() {
                                     {"call_id", Value{"active"}},
                                     {"output", Value{"settled"}}})},
                     "active-result");
+    bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
     check(ok(restored.finish_workflow(true)));
+    check(kinds() == "ERM:summarizeM:restoreEM:restoreM:archive"); // At activation.
     check(restored.items().size() == 5 &&
           string_field(restored.items()[3], "call_id") == "active");
     restored.begin_workflow();
@@ -213,6 +262,93 @@ int main() {
         value = Value{"obsolete"};
     check(!ok(restored.manage(stale_read_proposal)));
     check(restored.view() == view_before_reject);
+    {
+      // A response round is atomic: a reasoning item binds every later item of its
+      // append, and with them their calls' whole groups. An OpenAI encrypted
+      // reasoning item without its call is invalid input.
+      restored.append(
+          {Value::object(
+               {{"type", Value{"reasoning"}}, {"encrypted_content", Value{"R1=="}}}),
+           Value::object({{"type", Value{"function_call"}}, {"call_id", Value{"r1"}}})},
+          "round-output");
+      restored.append({Value::object({{"type", Value{"function_call_output"}},
+                                      {"call_id", Value{"r1"}},
+                                      {"output", Value{"done"}}})},
+                      "round-result");
+      restored.append(
+          {Value::object(
+               {{"type", Value{"reasoning"}}, {"encrypted_content", Value{"R2=="}}}),
+           Value::object({{"role", Value{"assistant"}}, {"content", Value{"answer"}}})},
+          "round-answer");
+      const auto round = field(restored.view(), "entries").array();
+      const auto n = round.size();
+      const auto reasoning = field(round[n - 5], "id"),
+                 round_call = field(round[n - 4], "id"),
+                 round_output = field(round[n - 3], "id"),
+                 answer_reasoning = field(round[n - 2], "id"),
+                 answer = field(round[n - 1], "id");
+      bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
+      auto summary = [&](Value::Array ids) {
+        auto p = proposal("summarize", std::move(ids));
+        p.object().emplace_back(
+            "summary",
+            Value::object({{"role", Value{"assistant"}}, {"content", Value{"short"}}}));
+        return p;
+      };
+      check(string_field(restored.manage(summary({round_call, round_output})),
+                         "reason") == "partial-round");
+      check(string_field(restored.manage(summary({answer})), "reason") ==
+            "partial-round");
+      check(string_field(restored.manage(summary({reasoning})), "reason") ==
+            "partial-round");
+      check(ok(restored.manage(summary({reasoning, round_call, round_output}))));
+      bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
+      check(ok(restored.manage(summary({answer_reasoning, answer}))));
+      // Reasoning binds every later item of its append, not only the next one.
+      restored.append(
+          {Value::object(
+               {{"type", Value{"reasoning"}}, {"encrypted_content", Value{"R3=="}}}),
+           Value::object({{"role", Value{"assistant"}}, {"content", Value{"working"}}}),
+           Value::object({{"type", Value{"function_call"}}, {"call_id", Value{"r3"}}})},
+          "round-three");
+      restored.append({Value::object({{"type", Value{"function_call_output"}},
+                                      {"call_id", Value{"r3"}},
+                                      {"output", Value{"ok"}}})},
+                      "round-three-result");
+      const auto three = field(restored.view(), "entries").array();
+      const auto m = three.size();
+      const auto r3 = field(three[m - 4], "id"), msg3 = field(three[m - 3], "id"),
+                 call3 = field(three[m - 2], "id"), out3 = field(three[m - 1], "id");
+      check(string_field(restored.manage(summary({r3, msg3})), "reason") ==
+            "partial-round");
+      check(string_field(restored.manage(summary({call3, out3})), "reason") ==
+            "partial-round");
+      bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
+      check(ok(restored.manage(summary({r3, msg3, call3, out3}))));
+      // A select staged in a workflow while its own call is still open (the model's
+      // context_manage) keeps that call's whole round, reasoning included, at publish.
+      restored.begin_workflow();
+      restored.append(
+          {Value::object(
+               {{"type", Value{"reasoning"}}, {"encrypted_content", Value{"R4=="}}}),
+           Value::object({{"type", Value{"function_call"}}, {"call_id", Value{"r4"}}})},
+          "round-open");
+      Value::Array keep;
+      const auto before_select = field(restored.view(), "entries").array();
+      for (std::size_t k = 0; k + 2 < before_select.size(); ++k)
+        keep.push_back(field(before_select[k], "id"));
+      check(field(restored.manage(proposal("select", keep)), "staged") == Value{true});
+      restored.append({Value::object({{"type", Value{"function_call_output"}},
+                                      {"call_id", Value{"r4"}},
+                                      {"output", Value{"closed"}}})},
+                      "round-open-result");
+      bytes_now = std::stoul(field(restored.stats(), "input_bytes").number().text());
+      check(ok(restored.finish_workflow(true)));
+      const auto after_select = field(restored.view(), "entries").array();
+      check(after_select.size() == before_select.size() + 1 &&
+            string_field(field(after_select[after_select.size() - 3], "item"),
+                         "type") == "reasoning");
+    }
     const auto rejection_cursor = root->cursor().sequence;
     bool rejected_history_stale = false;
     try {
@@ -359,6 +495,23 @@ int main() {
         break;
       history_offset = next;
     }
+    // Snapshot round trip (unit S1): the checkpoint is version 2 with refs, and the
+    // reopened store restores the same view and originals from it.
+    unwrap(native_restored.checkpoint());
+    check(field(root->saved_state()->context, "version") == Value{Number{"2"}} &&
+          !root->saved_state()->context.find("live_originals"));
+    const auto snapshot_view = native_restored.view();
+    const auto snapshot_originals = native_restored.originals();
+    root.reset();
+    root = take(RetainedState::open(std::make_unique<NativeJournalDirectory>(
+                                        take(NativeJournalDirectory::open(path))),
+                                    "audit", h, cap));
+    check(root->saved_state() && root->confirm_recovery().has_value());
+    check(root->reconcile(custody).has_value());
+    AuditLog snapshot_log{*root};
+    ContextStore snapshot_restored{snapshot_log};
+    check(snapshot_restored.view() == snapshot_view &&
+          snapshot_restored.originals() == snapshot_originals);
   } catch (const Error &e) {
     std::cerr << error_name(e.code) << '\n';
     std::filesystem::remove_all(path);

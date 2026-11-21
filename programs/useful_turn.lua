@@ -1,7 +1,9 @@
 -- Model-governed useful-work workflow. Configure paths normally in source.
 -- Both source files and boundary steer are retained through audited reads.
-local source =
-  blackbird.call("read_file", { path = "programs/useful_work.lua" }).content
+local source = blackbird.call(
+  "read_file",
+  { path = "programs/useful_work.lua", range = { mode = "bytes", start = 0 } }
+).content
 work = assert(load(source, "useful-work-helpers", "t"))()
 local boundary = work.boundary("context/useful-work/steer.bbm")
 blackbird.append({
@@ -21,7 +23,8 @@ for step = 1, 64 do
   for _, item in ipairs(response.output) do
     if item.type == "function_call" then
       calls = calls + 1
-      local result = blackbird.call(item.name, item.arguments)
+      local result =
+        blackbird.call(item.name, item.arguments, { call_id = item.call_id })
       blackbird.append({
         { type = "function_call_output", call_id = item.call_id, output = result },
       })

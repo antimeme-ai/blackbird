@@ -7,6 +7,7 @@
 #include "blackbird/observations.hpp"
 #include "blackbird/openai.hpp"
 #include "blackbird/participants.hpp"
+#include "blackbird/provider_profile.hpp"
 #include "blackbird/raw_program.hpp"
 #include "blackbird/session.hpp"
 #include "blackbird/tools.hpp"
@@ -36,6 +37,9 @@ public:
   virtual bool supports_prompt_cache_key() const noexcept { return false; }
   // Signed native histories must replay operational input at its original place.
   virtual bool retain_request_state() const noexcept { return false; }
+  // The binding of the open request group, for its profile record; nullptr outside a
+  // group or for an adapter that binds no route (test doubles).
+  virtual const Value *group_binding() const noexcept { return nullptr; }
   virtual Value respond(const Value &request,
                         const std::function<void(std::string_view)> &capture) = 0;
   virtual Value respond(const Value &request,
@@ -65,6 +69,9 @@ public:
                 const RawProviderOwner *) override;
   Value respond(const Value &, const std::function<void(std::string_view)> &,
                 const RawProviderOwner *, const RawAdapterContext *) override;
+  const Value *group_binding() const noexcept override {
+    return request_binding_ ? &*request_binding_ : nullptr;
+  }
 
 private:
   OpenAiConfig config_;
@@ -76,6 +83,28 @@ enum class RecoveryMode { provider_only, acknowledge_local_unknowns };
 void recover_coding_session(RetainedState &root,
                             RecoveryMode mode = RecoveryMode::provider_only,
                             const RawAdapterContext *context = nullptr);
+// The provider profiles a session loaded at its start (docs/CONTEXT_LIFECYCLE.md
+// §15.4). Files are read only then (owner decision 2026-10-20).
+struct SessionProfiles {
+  std::shared_ptr<const ProfileSet> set;
+  // The route binding read at session start. Absent when the auth store could not be
+  // read then (`deferral` says why): bind() reads it at the first provider request,
+  // whose failure is reported as an auth-store refusal naming the store.
+  std::optional<Value> binding;
+  std::string deferral;
+  // Traced under the caller's raw parent: the request's assembly phase, or /profile's
+  // command.
+  std::function<Value(const RawAuthParent *)> bind;
+  std::filesystem::path auth_store;
+  std::optional<Value> session_override;
+  // provider-profile-set-v1 as the session recorded it; the backstop records it too.
+  Value set_record;
+};
+// The profile in force for one (model, binding) pair, and the route it resolved from.
+struct ProfileView {
+  const EffectiveProfile *profile = nullptr;
+  RouteQuery route;
+};
 struct TurnInput {
   std::string_view prompt;
   std::string_view program;
@@ -106,6 +135,20 @@ public:
   TaskStore &tasks() noexcept { return tasks_; }
   ParticipantObservationReader participant_observer() const;
   void model(std::string name) { model_ = std::move(name); }
+  // Pins the session's profiles. Each provider.request resolves its profile from its
+  // final model (after request options) and its request group's binding, cached per
+  // (model, binding digest); the set is never reread. When the start binding was read,
+  // the definition-level model is resolved now, so a refusal is immediate. An engine
+  // without profiles records none.
+  ProfileResult<void> profiles(SessionProfiles profiles);
+  const SessionProfiles *session_profiles() const noexcept {
+    return profiles_ ? &*profiles_ : nullptr;
+  }
+  // The profile for the definition-level model and the session's binding (reading a
+  // deferred binding now), as /profile shows it; a null profile without profiles.
+  ProfileResult<ProfileView> effective_profile(const RawAuthParent *parent = nullptr);
+  // The program config's model, else the launch model.
+  std::string definition_model() const;
   std::function<void(std::string_view)> display;
   std::function<void(std::string_view)> diagnostic;
   std::function<void(std::string_view)> notice;
@@ -148,6 +191,41 @@ private:
   std::optional<Error> failed_turn_;
   Value workflow_result_;
   std::optional<Value> operator_arguments_;
+  bool operator_call_ = false; // Operator inspection stays exact; programs get budgets.
+  // What call() (or a drained continuation) hands one operation: the budget keys
+  // Blackbird supplied, and the shape applied where the result becomes visible to
+  // the model, once its original is retained (T1, design §9). Passed by value, so
+  // nothing stays armed for a later operation.
+  struct OperationShaping {
+    std::vector<std::string> native_defaults;
+    std::optional<ResultShape> shape;
+    std::string call_id;  // The model's function call this operation answers.
+    std::string declared; // The call_id a relay declared, accepted or not.
+    std::string refusal;  // Why a declared call_id is refused, if it is.
+  };
+  // The model's function calls from provider responses in this turn, by call_id. A
+  // relay declares the call it answers (blackbird.call(name, args, {call_id = ID}));
+  // an undeclared call matches one by name and arguments only until the turn's first
+  // declaration. generation orders responses: a call nested inside a model-boundary
+  // operation matches only calls from responses that arrived after it began. An
+  // appended output answers its call, which then can no longer be declared.
+  struct ModelCall {
+    std::string name;
+    Value arguments;
+    std::uint64_t generation = 0, sequence = 0;
+    bool dispatched = false;
+  };
+  std::map<std::string, ModelCall, std::less<>> model_calls_;
+  std::set<std::string, std::less<>> answered_calls_;
+  bool declared_turn_ = false;
+  std::uint64_t response_generation_ = 0, boundary_floor_ = 0, call_sequence_ = 0;
+  void note_answered(const Value::Array &items);
+  // The texts shaped in this turn and their result_ref: a value that is itself one of
+  // them, passed through whole, is not cut again (T1).
+  std::map<std::string, std::string, std::less<>> shaped_texts_;
+  // The last result_ref read's text, kept for the turn so paging does not decode the
+  // original again (released at turn end or on another reference).
+  std::string cached_result_ref_, cached_result_text_;
   std::shared_ptr<CommandJobs> command_jobs_;
   std::unique_ptr<RetainedState::SettlementScope> settlement_;
   CommandTaskMap command_tasks_;
@@ -167,6 +245,17 @@ private:
   CodingProvider &provider_;
   std::string model_;
   std::string effort_ = "medium";
+  std::optional<SessionProfiles> profiles_;
+  struct ResolvedProfile {
+    EffectiveProfile profile;
+    Value record;
+  };
+  std::map<std::pair<std::string, std::string>, ResolvedProfile> resolved_profiles_;
+  ProfileResult<const ResolvedProfile *>
+  resolve_profile_for(const SessionProfiles &profiles, const std::string &model,
+                      const Value &binding, RouteQuery *route = nullptr);
+  static ProfileResult<Value> session_binding(SessionProfiles &profiles,
+                                              const RawAuthParent *parent);
   Value last_request_bytes_, usage_;
   // Calls already unanswered at workflow admission. Repair never closes calls
   // introduced by the currently running workflow.
@@ -188,11 +277,12 @@ private:
     std::string revision, selection_attempt;
     RawEventRef selection{};
     RawProgramLifetime parked;
+    std::optional<ResultShape> shape; // The invoking call's; default when absent.
   };
   std::vector<WorkflowContinuation> workflow_continuations_;
   bool draining_workflows_ = false;
   std::optional<Error> workflow_failure_;
-  Value execute_workflow(WorkflowContinuation &invocation);
+  Value execute_workflow(WorkflowContinuation &invocation, bool continuation = false);
   void drain_workflows();
   Value pending_program_config_;
   std::string program_revision_ = "initial-empty", pending_program_revision_;
@@ -203,7 +293,9 @@ private:
   Value request_tools() const;
   Value budget_, pending_budget_;
 
-  std::string budget_revision_ = "initial-disabled", pending_budget_revision_;
+  // The built-in policy has its own revision so restore follows the current
+  // default rather than freezing whichever default was active when recorded.
+  std::string budget_revision_ = "builtin-default", pending_budget_revision_;
   Value context_budget(const Value &arguments);
   Value budget_view(std::string_view model, std::size_t input_bytes) const;
   Value budget_view(std::string_view model, std::size_t input_bytes,
@@ -221,7 +313,11 @@ private:
   std::unique_ptr<Observations> observations_;
   std::unique_ptr<Runtime> runtime_;
   Value request(Value options = Value::object({}));
-  Value call(std::string name, Value arguments);
+  Value call(std::string name, Value arguments) {
+    return dispatch(std::move(name), std::move(arguments), Value{});
+  }
+  // call() with options: {call_id = ID} declares the model call a relay answers (T1).
+  Value dispatch(std::string name, Value arguments, const Value &options);
   struct ProcessOriginalIndex {
     bool known = false;
     std::vector<std::pair<RecordReference, SourceReference>> chunks;
@@ -229,6 +325,7 @@ private:
   std::size_t process_original_cursor_ = 0;
   std::map<std::string, ProcessOriginalIndex> process_originals_;
   Value retained_process_output(const Value &arguments);
+  Value retained_result_output(const Value &arguments);
   Value operation(std::string_view name, const Value &input,
                   const std::function<
                       Value(OperationAttemptId, InvocationId, DefinitionGenerationId,
@@ -236,7 +333,8 @@ private:
                   RawProviderOperationContext *provider_operation = nullptr,
                   const CommandStartStatus *command_start = nullptr,
                   const DomainAdmission *domain_admission = nullptr,
-                  const FileEffectObservation *file_effect = nullptr);
+                  const FileEffectObservation *file_effect = nullptr,
+                  OperationShaping shaping = {});
   friend struct Runtime;
 };
 } // namespace blackbird

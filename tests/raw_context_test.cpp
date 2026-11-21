@@ -432,7 +432,7 @@ void verify_pairs(const std::vector<Record> &records) {
       {1813, 1814}, {1817, 1818}, {1819, 1820}};
   std::map<std::uint64_t, unsigned> terminals;
   for (const auto &record : records) {
-    if (record.site < 1800 || record.site > 1827 || record.site == 1800)
+    if (record.site < 1800 || record.site > 1828 || record.site == 1800)
       continue;
     auto bytes = ByteView{record.body};
     const auto ref = take_ref(bytes);
@@ -836,6 +836,8 @@ void owner() {
       require(context.items() == Value::Array{item}, "exact original business bytes");
       (void)context.stats();
       (void)context.originals();
+      // c3f: a result-class item is no live instruction; the query is recorded.
+      require(!context.live_instruction(item), "result item is no live instruction");
       (void)context.cancellation_budget(field(first_view, "entries").array(), Value{});
       const auto entry =
           string_field(field(first_view, "entries").array().front(), "id");
@@ -1165,6 +1167,67 @@ void owner() {
       require(restore_refused && cold_context.view() == restored_view,
               "blocked native source refuses subsequent publication without changing "
               "accepted view");
+      stage = "native cut, read-only playback and repair (unit S1)";
+      const JournalHeader cut_header{header.environment, identity<AuditStreamId>(77), 5,
+                                     header.limits, std::nullopt};
+      auto cut_root = unwrap(
+          RetainedState::create(native(), "cutting", cut_header, {33554432, 4096}));
+      Value repaired_view;
+      {
+        AuditLog cut_log{*cut_root};
+        ContextStore cut_context{cut_log};
+        cut_context.append({item}, "cut.fixture");
+        CutFrame frame;
+        frame.originals = {{item, 0}};
+        frame.insert = {{std::nullopt, std::uint32_t{0}}};
+        require(field(cut_context.cut(frame), "accepted") == Value{true},
+                "native cut frame accepted");
+        const auto bad = cut_log.issue();
+        CutFrame broken;
+        broken.revision = hex_identity(bad.bytes());
+        broken.base = broken.observed = cut_context.head();
+        broken.result = CutResult{7, 7, 0};
+        (void)cut_log.record(bad, ApplicationChannel::context,
+                             encode_cut_frame(broken));
+        // A later frame chained on the bad one: set aside (branch 6), then skipped
+        // by the repair on the next playback (branch 5).
+        const auto later = cut_log.issue();
+        const auto revision = hex_identity(later.bytes());
+        (void)cut_log.record(
+            later, ApplicationChannel::context,
+            Value::object({{"op", Value{"append"}},
+                           {"base", Value{broken.revision}},
+                           {"observed", Value{broken.revision}},
+                           {"revision", Value{revision}},
+                           {"accepted", Value{true}},
+                           {"origin", Value{"later"}},
+                           {"format", Value{"append-delta-v1"}},
+                           {"originals",
+                            Value{Value::Array{Value::object(
+                                {{"id", Value{revision + ".0"}}, {"item", item}})}}}}));
+        repaired_view = cut_context.view();
+      }
+      cut_root.reset();
+      cut_root = unwrap(
+          RetainedState::open(native(), "cutting", cut_header, {33554432, 4096}));
+      unwrap(cut_root->confirm_recovery());
+      unwrap(cut_root->reconcile(verifier));
+      {
+        AuditLog cut_log{*cut_root};
+        ContextStore cut_context{cut_log};
+        require(cut_context.read_only() && cut_context.view() == repaired_view,
+                "native playback stops read-only at the frame that does not apply");
+        (void)cut_context.repair({});
+        require(!cut_context.read_only(), "native repair frame accepted");
+      }
+      {
+        AuditLog cut_log{*cut_root};
+        ContextStore replayed{cut_log,
+                              ContextOpen{.whole_history = true, .probe = true}};
+        require(!replayed.read_only() && replayed.open_report().skipped == 2,
+                "native playback skips the frames the repair names");
+      }
+      oracle.collect(*cut_root);
       oracle.collect(*root);
       oracle.collect(*failed_root);
       oracle.collect(*cold_root);
@@ -1182,6 +1245,40 @@ void owner() {
   require(std::count_if(records.begin(), records.end(),
                         [](const auto &r) { return r.site == 1823; }) >= 2,
           "managed actual fields emitted");
+  const auto owners = [&](RawContextAction action) {
+    return std::count_if(records.begin(), records.end(), [&](const auto &r) {
+      return r.site == 1800 && !r.body.empty() &&
+             r.body.front() == static_cast<std::byte>(action);
+    });
+  };
+  require(owners(RawContextAction::cut) == 1 && owners(RawContextAction::repair) == 1,
+          "cut20 and repair21 owner requests emitted once each");
+  // The query's item is recorded as the print of its sorted-key form.
+  const auto print = item_fingerprint(Value::object(
+      {{"content", Value{std::string{"a\0b", 3}}}, {"role", Value{"assistant"}}}));
+  const auto queried =
+      std::count_if(records.begin(), records.end(), [&](const auto &r) {
+        if (r.site != 1828)
+          return false;
+        auto bytes = ByteView{r.body};
+        (void)take_ref(bytes);
+        const auto size = take<std::uint64_t>(bytes);
+        const auto crc = take<std::uint32_t>(bytes);
+        return size == print.first && crc == print.second && bytes.empty();
+      });
+  require(owners(RawContextAction::instructions) == 1 && queried == 1,
+          "instructions25 records the queried item's sorted-key print once");
+  const auto branches = [&](std::uint8_t wanted) {
+    return std::count_if(records.begin(), records.end(), [&](const auto &r) {
+      if (r.site != 1821)
+        return false;
+      auto bytes = ByteView{r.body};
+      (void)take_ref(bytes);
+      return take<std::uint8_t>(bytes) == wanted;
+    });
+  };
+  require(branches(7) == 1 && branches(6) == 1 && branches(5) == 2,
+          "reconstruct branches: read-only 7 once, after-bad 6 once, skipped 5 twice");
 }
 } // namespace
 void *operator new(std::size_t size) {

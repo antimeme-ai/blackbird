@@ -2,15 +2,30 @@
 
 ## Policy and units
 
-The native default is **disabled**, with `trigger_bytes: 262144` (256 KiB),
-`target_bytes: 131072` (128 KiB), and reason
-`opt-in; byte policy is not a provider token limit`.
+The native default is **enabled**, with `trigger_bytes: 393216` (384 KiB) and
+`target_bytes: 196608` (192 KiB), chosen from measured campaign requests
+([REQUEST_SIZES](../papers/clm-a1v-2026-10-19/REQUEST_SIZES.md)), under revision
+`builtin-default`. A session that never chose a policy follows the current
+default on reopen; that includes one recorded under the pre-2026-10-19
+`initial-disabled` revision. An explicitly chosen policy is kept exactly.
+
+Every request also carries one `CONTEXT_SIZE input_bytes=N entries=M
+trigger_bytes=T target_bytes=G` line, or `budget=off`, in its developer
+operational state, so the model always knows its size. The line informs only:
+context tools stay available to the model's judgment at every request, the
+trigger guidance below is the first nudge, and any later direction escalates from
+there. No size is a goal; the model manages context to be effective for the
+work at hand. A provider that retains
+request state in context (today only Anthropic) gets the line only with the
+trigger guidance, so stale sizes accumulate only while the trigger is
+reached (see `arconaut-2o9`). `state_context = "omit"`
+drops it.
 This documentation session instead has an enabled **9000/4500-byte** policy;
 those are session choices, not defaults.
 
 When enabled, `input_bytes >= trigger_bytes` invites the model to inspect its
-working map and propose managed compaction. Measurement is **serialized input
-UTF-8 JSON bytes**, not tokens, total request/wire bytes, or a provider context
+working map and propose managed compaction. Measurement is **encoded native
+packet bytes of the request input** (`coding.cpp` `encode_packet_string`), not tokens, total request/wire bytes, or a provider context
 limit. The trigger does not reject requests or force shrinking. The target is
 advisory: retaining instructions and repairing omissions may require growth.
 Compaction changes presentation; it performs **no physical audit reclamation**.
@@ -112,22 +127,27 @@ base is the **context** revision and can become stale as tool exchanges append.
 Managed changes also wait for successful workflow completion.
 
 Recover omitted details with bounded `context_inspect` pages, not an unbounded
-read of all originals. This session's repair used:
+read of all originals. The default page format is the native framed BBM2 stream
+(`BBMS\1` header, then eight-byte little-endian lengths and packets), which a
+model cannot read. Ask for `"format": "json"` to page JSON text instead:
 
 ```json
 {
   "query": {
     "kind": "originals",
     "entry": "3de1dba2e9e6fb751b00000000000000.0",
+    "format": "json",
     "offset": 4500,
     "limit": 4000
   }
 }
 ```
 
-Pages are hex-encoded serialized JSON UTF-8 bytes; a slice may not be a complete
-JSON document. Decode the hex as needed. For subsequent pages, bind the returned
-`revision`; on conflict restart pagination. Append a recovered fact to the
+Either format returns the page as hex in `bytes`, plus `total_bytes`, `next`,
+`revision` and `context_revision` (`src/context.cpp`, `ContextStore::inspect`). A
+JSON slice may not be a complete document, so decode the hex and join pages as
+needed. For subsequent pages, bind the returned `revision`; on conflict, restart
+pagination. Append a recovered fact to the
 working map with `arco.append`, or use managed `restore` when the full original
 is needed. Repair can exceed the advisory target; retained originals remain
 available even after removal from presentation.
@@ -148,7 +168,7 @@ policy.
 - `src/coding.cpp`: `default_context_budget`, `validate_context_budget`,
   `CodingEngine::budget_view`, `context_budget`, constructor replay, and `turn`.
 - `src/context.cpp`: `ContextStore::finish_workflow` and boundary publication.
-- `include/arconaut/coding.hpp`: engine API/state.
+- `include/blackbird/coding.hpp`: engine API/state.
 - `tests/context_budget_test.cpp`: policy, trigger, repair, combined-boundary,
   notification, and reopen oracles (not executed for this documentation task).
 

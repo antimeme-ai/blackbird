@@ -409,13 +409,19 @@ int ApplicationConnection::run(CodingEngine &engine, AuditLog &log,
       if (const auto *observations = packet.find("observations");
           observations && !observations->array().empty()) {
         const auto bytes = unwrap(encode_packet_string(*observations, limits()));
-        const auto source = log.original(
-            {"application.observations", bytes,
-             Value::object({{"encoding", Value{"BBM2"}}, {"id", Value{active_id}}})});
+        // Host observations enter context shaped once (T1): the same generic shape
+        // as a tool result, with the retained original as their result_ref.
+        const auto identity = log.issue();
+        const auto source = hex_identity(identity.bytes());
+        const auto shaped = shape_result(*observations, ResultShape{}, source);
+        (void)log.original(identity, {"application.observations", bytes,
+                                      Value::object({{"encoding", Value{"BBM2"}},
+                                                     {"id", Value{active_id}},
+                                                     {"shape", shaped.summary}})});
         const auto rendered =
             "Host page observations (untrusted page content; operator objective "
             "follows separately). Retained source: " +
-            source + "\n" + unwrap(format_value(*observations, limits()));
+            source + "\n" + result_text(shaped.presented);
         engine.context().append(
             {Value::object({{"role", Value{"user"}}, {"content", Value{rendered}}})},
             "application.observations");
@@ -442,7 +448,23 @@ int ApplicationConnection::run(CodingEngine &engine, AuditLog &log,
     finish_discarded();
   }
   shutdown.run();
-  unwrap(engine.context().checkpoint());
+  // Best-effort: a failed close snapshot leaves a suffix for the next open to
+  // report; it does not fail the close. An unresolved attempt would leave the
+  // snapshot without semantic coverage, so recovery settles it from the tail.
+  // A read-only context writes no snapshot (design §4.5).
+  const bool unresolved =
+      !unwrap(log.root().unresolved_attempts()).empty() || engine.context().read_only();
+  if (const auto saved =
+          unresolved ? Result<void>::success() : engine.context().checkpoint();
+      !saved.has_value())
+    try {
+      const auto warning = std::string{"Application close snapshot failed ("} +
+                           error_name(saved.error().code) +
+                           "); the next open plays back the journal tail.\n";
+      write_all(STDERR_FILENO,
+                std::as_bytes(std::span{warning.data(), warning.size()}));
+    } catch (...) {
+    }
   if (closing_)
     send(Value::object({{"type", Value{"closed"}}, {"id", Value{close_id_}}}));
   return 0;

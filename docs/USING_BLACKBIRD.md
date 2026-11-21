@@ -199,11 +199,35 @@ persistent state. The model has a `lua` tool and the same APIs:
   6144 tail, unless `output_max_bytes` is explicit. Un-ranged `read_file` keeps
   its 16384-byte head-first default. An
   explicit file range bypasses that workflow default. This bounds returned raw
-  bytes, not tokens, capture, memory or external encoding. Custom Lua callers keep
-  full-read defaults; zero or larger explicit limits are accepted.
+  bytes, not tokens, capture, memory or external encoding. The same defaults apply
+  natively to every program, including custom Lua and `ultracode`, and to
+  `process op=foreground` and unranged `read_process_output`. The operator's own
+  `/exec`, `/process` and `/fg` stay complete; calls nested in an operator `/lua`
+  program are shaped. Zero or larger explicit limits are accepted.
+  Results of the other tools (not `write_file`/`edit_file` or the paged readers)
+  are shaped once, where they reach the model (T1): the output of the model's own
+  call, a drained workflow continuation, host observations. When such a result's
+  text (a UTF-8 string as is, otherwise its JSON) exceeds 16384 bytes it returns as
+  one string: the first 4096 bytes, a marker line naming the omitted range, total and
+  `result_ref`, and the last 12288 bytes.
+  `blackbird.call("read_process_output", {result_ref=REF, range={mode="bytes",
+  start=H, ["end"]=T}})` pages the original's text, 8192 bytes per page unless
+  `output_max_bytes` asks for more. A program relaying a model call declares it:
+  `blackbird.call(item.name, args, {call_id = item.call_id})` makes the result the
+  model's own and shaped, even when the relay changes the arguments; an unknown or
+  already answered call_id is refused and not run. Without the declaration a relayed
+  call is shaped only while its name and arguments equal an undispatched model call
+  and the turn has made no declaration yet; otherwise its whole result enters
+  context. A program's own `blackbird.call` (at any nesting) returns these tools'
+  results whole, so recipes that read fields such
+  as `program_config`'s `revision` keep working; `blackbird.append` content is the
+  program's own and is never shaped. On the model's call, `output_max_bytes` and
+  `output_head_bytes` set the budget and never reach the tool; a Lua-defined tool
+  takes its shape from `definition.shape`. See
+  [economical defaults](ECONOMICAL_DEFAULTS.md).
   `read_file` accepts one optional `range` object: `{mode="lines", start=1,
   ["end"]=20}` (one-based inclusive) or `{mode="bytes", start=0, ["end"]=256}`
-  (zero-based half-open). Omit `range` for the whole file. Only one mode is possible;
+  (zero-based half-open). Omit `range` for the first 16384 bytes; use a range or `output_max_bytes` for more. Only one mode is possible;
   unknown range keys and mixed selectors fail with correction guidance. Historical
   Lua calls using one `line_start`/`line_end` or `byte_start`/`byte_end` pair remain
   supported, but those fields are absent from the advertised model schema.
@@ -259,7 +283,22 @@ persistent state. The model has a `lua` tool and the same APIs:
   Last request/usage are scoped to this process; null means unavailable. No token
   estimates or model-limit guesses are made.
 - `blackbird.originals()` lists originals; `blackbird.restore(id)` repairs an item.
-  `blackbird.append(items)` adds synthetic items with fresh original IDs.
+  `blackbird.append(items[, {class = "instruction" | "result"}])` adds synthetic
+  items with fresh original IDs. The class belongs to the appended record and an
+  edit cannot change it: an instruction is never archived, summarised or left out
+  by `context_manage`, except an older copy whose bytes equal a later live
+  instruction, which may be archived or left out by a select; the default,
+  `result`, can be archived. An
+  append holding function calls or reasoning takes no class and is a `round`,
+  atomic with the outputs that answer its calls; outputs take no class either and
+  join their call's round. Any other option or class is refused.
+- `blackbird.live_instruction(item)` returns true when a live entry whose creating
+  record makes it an instruction holds an item equal to `item`, ignoring the order of
+  object keys at every depth (both are compared with keys sorted; every other byte,
+  and array order, must match). A result entry with an equal item does not count.
+  The built-in ultracode appends its brief only when this is false, so repeated runs
+  keep one copy of each brief revision. Only this query ignores key order: a
+  superseded copy, and an entry's comparison with its original, need exact bytes.
 - `blackbird.json.decode/encode` import/export JSON at external boundaries; native values preserve null, arrays and exact numeric values.
   Use `blackbird.binary.encode/decode` for BBM2 persistence, and `blackbird.format` for text.
   Use `blackbird.array({})` for a new empty array.
@@ -377,11 +416,30 @@ is mechanism evidence; readiness for daily self-development depends on operator 
 
 `/compact JSON` accepts `{base,mode,ids,reason,source}`; mode is `archive`, `select`,
 `summarize` or `restore`. Summary also requires `summary:{role:"assistant",content:...}`.
-Use `/context` for entry IDs/revision. Complete call/result intervals are atomic;
-all live user/system/developer instructions are mandatory. Restore merges exact
+Use `/context` for entry IDs/revision. `ids` name whole units. A response round is
+one unit: the reasoning, messages and calls of one record plus every output that
+answers those calls, wherever the outputs sit; a Lua append of calls or reasoning is
+a round too. Every other entry is its own unit. The class comes from the record that
+created the entry, never from an edit:
+- never archived, summarised or left out of a select: instructions (operator prompts,
+  restart notes, backstop instructions, Lua appends declared `instruction`, the
+  built-in ultracode brief, seeded user/system/developer entries, and user, system
+  or developer entries of Lua appends written before S2 or of other legacy records),
+  and pinned units. An older instruction whose item bytes equal a later live
+  instruction may be archived or left out of a select, never summarised;
+- archivable: rounds, results (the Lua default, workflow continuations, protocol
+  repairs, stop linkage, `operator.beads`, application observations), request state
+  and summaries.
+Refusals: `partial-tool-group` (a call without its output, or a call no output
+answers yet), then `partial-round` (reasoning without the rest of its round), both
+over the whole selection; then, at the first unit in context order with a problem,
+`protected-unit`, `pinned-unit` or `partial-unit` (part of a unit), checked in that
+order for that unit. A select keeps the open round at the tail. Restore merges exact
 originals in capture order and repairs selected edited/reordered presentations.
 Archive only changes presentation. Summaries have fresh IDs and source ancestry;
-structural acceptance cannot establish fact accuracy. No automatic thresholds.
+structural acceptance cannot establish fact accuracy. Management never runs
+automatically. The default context budget (trigger 393216 bytes, target 196608)
+only invites the model to act; see [CONTEXT_BUDGET](CONTEXT_BUDGET.md).
 
 Lua uses `blackbird.manage(proposal)` and `blackbird.inspect(query)`. Model tools are
 `context_manage {proposal}` and `context_inspect {query}`. A supplied base is strict

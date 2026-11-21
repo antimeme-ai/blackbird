@@ -288,13 +288,14 @@ Value default_workflows() {
             {{"token", Value{"ultracode"}}, {"color", Value{"keyword"}}})}}},
        {"source",
         Value{
-            R"lua(blackbird.append({{role='developer',content='Ultracode: implement useful working code. Read targeted sources, state concrete tasks and a fixed allowance before hardening. Preserve the operator prompt. Use direct specification oracles and fake effects where possible. One independent review and one findings recheck within the allowance; never reset it. Report actual outcomes and gaps; no invented scheduler or performance claims.'}})
+            R"lua(local brief={role='developer',content='Ultracode: implement useful working code. Read targeted sources, state concrete tasks and a fixed allowance before hardening. Preserve the operator prompt. Use direct specification oracles and fake effects where possible. One independent review and one findings recheck within the allowance; never reset it. Report actual outcomes and gaps; no invented scheduler or performance claims.'}
+if not blackbird.live_instruction(brief) then blackbird.append({brief}, {class='instruction'}) end
 for step=1,64 do
  blackbird.emit(3880,step)
  local r=blackbird.request(); local calls=0
  for _,item in ipairs(r.output) do
   if item.type=='function_call' then
-   calls=calls+1; local result=blackbird.call(item.name,item.arguments)
+   calls=calls+1; local result=blackbird.call(item.name,item.arguments,{call_id=item.call_id})
    blackbird.append({{type='function_call_output',call_id=item.call_id,output=result}})
   elseif item.type=='message' then blackbird.present(item) end
  end

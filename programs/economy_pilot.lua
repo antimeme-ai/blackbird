@@ -1,11 +1,17 @@
 -- Finite matched useful-work pilot. Config and raw records remain local.
 -- Same instrumentation and context policy in both arms; one information policy differs.
 local cfg = blackbird.binary.decode(
-  blackbird.call("read_file", { path = "context/pilot-config.bbm" }).content
+  blackbird.call(
+    "read_file",
+    { path = "context/pilot-config.bbm", range = { mode = "bytes", start = 0 } }
+  ).content
 )
 local M = assert(
   load(
-    blackbird.call("read_file", { path = "programs/useful_work.lua" }).content,
+    blackbird.call(
+      "read_file",
+      { path = "programs/useful_work.lua", range = { mode = "bytes", start = 0 } }
+    ).content,
     "@programs/useful_work.lua",
     "t"
   )
@@ -21,8 +27,8 @@ blackbird.append({
     content = policies[cfg.policy]
       .. " Common rules: only inspect declared project sources and write the declared local deliverable. No delegates, network commands, checkout changes, background programs, builds, restart or context compaction. Same access and up to 8 requests in either arm. No command approvals. Feedback is advisory; correctness comes first.",
   },
-  { role = "assistant", content = blackbird.format(M.feedback()) },
-})
+}, { class = "instruction" })
+blackbird.append({ { role = "assistant", content = blackbird.format(M.feedback()) } })
 local records = {
   id = cfg.id,
   policy = cfg.policy,
@@ -72,7 +78,8 @@ for step = 1, 8 do
     if item.type == "function_call" then
       calls = calls + 1
       local t = clock()
-      local success, result = pcall(blackbird.call, item.name, item.arguments)
+      local success, result =
+        pcall(blackbird.call, item.name, item.arguments, { call_id = item.call_id })
       local u = clock()
       rec.tools[#rec.tools + 1] =
         { name = item.name, wall_seconds = u - t, completed = success }
