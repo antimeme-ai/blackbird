@@ -13318,3 +13318,42 @@ checkout and removing the repository's `.beads/` tracker and Dolt workspace
      (pass), and all 8 TUI tests (pass), followed by the mandatory clean-slate
      pre-commit hook (`scripts/rigor check debug`: full Debug CTest suite plus
      owned C++/Lua formatting and static analysis).
+
+## 2026-11-21 — Unit (4): stop raw storage amplification & remove 64-step ceiling
+
+Baseline analysis of live DeepSeek v4.1-flash + Oxcart sessions (`~/business/oxcart-traces/`,
+85.7 GiB across 22 sessions) showed `raw/events.*` consuming 94–99% of 1.7–6.98 GiB per
+session from four compounding amplification paths, plus an unauthorized hardcoded 64-step
+turn loop ceiling. Wrote `docs/STORAGE_AMPLIFICATION_SUBPLAN.md` and five RED oracles in
+`tests/storage_amplification_test.cpp` (all 5 verified failing on `03c1050` before edits):
+
+1. **Metadata-only `raw_storage` (`src/raw_storage.cpp`):** Stopped copying literal file
+   payload bytes into `raw/events.*` on `3008` (`read`/`pread`) and `3009` (`write`/`pwrite`).
+   Both now emit compact control-partition metadata (`fd`, requested/returned counts,
+   offset, errno), set `r.data = 0` in `raw_storage_loan_reservation()`, and preserve
+   exact continuation chunk clamping.
+2. **Streaming batched `ArchiveCatalog::publish_merge` (`src/archive_catalog.cpp`):**
+   Replaced per-entry 96-byte `pread`s, `O(|delta| log N)` probe passes, and
+   `3206`/`3207`/`3208` storms with a single-pass two-pointer streaming merge over
+   128-entry (12 KiB) `CatalogBatchReader` chunks, keeping `3200`/`3201` summaries
+   and exact CRC/ordinal validation while preserving `ContextStore::maybe_checkpoint()`
+   cadence (`64` records / `4 MiB`).
+3. **`CommandJobs` idle backoff & lane recycling (`src/command_jobs.cpp`):** Added
+   `stop_wake->read_fd()` (gated by `!stopping`) to `Impl::run()`'s `::poll()` with
+   exponential idle backoff (`10 -> 250ms`, reset on I/O, pending control, or stop) while
+   preserving two-call `waitid()` custody semantics. Added `free_lanes` recycling in
+   `reclaim_settled_lanes()` so settled `exec` jobs reuse raw worker lanes instead of
+   rotating `events.*` per command.
+4. **Removed hardcoded 64-step turn ceiling (`programs/turn.lua`,
+   `programs/useful_turn.lua`, `src/workflows.cpp`, `src/coding.cpp`):** Replaced
+   `for step = 1, 64` loops with unbounded `while true` loops (preserving `3880/3881/3882`
+   telemetry, restart checks, and `calls == 0` termination) and bumped
+   `builtin-ultracode-v4` to `builtin-ultracode-v5` for automatic upgrade on reopen.
+5. **Adversarial review & hardening (layer 1):** Independent review caught a `poll(..., 0)`
+   spin storm when `now >= deadline` during `SIGTERM`->`SIGKILL` grace windows, a
+   `lane_reclaiming` concurrency hazard with `control("archive")`/`start()` eviction,
+   a `clang-tidy` `bugprone-unchecked-optional-access` in `src/archive_catalog.cpp`, and
+   `clang-format` / `#include <thread>` / test-oracle tightening items. Fixed all findings
+   and added a deadline-timeout SIGTERM-trap regression oracle before running the full
+   clean-slate pre-commit gate (`scripts/rigor check debug`: all 300 Debug tests + C++/Lua
+   lint).

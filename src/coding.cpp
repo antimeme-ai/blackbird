@@ -2711,9 +2711,10 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
     // The built-in program's revision names its exact source: v2 declares the
     // ultracode brief an instruction (unit S2); v3 appends it only when no live
     // instruction holds an equal item, object key order ignored (unit c3f); v4
-    // declares the call_id of each model call it dispatches (unit T1).
+    // declares the call_id of each model call it dispatches (unit T1); v5
+    // removes the arbitrary 64-step ceiling.
     constexpr std::string_view builtin_prefix = "builtin-ultracode-v";
-    const std::string builtin = std::string{builtin_prefix} + "4";
+    const std::string builtin = std::string{builtin_prefix} + "5";
     program_revision_ = builtin;
     budget_ = default_context_budget();
     std::optional<Value> recorded_config;

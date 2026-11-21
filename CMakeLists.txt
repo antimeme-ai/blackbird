@@ -1109,3 +1109,8 @@ foreach(wiring_case refusal pin digests layering record request model resolution
   set_tests_properties(profile_wiring_${wiring_case} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 set_tests_properties(profile_wiring_refusal PROPERTIES TIMEOUT 400)
+add_executable(storage_amplification_test tests/storage_amplification_test.cpp)
+target_compile_definitions(storage_amplification_test PRIVATE BLACKBIRD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(storage_amplification_test PRIVATE blackbird_coding)
+add_test(NAME storage_amplification COMMAND storage_amplification_test)
+set_tests_properties(storage_amplification PROPERTIES TIMEOUT 120)

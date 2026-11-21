@@ -212,12 +212,9 @@ raw_storage_loan_reservation(const RawStorageLoanBudget &b) noexcept {
   if (b.kind == RawStorageLoanKind::selected_exec &&
       !product_checked(r.control, b.submissions, 148))
     return R::failure({ErrorCode::overflow});
-  r.data = b.write_bytes;
-  if (!product_checked(r.data, r.write_calls, 86) ||
-      !product_checked(r.data, r.probes, 145) ||
-      !add_checked(r.data, b.positive_read_bytes) ||
-      !product_checked(r.data, b.positive_read_calls, 49))
-    return R::failure({ErrorCode::overflow});
+  // Storage reads/writes emit control-only metadata (fd, offset, counts, errno)
+  // without copying literal file payload bytes into raw/events.
+  r.data = 0;
   if (b.batches > UINT64_MAX / 3 - b.submissions)
     return R::failure({ErrorCode::overflow});
   return R::success(r);
@@ -777,13 +774,6 @@ RawStorageSettlementLoan::prepare_authorized(const void *root,
     try {
       loan->control_.emplace(claim(reservation.control - 172 - lifecycle));
       loan->lifecycle_.emplace(claim(lifecycle));
-      loan->writes_.emplace(
-          data_claim(budget.write_bytes + 86 * reservation.write_calls));
-      if (reservation.probes)
-        loan->catalog_.emplace(data_claim(145 * reservation.probes));
-      if (budget.positive_read_calls)
-        loan->reads_.emplace(
-            data_claim(budget.positive_read_bytes + 49 * budget.positive_read_calls));
     } catch (...) {
       loan->joined();
       throw;
@@ -827,7 +817,7 @@ void RawStorageSettlementLoan::finish(std::optional<Error> error) noexcept {
 }
 std::optional<RawControlToken>
 RawStorageSettlementLoan::action(RawStorageActionKind kind, bool catalog,
-                                 RawCapacityClaim *&data, std::uint64_t &read_limit) {
+                                 RawCapacityClaim *&, std::uint64_t &read_limit) {
   if (!active_ || finished_ || raw_current_thread() != issuer_ ||
       !owner_.permits_thread())
     throw Error{ErrorCode::wrong_incarnation};
@@ -850,13 +840,11 @@ RawStorageSettlementLoan::action(RawStorageActionKind kind, bool catalog,
       if (!catalog_calls_)
         throw Error{ErrorCode::capacity};
       --catalog_calls_;
-      data = &required(catalog_);
       read_limit = 96;
     } else {
       if (!read_calls_ || !read_bytes_)
         throw Error{ErrorCode::capacity};
       --read_calls_;
-      data = &required(reads_);
       read_limit = std::min(read_bytes_, raw_storage_io_limit);
     }
     amount = read_credit;
@@ -1053,7 +1041,6 @@ RawStorageAction::RawStorageAction(const RawProductStorageOwner &owner,
         throw Error{ErrorCode::capacity};
       --continuation->remaining_calls;
       credit_.emplace(split(*continuation->slots, write_credit));
-      data_ = &required(loan_->writes_);
     } else
       credit_ = loan_->action(kind, resource == resource->scope_->archive_, data_,
                               native_read_limit_);
@@ -1275,7 +1262,7 @@ ssize_t RawStorageNative::read(RawStorageAction &action, int descriptor,
     throw Error{ErrorCode::capacity};
   const bool positioned = offset.has_value();
   const std::uint8_t method = positioned ? 2 : 1;
-  RawStorageCall call{action, (positioned ? 86ULL : 78ULL) + 53, 49 + count};
+  RawStorageCall call{action, (positioned ? 86ULL : 78ULL) + 53};
   auto request = call.prefix(method);
   request.native(descriptor);
   request.native(count);
@@ -1294,13 +1281,10 @@ ssize_t RawStorageNative::read(RawStorageAction &action, int descriptor,
     fields.native(failed);
     if (failed)
       fields.native(native_errno);
-    if (returned > 0) {
-      fields.add(output.first(static_cast<std::size_t>(returned)));
-      (void)emit(3008, fields.view(), *call.data, RawPartition::data);
-      if (action.loan_ && action.resource_ != action.resource_->scope_->archive_)
-        action.loan_->read_bytes_ -= static_cast<std::uint64_t>(returned);
-    } else
-      (void)emit(3008, fields.view(), *call.control);
+    (void)emit(3008, fields.view(), *call.control);
+    if (returned > 0 && action.loan_ &&
+        action.resource_ != action.resource_->scope_->archive_)
+      action.loan_->read_bytes_ -= static_cast<std::uint64_t>(returned);
   }
   errno = native_errno;
   return returned;
@@ -1314,43 +1298,33 @@ ssize_t RawStorageNative::write(RawStorageAction &action, int descriptor,
   const bool positioned = offset.has_value();
   const std::uint8_t method = positioned ? 2 : 1;
   auto *continuation = action.continuation_;
-  bool reference = false;
-  std::size_t payload_offset = 0;
+  bool continuing = false;
   if (continuation && continuation->input.ordinal && positioned &&
       std::less_equal<const std::byte *>{}(continuation->published.data(),
                                            input.data()) &&
       std::less_equal<const std::byte *>{}(input.data(),
                                            continuation->published.data() +
                                                continuation->published.size())) {
-    payload_offset =
+    const auto payload_offset =
         static_cast<std::size_t>(input.data() - continuation->published.data());
     const auto available = continuation->published.size() - payload_offset;
     if (available) {
       count = std::min(count, available);
-      reference = true;
+      continuing = true;
     }
   }
-  RawStorageCall call{action, reference ? 171ULL : 53ULL,
-                      reference ? 0 : (positioned ? 86 : 78) + count};
+  RawStorageCall call{action, (positioned ? 86ULL : 78ULL) + 53};
   auto request = call.prefix(method);
   request.native(descriptor);
   request.native(count);
   request.native(positioned);
   if (offset)
     request.native(*offset);
-  if (reference) {
-    request.ref(continuation->input);
-    payload_offset += 86;
-    request.native(payload_offset);
-    call.start(3032, request);
-  } else {
-    request.add(input.first(count));
-    call.start(3009, request, true);
-    if (continuation) {
-      continuation->input = call.request;
-      continuation->published = input.first(count);
-      continuation->offset = offset ? static_cast<std::uint64_t>(*offset) : 0;
-    }
+  call.start(3009, request);
+  if (continuation && !continuing) {
+    continuation->input = call.request;
+    continuation->published = input.first(count);
+    continuation->offset = offset ? static_cast<std::uint64_t>(*offset) : 0;
   }
   const ssize_t returned = offset ? ::pwrite(descriptor, input.data(), count, *offset)
                                   : ::write(descriptor, input.data(), count);
@@ -1634,9 +1608,9 @@ std::string_view raw_storage_description() noexcept {
       "3005 Q,[openat int directory],int flags,bool mode,[mode_t],size_t name,exact "
       "Cstring including NUL;3006 T,int,bool failure,[int errno];"
       "3007 Q,int fd,size_t native_count,bool positioned,[off_t];3008 T,ssize_t,bool "
-      "failure,[int errno],positive-only exact bytes;"
-      "3009 Q,int fd,size_t native_count,bool positioned,[off_t],exact native "
-      "input;3010 T,ssize_t,bool failure,[int errno];"
+      "failure,[int errno];"
+      "3009 Q,int fd,size_t native_count,bool positioned,[off_t];"
+      "3010 T,ssize_t,bool failure,[int errno];"
       "3011 Q,int fd OR int dir,int flags,size_t name,Cstring;3012 T,int,bool "
       "failure,[int errno],success-only dev_t,ino_t,mode_t,uid_t,nlink_t,off_t;"
       "3013 Q,int fd,u8 method,[int F_FULLFSYNC],SyncStrengthu8;3014 T,int,bool "

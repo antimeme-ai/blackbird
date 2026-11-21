@@ -378,6 +378,8 @@ struct CommandJobs::Impl {
     std::uint64_t release_epoch = 0;
     unsigned short rows = 24, columns = 80;
     bool resize_pending = false;
+    bool lane_reclaimed = false;
+    bool lane_reclaiming = false;
     // Joined before the wake, its claims, and its producer are destroyed.
     std::jthread worker;
     ~Job() {
@@ -392,7 +394,39 @@ struct CommandJobs::Impl {
   std::condition_variable condition;
   RawThreadHandle cleanup_context;
   std::optional<RawControlToken> shutdown_credit;
+  std::vector<RawThreadHandle> free_lanes;
   std::map<std::string, std::shared_ptr<Job>, std::less<>> jobs;
+  void reclaim_settled_lanes() {
+    std::vector<std::shared_ptr<Job>> candidates;
+    {
+      const std::lock_guard lock{mutex};
+      for (auto &[key, candidate] : jobs) {
+        (void)key;
+        if (retirable(*candidate) && !candidate->lane_reclaimed &&
+            candidate->raw_context) {
+          candidate->lane_reclaimed = true;
+          candidate->lane_reclaiming = true;
+          candidates.push_back(candidate);
+        }
+      }
+    }
+    for (auto &candidate : candidates) {
+      if (candidate->worker.joinable())
+        candidate->worker.join();
+      if (candidate->retained_loan) {
+        candidate->retained_loan->joined();
+        candidate->retained_loan.reset();
+      }
+      candidate->worker_credit.reset();
+      candidate->retry_credit.reset();
+      candidate->semantic_credit.reset();
+      candidate->stop_wake.reset();
+      const std::lock_guard lock{mutex};
+      if (candidate->raw_context)
+        free_lanes.push_back(std::move(candidate->raw_context));
+      candidate->lane_reclaiming = false;
+    }
+  }
   // Every access to cleanup producer/claims is serialized by mutex.
   void caller_stop(Job &job, std::uint8_t source) noexcept {
     RawThreadBinding owner{cleanup_context};
@@ -437,9 +471,10 @@ struct CommandJobs::Impl {
         }));
   }
   bool retirable(const Job &job) const {
-    return job.finished && job.terminal_retained && job.pending.empty() &&
-           job.custody != Custody::pending && job.custody != Custody::owned &&
-           waiting != job.id && job.reservations.empty() &&
+    return job.finished && job.terminal_retained && !job.lane_reclaiming &&
+           job.pending.empty() && job.custody != Custody::pending &&
+           job.custody != Custody::owned && waiting != job.id &&
+           job.reservations.empty() &&
            std::none_of(job.deliveries.begin(), job.deliveries.end(),
                         [](const auto &entry) { return !entry.second.done; }) &&
            std::none_of(mailbox.begin(), mailbox.end(), [&](const Mailbox &entry) {
@@ -741,7 +776,10 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
       job->ready = group_ready;
       condition.notify_all();
     }
+    int idle_poll_ms = 10;
     while (true) {
+      bool made_progress = false;
+      bool has_pending_control = false;
       bool stop = false;
       bool exited = false;
       std::size_t available = 0;
@@ -787,9 +825,11 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
             n > 0         ? nullptr
             : read_credit ? &*read_credit
                           : nullptr);
-        if (n > 0)
+        if (n > 0) {
+          made_progress = true;
           bootstrap_size += static_cast<std::size_t>(n);
-        else if (n == 0) {
+        } else if (n == 0) {
+          made_progress = true;
           if (!group_ready || bootstrap_size != 0)
             throw Error{ErrorCode::io, EPROTO};
           boot_read.close();
@@ -889,6 +929,7 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
                 2017, request, std::array{raw_native_field(n), raw_native_field(error)},
                 control_held);
             if (n > 0) {
+              made_progress = true;
               const auto size = static_cast<std::size_t>(n);
               delivery.written += size;
               job->input_bytes -= size;
@@ -952,6 +993,7 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
             : read_credit ? &*read_credit
                           : nullptr);
         if (n > 0) {
+          made_progress = true;
           auto chunk =
               std::make_shared<const std::string>(bytes, static_cast<std::size_t>(n));
           const std::lock_guard lock{mutex};
@@ -994,6 +1036,7 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
           }
         } else if (n == 0 ||
                    (n < 0 && errno == EIO && job->launch.pty && group_ready)) {
+          made_progress = true;
           channel_closed = true;
           output_read.close();
           const std::lock_guard lock{mutex};
@@ -1066,10 +1109,31 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
       }
       if (exited && channel_closed && boot_read.value < 0)
         break;
-      pollfd descriptors[2]{{available >= 8192 ? output_read.value : -1, POLLIN, 0},
-                            {boot_read.value, POLLIN, 0}};
+      {
+        const std::lock_guard lock{mutex};
+        has_pending_control =
+            !job->input.empty() || !job->signals.empty() || job->resize_pending;
+      }
+      if (made_progress || stopping || has_pending_control)
+        idle_poll_ms = 10;
+      const int stop_fd = !stopping && job->stop_wake ? job->stop_wake->read_fd() : -1;
+      pollfd descriptors[3]{{available >= 8192 ? output_read.value : -1, POLLIN, 0},
+                            {boot_read.value, POLLIN, 0},
+                            {stop_fd, POLLIN, 0}};
       auto poll_credit = raw_command_claim(108);
-      const int timeout = 10;
+      int timeout = idle_poll_ms;
+      if (!stopping) {
+        const auto now = Clock::now();
+        if (now < deadline) {
+          const auto remaining_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                  .count();
+          if (remaining_ms < timeout)
+            timeout = std::max(1, static_cast<int>(remaining_ms));
+        } else {
+          timeout = 0;
+        }
+      }
       const auto request =
           raw_command_linked(2046, job->launch_ref,
                              std::array{raw_native_field(descriptors[0].fd),
@@ -1078,13 +1142,17 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
                                         raw_native_field(descriptors[1].events),
                                         raw_native_field(timeout)},
                              poll_credit ? &*poll_credit : nullptr);
-      const int result = ::poll(descriptors, 2, timeout), error = errno;
+      const int result = ::poll(descriptors, 3, timeout), error = errno;
       (void)raw_command_linked(2047, request,
                                std::array{raw_native_field(result),
                                           raw_native_field(error),
                                           raw_native_field(descriptors[0].revents),
                                           raw_native_field(descriptors[1].revents)},
                                poll_credit ? &*poll_credit : nullptr);
+      if (result == 0 && !stopping)
+        idle_poll_ms = std::min(idle_poll_ms * 2, 250);
+      else if (result > 0)
+        idle_poll_ms = 10;
     }
   } catch (const Error &error) {
     if (!spawn_written) {
@@ -1224,14 +1292,20 @@ void CommandJobs::start(const std::string &id, const Value &arguments,
     job->launch = std::move(launch);
     job->deadline = Clock::now() + job->launch.lifetime;
     job->request = request;
+    impl_->reclaim_settled_lanes();
     bool prepare_cleanup = false;
     {
       const std::lock_guard lock{impl_->mutex};
       prepare_cleanup = !impl_->cleanup_context && raw_enabled();
+      if (raw_enabled() && !impl_->free_lanes.empty()) {
+        job->raw_context = std::move(impl_->free_lanes.back());
+        impl_->free_lanes.pop_back();
+      }
     }
     if (prepare_cleanup)
       cleanup_candidate = unwrap(raw_prepare_thread());
-    job->raw_context = unwrap(raw_prepare_thread());
+    if (!job->raw_context)
+      job->raw_context = unwrap(raw_prepare_thread());
     if (admission)
       job->retained_loan = unwrap(admission->prepare_job(job->raw_context));
     {

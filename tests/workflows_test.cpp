@@ -116,7 +116,8 @@ void builtin_upgrade() {
   };
   for (const std::string &recorded :
        {std::string{"builtin-ultracode-v1"}, std::string{"builtin-ultracode-v2"},
-        std::string{"builtin-ultracode-v3"}, std::string(32, 'a')}) {
+        std::string{"builtin-ultracode-v3"}, std::string{"builtin-ultracode-v4"},
+        std::string(32, 'a')}) {
     const bool supplied = !recorded.starts_with("builtin-");
     std::filesystem::remove_all(path);
     std::filesystem::create_directory(path);
@@ -137,7 +138,8 @@ void builtin_upgrade() {
         const auto open_brief = current.find("content='") + 9;
         const auto brief_text =
             current.substr(open_brief, current.find('\'', open_brief) - open_brief);
-        const auto loop = current.find("for step=1,64 do");
+        const auto loop = current.find("local step=0");
+        check(loop != std::string::npos);
         const auto v2 = "blackbird.append({{role='developer',content='" + brief_text +
                         "'}}, {class='instruction'})\n" + current.substr(loop);
         eval(engine, v2);
@@ -215,7 +217,7 @@ void builtin_upgrade() {
     // a supplied revision is kept.
     const auto latest = latest_config(*root);
     const auto revision = string_field(latest, "program_revision");
-    check(revision == (supplied ? recorded : "builtin-ultracode-v4"));
+    check(revision == (supplied ? recorded : "builtin-ultracode-v5"));
     if (!supplied)
       check(string_field(latest, "activation") == "builtin-current" &&
             string_field(latest, "replaced_revision") == recorded);

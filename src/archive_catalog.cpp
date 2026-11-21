@@ -64,86 +64,153 @@ std::array<std::byte, entry_size> encode(const ArchiveEntry &entry,
   put(out.subspan(92, 4), crc32c(ByteView{bytes}.first(92)));
   return bytes;
 }
+Result<ArchiveEntry> decode_entry(ByteView in, std::uint64_t ordinal,
+                                  const JournalHeader &header, JournalCursor boundary) {
+  const auto kind = get(in.subspan(40, 8)), sequence = get(in.subspan(48, 8)),
+             first = get(in.subspan(56, 8));
+  const auto offset = get(in.subspan(64, 8)), size = get(in.subspan(72, 8)),
+             checksum = get(in.subspan(80, 8));
+  if (get(in.subspan(88, 4)) != ordinal ||
+      get(in.subspan(92, 4)) != crc32c(in.first(92)) || (kind != 1 && kind != 2) ||
+      !sequence || sequence >= boundary.sequence || !first || first > sequence ||
+      offset < journal_header_size + journal_frame_header_size ||
+      offset > boundary.end_offset || size > boundary.end_offset - offset ||
+      size > header.limits.max_payload || checksum > UINT32_MAX)
+    return Result<ArchiveEntry>::failure({ErrorCode::corrupt});
+  ArchiveEntry result{{},
+                      {header.environment, header.journal, static_cast<FrameKind>(kind),
+                       sequence, first, offset, static_cast<std::uint32_t>(size),
+                       static_cast<std::uint32_t>(checksum)}};
+  std::copy_n(in.begin(), result.key.size(), result.key.begin());
+  return Result<ArchiveEntry>::success(result);
+}
+class CatalogBatchReader {
+public:
+  CatalogBatchReader(Storage &file, const JournalHeader &header, JournalCursor boundary,
+                     std::uint64_t count)
+      : file_(file), header_(header), boundary_(boundary), count_(count) {}
+  Result<std::optional<ArchiveEntry>> next() {
+    using Answer = Result<std::optional<ArchiveEntry>>;
+    if (ordinal_ >= count_)
+      return Answer::success(std::nullopt);
+    if (cursor_ == buffered_) {
+      constexpr std::uint64_t batch_entries = 128;
+      const auto chunk = std::min(batch_entries, count_ - ordinal_);
+      buffer_.resize(static_cast<std::size_t>(chunk) * entry_size);
+      auto read = read_at(file_, prefix_size + ordinal_ * entry_size, buffer_);
+      if (!read.has_value())
+        return Answer::failure(read.error());
+      cursor_ = 0;
+      buffered_ = static_cast<std::size_t>(chunk);
+    }
+    const auto slice = ByteView{buffer_}.subspan(cursor_ * entry_size, entry_size);
+    auto decoded = decode_entry(slice, ordinal_, header_, boundary_);
+    if (!decoded.has_value())
+      return Answer::failure(decoded.error());
+    ++cursor_;
+    ++ordinal_;
+    return Answer::success(std::move(decoded).value());
+  }
+
+private:
+  Storage &file_;
+  JournalHeader header_;
+  JournalCursor boundary_;
+  std::uint64_t count_ = 0, ordinal_ = 0;
+  std::vector<std::byte> buffer_;
+  std::size_t cursor_ = 0, buffered_ = 0;
+};
 } // namespace
-static Result<void>
-publish_entries(JournalDirectory &directory, std::string_view name,
-                JournalHeader header, JournalCursor boundary, std::uint64_t count,
-                const std::function<Result<ArchiveEntry>(std::uint64_t)> &next,
-                const RawRetainedOrigin &raw_origin) {
+static Result<std::uint64_t>
+publish_stream(JournalDirectory &directory, std::string_view name, JournalHeader header,
+               JournalCursor boundary,
+               const std::function<Result<std::optional<ArchiveEntry>>()> &next) {
+  using Answer = Result<std::uint64_t>;
   try {
-    if (count > UINT32_MAX || boundary.journal != header.journal ||
-        boundary.end_offset < journal_header_size)
-      return Result<void>::failure({ErrorCode::invalid_range});
-    std::array<std::byte, prefix_size> bytes{};
-    MutableByteView out{bytes};
-    put(out.first(8), magic);
-    put(out.subspan(8, 8), 2);
+    if (boundary.journal != header.journal || boundary.end_offset < journal_header_size)
+      return Answer::failure({ErrorCode::invalid_range});
     auto h = encode_journal_header(header);
     if (!h.has_value())
-      return Result<void>::failure(h.error());
-    std::copy(h.value().begin(), h.value().end(), bytes.begin() + 16);
-    put(out.subspan(128, 8), boundary.sequence);
-    put(out.subspan(136, 8), boundary.end_offset);
-    put(out.subspan(144, 8), count);
-    put(out.subspan(152, 4), crc32c(ByteView{bytes}.first(152)));
+      return Answer::failure(h.error());
     const auto temporary =
         std::string{name} + ".tmp." +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     auto created = directory.create_exclusive(temporary);
     if (!created.has_value())
-      return Result<void>::failure(created.error());
+      return Answer::failure(created.error());
     auto file = std::move(created).value();
+    std::array<std::byte, prefix_size> bytes{};
     auto written = write_at(*file, 0, bytes);
     if (!written.has_value())
-      return written;
-    // Flush complete contiguous batches. The on-disk index is O(keys), not O(keys *
-    // path).
+      return Answer::failure(written.error());
+    // Stream complete contiguous batches and patch the header count/CRC before sync.
     constexpr std::size_t batch_entries = 128;
     std::optional<RecoveryKey> prior;
     std::vector<std::byte> batch;
     batch.reserve(batch_entries * entry_size);
-    for (std::size_t first = 0; first < count;) {
-      batch.clear();
-      const auto end = std::min<std::uint64_t>(count, first + batch_entries);
-      for (std::size_t i = first; i < end; ++i) {
-        auto loaded = next(i);
-        if (!loaded.has_value())
-          return Result<void>::failure(loaded.error());
-        const auto &entry = loaded.value();
-        const auto &r = entry.record;
-        if ((prior && !(prior.value() < entry.key)) || r.journal != header.journal ||
-            r.environment != header.environment || !r.sequence ||
-            r.sequence >= boundary.sequence || !r.batch_first ||
-            r.batch_first > r.sequence ||
-            r.payload_offset < journal_header_size + journal_frame_header_size ||
-            r.payload_offset > boundary.end_offset ||
-            r.payload_size > boundary.end_offset - r.payload_offset ||
-            r.payload_size > header.limits.max_payload ||
-            (r.kind != FrameKind::source && r.kind != FrameKind::semantic))
-          return Result<void>::failure({ErrorCode::invalid_range});
-        prior = entry.key;
-        RawRetainedFields selected;
-        selected.native(i);
-        selected.add(entry.key);
-        selected.physical(entry.record);
-        (void)raw_retained_event(raw_origin, {3208, 154}, selected.view());
-        const auto item = encode(entry, static_cast<std::uint32_t>(i));
-        batch.insert(batch.end(), item.begin(), item.end());
+    std::uint64_t count = 0;
+    std::uint64_t batch_start = 0;
+    for (;;) {
+      auto loaded = next();
+      if (!loaded.has_value())
+        return Answer::failure(loaded.error());
+      const auto &maybe = loaded.value();
+      if (!maybe.has_value())
+        break;
+      if (count >= UINT32_MAX)
+        return Answer::failure({ErrorCode::invalid_range});
+      const auto &entry = *maybe;
+      const auto &r = entry.record;
+      if ((prior && !(prior.value() < entry.key)) || r.journal != header.journal ||
+          r.environment != header.environment || !r.sequence ||
+          r.sequence >= boundary.sequence || !r.batch_first ||
+          r.batch_first > r.sequence ||
+          r.payload_offset < journal_header_size + journal_frame_header_size ||
+          r.payload_offset > boundary.end_offset ||
+          r.payload_size > boundary.end_offset - r.payload_offset ||
+          r.payload_size > header.limits.max_payload ||
+          (r.kind != FrameKind::source && r.kind != FrameKind::semantic))
+        return Answer::failure({ErrorCode::invalid_range});
+      prior = entry.key;
+      const auto item = encode(entry, static_cast<std::uint32_t>(count));
+      batch.insert(batch.end(), item.begin(), item.end());
+      ++count;
+      if (batch.size() == batch_entries * entry_size) {
+        written = write_at(*file, prefix_size + batch_start * entry_size, batch);
+        if (!written.has_value())
+          return Answer::failure(written.error());
+        batch.clear();
+        batch_start = count;
       }
-      written = write_at(*file, prefix_size + first * entry_size, batch);
-      if (!written.has_value())
-        return written;
-      first = end;
     }
+    if (!batch.empty()) {
+      written = write_at(*file, prefix_size + batch_start * entry_size, batch);
+      if (!written.has_value())
+        return Answer::failure(written.error());
+    }
+    MutableByteView out{bytes};
+    put(out.first(8), magic);
+    put(out.subspan(8, 8), 2);
+    std::copy(h.value().begin(), h.value().end(), bytes.begin() + 16);
+    put(out.subspan(128, 8), boundary.sequence);
+    put(out.subspan(136, 8), boundary.end_offset);
+    put(out.subspan(144, 8), count);
+    put(out.subspan(152, 4), crc32c(ByteView{bytes}.first(152)));
+    written = write_at(*file, 0, bytes);
+    if (!written.has_value())
+      return Answer::failure(written.error());
     auto synced = file->synchronize(SyncStrength::full);
     if (!synced.has_value())
-      return synced;
+      return Answer::failure(synced.error());
     auto replaced = directory.replace_file(temporary, name);
     if (!replaced.has_value())
-      return replaced;
-    return directory.synchronize_directory(SyncStrength::full);
+      return Answer::failure(replaced.error());
+    auto dir_synced = directory.synchronize_directory(SyncStrength::full);
+    if (!dir_synced.has_value())
+      return Answer::failure(dir_synced.error());
+    return Answer::success(count);
   } catch (const std::bad_alloc &) {
-    return Result<void>::failure({ErrorCode::allocation});
+    return Answer::failure({ErrorCode::allocation});
   }
 }
 Result<void> ArchiveCatalog::publish(JournalDirectory &directory, std::string_view name,
@@ -159,10 +226,16 @@ Result<void> ArchiveCatalog::publish(JournalDirectory &directory, std::string_vi
   arguments.native(previous_present);
   RawRetainedPair trace{raw_origin, {3200, 3201}, 228, arguments.view()};
   auto answer = trace.run([&]() -> Result<void> {
-    return publish_entries(
-        directory, name, header, boundary, sorted.size(),
-        [&](std::uint64_t i) { return Result<ArchiveEntry>::success(sorted[i]); },
-        trace.child());
+    std::size_t index = 0;
+    auto published = publish_stream(
+        directory, name, header, boundary,
+        [&]() -> Result<std::optional<ArchiveEntry>> {
+          if (index >= sorted.size())
+            return Result<std::optional<ArchiveEntry>>::success(std::nullopt);
+          return Result<std::optional<ArchiveEntry>>::success(sorted[index++]);
+        });
+    return published.has_value() ? Result<void>::success()
+                                 : Result<void>::failure(published.error());
   });
   RawRetainedFields returned;
   if (answer.has_value()) {
@@ -192,44 +265,34 @@ Result<std::uint64_t> ArchiveCatalog::publish_merge(
     previous_origin.emplace(previous->raw_origin_, trace.child());
   auto answer = trace.run([&]() -> Result<std::uint64_t> {
     using Answer = Result<std::uint64_t>;
-    std::uint64_t count = previous ? previous->count() : 0;
-    for (std::size_t i = 0; i < delta.size(); ++i) {
-      if (i && !(delta[i - 1].key < delta[i].key))
+    for (std::size_t i = 1; i < delta.size(); ++i)
+      if (!(delta[i - 1].key < delta[i].key))
         return Answer::failure({ErrorCode::invalid_range});
-      auto found =
-          previous
-              ? previous->find(delta[i].key)
-              : Result<std::optional<PhysicalJournalRecord>>::success(std::nullopt);
-      if (!found.has_value())
-        return Answer::failure(found.error());
-      if (!found.value())
-        ++count;
-    }
-    std::uint64_t old = 0;
+    std::optional<CatalogBatchReader> reader;
+    if (previous)
+      reader.emplace(*previous->file_, previous->header_, previous->boundary_,
+                     previous->count_);
     std::size_t fresh = 0;
     std::optional<ArchiveEntry> selected;
-    const auto next = [&](std::uint64_t) -> Result<ArchiveEntry> {
-      if (!selected && previous && old < previous->count()) {
-        auto loaded = previous->entry(old++);
+    const auto next = [&]() -> Result<std::optional<ArchiveEntry>> {
+      if (!selected && reader) {
+        auto loaded = reader->next();
         if (!loaded.has_value())
-          return loaded;
+          return Result<std::optional<ArchiveEntry>>::failure(loaded.error());
         selected = std::move(loaded).value();
       }
       if (fresh < delta.size() && (!selected || !(selected->key < delta[fresh].key))) {
         if (selected && selected->key == delta[fresh].key)
           selected.reset();
-        return Result<ArchiveEntry>::success(delta[fresh++]);
+        return Result<std::optional<ArchiveEntry>>::success(delta[fresh++]);
       }
       if (!selected)
-        return Result<ArchiveEntry>::failure({ErrorCode::corrupt});
+        return Result<std::optional<ArchiveEntry>>::success(std::nullopt);
       auto result = std::move(*selected);
       selected.reset();
-      return Result<ArchiveEntry>::success(std::move(result));
+      return Result<std::optional<ArchiveEntry>>::success(std::move(result));
     };
-    auto written =
-        publish_entries(directory, name, header, boundary, count, next, trace.child());
-    return written.has_value() ? Answer::success(count)
-                               : Answer::failure(written.error());
+    return publish_stream(directory, name, header, boundary, next);
   });
   RawRetainedFields returned;
   if (answer.has_value()) {
@@ -304,24 +367,7 @@ Result<ArchiveEntry> ArchiveCatalog::entry(std::uint64_t ordinal) const {
     if (!read.has_value())
       return Result<ArchiveEntry>::failure(read.error());
     const ByteView in{bytes};
-    const auto kind = get(in.subspan(40, 8)), sequence = get(in.subspan(48, 8)),
-               first = get(in.subspan(56, 8));
-    const auto offset = get(in.subspan(64, 8)), size = get(in.subspan(72, 8)),
-               checksum = get(in.subspan(80, 8));
-    if (get(in.subspan(88, 4)) != ordinal ||
-        get(in.subspan(92, 4)) != crc32c(in.first(92)) || (kind != 1 && kind != 2) ||
-        !sequence || sequence >= boundary_.sequence || !first || first > sequence ||
-        offset < journal_header_size + journal_frame_header_size ||
-        offset > boundary_.end_offset || size > boundary_.end_offset - offset ||
-        size > header_.limits.max_payload || checksum > UINT32_MAX)
-      return Result<ArchiveEntry>::failure({ErrorCode::corrupt});
-    ArchiveEntry result{{},
-                        {header_.environment, header_.journal,
-                         static_cast<FrameKind>(kind), sequence, first, offset,
-                         static_cast<std::uint32_t>(size),
-                         static_cast<std::uint32_t>(checksum)}};
-    std::copy_n(bytes.begin(), result.key.size(), result.key.begin());
-    return Result<ArchiveEntry>::success(result);
+    return decode_entry(in, ordinal, header_, boundary_);
   });
   RawRetainedFields returned;
   if (answer.has_value()) {

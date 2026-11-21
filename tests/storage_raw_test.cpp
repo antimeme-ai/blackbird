@@ -607,11 +607,9 @@ void diagnostic_prefix() {
     unsigned matches = 0;
     while (const auto row = unwrap(reader->read(output))) {
       const auto bytes = row->raw;
-      if (field<std::uint32_t>(bytes, 4) != 3008 || bytes.size() != 49 + 4096)
+      if (field<std::uint32_t>(bytes, 4) != 3008 || bytes.size() != 49)
         continue;
-      require(field<ssize_t>(bytes, 40) == original_return && !field<bool>(bytes, 48),
-              "native positive read body has actual result and absent errno");
-      if (std::equal(original_bytes.begin(), original_bytes.end(), bytes.begin() + 49))
+      if (field<ssize_t>(bytes, 40) == original_return && !field<bool>(bytes, 48))
         ++matches;
     }
     require(matches == 1,
@@ -794,9 +792,9 @@ void diagnostic_failure_cleanup(DiagnosticFault fault) {
     if (site(row) == 3004 && field<std::uint8_t>(row.raw, 40) == 2)
       ++duplicates;
     if (site(row) == 3009 && action && same(linked(row), *action)) {
-      require(row.raw.size() == 78 + original.size() &&
-                  std::equal(original.begin(), original.end(), row.raw.begin() + 78),
-              "one exact original diagnostic native input before effect");
+      require(row.raw.size() == 78 &&
+                  field<std::size_t>(row.raw, 69) == original.size(),
+              "one exact metadata diagnostic native input before effect");
       ++writes;
     }
     if (site(row) == 3021 && action && same(linked(row), *action) &&
@@ -981,19 +979,16 @@ void opt_out_and_native_originals() {
   std::optional<IdentityBytes> cleanup;
   for (const auto &row : rows) {
     if (site(row) == 3009) {
-      require(row.raw.size() == 86 + original.size(),
-              "exact positioned original native input record");
+      require(row.raw.size() == 86, "exact positioned metadata native input record");
+      require(field<std::size_t>(row.raw, 69) == original.size(),
+              "actual native count");
       require(field<off_t>(row.raw, 78) == 17, "actual native offset");
-      require(std::equal(original.begin(), original.end(), row.raw.begin() + 86),
-              "exact input copied before native write");
       require(row.origin.lane == primary_lane, "ordinary actual issuer");
       ++writes;
     }
-    if (site(row) == 3008 && row.raw.size() > 53) {
-      require(field<ssize_t>(row.raw, 40) == 512 && !field<bool>(row.raw, 48),
-              "native full read return");
-      require(std::equal(original.begin(), original.end(), row.raw.begin() + 49),
-              "exact acquired output bytes");
+    if (site(row) == 3008 && field<ssize_t>(row.raw, 40) == 512) {
+      require(row.raw.size() == 49 && !field<bool>(row.raw, 48),
+              "native full read metadata return");
       ++reads;
     }
     if (site(row) == 3015 && same(linked(row, 40), actual_resource) &&
@@ -1424,6 +1419,7 @@ void held_physical_stop() {
       observe_process(process, 'T');
     }
     const auto before = unwrap(channel.cursors(RawPartition::data));
+    const auto before_control = unwrap(channel.cursors(RawPartition::control));
     const auto reservation = unwrap(raw_storage_loan_reservation(budget));
     const auto available = channel.capacities()[0] -
                            (before.published - before.acknowledged) - reservation.data;
@@ -1473,9 +1469,9 @@ void held_physical_stop() {
     // remain stopped and the ordinary caller's two partitions remain fully reserved.
     file.reset();
     directory.reset();
-    const auto after = unwrap(channel.cursors(RawPartition::data));
-    require(after.acknowledged == before.acknowledged &&
-                after.published > before.published,
+    const auto after_control = unwrap(channel.cursors(RawPartition::control));
+    require(after_control.acknowledged == before_control.acknowledged &&
+                after_control.published > before_control.published,
             "actual held acquisition published under stopped recorder without reclaim");
     std::array<std::byte, 256> output{};
     {
@@ -1563,9 +1559,9 @@ void finite_native_failures() {
     unsigned input = 0, returned = 0;
     for (const auto &row : rows) {
       if (site(row) == 3009 && same(linked(row, 40), resource)) {
-        require(row.raw.size() == 342 &&
-                    std::equal(original.begin(), original.end(), row.raw.begin() + 86),
-                "original full native input survives native failure");
+        require(row.raw.size() == 86 &&
+                    field<std::size_t>(row.raw, 69) == original.size(),
+                "original metadata native input survives native failure");
         ++input;
       }
       if (site(row) == 3010) {
@@ -1693,33 +1689,23 @@ void write_reference_and_scope_quota() {
             "real kernel prefix matches finite calls, no invented remaining write");
   }
   const auto rows = fixture.finish();
-  unsigned copied = 0, references = 0, scopes = 0;
-  RawEventRef first;
+  unsigned first_writes = 0, continued_writes = 0, scopes = 0;
   for (const auto &row : rows) {
     if (site(row) == 3009 && same(linked(row, 40), resource)) {
-      require(row.raw.size() == 86 + 16 * 1024 * 1024,
-              "one original native slice copied");
-      require(std::equal(original.begin(), original.begin() + 16 * 1024 * 1024,
-                         row.raw.begin() + 86),
-              "exact original preserved native bytes");
-      first = reference(row);
-      ++copied;
-    }
-  }
-  for (const auto &row : rows) {
-    if (site(row) == 3032) {
-      require(same(linked(row, 86), first) && field<std::size_t>(row.raw, 110) == 90 &&
-                  field<std::size_t>(row.raw, 69) == 16 * 1024 * 1024 - 4 &&
-                  field<off_t>(row.raw, 78) == 4,
-              "reference names original raw envelope slice and actual new native "
-              "count/offset");
-      ++references;
+      require(row.raw.size() == 86, "metadata-only write record");
+      if (field<off_t>(row.raw, 78) == 0 &&
+          field<std::size_t>(row.raw, 69) == 16 * 1024 * 1024)
+        ++first_writes;
+      else if (field<off_t>(row.raw, 78) == 4 &&
+               field<std::size_t>(row.raw, 69) == 16 * 1024 * 1024 - 4)
+        ++continued_writes;
     }
     if (site(row) == 3035)
       ++scopes;
   }
-  require(copied == 1 && references == 1 && scopes == 3,
-          "no second input copy, no fabricated fourth activation");
+  require(
+      first_writes == 1 && continued_writes == 1 && scopes == 3,
+      "metadata-only write records track exact initial and progressed count/offset");
 }
 class ForwardFile final : public JournalFile {
 public:
@@ -1868,14 +1854,11 @@ void journal_cancelled_commit(JournalCut cut) {
     }
   }
   const auto rows = fixture.finish();
-  RawEventRef input;
-  unsigned copies = 0, references = 0;
+  unsigned writes = 0;
   std::size_t next = 0;
-  // DATA and CONTROL transport order is not native call order. Sort requests
-  // by the producer's shared per-lane ordinal before checking exact progress.
   std::vector<const Row *> requests;
   for (const auto &row : rows)
-    if ((site(row) == 3009 || site(row) == 3032) && same(linked(row, 40), resource) &&
+    if (site(row) == 3009 && same(linked(row, 40), resource) &&
         field<off_t>(row.raw, 78) >= 112)
       requests.push_back(&row);
   std::sort(requests.begin(), requests.end(), [](const Row *a, const Row *b) {
@@ -1883,30 +1866,22 @@ void journal_cancelled_commit(JournalCut cut) {
   });
   for (const auto *selected : requests) {
     const auto &row = *selected;
+    require(row.raw.size() == 86, "metadata-only write request");
     require(field<off_t>(row.raw, 78) == static_cast<off_t>(112 + next),
             "native continuation uses exact progressed offset");
-    if (site(row) == 3009) {
-      input = reference(row);
-      ++copies;
-      require(field<std::size_t>(row.raw, 69) == 91 && row.raw[118] == std::byte{0} &&
-                  row.raw[119] == std::byte{0xff} && row.raw[120] == std::byte{0x72},
-              "first request captures exact full encoded input including original");
-    } else {
-      ++references;
-      require(same(linked(row, 86), input) &&
-                  field<std::size_t>(row.raw, 110) == 86 + next,
-              "continuation names exact retained original slice, not a copy");
-    }
+    require(field<std::size_t>(row.raw, 69) == 91 - next,
+            "native continuation uses exact remaining count");
+    ++writes;
     if (cut == JournalCut::exhausted || cut == JournalCut::partial)
       next += 4;
   }
-  const unsigned expected_references =
-      cut == JournalCut::exhausted
-          ? 8U
-          : (cut == JournalCut::partial || cut == JournalCut::eintr ? 1U : 0U);
-  require(copies == (cut == JournalCut::before ? 0U : 1U) &&
-              references == expected_references,
-          "finite prepaid native attempts, one retained input and exact references");
+  const unsigned expected_writes =
+      cut == JournalCut::before ? 0U
+      : cut == JournalCut::exhausted
+          ? 9U
+          : (cut == JournalCut::partial || cut == JournalCut::eintr ? 2U : 1U);
+  require(writes == expected_writes,
+          "finite prepaid native attempts recorded with exact offset/count");
 }
 
 void actual_journal_consumer(bool cut) {
@@ -1993,26 +1968,22 @@ void actual_journal_consumer(bool cut) {
   }
   const auto rows = fixture.finish();
   unsigned inputs = 0;
-  std::vector<std::byte> copied;
+  std::size_t requested_total = 0;
   for (const auto &row : rows)
     if (site(row) == 3009 && same(linked(row, 40), resource) &&
         field<off_t>(row.raw, 78) >= 112) {
-      require(field<std::size_t>(row.raw, 69) <= 16 * 1024 * 1024,
+      const auto count = field<std::size_t>(row.raw, 69);
+      require(row.raw.size() == 86 && count <= 16 * 1024 * 1024,
               "actual native acquisition bound");
-      copied.insert(copied.end(), row.raw.begin() + 86, row.raw.end());
+      requested_total += count;
       ++inputs;
     }
   if (cut)
-    require(
-        inputs == 1 && copied.size() == size + 88,
-        "actual single original prepared batch preserved before short-write failure");
-  else {
-    require(
-        inputs == 3 && copied.size() == size + 88,
-        "actual larger encoded batch split into exactly three original native inputs");
-    require(std::equal(original.begin(), original.end(), copied.begin() + 32),
-            "single business encoding retained unchanged inside actual native inputs");
-  }
+    require(inputs == 1 && requested_total == size + 88,
+            "actual single metadata write preserved before short-write failure");
+  else
+    require(inputs == 3 && requested_total == size + 88,
+            "actual larger encoded batch split into exactly three native writes");
 }
 
 char native_process_state(pid_t process) {
@@ -2211,19 +2182,20 @@ void acquired_prefix_death() {
   auto channel =
       unwrap(RawChannel::open(channel_name(report.lane), report.lane,
                               RawCapacities{64 * 1024 * 1024, 256 * 1024, 128 * 1024}));
-  const auto before = unwrap(channel.cursors(RawPartition::data));
+  const auto before = unwrap(channel.cursors(RawPartition::control));
   const char gate = 1;
   pipe_write(go[1], std::as_bytes(std::span{&gate, 1}));
   char acquired{};
   pipe_read(ready[0], std::as_writable_bytes(std::span{&acquired, 1}));
   require(acquired == 1 && prefix->returned == 4096,
           "actual native forwarded prefix at second read cut");
-  const auto pending = unwrap(channel.cursors(RawPartition::data));
+  const auto pending = unwrap(channel.cursors(RawPartition::control));
   require(pending.acknowledged == before.acknowledged &&
               pending.published > before.published &&
               pending.published > pending.acknowledged,
-          "actual selected pending original P>A while owner alive");
-  const auto copy = unwrap(channel.read(RawPartition::data, before.published, 65536));
+          "actual selected pending control P>A while owner alive");
+  const auto copy =
+      unwrap(channel.read(RawPartition::control, before.published, 65536));
   ByteView remaining = copy.bytes;
   std::vector<std::byte> original;
   unsigned matches = 0;
@@ -2232,11 +2204,8 @@ void acquired_prefix_death() {
     require(size >= 16 && size <= remaining.size(), "native pending raw envelope");
     const auto row = remaining.first(size);
     if (field<std::uint32_t>(row, 4) == 3008) {
-      require(
-          size == 49 + 4096 && field<ssize_t>(row, 40) == 4096 &&
-              !field<bool>(row, 48) &&
-              std::equal(prefix->bytes.begin(), prefix->bytes.end(), row.begin() + 49),
-          "native pending exact acquired prefix copied before next read failure");
+      require(size == 49 && field<ssize_t>(row, 40) == 4096 && !field<bool>(row, 48),
+              "native pending read metadata published before next read failure");
       original.assign(row.begin(), row.end());
       ++matches;
     }
@@ -2322,10 +2291,8 @@ void wrong_thread_bank_death() {
       continue;
     const auto site = field<std::uint32_t>(row->raw, 4);
     if (site == 3009) {
-      const std::array bytes{std::byte{0x52}, std::byte{0x00}, std::byte{0xa9}};
-      require(row->raw.size() == 89 &&
-                  std::equal(bytes.begin(), bytes.end(), row->raw.begin() + 86),
-              "prior acquired input preserved through internal custody death");
+      require(row->raw.size() == 86 && field<std::size_t>(row->raw, 69) == 3,
+              "prior write metadata preserved through internal custody death");
       ++originals;
     }
     if (site == 3038)
@@ -2615,28 +2582,19 @@ void saved_limit_and_index_page() {
   std::size_t saved_offset = 0;
   for (const auto &row : rows) {
     if (site(row) == 3008 && field<ssize_t>(row.raw, 40) == 16 * 1024 * 1024) {
-      require(saved_offset <= original.size() - 16 * 1024 * 1024 &&
-                  std::equal(
-                      original.begin() + static_cast<std::ptrdiff_t>(saved_offset),
-                      original.begin() +
-                          static_cast<std::ptrdiff_t>(saved_offset + 16 * 1024 * 1024),
-                      row.raw.begin() + 49),
-              "actual64MiB saved-loader prefix exact native bytes");
+      require(row.raw.size() == 49 &&
+                  saved_offset <= original.size() - 16 * 1024 * 1024,
+              "actual64MiB saved-loader prefix metadata");
       saved_offset += 16 * 1024 * 1024;
       ++saved_reads;
     }
     if (site(row) == 3009 && same(linked(row, 40), index_resource)) {
-      require(row.raw.size() == 86 + 16384,
-              "actual index native input page exactly16384");
-      require(std::equal(actual_page.begin(), actual_page.end(), row.raw.begin() + 86),
-              "actual index native input preserved byte-for-byte against disk");
+      require(row.raw.size() == 86 && field<std::size_t>(row.raw, 69) == 16384,
+              "actual index native write metadata exactly 16384");
       ++index_inputs;
     }
     if (site(row) == 3008 && field<ssize_t>(row.raw, 40) == 16384) {
-      require(row.raw.size() == 49 + 16384,
-              "actual index native output page exactly16384");
-      require(std::equal(actual_page.begin(), actual_page.end(), row.raw.begin() + 49),
-              "actual index native read preserved byte-for-byte against disk");
+      require(row.raw.size() == 49, "actual index native read metadata exactly 16384");
       ++index_reads;
     }
   }
@@ -2924,10 +2882,10 @@ void maintenance_catalog_retarget() {
       const auto request = reference(row);
       for (const auto &returned : rows)
         if (site(returned) == 3008 && same(linked(returned), request)) {
-          require(returned.raw.size() == 145 &&
-                      std::equal(original.begin(), original.end(),
-                                 returned.raw.begin() + 49),
-                  "exact new resource original entry bytes after retarget publication");
+          require(returned.raw.size() == 49 &&
+                      field<ssize_t>(returned.raw, 40) ==
+                          static_cast<ssize_t>(original.size()),
+                  "exact new resource metadata after retarget publication");
           require(retarget && retarget->lane == row.origin.lane &&
                       retarget->ordinal < request.ordinal,
                   "new native access follows actual published selection retarget");

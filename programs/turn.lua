@@ -1,5 +1,7 @@
 -- Effective source is retained each turn. Edit this program; next turn reloads it.
-for step = 1, 64 do
+local step = 0
+while true do
+  step = step + 1
   blackbird.emit(3880, step)
   local response = blackbird.request()
   local calls = 0
@@ -49,4 +51,3 @@ for step = 1, 64 do
     return
   end
 end
-error("Workflow reached its configured 64-step budget; context is retained.")

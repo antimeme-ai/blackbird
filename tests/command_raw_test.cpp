@@ -84,7 +84,8 @@ extern "C" int poll(pollfd *fds, nfds_t count, int timeout) {
   static auto native = reinterpret_cast<Native>(::dlsym(RTLD_NEXT, "poll"));
   if (!native)
     std::abort();
-  if (track_space_wait.load() && count >= 3 && timeout != 0)
+  if (track_space_wait.load() && count >= 3 && timeout != 0 &&
+      (fds[count - 1].events & POLLHUP) != 0)
     space_wait_entered.store(true);
   if (registration_probe && registration_probe->enabled.load() &&
       ::getpid() == registration_probe->supervisor.load() && count == 2 &&
@@ -851,7 +852,7 @@ void raw_oracles(std::string_view fixture, const std::filesystem::path &root) {
         ++successful_reaps;
     }
   }
-  std::map<IdentityBytes, std::size_t> offsets;
+  std::map<std::string, std::size_t> offsets;
   std::map<std::string, std::string> exact;
   for (const auto &[key, record] : all) {
     if (record.site != 2008)
@@ -874,13 +875,13 @@ void raw_oracles(std::string_view fixture, const std::filesystem::path &root) {
                requested = native<std::size_t>(fields);
     const auto count = native<ssize_t>(body);
     (void)native<int>(body);
-    require(requested == 8192 && fields.empty() && offset == offsets[key.first],
+    require(requested == 8192 && fields.empty() && offset == offsets[job],
             "binary read request records actual native extent and byte offset");
     if (count > 0) {
       require(body.size() == static_cast<std::size_t>(count) &&
                   body.size() <= requested && record.partition == RawPartition::data,
               "binary DATA original is exactly native returned bytes");
-      offsets[key.first] += body.size();
+      offsets[job] += body.size();
       exact[job].append(reinterpret_cast<const char *>(body.data()), body.size());
     } else
       require(body.empty() && record.partition == RawPartition::control,

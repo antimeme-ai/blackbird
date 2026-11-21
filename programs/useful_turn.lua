@@ -17,7 +17,7 @@ blackbird.append({
     },
   },
 })
-for step = 1, 64 do
+while true do
   local response = blackbird.request()
   local calls = 0
   for _, item in ipairs(response.output) do
@@ -36,4 +36,3 @@ for step = 1, 64 do
     return
   end
 end
-error("Useful-work 64-step budget exhausted; retained work, no automatic replay.")

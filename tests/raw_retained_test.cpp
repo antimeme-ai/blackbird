@@ -1521,20 +1521,13 @@ void checked_payload_error_state() {
   const auto frames = disk_frames(directory, header());
   require(frames.size() == 1 && frames.front().payload.size() == 3,
           "actual native source restored independently");
-  std::ifstream disk{directory.path / "audit", std::ios::binary};
-  const std::vector<char> raw{std::istreambuf_iterator<char>{disk},
-                              std::istreambuf_iterator<char>{}};
-  const auto expected_prefix =
-      std::as_bytes(std::span{raw}).subspan(journal_header_size, 33);
   for (const auto &record : records) {
     if (record.site == 3008) {
       auto bytes = ByteView{record.body};
       (void)take_ref(bytes);
       const auto count = take<ssize_t>(bytes);
       const auto failed = take<bool>(bytes);
-      if (count == 33 && !failed &&
-          std::equal(bytes.begin(), bytes.end(), expected_prefix.begin(),
-                     expected_prefix.end()))
+      if (count == 33 && !failed && bytes.empty())
         ++positive_prefix;
       if (count == 0 && !failed && bytes.empty())
         ++native_eof;

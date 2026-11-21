@@ -290,7 +290,9 @@ Value default_workflows() {
         Value{
             R"lua(local brief={role='developer',content='Ultracode: implement useful working code. Read targeted sources, state concrete tasks and a fixed allowance before hardening. Preserve the operator prompt. Use direct specification oracles and fake effects where possible. One independent review and one findings recheck within the allowance; never reset it. Report actual outcomes and gaps; no invented scheduler or performance claims.'}
 if not blackbird.live_instruction(brief) then blackbird.append({brief}, {class='instruction'}) end
-for step=1,64 do
+local step=0
+while true do
+ step=step+1
  blackbird.emit(3880,step)
  local r=blackbird.request(); local calls=0
  for _,item in ipairs(r.output) do
@@ -303,7 +305,6 @@ for step=1,64 do
  local restarting=blackbird.restarting(); blackbird.emit(3882,restarting)
  if restarting or calls==0 then return end
 end
-error('ultracode reached its 64-step budget')
 )lua"}}})}};
 }
 } // namespace blackbird
