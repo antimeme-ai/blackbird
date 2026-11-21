@@ -139,7 +139,8 @@ struct LoadedProfiles {
 };
 std::expected<LoadedProfiles, std::string> load_profiles(const char *home) {
   LoadedProfiles loaded;
-  loaded.directories.shipped = BLACKBIRD_PROFILE_DIRECTORY;
+  loaded.directories.shipped = runtime_resource(
+      {.relative = "profiles/providers", .development = BLACKBIRD_PROFILE_DIRECTORY});
   loaded.directories.operator_overrides =
       std::filesystem::path{home} / ".local/share/blackbird/profiles";
   if (const char *chosen = std::getenv("BLACKBIRD_PROFILES")) {

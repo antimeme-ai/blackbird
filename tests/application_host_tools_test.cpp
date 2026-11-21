@@ -1,5 +1,6 @@
 #include "blackbird/application.hpp"
 #include "blackbird/json.hpp"
+#include "request_state.hpp"
 #include <fcntl.h>
 #include <iostream>
 #include <poll.h>
@@ -259,7 +260,7 @@ void circuit(const std::filesystem::path &directory) {
         if (calls == 1)
           return function("oxcart_state", "model-call",
                           Value::object({{"document", Value{"doc-7"}}}));
-        const auto &input = field(request, "input").array();
+        const auto input = test::request_conversation(request);
         const auto &result = field(input.back(), "output");
         if (calls == 2) {
           check(string_field(result, "outcome") == "success" &&
@@ -348,7 +349,7 @@ void control_case(const std::filesystem::path &directory, const char *control) {
         (void)until(fd, "closed", "close");
       },
       [](const Value &request, unsigned calls) {
-        const auto &input = field(request, "input").array();
+        const auto input = test::request_conversation(request);
         if (input.back().find("output"))
           return answer();
         return function("oxcart_state", calls == 1 ? "old-model" : "new-model",
@@ -386,7 +387,7 @@ void outcomes(const std::filesystem::path &directory, const char *outcome) {
         if (calls == 1)
           return function("oxcart_state", "model",
                           Value::object({{"document", Value{"doc-7"}}}));
-        const auto &input = field(request, "input").array();
+        const auto input = test::request_conversation(request);
         check(string_field(field(input.back(), "output"), "outcome") == outcome,
               "observed non-success reaches model");
         return answer();
@@ -572,7 +573,7 @@ void oversized_call(const std::filesystem::path &directory) {
                   {{"document", Value{std::string(
                                     ApplicationConnection::max_packet_bytes, 'x')}}}));
         if (calls == 2) {
-          const auto &input = field(request, "input").array();
+          const auto input = test::request_conversation(request);
           const auto &result = field(input.back(), "output");
           check(string_field(result, "outcome") == "error" &&
                     string_field(field(result, "result"), "effect_outcome") ==

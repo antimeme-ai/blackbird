@@ -1,6 +1,41 @@
 # Current Blackbird stock
 
-## Front line, 2026-10-19
+## Front line, 2026-11-21
+
+Read this before the older sections below, which describe stock from October 2026.
+
+- **master** unifies the qualified worktrees and branches onto one working checkout
+  (`/Users/patrickbeam/projects/blackbird`):
+  - **Oxcart native host tools, pinned Lua 5.5.1, and portable runtime paths**
+    (`work/oxcart-host-tools-2026-10-23`, `work/oxcart-lua-2026-10-29`,
+    `work/oxcart-portable-resources-2026-11-01`). `load_profiles()` also resolves
+    shipped `profiles/providers` through `runtime_resource()`.
+  - **Context lifecycle foundation and SIGTERM/journal continuity**
+    (`work/clm-rd7` 40-commit stack + `work/autodev-continuity-2026-10-26`):
+    clean-stop snapshots, SIGTERM handling, provider profiles (`P1a`/`P1b`),
+    cut-frame persistence (`S1`), unit classes (`S2`), ultracode dedup (`c3f`),
+    result shaping at creation (`T1`), context status badge/budget (`a1v`), and
+    `FramedJournal::write_exact` cancellation settlement.
+  - **Accepted research, designs, and campaign records** (`work/text-bugs-2026-10-19`
+    journal/campaign records, `work/autodev-chat-design-2026-10-27` chat usability
+    study + holistic design + T1–T6 plan, `work/corpus-assessments-2026-10-19`).
+  - **Repository `.beads/` and Dolt workspace removed** by operator direction;
+    in-product `BeadsAdapter` (`src/beads.cpp`, `src/raw_beads.cpp`, and tests)
+    remains intact.
+- **Unmerged WIP / deferred branches** (auxiliary worktrees removed; all preserved
+  and pushed to `origin`):
+  - `work/autodev-chat-t1-2026-10-27` (`9eafcca`): Chat Usability T1 candidate
+    (send receipts, queue correction, ESC stop) — blocked/unqualified WIP.
+  - `work/autodev-composition-2026-10-26` (`aca277e`): CLM S3a cut composition
+    candidate — blocked/unqualified WIP.
+  - `work/campaign-defects-2026-10-18` (C++26 + `j1l` + `vv6`),
+    `work/defect-pyg-3nx-2026-10-18` (provider stall vs ceiling),
+    `work/defect-{3o2,5st,e5g}-2026-10-18`, `work/sol-slash-2026-10-19`,
+    `work/glm-bugbash-2026-10-17` (on ice).
+- **Installed managed runtime** (`~/.local/lib/blackbird/current`) remains separate
+  from source integration until rebuilt/activated with `scripts/install-blackbird --update`.
+
+## Historical front line, 2026-10-19
 
 Read this before the older sections below, which describe stock as of 2026-10-15.
 

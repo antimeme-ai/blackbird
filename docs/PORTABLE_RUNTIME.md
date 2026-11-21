@@ -1,8 +1,8 @@
 # Executable-owned runtime resources
 
 A Blackbird executable placed under `Contents/MacOS` uses
-`Contents/Resources/Blackbird/programs` and `assets` for its default workflow,
-result instrument and sprite. It starts `blackbird-job-runner` and
+`Contents/Resources/Blackbird/programs`, `assets` and `profiles` for its default
+workflow, result instrument, sprite and shipped provider profiles. It starts `blackbird-job-runner` and
 `blackbird-archive` beside itself. Bundle names and the current working directory
 do not select these files; the running executable's actual path does.
 

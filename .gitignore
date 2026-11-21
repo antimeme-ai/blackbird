@@ -2,13 +2,9 @@
 /.context/
 /context/
 *.pdf
-
-# Dolt database files (added by bd init)
-.dolt/
 *.db
 target/
 .DS_Store
-dolt-config.log
 __pycache__/
 *.pyc
 /build/

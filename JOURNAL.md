@@ -13265,3 +13265,56 @@ bridges it.
 The operator sets a commit attribution convention, one family for all agents:
 `Co-Authored-By` plus provenance trailers. See `docs/ATTRIBUTION.md`, with a
 pointer in AGENTS.md. Text-only change; diff and link checks only.
+
+
+## 2026-11-21 — unify worktrees and remove repo .beads/Dolt tracker
+
+Operator directs unifying the active worktrees back into a single primary
+checkout and removing the repository's `.beads/` tracker and Dolt workspace
+(keeping the in-product `BeadsAdapter` C++ implementation and tests intact).
+
+1. **Preserved blocked candidates and retired auxiliary worktrees:**
+   - Committed and pushed the 9 staged S3a files on
+     `work/autodev-composition-2026-10-26` (`aca277e`, explicitly marked WIP/blocked).
+   - Committed and pushed the 30 Chat T1 files on
+     `work/autodev-chat-t1-2026-10-27` (`9eafcca`, explicitly marked WIP/blocked).
+   - Removed all four auxiliary worktrees (`context/autodev-2026-10-26/composition`,
+     `context/autodev-2026-10-26/continuity`, `context/oxcart-upgrade-2026-10-29`,
+     and `../oxcart/context/blackbird-portable-source-2026-11-01/worktree`),
+     leaving `/Users/patrickbeam/projects/blackbird` as the sole checkout.
+   - Archived untracked primary-checkout clutter (`blackbird-art/`,
+     `blackbird-art.zip`, superseded `OXCART-HANDOFF-2026-10-23.md`, and the
+     `.beads/backup/` snapshot) under `~/archives/blackbird-unification-2026-11-21/`.
+
+2. **Unified qualified branches on `work/unify-2026-11-21` from `master` (`a94d094`):**
+   - Integrated `work/oxcart-portable-resources-2026-11-01` (host tools +
+     pinned Lua 5.5.1 + executable-relative resource lookup),
+     `work/oxcart-lua-2026-10-29`, and `work/oxcart-host-tools-2026-10-23`.
+     Pinning Lua 5.5.1 restores `scripts/rigor doctor` against Homebrew Lua 5.5.1.
+   - Integrated `work/autodev-continuity-2026-10-26` (the 40-commit `clm-rd7`
+     stack plus the SIGTERM/interrupted journal-write fix). Resolved the 4-file
+     merge with Oxcart (`src/coding.cpp` preserves both `host_catalog` metadata
+     and T1 shape refusal before host-tool dispatch; `src/main.cpp` includes
+     both headers and routes `load_profiles()` through `runtime_resource()` so
+     shipped provider profiles resolve inside relocated bundles;
+     `scripts/check-terminal-pty` checks already-visible `BG_3` before waiting
+     and settling; `JOURNAL.md` retains both histories).
+   - Integrated accepted docs/designs: `work/text-bugs-2026-10-19`,
+     `work/autodev-chat-design-2026-10-27`, and `work/corpus-assessments-2026-10-19`.
+   - Updated `tests/application_host_tools_test.cpp` to use
+     `test::request_conversation(request)` (matching CLM's trailing `CONTEXT_SIZE`
+     developer operational-state item) and `scripts/check-portable-runtime` +
+     `docs/PORTABLE_RUNTIME.md` to bundle `profiles/`.
+
+3. **Removed repo `.beads/` & Dolt:**
+   - Removed tracked `.beads/` files, deleted untracked `.beads/dolt*` detritus,
+     unset local `beads.role` config, and updated `AGENTS.md` and `.gitignore`.
+   - In-product `src/beads.cpp`, `src/raw_beads.cpp`, `tests/beads_test.cpp`,
+     and `tests/beads_raw_test.cpp` remain untouched.
+
+4. **Verification:**
+   - Installed pinned `microsoft/tui-test` 0.1.0 from the quarantined archive.
+   - Verified `application_host_tools` (pass), `scripts/check-portable-runtime`
+     (pass), and all 8 TUI tests (pass), followed by the mandatory clean-slate
+     pre-commit hook (`scripts/rigor check debug`: full Debug CTest suite plus
+     owned C++/Lua formatting and static analysis).

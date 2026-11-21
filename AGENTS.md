@@ -101,19 +101,14 @@ Keep research and independent review reports in `papers/`, reference material in
 ignored `quarantine/`, and working logs in ignored `context/`. Ignore PDFs. Record
 actions and decisions in the journal. Do not initialize Git in the parent workspace.
 
-Use the current local beads database for issues, with programmatic `--json` output.
-The old backlog remains in `quarantine/arconaut/.beads/` for study.
-Before ending a session, close completed issues, record substantive remaining
-work, run checks appropriate to the changes, and run `bd backup`. This supported
-backup preserves issues and dependencies in `.beads/backup/`. On a new clone,
-run `bd init` followed by `bd backup restore`. Avoid exporting to the legacy
-`.beads/issues.jsonl` path: installed bd 0.58.0 treats it as an incoming import and
-reports a stale database after export. The earlier export is preserved in context.
+Operator2026-11-21 removed the repository's `.beads/` tracker and Dolt
+workspace (Dolt's model does not fit many vigorously moving local projects).
+In-product `BeadsAdapter` code (`src/beads.cpp`, `src/raw_beads.cpp`, and its
+tests) remains intact. The old historical backlog remains in
+`quarantine/arconaut/.beads/` for study; record active work and remaining scope
+in `JOURNAL.md` and unit notes until a replacement tracker is selected.
 
-Arconaut's Dolt server uses dedicated port `13308`, persisted in
-`.beads/config.yaml` and `.beads/metadata.json`. Rhizome uses `13307`; the default
-`3307` can belong to other projects. Beads starts the configured server as needed.
-Automatic bead-backup pushes remain disabled. Operator2026-10-06 explicitly
+Operator2026-10-06 explicitly
 authorizes and requires Git checkpoint commits and pushes, including work and
 candidate branches before main integration. Commit completed conceptual units
 and meaningful experiment checkpoints; push their branches to the configured
@@ -239,8 +234,6 @@ leave it alone: preserve its native output queue without inspecting, polling,
 minimizing or repairing findings during the campaign. Keep fuzzing off the laptop
 and out of measured host windows; no unrelated assurance, eval or cloud scope.
 
-Operator2026-10-23 says Dolt is not used. This supersedes the historical
-Dolt-specific directions above: do not start, initialize or repair a Dolt server,
-or block delivery on Dolt-backed issue access/backup. Preserve existing issue
-backup snapshots and record remaining work in the journal. This is not a request
-to migrate or discard issue history.
+Operator2026-11-21 removed `.beads/` and Dolt from the repository; do not
+start, initialize, or recreate a Dolt/Beads workspace here. Record remaining
+work in `JOURNAL.md` until a replacement issue tracker is adopted.

@@ -29,7 +29,7 @@ for name in ('blackbird', 'blackbird-job-runner', 'blackbird-archive'):
     shutil.copy2(args.executable.parent/name, macos/name)
 resources = bundle/'Resources/Blackbird'
 resources.mkdir(parents=True)
-for name in ('programs', 'assets'):
+for name in ('programs', 'assets', 'profiles'):
     shutil.copytree(args.resources/name, resources/name)
 executable = macos/'blackbird'
 home = root/'home'
