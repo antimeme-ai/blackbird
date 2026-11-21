@@ -1593,16 +1593,61 @@ Value tool_definitions() {
                 "A refusal names partial-tool-group or partial-round, else the first "
                 "unit in context order that is protected-unit, pinned-unit or "
                 "partial-unit. Stages until "
-                "successful workflow completion; appended current tool exchange is "
-                "retained. One pending; failed/interrupted workflows cancel. "
+                "successful workflow completion by default (or commits automatically "
+                "on "
+                "cold cache / route switch); pass apply='now' to commit immediately "
+                "mid-turn and roll a fresh upstream cache epoch. Appended current tool "
+                "exchange is retained. One pending; failed/interrupted workflows "
+                "cancel. "
                 "Structural acceptance does not certify accuracy."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
                  {"properties",
                   Value::object(
-                      {{"proposal", Value::object({{"type", Value{"object"}}})}})},
+                      {{"proposal", Value::object({{"type", Value{"object"}}})},
+                       {"apply", Value::object(
+                                     {{"type", Value{"string"}},
+                                      {"enum", Value{Value::Array{Value{"staged"},
+                                                                  Value{"now"}}}}})}})},
                  {"required", Value{Value::Array{Value{"proposal"}}}}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
+           {"name", Value{"context_pin"}},
+           {"description",
+            Value{"Pin live context units against compaction and overflow archival. "
+                  "selection accepts unit handles or ranges (e.g. 'r1,r3' or 'r1-r4'). "
+                  "Pinned units stay live across context_manage and automatic overflow "
+                  "recovery."}},
+           {"parameters",
+            Value::object(
+                {{"type", Value{"object"}},
+                 {"properties",
+                  Value::object(
+                      {{"selection", Value::object({{"type", Value{"string"}}})}})},
+                 {"required", Value{Value::Array{Value{"selection"}}}}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
+           {"name", Value{"context_unpin"}},
+           {"description",
+            Value{"Unpin previously pinned live context units. selection accepts unit "
+                  "handles or selectors."}},
+           {"parameters",
+            Value::object(
+                {{"type", Value{"object"}},
+                 {"properties",
+                  Value::object(
+                      {{"selection", Value::object({{"type", Value{"string"}}})}})},
+                 {"required", Value{Value::Array{Value{"selection"}}}}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
+           {"name", Value{"context_units"}},
+           {"description", Value{"List current live context units with handles, "
+                                 "classes, open/superseded/"
+                                 "pinned flags, entry IDs, byte sizes, and current "
+                                 "upstream cache epoch."}},
+           {"parameters", Value::object({{"type", Value{"object"}},
+                                         {"properties", Value::object({})}})}}),
       Value::object(
           {{"type", Value{"function"}},
            {"name", Value{"context_inspect"}},
@@ -1692,7 +1737,9 @@ Value tool_definitions() {
                   "blackbird.live_instruction(item) (true when a live entry whose "
                   "creating record makes it an instruction holds an item equal to "
                   "item, object key order ignored at every depth; a result entry "
-                  "does not count), "
+                  "does not count), blackbird.now(), safe read-only os.time/clock/"
+                  "difftime, blackbird.pin(sel), blackbird.unpin(sel), "
+                  "blackbird.units(), blackbird.commit_context(), "
                   "blackbird.call(name,args[, {call_id=ID}]) are available; calls "
                   "inside the code get whole results (exec, process and file reads "
                   "keep their own defaults), only this tool's own result is shaped. "

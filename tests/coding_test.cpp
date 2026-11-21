@@ -1902,7 +1902,7 @@ int main(int argc, char **argv) {
       throw Error{ErrorCode::corrupt};
     engine.turn(
         {"",
-         R"(assert(not pcall(arco.call, "provider", {})); assert(io == nil and os == nil and package == nil and debug == nil); assert(dofile == nil and loadfile == nil); print("audited", 42))"});
+         R"(assert(not pcall(arco.call, "provider", {})); assert(io == nil and package == nil and debug == nil); assert(os.execute == nil and os.remove == nil and os.rename == nil and os.getenv == nil and os.exit == nil and os.tmpname == nil and os.setlocale == nil); assert(dofile == nil and loadfile == nil); print("audited", 42))"});
     if (!displayed.ends_with("doneaudited\t42\n"))
       throw Error{ErrorCode::corrupt};
     bool print_retained = false;

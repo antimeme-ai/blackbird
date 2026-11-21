@@ -629,7 +629,7 @@ Value WorkflowHost::request(const std::filesystem::path &session, const Value &r
     if (!code_value || !detail || object->size() != 3)
       throw Error{ErrorCode::corrupt};
     const auto code = native_integer<unsigned>(*code_value);
-    if (code > static_cast<unsigned>(ErrorCode::provider_rate_limit))
+    if (code > static_cast<unsigned>(ErrorCode::provider_context_overflow))
       throw Error{ErrorCode::corrupt};
     throw Error{static_cast<ErrorCode>(code), native_integer<std::int64_t>(*detail)};
   }

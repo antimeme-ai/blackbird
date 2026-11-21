@@ -230,7 +230,7 @@ std::string_view raw_bridge_description() noexcept {
          "4800:VM R,G16,int Op,argc,bool operation,[R],bool module,[R];"
          "4801:R,u8 branch,stage,bool Error,[ErrorCode,i64],bool returns,[int];"
          "4802:R,u8 role,size_t N,original "
-         "bytes;role1callName2JSON3restore4display5error;"
+         "bytes;role1callName2JSON3restore4display5error6pinSelection;"
          "4803:R,u8 mode(result0,error1,array2),int stackBase;4804:R,int "
          "LuaStatus,stackTop;"
          "4820:VM R,G16,int argc,inputType,bool parentModule,[R],bool operation,[R];"

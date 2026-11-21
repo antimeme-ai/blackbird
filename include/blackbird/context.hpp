@@ -223,6 +223,9 @@ public:
                                       const Value &proposal,
                                       RawContextOrigin origin = {}) const;
   Value pending_proposal(RawContextOrigin origin = {}) const;
+  // Publish any staged managed-context proposal immediately while keeping the
+  // current workflow open (returns null when nothing is pending).
+  Value commit_pending(RawContextOrigin origin = {});
   void begin_workflow(RawContextOrigin origin = {});
   Value finish_workflow(bool success, const Value &boundary_program = Value{},
                         RawContextOrigin origin = {},

@@ -356,10 +356,19 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
     call.owner = config.raw_owner;
   std::optional<RawWaitScope> wait_scope;
   try {
+    const int outer_seconds =
+        config.timeout_seconds >= 1 && config.timeout_seconds <= 3600
+            ? std::max<int>(config.timeout_seconds * 10, 1800)
+            : config.timeout_seconds;
     const auto deadline = Clock::now() + std::chrono::seconds{config.timeout_seconds};
+    const auto outer_deadline = [&] {
+      const auto computed = Clock::now() + std::chrono::seconds{outer_seconds};
+      const auto inherited = raw_wait_control().deadline;
+      return inherited && *inherited < computed ? *inherited : computed;
+    }();
     if (config.timeout_seconds >= 1 && config.timeout_seconds <= 3600) {
       auto control = raw_wait_control();
-      control.deadline = deadline;
+      control.deadline = outer_deadline;
       wait_scope.emplace(control);
     }
     adapter.emplace(provider_adapter_extra);
@@ -430,18 +439,24 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
     child.original_capture = call.originals;
     child.cancelled = config.cancelled;
     // --disable is first: do not load curlrc; no redirects, retries or verbose secret
-    // output.
+    // output. Use stream-inactivity speed limits so active streaming stays alive while
+    // stalled sockets still time out in config.timeout_seconds.
+    const int idle_seconds = config.timeout_seconds;
+    const int connect_seconds = std::min<int>(idle_seconds, 30);
     child.start({config.curl_executable, "--disable", "--silent", "--no-buffer",
-                 "--max-time", std::to_string(config.timeout_seconds), "--write-out",
-                 "\n%{http_code}", "--config", "-"});
-    child.send(input, deadline);
+                 "--connect-timeout", std::to_string(connect_seconds), "--speed-limit",
+                 "1", "--speed-time", std::to_string(idle_seconds), "--max-time",
+                 std::to_string(outer_seconds), "--write-out", "\n%{http_code}",
+                 "--config", "-"});
+    child.send(input, std::min(deadline, outer_deadline));
     child.close_input();
     int curl_exit = 0;
     acquisition.emplace(adapter->split(provider_native_acquisition_credit));
     acquisition->start(trace->reference(), child.raw_reference());
     if (call.receipt && acquisition->reference().ordinal)
       call.receipt->response = acquisition->reference();
-    auto output = child.collect(deadline, config.response_limit, &curl_exit);
+    auto output = child.collect(outer_deadline, config.response_limit, &curl_exit,
+                                std::chrono::seconds{idle_seconds});
     acquisition->finish(1);
     if (curl_exit != 0)
       fail(ErrorCode::provider_transport, curl_exit);
@@ -455,8 +470,13 @@ Result<std::string> openai_http(const OpenAiConfig &config, const OpenAiLogin &l
       status = status * 10 + output[i] - '0';
     }
     trace->http(child.raw_reference(), status);
-    if (status < 200 || status >= 300)
+    if (status < 200 || status >= 300) {
+      const auto body = std::string_view{output}.substr(0, separator);
+      if (status == 413 ||
+          ((status == 400 || status == 422) && is_context_overflow_text(body)))
+        fail(ErrorCode::provider_context_overflow, status);
       fail(ErrorCode::external_unknown, status);
+    }
     output.resize(separator);
     trace->finish(1);
     adapter->finish(1);
@@ -638,14 +658,66 @@ Result<Value> completed_response(std::string_view stream, ValueLimits limits,
         if (type == "error" || type == "response.failed") {
           event_phase.stage(44);
           event_phase.scalar(44, 0);
+          const auto dumped = dump_json(parsed.value());
+          if (dumped.has_value() && is_context_overflow_text(dumped.value()))
+            fail(ErrorCode::provider_context_overflow);
           fail(ErrorCode::external_unknown);
         }
         if (type == "response.incomplete") {
-          event_phase.stage(45);
-          event_phase.scalar(45, 0);
-          fail(ErrorCode::incomplete);
-        }
-        if (completed.has_value()) {
+          if (completed.has_value()) {
+            event_phase.stage(46);
+            event_phase.scalar(46, 0);
+            fail(ErrorCode::corrupt);
+          }
+          const auto *response = parsed.value().find("response");
+          const auto *details =
+              response && std::holds_alternative<Value::Object>(response->value())
+                  ? response->find("incomplete_details")
+                  : nullptr;
+          const auto *reason =
+              details && std::holds_alternative<Value::Object>(details->value())
+                  ? details->find("reason")
+                  : nullptr;
+          const auto *output =
+              response && std::holds_alternative<Value::Object>(response->value())
+                  ? response->find("output")
+                  : nullptr;
+          bool valid_truncation =
+              response != nullptr && response->find("status") != nullptr &&
+              *response->find("status") == Value{"incomplete"} && reason != nullptr &&
+              *reason == Value{"max_output_tokens"} && output != nullptr &&
+              std::holds_alternative<Value::Array>(output->value()) &&
+              (!output->array().empty() || !items.empty());
+          if (valid_truncation) {
+            const auto check_calls = [&](const Value &item) {
+              if (!std::holds_alternative<Value::Object>(item.value()))
+                return false;
+              const auto *item_type = item.find("type");
+              if (item_type && (*item_type == Value{"function_call"} ||
+                                *item_type == Value{"custom_tool_call"})) {
+                const auto *st = item.find("status");
+                if (st == nullptr || *st != Value{"completed"})
+                  return false;
+              }
+              return true;
+            };
+            for (const auto &item : output->array())
+              if (!check_calls(item))
+                valid_truncation = false;
+            for (const auto &[_, item] : items)
+              if (!check_calls(item))
+                valid_truncation = false;
+          }
+          if (valid_truncation) {
+            event_phase.stage(48);
+            event_phase.scalar(48, 0);
+            completed = *response;
+          } else {
+            event_phase.stage(45);
+            event_phase.scalar(45, 0);
+            fail(ErrorCode::incomplete);
+          }
+        } else if (completed.has_value()) {
           event_phase.stage(46);
           event_phase.scalar(46, 0);
           fail(ErrorCode::corrupt);
@@ -686,7 +758,7 @@ Result<Value> completed_response(std::string_view stream, ValueLimits limits,
               !std::holds_alternative<Value::Array>(output->value()))
             fail(ErrorCode::corrupt);
           completed = *response;
-        } else if (type != "response.output_item.done")
+        } else if (type != "response.output_item.done" && type != "response.incomplete")
           event_phase.scalar(43, 0);
       });
     };

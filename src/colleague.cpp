@@ -429,7 +429,8 @@ Value call_prepared_colleague(const Value &prepared, const ColleagueCapture &cap
       }
     } catch (const Error &e) {
       if (e.code == ErrorCode::provider_auth ||
-          e.code == ErrorCode::provider_rate_limit) {
+          e.code == ErrorCode::provider_rate_limit ||
+          e.code == ErrorCode::provider_context_overflow) {
         set(reply, "status", Value{"failed"});
         set(reply, "remote_disposition",
             Value{e.detail >= 400 ? "reported_failure" : "not_dispatched"});

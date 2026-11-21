@@ -989,8 +989,37 @@ struct CodingEngine::Runtime {
     packet_decode_op,
     packet_encode_op,
     format_op,
-    live_instruction_op
+    live_instruction_op,
+    now_op,
+    pin_op,
+    unpin_op,
+    units_op,
+    commit_context_op
   };
+  std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+  static int lua_os_time(lua_State *L) {
+    if (!lua_isnoneornil(L, 1))
+      return luaL_error(L, "os.time table argument is not supported in sandbox");
+    const auto sec = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    lua_pushinteger(L, static_cast<lua_Integer>(sec));
+    return 1;
+  }
+  static int lua_os_clock(lua_State *L) {
+    auto *self = static_cast<Runtime *>(lua_touserdata(L, lua_upvalueindex(1)));
+    const auto elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - self->started_at)
+                             .count();
+    lua_pushnumber(L, elapsed);
+    return 1;
+  }
+  static int lua_os_difftime(lua_State *L) {
+    const lua_Number t2 = luaL_checknumber(L, 1);
+    const lua_Number t1 = luaL_checknumber(L, 2);
+    lua_pushnumber(L, t2 - t1);
+    return 1;
+  }
   static int install(lua_State *L) {
     auto *self = static_cast<Runtime *>(lua_touserdata(L, 1));
     bool failed = false;
@@ -1044,6 +1073,16 @@ struct CodingEngine::Runtime {
     lua_setglobal(L, "dofile");
     lua_pushnil(L);
     lua_setglobal(L, "loadfile");
+    // Safe read-only clock/time subset of `os`; zero shell/filesystem/env access.
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_os_time);
+    lua_setfield(L, -2, "time");
+    lua_pushlightuserdata(L, self);
+    lua_pushcclosure(L, lua_os_clock, 1);
+    lua_setfield(L, -2, "clock");
+    lua_pushcfunction(L, lua_os_difftime);
+    lua_setfield(L, -2, "difftime");
+    lua_setglobal(L, "os");
     for (int i = 0; i < 4; ++i) {
       lua_newtable(L);
       lua_rawsetp(L, LUA_REGISTRYINDEX, &markers[i]);
@@ -1059,10 +1098,11 @@ struct CodingEngine::Runtime {
         "request", "call",          "context",       "edit",   "originals",
         "restore", "append",        "decode",        "encode", "display",
         "array",   "present",       "restarting",    "stats",  "manage",
-        "inspect", "decode_packet", "encode_packet", "format", "live_instruction"};
-    for (int i = 0; i < 20; ++i) {
+        "inspect", "decode_packet", "encode_packet", "format", "live_instruction",
+        "now",     "pin",           "unpin",         "units",  "commit_context"};
+    for (std::size_t i = 0; i < std::size(names); ++i) {
       lua_pushlightuserdata(L, self);
-      lua_pushinteger(L, i);
+      lua_pushinteger(L, static_cast<lua_Integer>(i));
       lua_pushcclosure(L, bridge, 2);
       lua_setfield(L, -2, names[i]);
     }
@@ -1628,6 +1668,32 @@ struct CodingEngine::Runtime {
           frame.value = Value{
               self->engine.context_.live_instruction(read_value(L, 1, {0, &nodes}))};
           break;
+        case now_op: {
+          const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+          const auto mono_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+          frame.value = Value::object(
+              {{"epoch_ms",
+                Value{Number{static_cast<std::uint64_t>(epoch_ms > 0 ? epoch_ms : 0)}}},
+               {"monotonic_ms",
+                Value{Number{static_cast<std::uint64_t>(mono_ms > 0 ? mono_ms : 0)}}}});
+          break;
+        }
+        case pin_op:
+          frame.value = self->engine.context_.pin(bridge_string(L, 1, frame, 6));
+          break;
+        case unpin_op:
+          frame.value = self->engine.context_.unpin(bridge_string(L, 1, frame, 6));
+          break;
+        case units_op:
+          frame.value = self->engine.format_context_units();
+          break;
+        case commit_context_op:
+          frame.value = self->engine.commit_pending_context();
+          break;
         case restarting_op:
           frame.value = Value{self->engine.restart_note_.has_value()};
           break;
@@ -1649,6 +1715,9 @@ struct CodingEngine::Runtime {
         }
         case manage_op:
           frame.value = self->engine.context_.manage(read_value(L, 1, {0, &nodes}));
+          if (frame.value->find("accepted") &&
+              field(*frame.value, "accepted") == Value{true})
+            ++self->engine.upstream_epoch_;
           break;
         case inspect_op:
           frame.value = self->engine.context_.inspect(read_value(L, 1, {0, &nodes}));
@@ -1659,12 +1728,16 @@ struct CodingEngine::Runtime {
         case edit_op:
           frame.value = self->engine.context_.edit(read_value(L, 1, {0, &nodes}), {},
                                                    ContextStore::EditKeys::strict);
+          if (frame.value->find("accepted") &&
+              field(*frame.value, "accepted") == Value{true})
+            ++self->engine.upstream_epoch_;
           break;
         case originals_op:
           frame.value = self->engine.context_.originals();
           break;
         case restore_op:
           self->engine.context_.restore(bridge_string(L, 1, frame, 3));
+          ++self->engine.upstream_epoch_;
           frame.value = self->engine.context_.view();
           break;
         case append_op: {
@@ -1921,6 +1994,7 @@ struct CodingEngine::Runtime {
   }
   Value eval(std::string_view source, const Value *arguments = nullptr,
              SourceKind kind = SourceKind::root) {
+    error.clear();
     NativeExceptionFrame native_exception;
     struct RestoreExceptionFrame {
       NativeExceptionFrame *&current;
@@ -2717,6 +2791,24 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
     const std::string builtin = std::string{builtin_prefix} + "5";
     program_revision_ = builtin;
     budget_ = default_context_budget();
+    for (const auto &fact : log_.root().tail_facts()) {
+      const auto *record = std::get_if<ApplicationRecordEvent>(&fact.event.body);
+      if (!record || record->channel != ApplicationChannel::context)
+        continue;
+      const auto packet = read_packet(record->payload);
+      if (!packet.has_value())
+        continue;
+      const auto *op = packet.value().find("op");
+      if (!op || !std::holds_alternative<std::string>(op->value()))
+        continue;
+      const auto &kind = op->string();
+      if (kind == "restore" || kind == "cut")
+        ++upstream_epoch_;
+      else if ((kind == "edit" || kind == "managed") &&
+               packet.value().find("accepted") &&
+               field(packet.value(), "accepted") == Value{true})
+        ++upstream_epoch_;
+    }
     std::optional<Value> recorded_config;
     for (const auto &packet : log_.root().current_programs()) {
       if (packet.find("label") && string_field(packet, "label") == "session.recovery")
@@ -3748,6 +3840,9 @@ Value CodingEngine::operation(
                 "limit64; "
                 "titles512 bytes, notes2048 bytes. No changes accepted for an invalid "
                 "batch."});
+      if (name == "lua" && effect_error && runtime_ && !runtime_->error.empty())
+        result.object().emplace_back("lua_error",
+                                     Value{std::exchange(runtime_->error, {})});
 
       adapter_capacity = domain_refused || (name == "process" && effect_error &&
                                             effect_error->code == ErrorCode::capacity);
@@ -4612,7 +4707,213 @@ void CodingEngine::drain_workflows() {
     }
   });
 }
+namespace {
+Value::Array project_input_for_provider(Value::Array items,
+                                        std::string_view provider_identity) {
+  if (provider_identity == "unavailable")
+    return items;
+  const bool anthropic = provider_identity == "anthropic-messages" ||
+                         provider_identity.starts_with("anthropic");
+  const bool keeps_encrypted = provider_identity == "openai-codex" ||
+                               provider_identity == "openrouter-responses";
+  Value::Array projected;
+  projected.reserve(items.size());
+  for (auto &item : items) {
+    const auto *type = item.find("type");
+    if (type && *type == Value{"reasoning"}) {
+      const bool has_anthropic = item.find("anthropic_content") != nullptr;
+      const auto *anth_id = item.find("anthropic_message_id");
+      const bool valid_anthropic =
+          has_anthropic && anth_id != nullptr &&
+          std::holds_alternative<std::string>(anth_id->value()) &&
+          !anth_id->string().empty();
+      const bool has_encrypted = item.find("encrypted_content") != nullptr;
+      if (anthropic) {
+        if (!valid_anthropic)
+          continue;
+      } else {
+        if (has_anthropic)
+          continue;
+        if (!keeps_encrypted && has_encrypted)
+          continue;
+      }
+    }
+    projected.push_back(std::move(item));
+  }
+  return projected;
+}
+} // namespace
+bool CodingEngine::has_open_tool_calls() const {
+  return !ContextStore::stop_outputs(field(context_.view(), "entries").array(), false)
+              .empty();
+}
+Value CodingEngine::format_context_units() const {
+  const auto view = context_.view();
+  const auto &entries = field(view, "entries").array();
+  const auto units = context_.units();
+  Value::Array out;
+  out.reserve(units.size());
+  for (const auto &u : units) {
+    Value::Array ids;
+    std::size_t bytes = 0;
+    for (const auto pos : u.entries) {
+      if (pos >= entries.size())
+        continue;
+      ids.push_back(field(entries[pos], "id"));
+      if (const auto encoded = encode_packet_string(field(entries[pos], "item"));
+          encoded.has_value())
+        bytes += encoded.value().size();
+    }
+    out.push_back(
+        Value::object({{"handle", Value{u.handle}},
+                       {"unit_class", Value{std::string{class_name(u.unit_class)}}},
+                       {"open", Value{u.open}},
+                       {"superseded", Value{u.superseded}},
+                       {"pinned", Value{u.pinned}},
+                       {"ids", Value{std::move(ids)}},
+                       {"bytes", Value{Number{bytes}}}}));
+  }
+  return Value::object({{"base", Value{context_.head()}},
+                        {"upstream_epoch", Value{Number{upstream_epoch_}}},
+                        {"units", Value{std::move(out)}}});
+}
+Value CodingEngine::commit_pending_context() {
+  if (context_.pending_proposal() == Value{})
+    return Value{};
+  if (has_open_tool_calls()) {
+    commit_pending_next_request_ = true;
+    return Value::object({{"accepted", Value{false}},
+                          {"deferred", Value{true}},
+                          {"reason", Value{"open-tool-call"}},
+                          {"apply", Value{"next_request"}}});
+  }
+  commit_pending_next_request_ = false;
+  auto settled = context_.commit_pending();
+  if (settled.find("accepted") && field(settled, "accepted") == Value{true}) {
+    ++upstream_epoch_;
+    settled.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
+  }
+  return settled;
+}
+bool CodingEngine::auto_compact_for_overflow() {
+  if (context_.read_only())
+    return false;
+  if (const auto pending = context_.pending_proposal(); pending != Value{}) {
+    const auto *mode = pending.find("mode");
+    const bool shrinking = mode && std::holds_alternative<std::string>(mode->value()) &&
+                           mode->string() != "restore";
+    if (shrinking && !has_open_tool_calls()) {
+      const auto before_bytes =
+          unwrap(encode_packet_string(Value{context_.items()})).size();
+      const auto settled = commit_pending_context();
+      if (settled.find("accepted") && field(settled, "accepted") == Value{true}) {
+        const auto after_bytes =
+            unwrap(encode_packet_string(Value{context_.items()})).size();
+        if (after_bytes < before_bytes)
+          return true;
+      }
+    }
+  }
+  const auto view = context_.view();
+  const auto &entries = field(view, "entries").array();
+  const auto units = context_.units();
+  const bool anthropic = provider_.provider_identity() == "anthropic-messages" ||
+                         provider_.provider_identity().starts_with("anthropic");
+  std::vector<const Unit *> removable;
+  for (const auto &u : units) {
+    if (u.open || u.pinned || u.unit_class == UnitClass::tool_state)
+      continue;
+    if (u.unit_class == UnitClass::instruction && !u.superseded)
+      continue;
+    if (u.entries.empty())
+      continue;
+    removable.push_back(&u);
+  }
+  if (removable.empty())
+    return false;
+  const std::size_t drop_count = std::max<std::size_t>(1, (removable.size() + 1) / 2);
+  std::set<std::size_t> drop_positions;
+  std::vector<const Unit *> chosen;
+  chosen.reserve(drop_count);
+  for (std::size_t i = 0; i < drop_count; ++i) {
+    chosen.push_back(removable[i]);
+    for (const auto pos : removable[i]->entries)
+      drop_positions.insert(pos);
+  }
+  if (anthropic && !chosen.empty()) {
+    // Anthropic requires the first wire message to have role "user". If archiving
+    // the leading unit would expose a non-user message first, spare that unit.
+    auto first_remaining_is_user = [&] {
+      for (std::size_t pos = 0; pos < entries.size(); ++pos) {
+        if (drop_positions.contains(pos))
+          continue;
+        const auto &item = field(entries[pos], "item");
+        const auto *type = item.find("type");
+        if (type && *type == Value{"reasoning"})
+          continue;
+        const auto *role = item.find("role");
+        return role != nullptr &&
+               (*role == Value{"user"} || *role == Value{"developer"} ||
+                *role == Value{"system"});
+      }
+      return false;
+    };
+    while (!chosen.empty() && !first_remaining_is_user()) {
+      for (const auto pos : chosen.front()->entries)
+        drop_positions.erase(pos);
+      chosen.erase(chosen.begin());
+    }
+  }
+  if (chosen.empty())
+    return false;
+  Value::Array ids;
+  for (const auto *unit : chosen) {
+    for (const auto pos : unit->entries) {
+      if (pos < entries.size())
+        ids.push_back(field(entries[pos], "id"));
+    }
+  }
+  if (ids.empty())
+    return false;
+  auto proposal =
+      Value::object({{"base", Value{context_.head()}},
+                     {"mode", Value{"archive"}},
+                     {"ids", Value{std::move(ids)}},
+                     {"reason", Value{"provider-context-overflow-recovery"}},
+                     {"source", Value{"native-overflow-recovery"}}});
+  const auto res = context_.manage(proposal);
+  if (res.find("staged") && field(res, "staged") == Value{true}) {
+    const auto committed = commit_pending_context();
+    return committed.find("accepted") && field(committed, "accepted") == Value{true};
+  }
+  if (res.find("accepted") && field(res, "accepted") == Value{true}) {
+    ++upstream_epoch_;
+    return true;
+  }
+  return false;
+}
 Value CodingEngine::request(Value options) {
+  const bool custom_input = std::holds_alternative<Value::Object>(options.value()) &&
+                            options.find("input") != nullptr;
+  try {
+    return request_impl(options);
+  } catch (const Error &e) {
+    if (custom_input || e.code != ErrorCode::provider_context_overflow ||
+        log_.root().state() != JournalWriterState::live)
+      throw;
+    if (!auto_compact_for_overflow())
+      throw;
+    const auto msg = "provider context overflow: auto-archived oldest unpinned units "
+                     "(originals retained), rolling upstream epoch " +
+                     std::to_string(upstream_epoch_) + " and retrying";
+    if (status)
+      status(msg);
+    if (notice || display)
+      (notice ? notice : display)("\n[" + msg + "]\n");
+    return request_impl(std::move(options));
+  }
+}
+Value CodingEngine::request_impl(Value options) {
   struct RequestGroup {
     CodingProvider &provider;
     bool &active;
@@ -4644,13 +4945,90 @@ Value CodingEngine::request(Value options) {
     validate_protocol(context_.items(), assembly.reference());
     assembly.stage(12);
     drain_workflows();
+    if (!std::holds_alternative<Value::Object>(options.value()))
+      throw Error{ErrorCode::invalid_range};
+    unsigned max_attempts = 5;
+    unsigned base_ms = 1000;
+    unsigned cap_ms = 16000;
+    if (const auto *policy = options.find("retry_policy")) {
+      if (!std::holds_alternative<Value::Object>(policy->value()))
+        throw Error{ErrorCode::invalid_range};
+      for (const auto &[key, value] : policy->object()) {
+        if (!std::holds_alternative<Number>(value.value()))
+          throw Error{ErrorCode::invalid_range};
+        unsigned n = 0;
+        const auto &text = value.number().text();
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+          throw Error{ErrorCode::invalid_range};
+        if (key == "max_attempts" && n >= 1 && n <= 100)
+          max_attempts = n;
+        else if (key == "base_ms" && n <= 60000)
+          base_ms = n;
+        else if (key == "cap_ms" && n <= 60000)
+          cap_ms = n;
+        else
+          throw Error{ErrorCode::invalid_range};
+      }
+    }
+    const auto cache_mode =
+        options.find("cache_policy") ? prompt_cache_mode(field(options, "cache_policy"))
+        : program_config_.find("prompt_cache")
+            ? prompt_cache_mode(field(program_config_, "prompt_cache"))
+            : PromptCacheMode::provider_default;
+    const auto *state_choice = options.find("state_context");
+    if (state_choice && *state_choice != Value{"auto"} &&
+        *state_choice != Value{"omit"})
+      throw Error{ErrorCode::invalid_range};
+    const bool state_context = !state_choice || *state_choice == Value{"auto"};
+    if (const auto *opt_store = options.find("store")) {
+      const auto *b = std::get_if<bool>(&opt_store->value());
+      if (b == nullptr || *b)
+        throw Error{ErrorCode::unsupported};
+    }
+    if (const auto *opt_stream = options.find("stream")) {
+      const auto *b = std::get_if<bool>(&opt_stream->value());
+      if (b == nullptr || !*b)
+        throw Error{ErrorCode::unsupported};
+    }
+    const std::string target_model = [&] {
+      if (const auto *opt_model = options.find("model");
+          opt_model && std::holds_alternative<std::string>(opt_model->value()) &&
+          !opt_model->string().empty())
+        return opt_model->string();
+      return string_field(program_config_, "model").empty()
+                 ? model_
+                 : string_field(program_config_, "model");
+    }();
+    const auto target_identity = provider_.provider_identity();
+    if (context_.pending_proposal() != Value{}) {
+      const auto now = std::chrono::steady_clock::now();
+      const bool cold_cache = last_provider_request_at_.has_value() &&
+                              (now - *last_provider_request_at_) >= cache_ttl_;
+      const bool route_switched =
+          (!last_provider_model_.empty() && last_provider_model_ != target_model) ||
+          (!last_provider_identity_.empty() &&
+           last_provider_identity_ != target_identity);
+      const bool explicit_now = commit_pending_next_request_;
+      if (explicit_now || cold_cache || route_switched) {
+        const auto settled = commit_pending_context();
+        if (settled.find("accepted") && field(settled, "accepted") == Value{true} &&
+            (notice || display)) {
+          const char *why = explicit_now     ? "explicit apply=now"
+                            : route_switched ? "route switch"
+                                             : "cold cache";
+          (notice ? notice : display)("\n[staged context committed on " +
+                                      std::string{why} + "; upstream epoch " +
+                                      std::to_string(upstream_epoch_) + "]\n");
+        }
+      }
+    }
     auto items = context_.items();
     auto origin = context_.head();
     validate_protocol(items, assembly.reference());
+    items = project_input_for_provider(std::move(items), target_identity);
     auto request = Value::object(
-        {{"model", Value{string_field(program_config_, "model").empty()
-                             ? model_
-                             : string_field(program_config_, "model")}},
+        {{"model", Value{target_model}},
          {"instructions",
           Value{"You are Blackbird, a programmable coding colleague for an expert "
                 "operator. Use local file/process tools without approval ceremony. "
@@ -4694,42 +5072,6 @@ Value CodingEngine::request(Value options) {
          {"store", Value{false}},
          {"stream", Value{true}}});
     assembly.stage(13);
-    if (!std::holds_alternative<Value::Object>(options.value()))
-      throw Error{ErrorCode::invalid_range};
-    unsigned max_attempts = 5;
-    unsigned base_ms = 1000;
-    unsigned cap_ms = 16000;
-    if (const auto *policy = options.find("retry_policy")) {
-      if (!std::holds_alternative<Value::Object>(policy->value()))
-        throw Error{ErrorCode::invalid_range};
-      for (const auto &[key, value] : policy->object()) {
-        if (!std::holds_alternative<Number>(value.value()))
-          throw Error{ErrorCode::invalid_range};
-        unsigned n = 0;
-        const auto &text = value.number().text();
-        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
-        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
-          throw Error{ErrorCode::invalid_range};
-        if (key == "max_attempts" && n >= 1 && n <= 100)
-          max_attempts = n;
-        else if (key == "base_ms" && n <= 60000)
-          base_ms = n;
-        else if (key == "cap_ms" && n <= 60000)
-          cap_ms = n;
-        else
-          throw Error{ErrorCode::invalid_range};
-      }
-    }
-    const auto cache_mode =
-        options.find("cache_policy") ? prompt_cache_mode(field(options, "cache_policy"))
-        : program_config_.find("prompt_cache")
-            ? prompt_cache_mode(field(program_config_, "prompt_cache"))
-            : PromptCacheMode::provider_default;
-    const auto *state_choice = options.find("state_context");
-    if (state_choice && *state_choice != Value{"auto"} &&
-        *state_choice != Value{"omit"})
-      throw Error{ErrorCode::invalid_range};
-    const bool state_context = !state_choice || *state_choice == Value{"auto"};
     for (auto &[key, value] : options.object()) {
       if (key == "retry_policy" || key == "cache_policy" || key == "state_context")
         continue;
@@ -4873,11 +5215,15 @@ Value CodingEngine::request(Value options) {
     prepare_request_cache(request,
                           {cache_mode, provider_.supports_prompt_cache_policy(),
                            provider_.provider_identity(), reusable_input_items});
-    // Cache affinity follows the conversation, so it survives reopen and restart.
+    // Cache affinity follows the conversation and current upstream cache epoch,
+    // so it survives reopen/restart and rolls cleanly after context cuts.
     // An authored key wins.
-    if (provider_.supports_prompt_cache_key() && !request.find("prompt_cache_key"))
-      request.object().emplace_back(
-          "prompt_cache_key", Value{hex_identity(identity_.conversation.bytes())});
+    if (provider_.supports_prompt_cache_key() && !request.find("prompt_cache_key")) {
+      auto key = hex_identity(identity_.conversation.bytes());
+      if (upstream_epoch_ > 0)
+        key += ":e" + std::to_string(upstream_epoch_);
+      request.object().emplace_back("prompt_cache_key", Value{std::move(key)});
+    }
     if (context_.head() != origin)
       throw Error{ErrorCode::conflict};
     ProviderOriginalLease final_packet{{ProviderOriginalRole::request_packet,
@@ -5232,6 +5578,14 @@ Value CodingEngine::request(Value options) {
               string_field(item, "call_id"),
               ModelCall{string_field(item, "name"), field(item, "arguments"),
                         response_generation_, ++call_sequence_});
+      last_provider_request_at_ = std::chrono::steady_clock::now();
+      last_provider_model_ = string_field(request, "model");
+      last_provider_identity_ = std::string{provider_.provider_identity()};
+      if (const auto *st = response.find("status");
+          st && *st == Value{"incomplete"} && (notice || display)) {
+        (notice ? notice : display)(
+            "\n[response hit max_output_tokens; partial reply preserved]\n");
+      }
       return response;
     });
   });
@@ -5821,13 +6175,50 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           return context_budget(arguments);
         if (name == "context_manage") {
           auto proposal = field(arguments, "proposal");
+          std::string apply = "staged";
+          if (const auto *mode = arguments.find("apply")) {
+            if (!std::holds_alternative<std::string>(mode->value()))
+              throw Error{ErrorCode::invalid_range};
+            apply = mode->string();
+            if (apply != "staged" && apply != "now")
+              throw Error{ErrorCode::invalid_range};
+          }
           // Explicit invocation-time snapshot convenience. Supplied bases remain strict
           // CAS.
           if (std::holds_alternative<Value::Object>(proposal.value()) &&
               !proposal.find("base"))
             proposal.object().emplace_back("base", Value{context_.head()});
-          return context_.manage(proposal);
+          auto res = context_.manage(proposal);
+          if (apply == "now") {
+            if (res.find("staged") && field(res, "staged") == Value{true}) {
+              if (has_open_tool_calls()) {
+                commit_pending_next_request_ = true;
+                res.object().emplace_back("apply", Value{"next_request"});
+                return res;
+              }
+              auto committed = commit_pending_context();
+              if (committed.find("accepted") &&
+                  field(committed, "accepted") == Value{true})
+                committed.object().emplace_back("applied", Value{"now"});
+              return committed;
+            }
+            if (res.find("accepted") && field(res, "accepted") == Value{true}) {
+              ++upstream_epoch_;
+              res.object().emplace_back("applied", Value{"now"});
+              res.object().emplace_back("upstream_epoch",
+                                        Value{Number{upstream_epoch_}});
+            }
+          } else if (res.find("accepted") && field(res, "accepted") == Value{true}) {
+            ++upstream_epoch_;
+          }
+          return res;
         }
+        if (name == "context_pin")
+          return context_.pin(string_field(arguments, "selection"));
+        if (name == "context_unpin")
+          return context_.unpin(string_field(arguments, "selection"));
+        if (name == "context_units")
+          return format_context_units();
         if (name == "rageshake") {
           const RawAdapterContext origin{
               nullptr,
@@ -6158,17 +6549,25 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           return stats();
         if (name == "context_view")
           return context_.view();
-        if (name == "context_edit")
-          return context_.edit(field(arguments, "candidate"), {},
-                               ContextStore::EditKeys::strict);
+        if (name == "context_edit") {
+          auto res = context_.edit(field(arguments, "candidate"), {},
+                                   ContextStore::EditKeys::strict);
+          if (res.find("accepted") && field(res, "accepted") == Value{true})
+            ++upstream_epoch_;
+          return res;
+        }
         if (name == "context_originals")
           return context_.originals();
         if (name == "context_restore") {
           context_.restore(string_field(arguments, "entry"));
+          ++upstream_epoch_;
           return context_.view();
         }
-        if (name == "lua")
+        if (name == "lua") {
+          if (runtime_)
+            runtime_->error.clear();
           return runtime_->eval(string_field(arguments, "code"));
+        }
         if (name == "read_file" && arguments.find("snapshot")) {
           if (arguments.find("path"))
             throw Error{ErrorCode::invalid_range};
@@ -6657,6 +7056,7 @@ void CodingEngine::turn(TurnInput input) {
     // The null business value is prepared before effects; cleanup uses moves.
     const Value empty;
     const auto rollback = [&](const Error *error) {
+      commit_pending_next_request_ = false;
       apply_activation();
       clear_pending();
       context_.protect = {};
@@ -6681,6 +7081,7 @@ void CodingEngine::turn(TurnInput input) {
     };
     try {
       failed_turn_.reset();
+      commit_pending_next_request_ = false;
       clear_value(workflow_result_);
       workflow_continuations_.clear();
       workflow_invocations_ = 0;
@@ -6770,6 +7171,8 @@ void CodingEngine::turn(TurnInput input) {
       state(stage);
       auto settlement =
           context_.finish_workflow(true, boundary_program, origin, &acceptance);
+      if (settlement.find("accepted") && field(settlement, "accepted") == Value{true})
+        ++upstream_epoch_;
       apply_activation();
       if (!is_null(settlement) && display) {
         try {

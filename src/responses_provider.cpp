@@ -135,8 +135,10 @@ Value RegisteredResponsesCodingProvider::respond(
   if (config_.timeout_seconds < 1 || config_.timeout_seconds > 3600)
     throw Error{ErrorCode::invalid_range};
   auto control = raw_wait_control();
-  control.deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{config_.timeout_seconds};
+  const auto outer =
+      std::chrono::steady_clock::now() +
+      std::chrono::seconds{std::max<int>(config_.timeout_seconds * 10, 1800)};
+  control.deadline = control.deadline ? std::min(*control.deadline, outer) : outer;
   RawWaitScope deadline{control};
   RawProviderPhase phase;
   return phase.run([&] {

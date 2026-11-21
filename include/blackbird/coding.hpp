@@ -169,6 +169,9 @@ public:
   void detach_host_tools();
   void effort(std::string value);
   Value stats() const;
+  std::uint64_t upstream_epoch() const noexcept { return upstream_epoch_; }
+  void set_cache_ttl(std::chrono::seconds ttl) noexcept { cache_ttl_ = ttl; }
+  std::chrono::seconds cache_ttl() const noexcept { return cache_ttl_; }
   bool uncontained_command_custody() const noexcept {
     return uncontained_exec_recovery_;
   }
@@ -186,6 +189,7 @@ private:
   using CommandTaskMap = std::map<std::string, CommandTaskActivity>;
   bool turn_running_ = false, backstop_claimed_ = false;
   bool request_group_active_ = false;
+  bool commit_pending_next_request_ = false;
   RawTurnTrace *turn_trace_ = nullptr;
   RawOperationTrace *operation_trace_ = nullptr;
   std::optional<Error> failed_turn_;
@@ -312,7 +316,17 @@ private:
   std::size_t root_source_length_ = 0;
   std::unique_ptr<Observations> observations_;
   std::unique_ptr<Runtime> runtime_;
+  std::uint64_t upstream_epoch_ = 0;
+  std::optional<std::chrono::steady_clock::time_point> last_provider_request_at_;
+  std::chrono::seconds cache_ttl_{300};
+  std::string last_provider_model_;
+  std::string last_provider_identity_;
+  bool has_open_tool_calls() const;
+  Value format_context_units() const;
+  Value commit_pending_context();
+  bool auto_compact_for_overflow();
   Value request(Value options = Value::object({}));
+  Value request_impl(Value options);
   Value call(std::string name, Value arguments) {
     return dispatch(std::move(name), std::move(arguments), Value{});
   }

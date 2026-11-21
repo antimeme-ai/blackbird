@@ -244,7 +244,8 @@ void dependencies_and_other_bodies() {
         later_failure.error().code == ErrorCode::allocation);
 }
 void provider_error_bytes() {
-  for (const auto code : {ErrorCode::provider_auth, ErrorCode::provider_rate_limit}) {
+  for (const auto code : {ErrorCode::provider_auth, ErrorCode::provider_rate_limit,
+                          ErrorCode::provider_context_overflow}) {
     const auto reason = static_cast<std::byte>(code);
     const std::array rejected{
         std::byte{1}, std::byte{0}, std::byte{10},   std::byte{0}, std::byte{0},
@@ -398,7 +399,8 @@ void continuation_wire() {
             {id<AuditStreamId>(12), 1, 48, CapturePurpose::ordinary_submission},
             {id<AuditStreamId>(12), 8, 511, CapturePurpose::rejected_proposal}});
   CHECK(require(encode_retained_event(populated, 228)) == full);
-  for (const auto code : {ErrorCode::provider_auth, ErrorCode::provider_rate_limit}) {
+  for (const auto code : {ErrorCode::provider_auth, ErrorCode::provider_rate_limit,
+                          ErrorCode::provider_context_overflow}) {
     auto provider_problem = full;
     provider_problem[98] = static_cast<std::byte>(code);
     const auto event = require(decode_retained_event(provider_problem, 256));

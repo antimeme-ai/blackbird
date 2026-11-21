@@ -13426,3 +13426,67 @@ failures in `tests/terminal_chat_ux_test.cpp`:
    header protection and neutral `•` for unknown outcomes, UTF-8-safe 76-byte
    preview clipping, `POLLIN` gating on `more_stdin`, `/keys` help accuracy, and
    isolated the PTY `Esc` + empty-Tasks-hidden test in its own clean session dir.
+
+
+## 2026-11-21 — Unit (3): Core Runtime & Decoupled Context Lifecycle
+
+Decoupled the durable Blackbird session from disposable upstream provider cache
+epochs and hardened provider error recovery and Lua ergonomics
+(`docs/CONTEXT_LIFECYCLE_UNIT3_SUBPLAN.md`), starting from genuine RED failures in
+`tests/context_lifecycle_unit3_test.cpp`:
+
+1. **Decoupled upstream cache epochs, mid-turn cuts, and context tools
+   (`include/blackbird/context.hpp`, `src/context.cpp`, `include/blackbird/coding.hpp`,
+   `src/coding.cpp`, `src/tools.cpp`, `src/raw_bridge.cpp`):**
+   - Added `ContextStore::commit_pending()` (wrapped in `RawContextTrace`) to
+     publish staged managed-context proposals while keeping the active workflow open.
+   - Added `apply = "now"` on `context_manage` (default `"staged"`), plus
+     `context_pin`, `context_unpin`, `context_units` model tools and Lua
+     `blackbird.pin/unpin/units/commit_context`. When invoked during an open model
+     tool call (`function_call` awaiting `function_call_output`), immediate commit
+     defers cleanly to `commit_pending_next_request_` and flushes right after tool
+     outputs append before the next provider request.
+   - Tracked `upstream_epoch_` (reconstructed on reopen from resident context
+     mutations and incremented on cuts/edits/restores), `last_provider_request_at_`,
+     `cache_ttl_` (default 300s), and last route `(model, provider_identity)`. Warm
+     staged drops stay staged to preserve KV cache prefixes; cold cache
+     (`idle >= cache_ttl_`) or route switch auto-flushes for free and rolls
+     `prompt_cache_key` from `<conversation>` (epoch 0) to `<conversation>:e<N>`.
+   - Projected `request["input"]` per target provider identity
+     (`project_input_for_provider`) so foreign reasoning items (`anthropic_content`
+     vs OpenAI `encrypted_content`) are stripped on the wire without mutating
+     `ContextStore` originals.
+2. **Typed overflow classification, automatic overflow recovery, partial-reply
+   preservation, and stream-inactivity timeouts (`include/blackbird/foundation.hpp`,
+   `src/foundation.cpp`, `src/retained_events.cpp`, `src/workflow_host.cpp`,
+   `src/raw_runtime.cpp`, `src/native_process.hpp`, `include/blackbird/provider_auth.hpp`,
+   `src/provider_auth.cpp`, `src/openai.cpp`, `src/openrouter.cpp`,
+   `src/anthropic_provider.cpp`, `src/responses_provider.cpp`, `src/colleague.cpp`):**
+   - Added `ErrorCode::provider_context_overflow` across all enum upper-bound
+     sentinels, `colleague.cpp`, and `tests/retained_events_test.cpp`.
+   - Consolidated `is_context_overflow_text()` across HTTP 413/400/422 and SSE
+     error paths. On `provider_context_overflow`, `CodingEngine::request()` commits
+     a shrinking staged proposal or archives oldest unpinned removable units
+     (respecting Anthropic's leading-user invariant and preserving originals), rolls
+     `upstream_epoch_`, and retries once.
+   - Preserved valid `response.incomplete` (`incomplete_details.reason ==
+     "max_output_tokens"` with non-empty output and only completed tool calls) in
+     OpenAI and OpenRouter SSE parsers while keeping bare/truncated tool calls
+     failing with `ErrorCode::incomplete`.
+   - Replaced fixed curl `--max-time` on active streams with `--connect-timeout`,
+     `--speed-limit 1 --speed-time <timeout_seconds>`, outer cap `max(10*timeout, 1800)`,
+     matching outer `RawWaitScope` deadlines (preserving tighter inherited deadlines),
+     and per-read `idle_timeout` in `Child::collect()`.
+3. **3-body Lua ergonomics (`src/coding.cpp`):**
+   - Exposed `blackbird.now()` and safe read-only `os.time` / `os.clock` /
+     `os.difftime` (zero shell/filesystem/env access).
+   - Propagated captured `lua_error` text on failed `lua` tool results without
+     leaking stale errors across subsequent calls.
+4. **Adversarial review & hardening (layer 1):** Fixed open-tool-call deferral for
+   real `turn.lua` `context_manage(apply="now")`, outer `RawWaitScope` and tighter
+   inherited deadline clamping, portable `RegisteredResponsesCodingProvider` and
+   Anthropic `anthropic_message_id` projection, `ContextStore::commit_pending()`
+   `RawContextTrace`, overflow classifier false-positive guard, epoch reconstruction
+   via `tail_facts()`, `lua_error` consumption/reset, OpenRouter `response.incomplete`
+   metadata/output_item/duplicate-terminal handling, `context_pin` `r1-r4` syntax
+   help, and raw bridge role 6 docs.

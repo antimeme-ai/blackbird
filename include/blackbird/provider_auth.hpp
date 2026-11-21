@@ -38,6 +38,7 @@ provider_http(const ProviderHttpRequest &request, const ProviderAuthConfig &conf
               const RawEventRef *auth_resolution = nullptr,
               const RawAdapterContext *raw_context = nullptr);
 void require_provider_success(int status);
+bool is_context_overflow_text(std::string_view text) noexcept;
 
 struct OAuthExpected {
   std::int64_t account_revision = -2;

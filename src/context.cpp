@@ -2088,6 +2088,35 @@ Value ContextStore::manage(const Value &proposal, RawContextOrigin origin) {
     }
   });
 }
+Value ContextStore::commit_pending(RawContextOrigin origin) {
+  const auto initial = raw_state();
+  RawContextTrace trace{RawContextAction::finish, 2978ULL, origin, &initial};
+  return trace.run([&]() -> Value {
+    require_writable();
+    if (!pending_)
+      return Value{};
+    const auto pending = *pending_;
+    WorkflowAcceptance acceptance{};
+    try {
+      auto result =
+          pending.expected != head_
+              ? reject_managed(pending.proposal, "settlement-conflict", trace.child(),
+                               &acceptance.context_settlement_accepted)
+              : publish_managed(pending.proposal, pending.snapshot, pending.stage,
+                                Value{}, trace.child(), &acceptance);
+      pending_.reset();
+      trace.state(3, raw_state());
+      refresh_history();
+      return result;
+    } catch (...) {
+      if (acceptance.context_settlement_accepted) {
+        pending_.reset();
+        trace.state(3, raw_state());
+      }
+      throw;
+    }
+  });
+}
 Value ContextStore::finish_workflow(bool success, const Value &boundary_program,
                                     RawContextOrigin origin,
                                     WorkflowAcceptance *acceptance) {

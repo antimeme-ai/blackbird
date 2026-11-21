@@ -483,8 +483,8 @@ void write_descriptions(const std::string &path) {
   write_description(file.value, raw_backstop_description());
   write_description(file.value, raw_plain_description());
   write_description(file.value, raw_candidate_description());
-  for (unsigned code = 0; code <= static_cast<unsigned>(ErrorCode::provider_rate_limit);
-       ++code) {
+  for (unsigned code = 0;
+       code <= static_cast<unsigned>(ErrorCode::provider_context_overflow); ++code) {
     const auto value = static_cast<ErrorCode>(code);
     write_all(file.value, bytes(value));
     write_description(file.value, error_name(value));
@@ -1754,7 +1754,7 @@ public:
     if (response[0] < 0 || response[0] > std::numeric_limits<pid_t>::max() ||
         (response[1] != 0 && response[1] != 1) ||
         (response[2] != 0 && response[2] != 1) || response[3] < 0 ||
-        response[3] > static_cast<std::int64_t>(ErrorCode::provider_rate_limit))
+        response[3] > static_cast<std::int64_t>(ErrorCode::provider_context_overflow))
       throw Error{ErrorCode::corrupt};
     known_fenced_.store(response[1] != 0, std::memory_order_release);
     return response;

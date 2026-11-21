@@ -355,10 +355,25 @@ public:
     }
   }
   std::string collect(Clock::time_point deadline, std::size_t limit,
-                      int *exit_code = nullptr) {
+                      int *exit_code = nullptr,
+                      std::optional<std::chrono::milliseconds> idle_timeout = {}) {
     try {
-      while (read(deadline, limit)) {
+      auto idle_deadline =
+          idle_timeout ? std::min(deadline, Clock::now() + *idle_timeout) : deadline;
+      while (true) {
+        const auto prev_out = pending.size();
+        const auto prev_err = error_bytes.size();
+        const auto step_deadline =
+            idle_timeout ? std::min(deadline, idle_deadline) : deadline;
+        const bool more = read(step_deadline, limit);
+        if (idle_timeout &&
+            (pending.size() > prev_out || error_bytes.size() > prev_err))
+          idle_deadline = std::min(deadline, Clock::now() + *idle_timeout);
+        if (!more)
+          break;
       }
+      const auto exit_deadline =
+          idle_timeout ? std::min(deadline, Clock::now() + *idle_timeout) : deadline;
       siginfo_t observed{};
       while (true) {
         if (cancelled && cancelled())
@@ -366,7 +381,7 @@ public:
         // Observe exit without reaping: the zombie leader pins its PID/group name
         // until owned group cleanup. Never kill a possibly recycled PGID.
         RawWaitControl control = raw_wait_control();
-        control.deadline = deadline;
+        control.deadline = exit_deadline;
         RawWaitScope scope{control};
         auto permit =
             trace ? trace->permit(raw_envelope_size + 24 + 1 + 2 * sizeof(int) +
@@ -392,7 +407,7 @@ public:
             lose_custody();
           fail(ErrorCode::io, error);
         }
-        if (Clock::now() >= deadline)
+        if (Clock::now() >= exit_deadline)
           throw deadline_error;
         (void)::poll(nullptr, 0, 10);
       }

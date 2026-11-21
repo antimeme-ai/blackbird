@@ -38,7 +38,8 @@ enum class ErrorCode : std::uint8_t {
   audit_unavailable,
   provider_transport,
   provider_auth,
-  provider_rate_limit
+  provider_rate_limit,
+  provider_context_overflow
 };
 
 struct Error {

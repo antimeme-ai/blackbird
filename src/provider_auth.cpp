@@ -419,14 +419,53 @@ oauth_headers(std::string_view provider) {
   return out;
 }
 } // namespace
-void require_provider_success(int status) {
+namespace {
+bool contains_icase(std::string_view hay, std::string_view needle) noexcept {
+  if (needle.empty() || hay.size() < needle.size())
+    return false;
+  for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+    bool match = true;
+    for (std::size_t j = 0; j < needle.size(); ++j) {
+      auto a = static_cast<unsigned char>(hay[i + j]);
+      auto b = static_cast<unsigned char>(needle[j]);
+      if (a >= 'A' && a <= 'Z')
+        a = static_cast<unsigned char>(a - 'A' + 'a');
+      if (b >= 'A' && b <= 'Z')
+        b = static_cast<unsigned char>(b - 'A' + 'a');
+      if (a != b) {
+        match = false;
+        break;
+      }
+    }
+    if (match)
+      return true;
+  }
+  return false;
+}
+void require_provider_success_body(int status, std::string_view body) {
   if (status == 401 || status == 403)
     throw Error{ErrorCode::provider_auth, status};
   if (status == 429)
     throw Error{ErrorCode::provider_rate_limit, status};
+  if (status == 413 ||
+      ((status == 400 || status == 422) && is_context_overflow_text(body)))
+    throw Error{ErrorCode::provider_context_overflow, status};
   if (status < 200 || status >= 300)
     throw Error{ErrorCode::external_unknown, status};
 }
+} // namespace
+bool is_context_overflow_text(std::string_view text) noexcept {
+  return contains_icase(text, "context_length_exceeded") ||
+         contains_icase(text, "maximum context length") ||
+         contains_icase(text, "exceeds the maximum context") ||
+         contains_icase(text, "exceeds the model's maximum context") ||
+         contains_icase(text, "prompt is too long") ||
+         contains_icase(text, "input is too long") ||
+         contains_icase(text, "context window") ||
+         contains_icase(text, "too many tokens") ||
+         contains_icase(text, " tokens exceed");
+}
+void require_provider_success(int status) { require_provider_success_body(status, {}); }
 ProviderHttpResponse
 provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
                    const std::function<void(std::string_view)> &observer,
@@ -440,8 +479,10 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
   std::optional<RawWaitScope> wait_scope;
   std::optional<detail::Clock::time_point> initial_deadline;
   try {
+    const int outer_seconds =
+        application ? std::max<int>(r.timeout_seconds * 10, 1800) : r.timeout_seconds;
     if (application && r.timeout_seconds >= 1 && r.timeout_seconds <= 3600) {
-      initial_deadline = detail::Clock::now() + std::chrono::seconds{r.timeout_seconds};
+      initial_deadline = detail::Clock::now() + std::chrono::seconds{outer_seconds};
       const auto inherited = raw_wait_control().deadline;
       if (inherited && *inherited < *initial_deadline)
         initial_deadline = inherited;
@@ -509,14 +550,27 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
     child.output_observer = observer;
     child.original_capture =
         application && raw_context ? raw_context->originals : nullptr;
-    child.start({c.curl_executable, "--disable", "--silent", "--no-buffer", "--proto",
-                 "=https", "--max-time", std::to_string(r.timeout_seconds),
-                 "--write-out", "\n%{http_code}", "--config", "-"});
-    const auto deadline =
-        initial_deadline
-            ? *initial_deadline
-            : detail::Clock::now() + std::chrono::seconds{r.timeout_seconds};
-    child.send(input, deadline);
+    const int idle_seconds = r.timeout_seconds;
+    const int max_seconds = outer_seconds;
+    if (application) {
+      const int connect_seconds = std::min<int>(idle_seconds, 30);
+      child.start({c.curl_executable, "--disable", "--silent", "--no-buffer", "--proto",
+                   "=https", "--connect-timeout", std::to_string(connect_seconds),
+                   "--speed-limit", "1", "--speed-time", std::to_string(idle_seconds),
+                   "--max-time", std::to_string(max_seconds), "--write-out",
+                   "\n%{http_code}", "--config", "-"});
+    } else {
+      child.start({c.curl_executable, "--disable", "--silent", "--no-buffer", "--proto",
+                   "=https", "--max-time", std::to_string(r.timeout_seconds),
+                   "--write-out", "\n%{http_code}", "--config", "-"});
+    }
+    const auto collect_deadline =
+        initial_deadline ? *initial_deadline
+                         : detail::Clock::now() + std::chrono::seconds{max_seconds};
+    const auto send_deadline =
+        std::min(collect_deadline,
+                 detail::Clock::now() + std::chrono::seconds{r.timeout_seconds});
+    child.send(input, send_deadline);
     child.close_input();
     int code = 0;
     if (phase && trace) {
@@ -525,7 +579,11 @@ provider_http_impl(const ProviderHttpRequest &r, const ProviderAuthConfig &c,
       if (raw_context && raw_context->receipt && acquisition->reference().ordinal)
         raw_context->receipt->response = acquisition->reference();
     }
-    auto output = child.collect(deadline, 16 * 1024 * 1024, &code);
+    auto output = child.collect(
+        collect_deadline, 16 * 1024 * 1024, &code,
+        application ? std::optional<std::chrono::milliseconds>{std::chrono::seconds{
+                          idle_seconds}}
+                    : std::nullopt);
     if (acquisition)
       acquisition->finish(1);
     if (code != 0)
@@ -583,8 +641,10 @@ provider_http(const ProviderHttpRequest &request, const ProviderAuthConfig &conf
   std::optional<RawWaitScope> deadline_scope;
   if (application && request.timeout_seconds >= 1 && request.timeout_seconds <= 3600) {
     auto control = raw_wait_control();
-    control.deadline =
-        detail::Clock::now() + std::chrono::seconds{request.timeout_seconds};
+    const auto outer =
+        detail::Clock::now() +
+        std::chrono::seconds{std::max<int>(request.timeout_seconds * 10, 1800)};
+    control.deadline = control.deadline ? std::min(*control.deadline, outer) : outer;
     deadline_scope.emplace(control);
   }
   std::optional<RawProviderPhase> phase;
@@ -1350,7 +1410,9 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
   std::optional<RawWaitScope> deadline_scope;
   if (timeout_seconds >= 1 && timeout_seconds <= 3600) {
     auto control = raw_wait_control();
-    control.deadline = detail::Clock::now() + std::chrono::seconds{timeout_seconds};
+    const auto outer = detail::Clock::now() +
+                       std::chrono::seconds{std::max<int>(timeout_seconds * 10, 1800)};
+    control.deadline = control.deadline ? std::min(*control.deadline, outer) : outer;
     deadline_scope.emplace(control);
   }
   RawProviderPhase adapter{provider_adapter_extra};
@@ -1561,7 +1623,7 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
     (void)metadata;
     auto result = provider_http_impl(r, config_, observer, call.owner, true,
                                      &resolution, &call, &adapter, &*http_trace);
-    require_provider_success(result.status);
+    require_provider_success_body(result.status, result.body);
     adapter.finish(1);
     return result;
   } catch (const Error &error) {

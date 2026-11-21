@@ -28,6 +28,11 @@ std::string text(const Value &value, std::string_view name) {
   if (kind == "authentication" || kind == "permission_denied" ||
       kind == "payment_required")
     throw Error{ErrorCode::provider_auth};
+  if (kind == "rate_limit" || kind == "rate_limit_exceeded")
+    throw Error{ErrorCode::provider_rate_limit, 429};
+  if (const auto dumped = dump_json(event);
+      dumped.has_value() && is_context_overflow_text(dumped.value()))
+    throw Error{ErrorCode::provider_context_overflow};
   // Canonical stream failures stay terminal. HTTP/transport retries are separate;
   // server_error alone cannot distinguish auth from overload.
   throw Error{ErrorCode::external_unknown};
@@ -108,7 +113,7 @@ Result<Value> openrouter_completed_response(std::string_view stream,
       throw Error{ErrorCode::capacity};
     std::string data, canonical;
     Value metadata, tail;
-    bool completed = false, done = false;
+    bool completed = false, done = false, saw_output_item = false;
     auto event = [&] {
       if (data.empty())
         return;
@@ -126,8 +131,6 @@ Result<Value> openrouter_completed_response(std::string_view stream,
       if (type == "error" || type == "response.error" || type == "response.failed" ||
           (type.empty() && parsed.find("error") && field(parsed, "error") != Value{}))
         stream_error(parsed);
-      if (type == "response.incomplete")
-        throw Error{ErrorCode::incomplete};
       if (const auto *router = parsed.find("openrouter_metadata")) {
         if (metadata != Value{} && metadata != *router)
           throw Error{ErrorCode::conflict};
@@ -144,6 +147,35 @@ Result<Value> openrouter_completed_response(std::string_view stream,
       }
       if (completed || type.empty())
         throw Error{ErrorCode::corrupt};
+      if (type == "response.output_item.done")
+        saw_output_item = true;
+      if (type == "response.incomplete") {
+        const auto *response = parsed.find("response");
+        const auto *details =
+            response && std::holds_alternative<Value::Object>(response->value())
+                ? response->find("incomplete_details")
+                : nullptr;
+        const auto *reason =
+            details && std::holds_alternative<Value::Object>(details->value())
+                ? details->find("reason")
+                : nullptr;
+        const auto *output =
+            response && std::holds_alternative<Value::Object>(response->value())
+                ? response->find("output")
+                : nullptr;
+        const bool valid_truncation =
+            response != nullptr && response->find("status") != nullptr &&
+            *response->find("status") == Value{"incomplete"} && reason != nullptr &&
+            *reason == Value{"max_output_tokens"} && output != nullptr &&
+            std::holds_alternative<Value::Array>(output->value()) &&
+            (!output->array().empty() || saw_output_item);
+        if (!valid_truncation)
+          throw Error{ErrorCode::incomplete};
+        completed = true;
+        canonical += "data: " + data + "\n\n";
+        data.clear();
+        return;
+      }
       if (type == "response.completed")
         completed = true;
       canonical += "data: " + data + "\n\n";
@@ -239,8 +271,10 @@ Value OpenRouterCodingProvider::respond(
   auto control = raw_wait_control();
   if (config_.timeout_seconds < 1 || config_.timeout_seconds > 3600)
     throw Error{ErrorCode::invalid_range};
-  control.deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{config_.timeout_seconds};
+  const auto outer =
+      std::chrono::steady_clock::now() +
+      std::chrono::seconds{std::max<int>(config_.timeout_seconds * 10, 1800)};
+  control.deadline = control.deadline ? std::min(*control.deadline, outer) : outer;
   RawWaitScope deadline{control};
   RawProviderPhase phase;
   return phase.run([&] {
