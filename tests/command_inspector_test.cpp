@@ -280,6 +280,10 @@ Row row(ByteView &bytes) {
     (void)take<int>(bytes);
   result.launch = ref(bytes);
   result.terminal = ref(bytes);
+  const auto label_size = take<std::uint8_t>(bytes);
+  require(label_size <= 64 && bytes.size() >= label_size,
+          "recorded bounded command label");
+  bytes = bytes.subspan(label_size);
   return result;
 }
 struct Source {

@@ -351,7 +351,7 @@ if arguments.case in ('all', 'editor'):
             "p.write_text('/lua print(\"EDIT_\" .. \"RUN\")')\n"
             "sys.exit(7 if mode=='fail' else 0)\n")
         editor.chmod(0o700)
-        env = dict(os.environ, VISUAL=str(editor))
+        env = dict(os.environ, VISUAL=str(editor), BLACKBIRD_MOUSE="1")
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -447,13 +447,19 @@ if arguments.case in ('all', 'input'):
         observed = Observed()
         try:
             wait_for(b"Workflow reloads")
+            # Default startup keeps mouse reporting OFF so plain drag-select works.
+            assert mouse_on not in bytes(observed), "default startup enabled mouse reporting"
+            send(b"/mouse on\r")
             wait_for(mouse_on)
             send(b'/lua print("INPUT_" .. "HISTORY")\r')
             wait_for(b"INPUT_HISTORY")
+            send(b"/copy\r")
+            wait_for(b"\x1b]52;c;")
+            wait_for(b"Copied ")
             send(b"typed")
             wait_for(b"> typed")
             send(b"\x1b[A")  # Bare Up at the first line recalls history.
-            wait_for(b'> /lua print("INPUT_')
+            wait_for(b'> /copy')
             send(b"\x1b[B")  # Down past the newest returns to the draft.
             wait_for(b"> typed")
             send(b"\x15/keys\r")
@@ -479,29 +485,42 @@ if arguments.case in ('all', 'input'):
             assert tail.rfind(mouse_off) != -1 and tail.rfind(mouse_off) < tail.rfind(b"\x1b[?1049l"), "exit ends reporting before leaving the screen"
             saved = native_packet.read_packet((Path(work) / 'ui-state.bbm'))
             assert bytes.fromhex(saved['draft']) == b"X\nY\nZ", saved
-            # BLACKBIRD_MOUSE=0 never enables reporting until /mouse on asks.
+            # BLACKBIRD_MOUSE=1 enables reporting from startup, including tiny frames.
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
                                      stdout=slave, stderr=slave, start_new_session=True,
-                                     env=dict(os.environ, BLACKBIRD_MOUSE="0"))
+                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
             wait_for(b"Workflow reloads")
-            startup = bytes(observed)
-            send(b"\x15/keys\r")
-            wait_for(b"Paste ")
-            assert mouse_on not in startup + bytes(observed), "BLACKBIRD_MOUSE=0 enabled reporting"
-            send(b"/mouse on\r")
             wait_for(mouse_on)
             send(b"\x11")
             assert exit_code() == 0
-            # A launch that starts tiny enables reporting through the small frame.
+            # A launch that starts tiny with BLACKBIRD_MOUSE=1 enables reporting through the small frame.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 10, 0, 0))
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
-                                     stdout=slave, stderr=slave, start_new_session=True)
+                                     stdout=slave, stderr=slave, start_new_session=True,
+                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
             wait_for(mouse_on)
             assert b"\x1b[2J" in observed, "first frame was not the small frame"
             send(b"\x11")
             assert exit_code() == 0
+            # Esc stops an active turn while preserving queued prompts, showing a
+            # queue receipt, and auto-hiding the empty Tasks pane on a fresh session.
+            with fixture_directory(prefix="arco-esc-") as esc_work:
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+                observed = Observed()
+                child = subprocess.Popen([arguments.executable, "--session", esc_work], stdin=slave,
+                                         stdout=slave, stderr=slave, start_new_session=True)
+                wait_for(b"Workflow reloads")
+                send(b'/lua arco.call("exec", {command="sleep 10"})\r')
+                wait_for("▸ exec".encode("utf-8"))
+                assert "TASKS" not in observed.screen.text(), "empty Tasks pane stole side width"
+                send(b'/lua print("ESC_KEPT_" .. "QUEUED")\r')
+                wait_for(b"Queued #1:")
+                send(b"\x1b")
+                wait_for(b"ESC_KEPT_QUEUED", 5)
+                send(b"\x11")
+                assert exit_code() == 0
         finally:
             if child.poll() is None:
                 child.kill()
@@ -566,9 +585,9 @@ if arguments.case in ('all', 'tools'):
                 while index > 0 and rows[index - 1] != "ACTIVITY":
                     index -= 1
                 return rows[index]
-            for marker, header in (("BG_", "[command "), ("FG_", "\u25b8 exec")):
+            for marker, headers in (("BG_", ("[command ",)), ("FG_", ("\u25b8 exec", "\u2713 exec"))):
                 found = [n for n, row in enumerate(rows) if row.startswith(marker)]
-                assert found and all(owner(n).startswith(header) for n in found), (marker, rows)
+                assert found and all(any(owner(n).startswith(h) for h in headers) for n in found), (marker, rows)
             send(b"\x11")
             assert exit_code() == 0
         finally:

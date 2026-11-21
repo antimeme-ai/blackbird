@@ -48,8 +48,8 @@ const std::array builtin_commands{
     ChatCommand{"/views", "", "Switch local views; Ctrl-\\ preserves the draft",
                 "View"},
     ChatCommand{"/mouse", "[on|off]",
-                "Wheel scrolls the transcript; off restores plain-drag selection (TUI "
-                "only)",
+                "Wheel scrolls transcript; default off keeps plain-drag selection "
+                "(TUI only)",
                 "View"},
     ChatCommand{
         "/edit", "",
@@ -59,6 +59,8 @@ const std::array builtin_commands{
     ChatCommand{"/cancel", "", "Request stop and clear pending queue (TUI only)",
                 "Chat"},
     ChatCommand{"/clear", "", "Clear display, not model context (TUI only)", "Chat"},
+    ChatCommand{"/copy", "[all|user]",
+                "Copy last reply (or transcript/prompt) via OSC 52 (TUI only)", "Chat"},
     ChatCommand{"/drafts", "", "List recovered drafts (TUI only)", "Chat"},
     ChatCommand{"/draft", "NUMBER",
                 "Load a recovered draft; explicit Enter sends (TUI only)", "Chat"},
@@ -354,21 +356,23 @@ std::string terminal_key_help() {
          "  Ctrl-W       Delete previous word; Alt-D deletes next word\n"
          "  Ctrl-K / Y   Kill to line end / yank last deletion\n"
          "  Ctrl-U       Clear draft; Ctrl-Y restores it\n"
+         "  Esc          Stop active turn (keep queue), dismiss menu, or focus/close "
+         "view\n"
          "  Ctrl-C       Request stop and clear pending queue; keep unsent draft\n"
          "  Ctrl-B       Background foreground command; preserve composer\n"
          "  Ctrl-O       Inspect command results; preserve draft/cursor\n"
          "  Ctrl-\\      View picker; switch views without replacing the draft\n"
          "  Ctrl-X       Current-session command center; preserve draft/cursor\n"
          "  Ctrl-]       Authored result lab; F6/F7 pin A/B; F8 request interrupt\n"
-         "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Esc draft\n"
+         "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Esc draft/close\n"
          "  Center       T tasks, P participants, J command runs; + means more\n"
          "               Ctrl-Left/Right: list pages or output pages by focus\n"
          "  PTY input    Keys and Ctrl-C reach selected command; Ctrl-B returns\n"
          "  Ctrl-Q       Stop and exit; preserve unsent draft\n"
          "  PgUp / PgDn  Scroll transcript\n"
-         "  Wheel        Scroll transcript; Shift-drag selects text. /mouse off or\n"
-         "               BLACKBIRD_MOUSE=0 restores plain drag; the wheel may then\n"
-         "               arrive as arrow keys, which recall history\n"
+         "  Mouse / Copy Plain drag selects text by default; /copy copies via OSC 52.\n"
+         "               /mouse on or BLACKBIRD_MOUSE=1 enables wheel transcript "
+         "scroll\n"
          "  Paste        Multiline text stays literal; Enter sends explicitly\n";
 }
 std::vector<std::string> terminal_builtin_names() {
@@ -492,6 +496,45 @@ std::size_t trim_history(std::vector<std::string> &values) {
   return size;
 }
 } // namespace
+std::string terminal_osc52_copy(std::string_view text) {
+  constexpr std::size_t max_copy_bytes = 100 * 1024;
+  constexpr char table[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const auto bounded = text.substr(0, std::min(text.size(), max_copy_bytes));
+  std::string out;
+  out.reserve(10 + ((bounded.size() + 2) / 3) * 4);
+  out += "\x1b]52;c;";
+  std::size_t i = 0;
+  while (i + 3 <= bounded.size()) {
+    const std::uint32_t v =
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i])) << 16) |
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i + 1])) << 8) |
+        static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i + 2]));
+    out.push_back(table[(v >> 18) & 63U]);
+    out.push_back(table[(v >> 12) & 63U]);
+    out.push_back(table[(v >> 6) & 63U]);
+    out.push_back(table[v & 63U]);
+    i += 3;
+  }
+  if (const auto rem = bounded.size() - i; rem == 1) {
+    const std::uint32_t v =
+        static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i])) << 16;
+    out.push_back(table[(v >> 18) & 63U]);
+    out.push_back(table[(v >> 12) & 63U]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2) {
+    const std::uint32_t v =
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i])) << 16) |
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(bounded[i + 1])) << 8);
+    out.push_back(table[(v >> 18) & 63U]);
+    out.push_back(table[(v >> 12) & 63U]);
+    out.push_back(table[(v >> 6) & 63U]);
+    out.push_back('=');
+  }
+  out.push_back('\x07');
+  return out;
+}
 std::size_t terminal_scroll_after_output(const TerminalScrollUpdate &update) {
   if (update.scroll == 0)
     return 0;
@@ -693,6 +736,7 @@ void Composer::restore(const TerminalState &state) {
   goal_column_.reset();
   escape_.clear();
   pasted_ = false;
+  pasted_cr_ = false;
   slash_open_ = false;
   palette_open_ = false;
   palette_query_.clear();
@@ -770,13 +814,29 @@ bool Composer::flush_escape() {
   escape_.clear();
   return true;
 }
+void Composer::insert_pasted(char byte) {
+  if (byte == '\r') {
+    insert('\n');
+    pasted_cr_ = true;
+    return;
+  }
+  if (byte == '\n' && pasted_cr_) {
+    pasted_cr_ = false;
+    return;
+  }
+  pasted_cr_ = false;
+  insert(byte);
+}
 TerminalInputDispatch
 terminal_input_dispatch(Composer &composer, std::chrono::steady_clock::time_point now,
                         std::chrono::steady_clock::time_point escape_deadline,
                         short events) {
   const bool palette = composer.palette_open();
+  const bool had_menu = palette || composer.slash_open();
+  const bool was_bare = composer.bare_escape_pending();
   const bool redraw = now >= escape_deadline && composer.flush_escape();
-  return {(events & (POLLIN | POLLHUP | POLLERR)) != 0, redraw, redraw && !palette};
+  return {(events & (POLLIN | POLLHUP | POLLERR)) != 0, redraw, redraw && !palette,
+          redraw && was_bare && !had_menu};
 }
 std::vector<std::string> Composer::palette_lines(std::size_t rows) const {
   const auto catalog = choices_ && palette_open_ ? choices_ : command_catalog();
@@ -963,11 +1023,13 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     if (escape_ == "\x1b[200~") {
       slash_open_ = false;
       pasted_ = true;
+      pasted_cr_ = false;
       escape_.clear();
       return {inspecting ? InputAction::inspect_focus_editor : InputAction::none, {}};
     }
     if (escape_ == "\x1b[201~") {
       pasted_ = false;
+      pasted_cr_ = false;
       escape_.clear();
       return {};
     }
@@ -975,7 +1037,7 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       if (std::string_view{"\x1b[201~"}.starts_with(escape_))
         return {};
       for (const char v : escape_)
-        insert(v);
+        insert_pasted(v);
       escape_.clear();
       return {};
     }
@@ -1124,7 +1186,7 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     return {};
   }
   if (pasted_) {
-    insert(byte == '\r' ? '\n' : byte);
+    insert_pasted(byte);
     return {};
   }
   if (c == 28) {
@@ -2081,7 +2143,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   Value task_page;
   std::map<std::string, Value> task_activity;
   std::vector<ChatRow> task_rows;
-  bool task_rows_dirty = true, tasks_hidden = false, tasks_expanded = false;
+  bool task_rows_dirty = true, tasks_hidden = false, tasks_expanded = false,
+       tasks_forced = false;
   std::size_t task_render_width = 0;
   bool live_provider = false;
   std::vector<bool> operations;
@@ -2217,9 +2280,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
            at - *context_changed_at < context_blink + std::chrono::milliseconds{250};
   };
   // SGR wheel reporting rides frame packets; emitted state commits on completion.
+  // Off by default so native terminal drag-select and copy work out of the box.
   const auto *mouse_setting = std::getenv("BLACKBIRD_MOUSE");
-  bool mouse_wanted = !mouse_setting || std::string_view{mouse_setting} != "0";
+  bool mouse_wanted = mouse_setting && std::string_view{mouse_setting} == "1";
   bool mouse_emitted = false, pending_mouse = false;
+  std::string pending_osc52;
   constexpr std::string_view mouse_on = "\x1b[?1000h\x1b[?1006h",
                              mouse_off = "\x1b[?1006l\x1b[?1000l";
   auto service_output = [&] {
@@ -2642,11 +2707,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             activity = message.text;
             tool_active = false;
             if (!live_provider)
-              transcript.tool_end();
-            if (!live_provider)
-              transcript.append(
-                  message.outcome == Ink::failure ? ChatKind::error : ChatKind::tool,
-                  (message.outcome == Ink::success ? "✓ " : "• ") + message.text);
+              transcript.tool_complete(message.text, message.outcome);
             if (!operations.empty())
               operations.pop_back();
             live_provider = !operations.empty() && operations.back();
@@ -2866,16 +2927,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         // Foreground PTY input reaches the child verbatim, so reporting stays off.
         const bool mouse_target = mouse_wanted && !foreground_pty;
         const bool mouse_change = mouse_target != mouse_emitted;
-        // A recovering frame is never empty, so a mode change always has a packet.
+        // A recovering frame is never empty, so a mode or clipboard update always
+        // has a packet.
         const bool recover = viewport_invalidated || committed.tiny ||
                              committed.rows != rows || committed.columns != width ||
-                             mouse_change;
+                             mouse_change || !pending_osc52.empty();
         // A later resize wake must survive completion of this packet.
         viewport_invalidated = false;
         if (rows < 8 || columns < 12) {
           const auto bound =
               raw_capture_ && raw_enabled()
-                  ? raw_ui_add(raw_ui_multiply(composer.text().size() + 2, 4), 256)
+                  ? raw_ui_add(raw_ui_multiply(composer.text().size() + 2, 4),
+                               256 + pending_osc52.size())
                   : 0;
           RawUiFrame captured{raw_capture_, bound};
           captured.run([&] {
@@ -2892,6 +2955,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               small_frame += mouse_target ? mouse_on : mouse_off;
               pending_mouse = mouse_target;
             }
+            if (!pending_osc52.empty()) {
+              small_frame += pending_osc52;
+              pending_osc52.clear();
+            }
             if (graphics_enabled && image_placement[2]) {
               small_frame += blackbird_graphics_erase();
               pending_image_placement = {};
@@ -2906,8 +2973,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           continue;
         }
         const bool inspecting = inspection_open();
-        const bool show_task_pane =
-            !inspecting && !welcoming && !tasks_hidden && width >= 90 && rows >= 18;
+        const bool has_tasks = !field(task_page, "items").array().empty();
+        const bool show_task_pane = !inspecting && !welcoming && !tasks_hidden &&
+                                    (has_tasks || tasks_forced) && width >= 90 &&
+                                    rows >= 18;
         const auto pane_width =
             show_task_pane ? std::clamp(width / 3, std::size_t{28}, std::size_t{36})
                            : 0;
@@ -2937,10 +3006,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         if (welcoming && (geometry_changed || welcome_lines.empty()))
           welcome_lines =
               blackbird_startup(width - 4, height > 2 ? height - 2 : 0, mascot_enabled);
-        if (!inspecting && display_generation != transcript.generation()) {
-          scroll =
-              0; // Evicted display history: return to live tail, never a false anchor.
-          display_generation = transcript.generation();
+        if (!inspecting && display_generation != transcript.cleared_generation()) {
+          scroll = 0; // Explicit /clear returns to the live tail.
+          display_generation = transcript.cleared_generation();
         }
         if (!inspecting && scroll > 0 && same_width)
           scroll = terminal_scroll_after_output({.scroll = scroll,
@@ -3140,7 +3208,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         }
         std::string hint = composer.palette_open() ? " command palette "
                            : composer.slash_open() ? " commands "
-                           : busy ? " Enter queue · Ctrl-C stop "
+                           : busy ? " Enter queue · Esc stop · Ctrl-C stop+clear "
                                   : " Enter send · / commands · Ctrl-G editor ";
         if (!foreground_job.empty())
           hint = std::string{foreground_pty ? " PTY input "
@@ -3210,22 +3278,28 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           pending_image_placement = image_placement;
           const bool graphics_update =
               graphics_enabled && (recover || placement != image_placement);
-          if (graphics_update || mouse_change) {
+          const bool osc52_update = !pending_osc52.empty();
+          if (graphics_update || mouse_change || osc52_update) {
             layout.stage(4);
             constexpr auto digits = std::numeric_limits<std::size_t>::digits10 + 1;
             const auto image_bound =
                 raw_capture_ && raw_enabled()
-                    ? raw_ui_add(packet.size(),
-                                 4096 + 256 + 4 * digits + mouse_on.size())
+                    ? raw_ui_add(packet.size(), 4096 + 256 + 4 * digits +
+                                                    mouse_on.size() +
+                                                    pending_osc52.size())
                     : 0;
             RawUiFrame image{raw_capture_, image_bound};
             image.run([&] {
-              // Insert image and mouse-mode commands before the existing
+              // Insert image, mouse-mode, and OSC 52 commands before the existing
               // synchronized-update close.
               packet.resize(packet.size() - std::string_view{"\x1b[?2026l"}.size());
               if (mouse_change) {
                 packet += mouse_target ? mouse_on : mouse_off;
                 pending_mouse = mouse_target;
+              }
+              if (osc52_update) {
+                packet += pending_osc52;
+                pending_osc52.clear();
               }
               if (graphics_update) {
                 packet += blackbird_graphics_erase();
@@ -3289,8 +3363,21 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     const auto dispatch = terminal_input_dispatch(
         composer, std::chrono::steady_clock::now(), escape_deadline, inputs[0].revents);
     redraw = redraw || dispatch.redraw;
-    if (dispatch.focus_editor)
+    if (dispatch.bare_escape) {
+      if (inspection_open()) {
+        if (inspection_focused())
+          visit_inspection([](auto &view) { view.focus_editor(); });
+        else
+          (void)select_view(tui::ViewRoute::conversation, {}, false, false);
+        redraw = true;
+      } else if (busy) {
+        cancel_turn();
+        activity = queued.empty() ? "Stopping" : "Stopping (queue kept)";
+        redraw = true;
+      }
+    } else if (dispatch.focus_editor) {
       visit_inspection([](auto &view) { view.focus_editor(); });
+    }
     if (!dispatch.read_input)
       continue;
     char bytes[128];
@@ -3685,9 +3772,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             else if (result.text == "/tasks hide") {
               tasks_hidden = true;
               tasks_expanded = false;
+              tasks_forced = false;
             } else if (result.text == "/tasks show") {
               tasks_hidden = false;
               tasks_expanded = false;
+              tasks_forced = true;
             } else if (result.text == "/tasks expand") {
               tasks_hidden = false;
               tasks_expanded = !tasks_expanded;
@@ -3733,6 +3822,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             scroll = 0;
           } else if (result.text == "/clear") {
             transcript.clear();
+            scroll = 0;
+          } else if (result.text == "/copy" || result.text == "/copy all" ||
+                     result.text == "/copy user") {
+            const auto payload = result.text == "/copy all"
+                                     ? transcript.plain_transcript()
+                                 : result.text == "/copy user"
+                                     ? transcript.last_text(ChatKind::user)
+                                     : transcript.last_text(ChatKind::assistant);
+            if (payload.empty()) {
+              transcript += "\nNothing to copy.\n";
+            } else {
+              pending_osc52 = terminal_osc52_copy(payload);
+              const auto copied = std::min<std::size_t>(payload.size(), 100 * 1024);
+              transcript += "\nCopied " + std::to_string(copied) +
+                            " bytes to clipboard (OSC 52).\n";
+            }
             scroll = 0;
           } else if (result.text == "/mouse" || result.text == "/mouse on" ||
                      result.text == "/mouse off") {
@@ -3813,6 +3918,29 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   raw_capture_, queued, result.text, result.source, 1,
                   result.source.record, session_control ? &*session_control : nullptr);
               action_branch = 2;
+              {
+                const auto lf = result.text.find('\n');
+                const auto first_line = std::string_view{result.text}.substr(
+                    0, lf == std::string::npos ? result.text.size() : lf);
+                const bool clipped = first_line.size() > 76;
+                std::size_t cut = clipped ? 76 : first_line.size();
+                if (clipped)
+                  while (cut > 0 &&
+                         (static_cast<unsigned char>(first_line[cut]) & 0xc0U) == 0x80U)
+                    --cut;
+                std::string preview{first_line.substr(0, cut)};
+                if (clipped)
+                  preview += "...";
+                if (lf != std::string::npos) {
+                  const auto extra = static_cast<std::size_t>(
+                      std::count(result.text.begin() + static_cast<std::ptrdiff_t>(lf),
+                                 result.text.end(), '\n'));
+                  preview += " (+" + std::to_string(extra) + " lines)";
+                }
+                transcript.append(ChatKind::notice, "Queued #" +
+                                                        std::to_string(queued.size()) +
+                                                        ": " + preview);
+              }
             } catch (const Error &) {
               ui_capture.require();
               composer.draft(std::move(result.text));
@@ -3848,14 +3976,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       }
     }
     pollfd next_input{STDIN_FILENO, POLLIN, 0};
-    if (child_input.size() >= 4096 ||
+    const bool more_stdin =
+        (child_input.size() < 4096 || composer.pasted()) &&
         terminal_native_poll(&terminal_context, std::span{&next_input, std::size_t{1}},
-                             0) == 0)
+                             0) > 0 &&
+        (next_input.revents & POLLIN) != 0;
+    if (child_input.size() >= 4096 || !more_stdin)
       (void)flush_child_input();
     report_refused_input();
     // A final-byte submission already saved this exact state before dispatch.
-    // Do not serialize/rename/fsync it again; trailing input still gets saved.
-    if (!saved_last_input)
+    // While an active bracketed paste still has bytes queued in stdin, coalesce
+    // before serializing/fsyncing ui-state.bbm.
+    if (!saved_last_input && !(composer.pasted() && more_stdin))
       persist();
     keyboard_process.finish();
   }

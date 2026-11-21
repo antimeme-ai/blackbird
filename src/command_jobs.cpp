@@ -1708,6 +1708,56 @@ CommandJobs::try_observe(const CommandObservationQuery &query) const noexcept {
       row.failure = job.failure;
       row.launch = job.launch_ref;
       row.terminal = job.terminal_ref;
+      {
+        const auto &argv = job.launch.argv;
+        std::size_t start = 0;
+        if (argv.size() >= 3 &&
+            (argv[0] == "/bin/sh" || argv[0] == "sh" || argv[0] == "/bin/bash" ||
+             argv[0] == "bash") &&
+            argv[1] == "-c")
+          start = 2;
+        std::size_t written = 0;
+        bool truncated = false;
+        auto push = [&](char ch) noexcept {
+          if (written >= row.command_label.size()) {
+            truncated = true;
+            return;
+          }
+          const auto u = static_cast<unsigned char>(ch);
+          row.command_label[written++] = (u < 0x20U || u == 0x7fU) ? ' ' : ch;
+        };
+        for (std::size_t idx = start; idx < argv.size() && !truncated; ++idx) {
+          if (idx > start)
+            push(' ');
+          for (const char ch : argv[idx]) {
+            push(ch);
+            if (truncated)
+              break;
+          }
+        }
+        // Only trim an incomplete trailing UTF-8 sequence when truncated.
+        if (truncated && written > 0) {
+          std::size_t lead = written - 1;
+          while (lead > 0 &&
+                 (static_cast<unsigned char>(row.command_label[lead]) & 0xc0U) == 0x80U)
+            --lead;
+          const auto first = static_cast<unsigned char>(row.command_label[lead]);
+          std::size_t expected = 1;
+          if ((first & 0x80U) == 0)
+            expected = 1;
+          else if ((first & 0xe0U) == 0xc0U)
+            expected = 2;
+          else if ((first & 0xf0U) == 0xe0U)
+            expected = 3;
+          else if ((first & 0xf8U) == 0xf0U)
+            expected = 4;
+          else
+            expected = 0;
+          if (expected == 0 || written - lead < expected)
+            written = lead;
+        }
+        row.command_label_size = static_cast<std::uint8_t>(written);
+      }
       ++out.examined_rows;
       return row;
     };

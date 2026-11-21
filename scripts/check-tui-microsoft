@@ -119,6 +119,7 @@ def main():
             # These literal cell assertions use the independent terminal engine,
             # rather than the renderer's own cluster-width assumptions.
             call("resize", "105", "52")
+            call("write", "/tasks show\r")
             expect("TASKS")
             joiner_text = " \u200d \u200d "
             code = ("for i=1,24 do print(string.format('ROW_%02d ',i).." +

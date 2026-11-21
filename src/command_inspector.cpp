@@ -117,6 +117,9 @@ struct Wire {
     scalar(r.failure);
     reference(r.launch);
     reference(r.terminal);
+    scalar(r.command_label_size);
+    const auto label = r.command_label_view();
+    append(std::as_bytes(std::span{label.data(), label.size()}));
   }
 };
 Wire observation_wire(const CommandObservationQuery &q, const CommandObservation &o) {
@@ -170,10 +173,14 @@ tui::SceneCandidate prepare(const CommandObservation &o, std::uint64_t revision,
     list.notice = {tui::NoticeKind::none, "More: Ctrl-Right"};
   for (std::size_t i = 0; i < o.row_count; ++i) {
     const auto &r = o.rows[i];
-    list.items.push_back(
-        {std::string{r.id.view()},
-         std::string{r.id.view().substr(0, 8)} + " " + std::string{phase_name(r.phase)},
-         target(r.id)});
+    const auto raw_cmd = r.command_label_view();
+    const auto safe_cmd =
+        raw_cmd.empty() ? std::string{} : terminal_lines(raw_cmd, 64).front();
+    const auto label = safe_cmd.empty()
+                           ? std::string{r.id.view().substr(0, 8)} + " " +
+                                 std::string{phase_name(r.phase)}
+                           : std::string{phase_name(r.phase)} + " | " + safe_cmd;
+    list.items.push_back({std::string{r.id.view()}, label, target(r.id)});
   }
   auto &detail = scene.inspectors.front();
   if (o.selection == CommandObservationSelection::not_requested) {

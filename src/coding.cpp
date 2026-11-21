@@ -4337,6 +4337,91 @@ Value CodingEngine::operation(
         task_exit = result.find("exit_code");
       task_run.activity->emit(branch, task_exit);
     }
+    const auto preview_lines = [](std::string_view text, char prefix) {
+      std::string out;
+      std::size_t pos = 0, emitted = 0, total = 0;
+      while (pos < text.size()) {
+        const auto lf = text.find('\n', pos);
+        const auto end = lf == std::string_view::npos ? text.size() : lf;
+        ++total;
+        if (emitted < 3) {
+          auto line = text.substr(pos, end - pos);
+          if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+          const bool clipped = line.size() > 76;
+          if (clipped) {
+            std::size_t cut = 76;
+            while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xc0U) == 0x80U)
+              --cut;
+            line = line.substr(0, cut);
+          }
+          out += prefix;
+          out += ' ';
+          out.append(line);
+          if (clipped)
+            out += "...";
+          out += '\n';
+          ++emitted;
+        }
+        if (lf == std::string_view::npos)
+          break;
+        pos = lf + 1;
+      }
+      if (total > emitted)
+        out += "  (+" + std::to_string(total - emitted) + " more lines)\n";
+      return out;
+    };
+    const auto count_lines = [](std::string_view text) {
+      if (text.empty())
+        return std::size_t{0};
+      auto n = static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n'));
+      return text.back() == '\n' ? n : n + 1;
+    };
+    std::string file_preview;
+    if (!boundary.error && process_output) {
+      if (name == "read_file") {
+        if (const auto *content = result.find("content");
+            content && std::holds_alternative<std::string>(content->value())) {
+          const auto &text = content->string();
+          file_preview = "[read " + std::to_string(count_lines(text)) + " lines · " +
+                         std::to_string(text.size()) + " B]\n";
+        }
+      } else if (name == "write_file") {
+        if (const auto *content = input.find("content");
+            content && std::holds_alternative<std::string>(content->value())) {
+          const auto &text = content->string();
+          file_preview = "[wrote " + std::to_string(count_lines(text)) + " lines · " +
+                         std::to_string(text.size()) + " B]\n";
+        }
+      } else if (name == "edit_file") {
+        const auto *old_v = input.find("old");
+        const auto *new_v = input.find("new");
+        if (old_v && new_v && std::holds_alternative<std::string>(old_v->value()) &&
+            std::holds_alternative<std::string>(new_v->value())) {
+          file_preview =
+              preview_lines(old_v->string(), '-') + preview_lines(new_v->string(), '+');
+        }
+      }
+    }
+    trace.stage(9);
+    trace.callback(
+        6,
+        static_cast<bool>(process_output) &&
+            ((boundary.error && name != "provider") || !file_preview.empty()),
+        [&] {
+          if (boundary.error && name != "provider") {
+            process_output("\n[" + std::string{name} + ": " +
+                           error_name(boundary.error->code) + "]" +
+                           ((command_refused || domain_refused)
+                                ? " " + string_field(result, "message")
+                            : file_effect && file_effect->applied()
+                                ? " file replacement applied; no replay"
+                                : std::string{}) +
+                           "\n");
+          } else {
+            process_output(file_preview);
+          }
+        });
     if (operation_completed || operation_outcome) {
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - began)
@@ -4360,19 +4445,6 @@ Value CodingEngine::operation(
       trace.callback(5, static_cast<bool>(operation_completed),
                      [&] { operation_completed(completion); });
     }
-    trace.stage(9);
-    trace.callback(
-        6, boundary.error && name != "provider" && static_cast<bool>(process_output),
-        [&] {
-          process_output("\n[" + std::string{name} + ": " +
-                         error_name(boundary.error->code) + "]" +
-                         ((command_refused || domain_refused)
-                              ? " " + string_field(result, "message")
-                          : file_effect && file_effect->applied()
-                              ? " file replacement applied; no replay"
-                              : std::string{}) +
-                         "\n");
-        });
     if (command_failure_ && boundary.error &&
         boundary.error->code == ErrorCode::capacity) {
       try {

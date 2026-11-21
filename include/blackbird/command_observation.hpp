@@ -47,6 +47,12 @@ struct CommandObservationRow {
   bool stop_requested = false, timed_out = false, has_exit = false, sealed = false;
   int exit_code = 0, signal = 0, failure = 0;
   RawEventRef launch{}, terminal{};
+  std::array<char, 64> command_label{};
+  std::uint8_t command_label_size = 0;
+  std::string_view command_label_view() const noexcept {
+    return {command_label.data(),
+            std::min<std::size_t>(command_label_size, command_label.size())};
+  }
 };
 struct CommandObservationSource {
   RawEventRef original{};

@@ -45,13 +45,21 @@ public:
   // stays in the queue's raw 4000 record and the command owner's retention.
   void tool_start(std::string_view header, RawEventRef source = {});
   void tool_output(std::string_view text, RawEventRef source = {});
+  void tool_complete(std::string_view summary, Ink outcome = Ink::success,
+                     RawEventRef source = {});
   // The command finished: later unprefixed output no longer belongs to it.
-  void tool_end() noexcept { tool_header_.clear(); }
+  void tool_end() noexcept {
+    tool_header_.clear();
+    tool_block_ = 0;
+  }
   ChatView &operator+=(std::string_view notice);
   void clear();
   std::size_t size() const noexcept { return bytes_; }
+  std::string last_text(ChatKind kind) const;
+  std::string plain_transcript() const;
   const std::vector<ChatRow> &rows(std::size_t width);
   std::uint64_t generation() const noexcept { return generation_; }
+  std::uint64_t cleared_generation() const noexcept { return cleared_generation_; }
   std::uint64_t reflows() const noexcept { return reflows_; }
 
 private:
@@ -73,7 +81,7 @@ private:
   std::size_t bytes_ = 0, width_ = 0;
   bool dirty_ = true, clipped_ = false;
   ChatKind stream_kind_ = ChatKind::assistant;
-  std::uint64_t reflows_ = 0, generation_ = 0;
+  std::uint64_t reflows_ = 0, generation_ = 0, cleared_generation_ = 0;
   std::size_t newlines_ = 0;
   // Blocks created so far; the newest block is always last.
   std::size_t serial_ = 0, tool_block_ = 0, background_block_ = 0;

@@ -406,6 +406,74 @@ void ChatView::tool_output(std::string_view text, RawEventRef source) {
                           blocks_.back().text.back() == '\n';
   append(ChatKind::tool, line_start ? marker : text, true, source);
 }
+void ChatView::tool_complete(std::string_view summary, Ink outcome,
+                             RawEventRef source) {
+  const bool failed = outcome == Ink::failure;
+  if (!failed && tool_block_ != 0 && !blocks_.empty() && serial_ == tool_block_ &&
+      blocks_.back().kind == ChatKind::tool && blocks_.back().text.starts_with("▸ ")) {
+    auto &block = blocks_.back();
+    const auto lf = block.text.find('\n');
+    const auto header_end = lf == std::string::npos ? block.text.size() : lf;
+    auto header = block.text.substr(0, header_end);
+    constexpr std::string_view running_prefix = "▸ ";
+    header.replace(0, running_prefix.size(), outcome == Ink::success ? "✓ " : "• ");
+    std::string suffix;
+    constexpr std::string_view dot_sep = " · ";
+    if (const auto sep = summary.rfind(dot_sep); sep != std::string_view::npos) {
+      const auto head = summary.substr(0, sep);
+      const auto duration = summary.substr(sep + dot_sep.size());
+      if (head.ends_with(" completed"))
+        suffix = " · " + std::string{duration};
+      else {
+        const auto space = head.find(' ');
+        const auto status =
+            space == std::string_view::npos ? head : head.substr(space + 1);
+        suffix = " · " + std::string{status} + " · " + std::string{duration};
+      }
+    } else if (!summary.empty()) {
+      suffix = " · " + std::string{summary};
+    }
+    if (header.size() + suffix.size() <= line_limit)
+      header += suffix;
+    const auto old_len = header_end;
+    const auto new_len = header.size();
+    const bool fits_display =
+        new_len <= old_len || bytes_ + (new_len - old_len) <= display_limit;
+    if (fits_display) {
+      block.text.replace(0, old_len, header);
+      bytes_ = bytes_ - old_len + new_len;
+      if (block.head_end)
+        block.head_end = block.head_end - old_len + new_len;
+      block.restart = block.dirty = dirty_ = true;
+      tool_end();
+      return;
+    }
+  }
+  tool_end();
+  append(failed ? ChatKind::error : ChatKind::tool,
+         std::string{failed                    ? "✗ "
+                     : outcome == Ink::success ? "✓ "
+                                               : "• "} +
+             std::string{summary},
+         false, source);
+}
+std::string ChatView::last_text(ChatKind kind) const {
+  for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
+    if (it->kind == kind && !it->text.empty())
+      return it->text;
+  return {};
+}
+std::string ChatView::plain_transcript() const {
+  std::string out;
+  for (const auto &block : blocks_) {
+    if (block.text.empty())
+      continue;
+    if (!out.empty() && out.back() != '\n')
+      out += '\n';
+    out += block.text;
+  }
+  return out;
+}
 void ChatView::begin(ChatKind kind) {
   stream_kind_ = kind;
   append(kind, {});
@@ -440,6 +508,7 @@ void ChatView::clear() {
   newlines_ = 0;
   clipped_ = false;
   ++generation_;
+  ++cleared_generation_;
   width_ = 0;
   dirty_ = true;
   trace.finish();

@@ -416,7 +416,8 @@ while True:
         pty_job = job_id(pty_pid)
         assert pty_job != pipe_job, "different launches share job identity"
         mouse_on, mouse_off = b"\x1b[?1000h\x1b[?1006h", b"\x1b[?1006l\x1b[?1000l"
-        assert mouse_on in raw, "composer frames enable SGR wheel reporting"
+        command("/mouse on")
+        wait(lambda: mouse_on in raw, "composer frames enable SGR wheel reporting")
         mark = len(raw)
         foreground(pty_job, interactive=True)
         # PTY input is forwarded verbatim, so the child must never get reports.

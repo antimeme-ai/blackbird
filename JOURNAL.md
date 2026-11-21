@@ -13380,3 +13380,49 @@ dogfooding runs on current `master` without Homebrew dylib fragility:
    verified `--version` + offline PTY smoke, and wrote `<generation>/MANIFEST`.
    `scripts/blackbird` prefers `<root>/bin/blackbird` while keeping fallback to
    `<root>/build/release/blackbird` for older generations and dev checkouts.
+
+## 2026-11-21 — Unit (1): Terminal & Chat UX overhaul
+
+Addressed the core cockpit usability gaps identified in baseline review and live
+operator feedback (`docs/TERMINAL_CHAT_UX_SUBPLAN.md`), starting from genuine RED
+failures in `tests/terminal_chat_ux_test.cpp`:
+
+1. **Native selection, clean fast paste, and OSC 52 copy (`src/terminal.cpp`,
+   `include/blackbird/terminal.hpp`, `src/chat_view.cpp`):**
+   - Changed `mouse_wanted` default to `false` (`BLACKBIRD_MOUSE=1` or `/mouse on`
+     opts into SGR wheel reporting) so plain drag-select and `Cmd+C` work out of
+     the box in Ghostty/Terminal.
+   - Normalized `\r\n` -> `\n` inside bracketed paste (`Composer::insert_pasted()`),
+     deferred `persist()` while paste bytes remain immediately readable on stdin
+     (`POLLIN`), and added `terminal_osc52_copy()` + `/copy [all|user]` emitted
+     through the single-writer `ChatPresenter`/`ChatOutput` frame packet.
+2. **`Esc` turn interrupt (keeping queue) & overlay close (`src/terminal.cpp`,
+   `include/blackbird/terminal.hpp`):**
+   - Added `TerminalInputDispatch::bare_escape`: bare `Esc` focuses editor or closes
+     an already-unfocused inspector, or interrupts an active turn without clearing
+     `queued` (`Ctrl-C` and `/cancel` remain explicit stop + clear-queue).
+3. **Immediate queue receipts (`src/terminal.cpp`):**
+   - Enqueueing while busy immediately appends a single-line UTF-8-safe
+     `Queued #N: <preview>` receipt to the transcript.
+4. **Single tool cards, file-tool previews, and readable `Ctrl-O` labels
+   (`src/chat_view.cpp`, `src/coding.cpp`, `include/blackbird/command_observation.hpp`,
+   `src/command_jobs.cpp`, `src/command_inspector.cpp`, `src/raw_ui.cpp`):**
+   - Added `ChatView::tool_complete()` updating the active tool block's header in
+     place (`▸` -> `✓`/`•` + duration, preserving `fold()` head/tail rows and
+     preventing nested outer completions from mutating inner cards).
+   - Emitted compact `process_output` summaries for `read_file`, `write_file`, and
+     `edit_file` (with UTF-8-safe `-`/`+` diff preview lines) inside callback slot 6.
+   - Added zero-alloc `command_label` to `CommandObservationRow` (UTF-8-safe
+     truncation, sanitized in `CommandInspector` with ASCII `" | "` separator for
+     `LC_CTYPE=C` resilience) and updated site `4087` schema/tests.
+5. **Auto-hide empty Tasks pane & preserve scroll on ring trim (`src/terminal.cpp`,
+   `src/chat_view.cpp`):**
+   - Reclaimed 28–36 side columns whenever there are zero tasks (unless explicitly
+     shown via `/tasks show`).
+   - Added `ChatView::cleared_generation()` so 64 KiB ring trims preserve the
+     operator's scroll position while explicit `/clear` still resets to the tail.
+6. **Adversarial review & hardening (layer 1):** Fixed UTF-8 `command_label`
+   truncation & `CommandInspector` `safe_text` sanitization, nested `tool_complete`
+   header protection and neutral `•` for unknown outcomes, UTF-8-safe 76-byte
+   preview clipping, `POLLIN` gating on `more_stdin`, `/keys` help accuracy, and
+   isolated the PTY `Esc` + empty-Tasks-hidden test in its own clean session dir.

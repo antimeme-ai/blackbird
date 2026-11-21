@@ -82,6 +82,7 @@ struct TerminalProcessJoin {
 std::optional<std::string_view> terminal_process_join(TerminalProcessJoin chunks);
 std::string terminal_key_help();
 std::string terminal_command_hint(std::string_view draft);
+std::string terminal_osc52_copy(std::string_view text);
 TerminalState load_terminal_state(const std::filesystem::path &path,
                                   bool capture = false);
 void save_terminal_state(const std::filesystem::path &path, const TerminalState &state,
@@ -109,12 +110,14 @@ public:
   bool palette_open() const noexcept { return palette_open_; }
   bool slash_open() const noexcept { return slash_open_; }
   bool escape_pending() const noexcept { return !escape_.empty(); }
+  bool bare_escape_pending() const noexcept { return escape_ == "\x1b"; }
   bool pasted() const noexcept { return pasted_; }
   bool flush_escape();
   // Input ownership moved between the composer and a PTY child: forget any
   // partial escape; optionally skip the rest of a mouse report the child held.
   void reset_escape(bool skip_report_tail = false) noexcept {
     escape_.clear();
+    pasted_cr_ = false;
     x10_tail_ = 0;
     sgr_tail_ = skip_report_tail;
   }
@@ -134,7 +137,7 @@ private:
   std::string draft_, killed_;
   std::size_t draft_cursor_ = 0;
   std::optional<std::size_t> goal_column_;
-  bool pasted_ = false, palette_open_ = false;
+  bool pasted_ = false, pasted_cr_ = false, palette_open_ = false;
   bool slash_open_ = false;
   // Remainder of a mouse report whose prefix expired at the escape deadline.
   bool sgr_tail_ = false;
@@ -143,13 +146,14 @@ private:
   std::size_t palette_selected_ = 0;
   void palette_move(bool up);
   void insert(char byte);
+  void insert_pasted(char byte);
   void history(bool older);
   void vertical(bool up);
   void kill(std::size_t begin, std::size_t end);
 };
 // One poll-turn decision: expiry is serviced for ready and idle input alike.
 struct TerminalInputDispatch {
-  bool read_input = false, redraw = false, focus_editor = false;
+  bool read_input = false, redraw = false, focus_editor = false, bare_escape = false;
 };
 TerminalInputDispatch
 terminal_input_dispatch(Composer &composer, std::chrono::steady_clock::time_point now,

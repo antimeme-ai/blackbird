@@ -1173,3 +1173,7 @@ target_compile_definitions(storage_amplification_test PRIVATE BLACKBIRD_SOURCE_D
 target_link_libraries(storage_amplification_test PRIVATE blackbird_coding)
 add_test(NAME storage_amplification COMMAND storage_amplification_test)
 set_tests_properties(storage_amplification PROPERTIES TIMEOUT 120)
+add_executable(terminal_chat_ux_test tests/terminal_chat_ux_test.cpp)
+target_link_libraries(terminal_chat_ux_test PRIVATE blackbird_coding)
+add_test(NAME terminal_chat_ux COMMAND terminal_chat_ux_test)
+set_tests_properties(terminal_chat_ux PROPERTIES TIMEOUT 30)

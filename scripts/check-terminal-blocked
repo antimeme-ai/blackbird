@@ -88,6 +88,8 @@ def check(pane, inspector=False, center=False):
         try:
             wait(lambda: ("│ > " in screen.text() if pane else "Tasks:" in screen.text() if center else "Workflow reloads" in screen.text())
                  and not screen.synchronized_update, "initial complete frame")
+            if pane:
+                os.write(input_master, b"/tasks show\r")
             os.write(input_master, b"fixture\r")
             wait(lambda: b"S" in observations and "ROW_079" in screen.text()
                  and not screen.synchronized_update, "local worker transcript frame")
