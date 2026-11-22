@@ -5,6 +5,7 @@
 #include "blackbird/task_observation.hpp"
 #include <array>
 #include <deque>
+#include <map>
 #include <set>
 
 namespace blackbird {

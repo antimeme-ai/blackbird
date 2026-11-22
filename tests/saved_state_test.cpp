@@ -104,9 +104,6 @@ int main() {
         unwrap(NativeJournalDirectory::open(path)));
   };
   auto directory = [&]() { return std::make_unique<FaultDirectory>(native(), fault); };
-  const auto history_query = Value::object({{"kind", Value{"history"}},
-                                            {"format", Value{"json"}},
-                                            {"limit", Value{Number{"65536"}}}});
   try {
     // Missing derived state is refused before automatic replay when the caller
     // selects a bounded reopen; explicit replay still restores the audit.
@@ -132,26 +129,23 @@ int main() {
       unwrap(allowed->confirm_recovery());
       CHECK(!allowed->compact_recovery() && allowed->fact_count() > 0);
     }
-    Value view, originals, history, programs;
-    std::string archived;
+    Value view, archived_read, programs;
+    std::uint64_t archived = 0;
     std::uint64_t highwater = 0;
     {
       auto root = unwrap(RetainedState::create(directory(), "audit", h, cap));
       AuditLog log{*root};
       ContextStore ctx{log};
-      ctx.append({Value::object({{"role", Value{"user"}},
-                                 {"content", Value{"exact old original"}}})},
-                 "test");
-      archived = string_field(ctx.view().find("entries")->array().front(), "id");
-      CHECK(field(ctx.edit(Value::object({{"base", Value{ctx.head()}},
-                                          {"entries", Value{Value::Array{}}}})),
-                  "accepted") == Value{true});
+      archived = ctx.append({Value::object({{"role", Value{"assistant"}},
+                                            {"content", Value{"exact old original"}}})},
+                            "test");
+      CompactRequest drop_req;
+      drop_req.ids = {archived};
+      drop_req.op = CompactOp::drop;
+      CHECK(field(ctx.compact(drop_req), "ok") == Value{true});
       ctx.append({Value::object(
                      {{"role", Value{"assistant"}}, {"content", Value{"current"}}})},
                  "test");
-      for (unsigned i = 0; i < 45; ++i)
-        ctx.edit(Value::object(
-            {{"base", Value{"stale"}}, {"candidate", Value{std::string(1024, 'x')}}}));
       SessionStore session{log};
       session.save({"model-test", "high", "native"});
       session.restart("exact resume note");
@@ -160,29 +154,17 @@ int main() {
       programs = Value{root->current_programs()};
       unwrap(ctx.checkpoint());
       CHECK(root->saved_state() && root->saved_state()->unresolved.empty());
-      // Version 2 (unit S1): no live_originals copy; each live entry equal to its
-      // original is a ref [record identity, ordinal] to the retained record.
       {
         const auto &saved = root->saved_state()->context;
-        CHECK(field(saved, "version") == Value{Number{"2"}} &&
-              !saved.find("live_originals") && saved.find("sections"));
-        const auto live_view = ctx.view();
-        const auto &live = field(live_view, "entries").array();
-        const auto &refs = field(saved, "entries").array();
-        CHECK(refs.size() == live.size());
-        for (std::size_t i = 0; i < refs.size(); ++i)
-          CHECK(std::holds_alternative<Value::Array>(refs[i].value()) &&
-                refs[i].array().size() == 2 &&
-                refs[i].array()[0].string() + "." +
-                        refs[i].array()[1].number().text() ==
-                    string_field(live[i], "id"));
+        CHECK(field(saved, "version") == Value{Number{"3"}} && saved.find("blocks") &&
+              saved.find("archived"));
+        CHECK(field(saved, "blocks").array().size() == ctx.blocks().size());
       }
       CHECK(std::filesystem::file_size(std::string(path) + "/audit.state." +
                                        std::to_string(root->saved_state()->slot)) <
             16384);
-      view = ctx.view();
-      originals = ctx.originals();
-      history = ctx.inspect(history_query);
+      view = ctx.list(true);
+      archived_read = ctx.read_block(archived);
       highwater = root->issuer_counter();
       // Each failed derived publication must leave the acknowledged journal live.
       for (unsigned phase = 1; phase <= 4; ++phase) {
@@ -201,28 +183,27 @@ int main() {
       unwrap(root->reconcile(custody));
       AuditLog log{*root};
       ContextStore ctx{log};
-      CHECK(ctx.view() == view);
+      CHECK(ctx.list(true) == view);
       CHECK(root->issuer_counter() == highwater);
       CHECK(Value{root->current_programs()} == programs);
-      CHECK(ctx.originals() == originals && ctx.inspect(history_query) == history);
+      CHECK(ctx.read_block(archived) == archived_read);
       SessionStore session{log};
       CHECK(session.settings().model == "model-test");
       CHECK(!session.resume(ctx));
       const auto issued = unwrap(root->issue<ApplicationRecordId>());
       CHECK(root->issuer_counter() > highwater);
       (void)issued;
-      // Exact archived original remains restorable, not replaced by its edited live
-      // item.
-      ctx.restore(archived);
-      CHECK(ctx.view().find("entries")->array().size() ==
-            view.find("entries")->array().size() + 1);
+      // Exact archived original remains restorable after checkpoint + reopen.
+      CompactRequest restore_req;
+      restore_req.ids = {archived};
+      restore_req.op = CompactOp::restore;
+      CHECK(field(ctx.compact(restore_req), "ok") == Value{true});
+      CHECK(ctx.blocks().size() == field(view, "blocks").array().size() + 1);
       unwrap(ctx.checkpoint());
-      // Accepted uncheckpointed suffix uses boundary-limited disk original predicates.
       ctx.append({Value::object({{"role", Value{"user"}}, {"content", Value{"tail"}}})},
                  "tail");
-      view = ctx.view();
-      originals = ctx.originals();
-      history = ctx.inspect(history_query);
+      view = ctx.list(true);
+      archived_read = ctx.read_block(archived);
     }
     {
       auto root = unwrap(RetainedState::open(directory(), "audit", h, cap));
@@ -231,9 +212,8 @@ int main() {
       unwrap(root->reconcile(custody));
       AuditLog log{*root};
       ContextStore ctx{log};
-      CHECK(ctx.view() == view);
-      CHECK(ctx.originals() == originals);
-      CHECK(ctx.inspect(history_query) == history);
+      CHECK(ctx.list(true) == view);
+      CHECK(ctx.read_block(archived) == archived_read);
       unwrap(ctx.checkpoint());
     }
     // Both unusable roots select full replay, preserving exact useful/history state.
@@ -254,9 +234,8 @@ int main() {
       unwrap(root->reconcile(custody));
       AuditLog log{*root};
       ContextStore ctx{log};
-      CHECK(ctx.view() == view);
-      CHECK(ctx.originals() == originals);
-      CHECK(ctx.inspect(history_query) == history);
+      CHECK(ctx.list(true) == view);
+      CHECK(ctx.read_block(archived) == archived_read);
     }
     // Full-ledger custody is still authoritative. The saved closure preserves an
     // open effect and does not turn reopening into dispatch permission.
@@ -332,7 +311,7 @@ int main() {
         return std::make_unique<NativeJournalDirectory>(
             unwrap(NativeJournalDirectory::open(dirpath)));
       };
-      std::string first;
+      std::uint64_t first = 0;
       Value expected;
       std::size_t count = 0;
       {
@@ -343,15 +322,14 @@ int main() {
         log.record(ApplicationChannel::program,
                    Value::object(
                        {{"label", Value{"station.profile"}}, {"adapter", Value{""}}}));
-        ctx.append({Value::object(
-                       {{"role", Value{"user"}}, {"content", Value{"kept original"}}})},
-                   "compact-test");
-        first = string_field(ctx.view().find("entries")->array()[0], "id");
+        first = ctx.append({Value::object({{"role", Value{"assistant"}},
+                                           {"content", Value{"kept original"}}})},
+                           "compact-test");
         unwrap(ctx.checkpoint());
         ctx.append({Value::object(
                        {{"role", Value{"user"}}, {"content", Value{"accepted tail"}}})},
                    "suffix");
-        expected = ctx.view();
+        expected = ctx.list(true);
         count = root->fact_count();
       }
       {
@@ -362,7 +340,7 @@ int main() {
         unwrap(root->reconcile(e));
         AuditLog log{*root};
         ContextStore ctx{log};
-        CHECK(ctx.view() == expected && root->fact_count() == count);
+        CHECK(ctx.list(true) == expected && root->fact_count() == count);
         CHECK(unwrap(root->fact(count - 1)).evidence == RetainedEvidence::recovered);
         // Ledger-only writes advance their accelerator without a context edit.
         for (unsigned i = 0; i < 300; ++i)
@@ -404,7 +382,7 @@ int main() {
               root->maintenance_error());
         unwrap(ctx.checkpoint());
         root->set_maintenance_checkpoint(
-            [&ctx](const RawEventRef &parent) { return ctx.checkpoint({parent}); });
+            [&ctx](const RawEventRef &) { return ctx.checkpoint(); });
         count = root->fact_count();
         const auto old = root->history_snapshot();
         ctx.append({Value::object({{"role", Value{"user"}},
@@ -430,13 +408,14 @@ int main() {
               RetainedEvidence::live);
         CHECK(old.count == count &&
               unwrap(old.read(count - 1)).evidence == RetainedEvidence::live);
-        const auto removed = ctx.edit(Value::object(
-            {{"base", Value{ctx.head()}}, {"entries", Value{Value::Array{}}}}));
-        (void)removed;
-        ctx.restore(first);
+        (void)ctx.replace_blocks(Value{Value::Array{}});
+        CompactRequest restore_first;
+        restore_first.ids = {first};
+        restore_first.op = CompactOp::restore;
+        CHECK(field(ctx.compact(restore_first), "ok") == Value{true});
         CHECK(string_field(ctx.items()[0], "content") == "kept original");
         unwrap(ctx.checkpoint());
-        expected = ctx.view();
+        expected = ctx.list(true);
         count = root->fact_count();
       }
       {
@@ -447,7 +426,7 @@ int main() {
         unwrap(root->reconcile(e));
         AuditLog log{*root};
         ContextStore ctx{log};
-        CHECK(ctx.view() == expected && root->fact_count() == count);
+        CHECK(ctx.list(true) == expected && root->fact_count() == count);
         CHECK(unwrap(root->fact(count - 1)).evidence == RetainedEvidence::recovered);
         log.record(ApplicationChannel::program,
                    Value::object({{"label", Value{"station.control"}},

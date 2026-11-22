@@ -2738,10 +2738,11 @@ void maintenance_catalog_retarget() {
                                {}};
     auto root = unwrap(RetainedState::create(std::move(directory), "journal", header,
                                              {64 * 1024 * 1024, 1024}, owner));
-    const auto context = Value::object({{"version", Value{Number{"1"}}},
-                                        {"base", Value{std::string(32, '0')}},
-                                        {"entries", Value{Value::Array{}}},
-                                        {"live_originals", Value{Value::Array{}}}});
+    const auto context = Value::object({{"version", Value{Number{std::uint64_t{3}}}},
+                                        {"head", Value{std::string(32, '0')}},
+                                        {"next_id", Value{Number{std::uint64_t{1}}}},
+                                        {"blocks", Value{Value::Array{}}},
+                                        {"archived", Value{Value::Array{}}}});
     auto marker = [&](const char *text) {
       AuditLog log{*root};
       log.record(ApplicationChannel::program, Value::object({{"label", Value{text}}}));

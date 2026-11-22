@@ -2976,7 +2976,6 @@ Value::Array RetainedState::current_programs() const {
     TaskState tasks;
     bool have_tasks = false;
     Value config;
-    Value budget;
     std::uint64_t boundary = 0;
     if (saved_ && std::holds_alternative<Value::Array>(saved_->programs.value())) {
       boundary = saved_->boundary.sequence;
@@ -2990,8 +2989,6 @@ Value::Array RetainedState::current_programs() const {
         if (label == "workflow-config-effective-v1")
           if (const auto *value = packet.find("program_config"))
             config = *value;
-        if (label == "context-budget-effective-v1")
-          budget = packet;
       }
     }
     for (const auto &fact : committed_.facts) {
@@ -3015,7 +3012,7 @@ Value::Array RetainedState::current_programs() const {
                  name == "session.recovery" || name.starts_with("station.") ||
                  name == "participants-state-v1" || name == "provider-profile-set-v1" ||
                  name == "provider-profile-override-v1" ||
-                 name == "context-format-level" || name == "context-pins-v1")
+                 name == "context-format-level")
         latest[name] = packet;
       else if (name == "workflow-config-effective-v1") {
         if (const auto *value = packet.find("program_config"))
@@ -3028,22 +3025,15 @@ Value::Array RetainedState::current_programs() const {
                                          field(prior->second, "program_revision"));
         }
         latest[name] = packet;
-        budget = Value::object({{"label", Value{"context-budget-effective-v1"}},
-                                {"policy", field(packet, "policy")},
-                                {"revision", field(packet, "revision")}});
-      } else if (name == "context-budget-effective-v1")
-        budget = packet;
+      }
     }
     Value::Array packets;
     for (const auto &[name, packet] : latest) {
-      if (name != "context-budget-effective-v1" && name != "task-state-v1")
+      if (name != "task-state-v1")
         packets.push_back(packet);
     }
     if (have_tasks)
       packets.push_back(tasks.snapshot());
-    // Policy chronology is independent of the workflow/tool generation.
-    if (budget != Value{})
-      packets.push_back(std::move(budget));
     return packets;
   });
   const auto packet_count = answer.size();

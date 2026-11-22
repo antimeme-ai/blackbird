@@ -13,7 +13,6 @@
 #include "blackbird/raw_provider.hpp"
 #include "blackbird/raw_restart.hpp"
 #include "blackbird/raw_runtime.hpp"
-#include "blackbird/raw_turn.hpp"
 #include "blackbird/request_cache.hpp"
 #include "stream_capture.hpp"
 extern "C" {
@@ -287,35 +286,37 @@ template <class T> T parse_id(std::string_view s) {
 }
 void validate_protocol(const Value::Array &items,
                        std::optional<RawEventRef> parent = {}) {
-  RawProtocolTrace trace{items.size(), parent};
-  trace.run([&] {
-    std::set<std::string> seen, pending;
-    for (const auto &item : items) {
-      const auto *type = item.find("type");
-      if (type == nullptr)
-        continue;
-      const auto &s = type->string();
-      if (s == "function_call") {
-        const auto &call = string_field(item, "call_id");
-        if (!seen.insert(call).second) {
-          trace.conflict(call);
-          throw Error{ErrorCode::conflict};
-        }
-        pending.insert(call);
-      }
-      if (s == "function_call_output") {
-        const auto &call = string_field(item, "call_id");
-        if (pending.erase(call) != 1) {
-          trace.conflict(call);
-          throw Error{ErrorCode::conflict};
-        }
-      }
+  (void)parent;
+  std::set<std::string> seen, pending;
+  for (const auto &item : items) {
+    const auto *type = item.find("type");
+    if (type == nullptr)
+      continue;
+    const auto &s = type->string();
+    if (s == "function_call") {
+      const auto &call = string_field(item, "call_id");
+      if (!seen.insert(call).second)
+        throw Error{ErrorCode::conflict};
+      pending.insert(call);
     }
-    if (!pending.empty()) {
-      trace.conflict(*pending.begin());
-      throw Error{ErrorCode::conflict};
+    if (s == "function_call_output") {
+      const auto &call = string_field(item, "call_id");
+      if (pending.erase(call) != 1)
+        throw Error{ErrorCode::conflict};
     }
-  });
+  }
+  if (!pending.empty())
+    throw Error{ErrorCode::conflict};
+}
+bool failed_tool_output(const Value &result) noexcept {
+  if (!std::holds_alternative<Value::Object>(result.value()))
+    return false;
+  if (result.find("error") != nullptr)
+    return true;
+  if (const auto *code = result.find("exit_code");
+      code && std::holds_alternative<Number>(code->value()))
+    return code->number().text() != "0";
+  return false;
 }
 } // namespace
 void OpenAiCodingProvider::begin_request_group(const Value &,
@@ -393,12 +394,11 @@ Value OpenAiCodingProvider::respond(
   });
 }
 struct CodingEngine::CommandTaskActivity {
-  RawThreadHandle owner;
-  RawTaskActivityTrace trace;
   std::function<void(const Value &)> &observer;
   std::function<void(const Value &, RawTaskPresentation)> &native_observer;
   std::string id, attempt_text, operation;
   OperationAttemptId attempt;
+  RawEventRef source_{};
   CommandTaskMap::node_type *pending_node = nullptr;
   bool *transferred = nullptr;
   bool bound = false, ended = false;
@@ -407,8 +407,7 @@ struct CodingEngine::CommandTaskActivity {
       std::function<void(const Value &, RawTaskPresentation)> &native_callback,
       std::string task, OperationAttemptId actual_attempt, std::string encoded_attempt,
       std::string operation_name)
-      : owner(raw_current_thread()), observer(callback),
-        native_observer(native_callback), id(std::move(task)),
+      : observer(callback), native_observer(native_callback), id(std::move(task)),
         attempt_text(std::move(encoded_attempt)), operation(std::move(operation_name)),
         attempt(actual_attempt) {}
   CommandTaskActivity(const CommandTaskActivity &) = delete;
@@ -418,7 +417,7 @@ struct CodingEngine::CommandTaskActivity {
       emit(3);
   }
   void bind(RawEventRef operation_request) noexcept {
-    trace.binding(operation_request, attempt, id);
+    source_ = operation_request;
     bound = true;
   }
   void emit(std::uint8_t branch, const Value *exit = nullptr) noexcept {
@@ -426,14 +425,8 @@ struct CodingEngine::CommandTaskActivity {
       return;
     if (branch != 0)
       ended = true;
-    RawThreadBinding binding{owner};
-    const auto activity = trace.activity(branch);
-    const auto notification =
-        trace.notification(activity, bool(native_observer) || bool(observer));
-    if (!native_observer && !observer) {
-      trace.notified(notification, 0);
+    if (!native_observer && !observer)
       return;
-    }
     try {
       std::string phase{branch == 0   ? "running"
                         : branch == 1 ? "finished"
@@ -449,16 +442,10 @@ struct CodingEngine::CommandTaskActivity {
         native_observer(
             event,
             RawTaskPresentation{
-                activity.ordinal ? std::optional{activity} : std::nullopt, {}, {}});
+                source_.ordinal ? std::optional{source_} : std::nullopt, {}, {}});
       else
         observer(event);
-      trace.notified(notification, 1);
-    } catch (const Error &error) {
-      trace.notified(notification, 2, error);
-    } catch (const std::bad_alloc &) {
-      trace.notified(notification, 3);
     } catch (...) {
-      trace.notified(notification, 4);
     }
   }
 };
@@ -973,10 +960,10 @@ struct CodingEngine::Runtime {
   enum Op {
     request_op,
     call_op,
-    context_op,
-    edit_op,
-    originals_op,
-    restore_op,
+    blocks_op,
+    compact_op,
+    read_block_op,
+    set_blocks_op,
     append_op,
     decode_op,
     encode_op,
@@ -985,17 +972,13 @@ struct CodingEngine::Runtime {
     present_op,
     restarting_op,
     stats_op,
-    manage_op,
-    inspect_op,
     packet_decode_op,
     packet_encode_op,
     format_op,
     live_instruction_op,
     now_op,
     pin_op,
-    unpin_op,
-    units_op,
-    commit_context_op
+    flush_context_op
   };
   std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
   static int lua_os_time(lua_State *L) {
@@ -1096,11 +1079,11 @@ struct CodingEngine::Runtime {
     lua_rawsetp(L, LUA_REGISTRYINDEX, &authored_error_tag);
     lua_newtable(L);
     constexpr const char *names[] = {
-        "request", "call",          "context",       "edit",   "originals",
-        "restore", "append",        "decode",        "encode", "display",
-        "array",   "present",       "restarting",    "stats",  "manage",
-        "inspect", "decode_packet", "encode_packet", "format", "live_instruction",
-        "now",     "pin",           "unpin",         "units",  "commit_context"};
+        "request",       "call",    "blocks",           "compact", "read_block",
+        "set_blocks",    "append",  "decode",           "encode",  "display",
+        "array",         "present", "restarting",       "stats",   "decode_packet",
+        "encode_packet", "format",  "live_instruction", "now",     "pin",
+        "flush_context"};
     for (std::size_t i = 0; i < std::size(names); ++i) {
       lua_pushlightuserdata(L, self);
       lua_pushinteger(L, static_cast<lua_Integer>(i));
@@ -1683,18 +1666,51 @@ struct CodingEngine::Runtime {
                 Value{Number{static_cast<std::uint64_t>(mono_ms > 0 ? mono_ms : 0)}}}});
           break;
         }
-        case pin_op:
-          frame.value = self->engine.context_.pin(bridge_string(L, 1, frame, 6));
+        case pin_op: {
+          const auto ids_val = read_value(L, 1, {0, &nodes});
+          const bool pin_flag =
+              lua_isnoneornil(L, 2) ? true : (lua_toboolean(L, 2) != 0);
+          Value::Object args{{"op", Value{pin_flag ? "pin" : "unpin"}}};
+          if (std::holds_alternative<Number>(ids_val.value()))
+            args.emplace_back("ids", Value{Value::Array{ids_val}});
+          else
+            args.emplace_back("ids", ids_val);
+          frame.value = self->engine.context_compact(Value::object(std::move(args)));
           break;
-        case unpin_op:
-          frame.value = self->engine.context_.unpin(bridge_string(L, 1, frame, 6));
+        }
+        case blocks_op: {
+          const bool include_archived =
+              !lua_isnoneornil(L, 1) && lua_toboolean(L, 1) != 0;
+          frame.value = self->engine.context_list(include_archived);
           break;
-        case units_op:
-          frame.value = self->engine.format_context_units();
+        }
+        case compact_op:
+          frame.value = self->engine.context_compact(read_value(L, 1, {0, &nodes}));
           break;
-        case commit_context_op:
-          frame.value = self->engine.commit_pending_context();
+        case read_block_op: {
+          Value::Object args{{"id", read_value(L, 1, {0, &nodes})}};
+          if (!lua_isnoneornil(L, 2)) {
+            const auto opts = read_value(L, 2, {0, &nodes});
+            if (!std::holds_alternative<Value::Object>(opts.value()))
+              throw Error{ErrorCode::invalid_range};
+            for (const auto &[k, v] : opts.object())
+              args.emplace_back(k, v);
+          }
+          frame.value = self->engine.context_read(Value::object(std::move(args)));
           break;
+        }
+        case set_blocks_op:
+          frame.value =
+              self->engine.context_.replace_blocks(read_value(L, 1, {0, &nodes}));
+          ++self->engine.upstream_epoch_;
+          break;
+        case flush_context_op: {
+          const auto flushed = self->engine.flush_pending_compactions("lua");
+          frame.value = Value::object(
+              {{"flushed", Value{Number{flushed}}},
+               {"upstream_epoch", Value{Number{self->engine.upstream_epoch_}}}});
+          break;
+        }
         case restarting_op:
           frame.value = Value{self->engine.restart_note_.has_value()};
           break;
@@ -1714,53 +1730,27 @@ struct CodingEngine::Runtime {
               self->engine.dispatch(std::move(name), std::move(args), options);
           break;
         }
-        case manage_op:
-          frame.value = self->engine.context_.manage(read_value(L, 1, {0, &nodes}));
-          if (frame.value->find("accepted") &&
-              field(*frame.value, "accepted") == Value{true})
-            ++self->engine.upstream_epoch_;
-          break;
-        case inspect_op:
-          frame.value = self->engine.context_.inspect(read_value(L, 1, {0, &nodes}));
-          break;
-        case context_op:
-          frame.value = self->engine.context_.view();
-          break;
-        case edit_op:
-          frame.value = self->engine.context_.edit(read_value(L, 1, {0, &nodes}), {},
-                                                   ContextStore::EditKeys::strict);
-          if (frame.value->find("accepted") &&
-              field(*frame.value, "accepted") == Value{true})
-            ++self->engine.upstream_epoch_;
-          break;
-        case originals_op:
-          frame.value = self->engine.context_.originals();
-          break;
-        case restore_op:
-          self->engine.context_.restore(bridge_string(L, 1, frame, 3));
-          ++self->engine.upstream_epoch_;
-          frame.value = self->engine.context_.view();
-          break;
         case append_op: {
           auto items = read_value(L, 1, {0, &nodes});
-          // blackbird.append(items[, {class = "instruction" | "result"}]): the one
-          // option a program has; the class goes into the record (design §5.2).
-          if (lua_isnoneornil(L, 2))
-            self->engine.context_.append(items.array(), "lua.synthetic");
-          else {
+          std::optional<BlockKind> declared;
+          if (!lua_isnoneornil(L, 2)) {
             const auto options = read_value(L, 2, {0, &nodes});
             const auto *fields = std::get_if<Value::Object>(&options.value());
             const auto *named =
-                fields && fields->size() == 1 && fields->front().first == "class"
+                fields && fields->size() == 1 && fields->front().first == "kind"
                     ? std::get_if<std::string>(&fields->front().second.value())
                     : nullptr;
-            const auto declared = named ? class_named(*named) : std::nullopt;
+            declared = named ? parse_block_kind(*named) : std::nullopt;
             if (!declared)
               throw Error{ErrorCode::invalid_range};
-            self->engine.context_.append(items.array(), "lua.synthetic", *declared);
           }
+          const auto id =
+              self->engine.context_.append(items.array(), "lua.synthetic", declared);
           self->engine.note_answered(items.array());
-          frame.value = self->engine.context_.view();
+          frame.value = Value::object(
+              {{"id", Value{Number{id}}},
+               {"live_blocks", Value{Number{self->engine.context_.blocks().size()}}},
+               {"total_bytes", Value{Number{self->engine.context_.total_bytes()}}}});
           break;
         }
         case decode_op:
@@ -2175,17 +2165,6 @@ void validate_tool_arguments(ToolValidation input) {
       throw Error{ErrorCode::invalid_range};
   }
 }
-Value default_context_budget() {
-
-  // Enabled by default (a1v C1): 384/192 KiB from the measured 2026-10-17
-  // campaign requests (papers/clm-a1v-2026-10-19/REQUEST_SIZES.md).
-  return Value::object(
-      {{"enabled", Value{true}},
-       {"trigger_bytes", Value{Number{"393216"}}},
-       {"target_bytes", Value{Number{"196608"}}},
-       {"reason", Value{"default from measured request sizes; byte policy is not a "
-                        "provider token limit"}}});
-}
 std::uint64_t command_number(const Value &value, std::string_view key,
                              std::uint64_t limit) {
   const auto *item = value.find(key);
@@ -2274,58 +2253,18 @@ bool equivalent(const Value &a, const Value &b) {
 // readers of design §9 (their arguments choose the page) and the file-effect
 // confirmations. Every other native tool's result is shaped generically (T1).
 bool own_result_bound(std::string_view name) {
-  constexpr std::array<std::string_view, 12> own{"exec",
-                                                 "process",
-                                                 "read_process_output",
-                                                 "read_file",
-                                                 "write_file",
-                                                 "edit_file",
-                                                 "context_inspect",
-                                                 "audit_inspect",
-                                                 "trajectory_read",
-                                                 "variables_read",
-                                                 "tasks_read",
-                                                 "git_observe"};
+  constexpr std::array<std::string_view, 12> own{
+      "exec",           "process",       "read_process_output",
+      "read_file",      "write_file",    "edit_file",
+      "context_read",   "audit_inspect", "trajectory_read",
+      "variables_read", "tasks_read",    "git_observe"};
   return std::find(own.begin(), own.end(), name) != own.end();
-}
-std::size_t budget_number(const Value &value, std::string_view key) {
-  const auto &text = field(value, key).number().text();
-  std::size_t n = 0;
-  auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
-  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || n == 0 ||
-      n > 64 * 1024 * 1024)
-    throw Error{ErrorCode::invalid_range};
-  return n;
-}
-void validate_context_budget(const Value &value, RawPolicyFields &fields) {
-  if (!std::holds_alternative<Value::Object>(value.value()))
-    throw Error{ErrorCode::invalid_range};
-  for (const auto &[key, v] : value.object()) {
-    (void)v;
-    if (key != "enabled" && key != "trigger_bytes" && key != "target_bytes" &&
-        key != "reason")
-      throw Error{ErrorCode::invalid_range};
-  }
-  const auto *enabled = std::get_if<bool>(&field(value, "enabled").value());
-  if (!enabled)
-    throw Error{ErrorCode::invalid_range};
-  fields.enabled = *enabled;
-  const auto target = budget_number(value, "target_bytes");
-  fields.target = target;
-  const auto trigger = budget_number(value, "trigger_bytes");
-  fields.trigger = trigger;
-  if (target >= trigger || string_field(value, "reason").empty() ||
-      string_field(value, "reason").size() > 4096)
-    throw Error{ErrorCode::invalid_range};
 }
 } // namespace
 namespace {
 RawProgramContext program_origin(const RawOperationTrace *operation,
-                                 const RawTurnTrace *turn,
                                  DefinitionGenerationId generation) {
-  return {operation ? std::optional{operation->reference()}
-          : turn    ? std::optional{turn->reference()}
-                    : std::nullopt,
+  return {operation ? std::optional{operation->reference()} : std::nullopt,
           generation.bytes()};
 }
 template <class Refused>
@@ -2369,7 +2308,7 @@ bool program_syntax(RawProgramCall &trace, std::uint8_t kind, std::string_view s
 }
 } // namespace
 Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admission) {
-  const auto origin = program_origin(operation_trace_, turn_trace_, generation_);
+  const auto origin = program_origin(operation_trace_, generation_);
   RawProgramCall trace{arguments.find("proposal") ? std::uint8_t{2} : std::uint8_t{1},
                        &origin};
   return trace.run([&] {
@@ -2479,10 +2418,6 @@ Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admi
                {"effort", Value{string_field(program_config_, "effort").empty()
                                     ? effort_
                                     : string_field(program_config_, "effort")}}})},
-         {"context_policy", budget_view(string_field(program_config_, "model").empty()
-                                            ? model_
-                                            : string_field(program_config_, "model"),
-                                        0)},
          {"governing_workflow",
           Value::object(
               {{"generation", Value{hex_identity(generation_.bytes())}},
@@ -2499,7 +2434,7 @@ Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admi
   });
 }
 Value CodingEngine::module_source(const Value &arguments) {
-  const auto origin = program_origin(operation_trace_, turn_trace_, generation_);
+  const auto origin = program_origin(operation_trace_, generation_);
   const std::uint8_t kind = 2;
   RawProgramCall trace{3815, 3816, &origin, std::array{raw_native(kind)}};
   return trace.run([&] {
@@ -2515,7 +2450,7 @@ Value CodingEngine::module_source(const Value &arguments) {
   });
 }
 Value CodingEngine::tool_registry() const {
-  const auto origin = program_origin(operation_trace_, turn_trace_, generation_);
+  const auto origin = program_origin(operation_trace_, generation_);
   const std::uint8_t kind = 1;
   RawProgramCall trace{3815, 3816, &origin, std::array{raw_native(kind)}};
   return trace.run([&] {
@@ -2556,7 +2491,7 @@ void CodingEngine::detach_host_tools() {
   host_tools_source_.clear();
 }
 Value CodingEngine::request_tools() const {
-  const auto origin = program_origin(operation_trace_, turn_trace_, generation_);
+  const auto origin = program_origin(operation_trace_, generation_);
   const std::uint8_t kind = 3;
   RawProgramCall trace{3815, 3816, &origin, std::array{raw_native(kind)}};
   return trace.run([&] {
@@ -2575,7 +2510,7 @@ Value CodingEngine::request_tools() const {
   });
 }
 Value CodingEngine::define_tool(const Value &arguments) {
-  const auto origin = program_origin(operation_trace_, turn_trace_, generation_);
+  const auto origin = program_origin(operation_trace_, generation_);
   RawProgramCall trace{4, &origin};
   return trace.run([&] {
     trace.stage(1);
@@ -2668,104 +2603,6 @@ Value CodingEngine::define_tool(const Value &arguments) {
     return result;
   });
 }
-Value CodingEngine::budget_view(std::string_view model, std::size_t input_bytes) const {
-  RawPolicyTrace trace{2, budget_revision_, 119,
-                       turn_trace_ ? std::optional{turn_trace_->reference()}
-                                   : std::nullopt};
-  return budget_view(model, input_bytes, trace);
-}
-Value CodingEngine::budget_view(std::string_view model, std::size_t input_bytes,
-                                RawPolicyTrace &trace) const {
-  return trace.run([&] {
-    const bool enabled = std::get<bool>(field(budget_, "enabled").value());
-    std::optional<std::size_t> trigger;
-    if (enabled)
-      trigger = budget_number(budget_, "trigger_bytes");
-    const bool triggered = trigger && input_bytes >= *trigger;
-    trace.observation(enabled, trigger, input_bytes, triggered);
-    auto result = Value::object(
-        {{"revision", Value{budget_revision_}},
-         {"effective", budget_},
-         {"pending", pending_budget_},
-         {"pending_revision",
-          pending_budget_ == Value{} ? Value{} : Value{pending_budget_revision_}},
-         {"triggered", Value{triggered}},
-         {"input_bytes", Value{Number{input_bytes}}},
-         {"units",
-          Value{"native binary input packet bytes; not tokens or total wire bytes"}},
-         {"capability",
-          Value::object(
-              {{"provider", Value{std::string{provider_.provider_identity()}}},
-               {"provider_source",
-                Value{"native adapter identity; unavailable for unspecified adapters"}},
-               {"model", Value{std::string{model}}},
-               {"model_source",
-                Value{"effective request model; stats uses engine default"}},
-               {"context_window_tokens", Value{}},
-               {"context_window_source",
-                Value{"unavailable; no qualified model capability catalog"}}})}});
-    trace.finish(0);
-    return result;
-  });
-}
-Value CodingEngine::context_budget(const Value &arguments) {
-  const bool proposal_present = arguments.find("proposal") != nullptr;
-  RawPolicyTrace trace{proposal_present ? std::uint8_t{1} : std::uint8_t{0},
-                       budget_revision_, proposal_present ? 318U : 170U,
-                       turn_trace_ ? std::optional{turn_trace_->reference()}
-                                   : std::nullopt};
-  return trace.run([&] {
-    if (!proposal_present) {
-      RawPolicyTrace view{2, budget_revision_, 119, trace.reference(), trace.bank()};
-      auto result = budget_view(
-          string_field(program_config_, "model").empty()
-              ? model_
-              : string_field(program_config_, "model"),
-          unwrap(encode_packet_string(Value{context_.items({view.reference()})}))
-              .size(),
-          view);
-      trace.finish(0);
-      return result;
-    }
-    auto proposal = field(arguments, "proposal");
-    const auto *base = proposal.find("base");
-    if (base && base->string() != budget_revision_) {
-      auto result = Value::object(
-          {{"staged", Value{false}}, {"reason", Value{"stale-policy-revision"}}});
-      trace.finish(1);
-      return result;
-    }
-    if (base) {
-      auto &fields = proposal.object();
-      fields.erase(std::remove_if(fields.begin(), fields.end(),
-                                  [](const auto &f) { return f.first == "base"; }),
-                   fields.end());
-    }
-    RawPolicyFields parsed;
-    try {
-      validate_context_budget(proposal, parsed);
-    } catch (...) {
-      trace.validation(parsed);
-      throw;
-    }
-    trace.validation(parsed);
-    auto revision =
-        hex_identity(unwrap(log_.root().issue<DefinitionGenerationId>()).bytes());
-    RawPolicyTrace view{2, budget_revision_, 119, trace.reference(), trace.bank()};
-    pending_budget_ = std::move(proposal);
-    pending_budget_revision_ = std::move(revision);
-    trace.staged(pending_budget_revision_);
-    auto result = budget_view(
-        string_field(program_config_, "model").empty()
-            ? model_
-            : string_field(program_config_, "model"),
-        unwrap(encode_packet_string(Value{context_.items({view.reference()})})).size(),
-        view);
-    result.object().emplace_back("staged", Value{true});
-    trace.finish(0);
-    return result;
-  });
-}
 CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
                            CodingProvider &provider, std::string model,
                            DecisionModelConfig decisions)
@@ -2777,21 +2614,12 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
   RawProgramCall trace{0, &bootstrap};
   trace.run([&] {
     command_jobs_ = std::make_shared<CommandJobs>();
-    // While the context is read-only the launcher holds AuditLog::begin_reserved
-    // over the whole open, this constructor included: its identity reservation
-    // (generation_ above) and this clock record go outside the tail cap.
     observations_ = std::make_unique<Observations>(log_);
     program_config_.object().emplace_back("workflows", default_workflows());
     program_config_.object().emplace_back("workflow_prefix", Value{""});
-    // The built-in program's revision names its exact source: v2 declares the
-    // ultracode brief an instruction (unit S2); v3 appends it only when no live
-    // instruction holds an equal item, object key order ignored (unit c3f); v4
-    // declares the call_id of each model call it dispatches (unit T1); v5
-    // removes the arbitrary 64-step ceiling.
     constexpr std::string_view builtin_prefix = "builtin-ultracode-v";
-    const std::string builtin = std::string{builtin_prefix} + "5";
+    const std::string builtin = std::string{builtin_prefix} + "6";
     program_revision_ = builtin;
-    budget_ = default_context_budget();
     for (const auto &fact : log_.root().tail_facts()) {
       const auto *record = std::get_if<ApplicationRecordEvent>(&fact.event.body);
       if (!record || record->channel != ApplicationChannel::context)
@@ -2803,11 +2631,7 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
       if (!op || !std::holds_alternative<std::string>(op->value()))
         continue;
       const auto &kind = op->string();
-      if (kind == "restore" || kind == "cut")
-        ++upstream_epoch_;
-      else if ((kind == "edit" || kind == "managed") &&
-               packet.value().find("accepted") &&
-               field(packet.value(), "accepted") == Value{true})
+      if (kind == "compact" || kind == "restore" || kind == "replace")
         ++upstream_epoch_;
     }
     std::optional<Value> recorded_config;
@@ -2826,33 +2650,6 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
         lua_tools_ = field(packet, "tools");
         tools_revision_ = string_field(packet, "tools_revision");
       }
-      if (!label || (label->string() != "context-budget-effective-v1" &&
-                     label->string() != "workflow-config-effective-v1"))
-
-        continue;
-      auto policy = field(packet, "policy");
-      const auto &revision = string_field(packet, "revision");
-      RawPolicyTrace restore{3, revision, 119};
-      restore.run([&] {
-        RawPolicyFields parsed;
-        try {
-          validate_context_budget(policy, parsed);
-        } catch (...) {
-          restore.validation(parsed);
-          throw;
-        }
-        restore.validation(parsed);
-        // A recorded built-in policy was never a session choice ("initial-disabled"
-        // before a1v): resolve it to the current default, keep chosen ones exactly.
-        if (revision == "builtin-default" || revision == "initial-disabled") {
-          budget_ = default_context_budget();
-          budget_revision_ = "builtin-default";
-        } else {
-          budget_ = std::move(policy);
-          budget_revision_ = revision;
-        }
-        restore.finish(0);
-      });
     }
     // A recorded built-in revision is the built-in program, never a session choice.
     // Any built-in revision other than this binary's (older, or newer from a later
@@ -2915,10 +2712,6 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
     const auto origin = trace.context();
     workflows_ =
         std::make_shared<WorkflowRegistry>(program_config_, program_revision_, &origin);
-    // Never over a head playback has not established (design §4.5): a read-only
-    // context stays as playback left it.
-    if (context_.head().empty() && !context_.read_only())
-      context_.append({}, "initial");
   });
 }
 CodingEngine::~CodingEngine() { command_jobs_->shutdown(); }
@@ -3081,8 +2874,6 @@ void CodingEngine::poll_commands() {
       if (!command_failure_)
         break;
     }
-    if (settlement_ && !turn_running_ && !operation_depth_ && !command_jobs_->debt())
-      settlement_.reset();
   } catch (const Error &error) {
     if (error.code == ErrorCode::interrupted)
       throw;
@@ -3092,6 +2883,8 @@ void CodingEngine::poll_commands() {
       log_.root().block_admission();
     throw;
   }
+  if (!turn_running_ && !command_jobs_->debt())
+    settlement_.reset();
   if (command_failure_)
     throw *command_failure_;
 }
@@ -3432,31 +3225,6 @@ void recover_coding_session(RetainedState &root, RecoveryMode mode,
   });
 }
 
-void CodingEngine::protect_workflow(const Value::Array &entries, const Value &proposal,
-                                    std::optional<RawEventRef> parent) {
-  if (capacity_stopped_)
-    throw Error{ErrorCode::capacity};
-  try {
-    if (!parent && turn_trace_)
-      parent = turn_trace_->reference();
-    const RawContextOrigin origin{parent.value_or(RawEventRef{})};
-    auto credit = context_.cancellation_budget(entries, proposal, origin);
-    const auto existing =
-        context_.cancellation_budget(field(context_.view(origin), "entries").array(),
-                                     context_.pending_proposal(origin), origin);
-    credit.max_file_bytes = std::max(credit.max_file_bytes, existing.max_file_bytes);
-    credit.max_records = std::max(credit.max_records, existing.max_records);
-    // One future admission plus each outstanding nested attempt. Error sources,
-    // issuers, receipt and terminal are bounded per slot. Depth is limited below.
-    credit.max_file_bytes += (operation_depth_ + 1 + command_jobs_->debt()) * 8192;
-    credit.max_records += (operation_depth_ + 1 + command_jobs_->debt()) * 16;
-    unwrap(log_.root().refresh_settlement(credit));
-  } catch (const Error &e) {
-    if (e.code == ErrorCode::capacity)
-      capacity_stopped_ = true;
-    throw;
-  }
-}
 Value CodingEngine::operation(
     std::string_view name, const Value &input,
     const std::function<Value(OperationAttemptId, InvocationId, DefinitionGenerationId,
@@ -3493,8 +3261,6 @@ Value CodingEngine::operation(
   else if (provider_operation && provider_operation->parent &&
            provider_operation->parent->ordinal)
     parent = provider_operation->parent;
-  else if (turn_trace_ && turn_trace_->reference().ordinal)
-    parent = turn_trace_->reference();
   trace.start(parent, generation_, operation_depth_, pumping_commands_,
               capacity_stopped_);
   auto *previous_trace = operation_trace_;
@@ -3525,14 +3291,21 @@ Value CodingEngine::operation(
       capacity_stopped_ = true;
       throw Error{ErrorCode::capacity};
     }
+    if (root.protected_settlement()) {
+      const std::uint64_t active = operation_depth_ + 1 + command_jobs_->debt();
+      const auto refreshed =
+          root.refresh_settlement({16 * 1024 + active * 8192, 16 + active * 16});
+      if (!refreshed.has_value()) {
+        if (refreshed.error().code == ErrorCode::capacity)
+          capacity_stopped_ = true;
+        throw refreshed.error();
+      }
+    }
     ++operation_depth_;
     struct Depth {
       std::size_t &value;
       ~Depth() { --value; }
     } depth{operation_depth_};
-    if (log_.root().protected_settlement())
-      protect_workflow(field(context_.view(), "entries").array(),
-                       context_.pending_proposal());
     const auto began = operation_completed || operation_outcome
                            ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
@@ -4238,9 +4011,7 @@ Value CodingEngine::operation(
     std::size_t result_record = 0;
     // A failure shaped to text keeps its status in its original's metadata, which
     // the failed selector reads by result_ref (T1).
-    const bool failed_result =
-        shape && failed_output(Value::object(
-                     {{"type", Value{"function_call_output"}}, {"output", result}}));
+    const bool failed_result = shape && failed_tool_output(result);
     try {
       auto result_metadata =
           Value::object({{"attempt", Value{hex_identity(attempt.bytes())}},
@@ -4677,8 +4448,7 @@ Value CodingEngine::execute_workflow(WorkflowContinuation &invocation,
 void CodingEngine::drain_workflows() {
   if (draining_workflows_ || workflow_continuations_.empty())
     return;
-  const RawProgramContext origin{
-      turn_trace_ ? std::optional{turn_trace_->reference()} : std::nullopt, {}};
+  const RawProgramContext origin{std::nullopt, {}};
   const auto count = workflow_continuations_.size();
   RawProgramCall trace{3825, 3826, &origin,
                        std::array{raw_native(draining_workflows_), raw_native(count)}};
@@ -4815,153 +4585,207 @@ Value::Array project_input_for_provider(Value::Array items,
   return projected;
 }
 } // namespace
-bool CodingEngine::has_open_tool_calls() const {
-  return !ContextStore::stop_outputs(field(context_.view(), "entries").array(), false)
-              .empty();
+namespace {
+std::uint64_t parse_block_id(const Value &v) {
+  const auto *n = std::get_if<Number>(&v.value());
+  if (!n || n->text().empty())
+    throw Error{ErrorCode::invalid_range};
+  std::uint64_t out = 0;
+  const auto &s = n->text();
+  const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+  if (r.ec != std::errc{} || r.ptr != s.data() + s.size() || out == 0)
+    throw Error{ErrorCode::invalid_range};
+  return out;
 }
-Value CodingEngine::format_context_units() const {
-  const auto view = context_.view();
-  const auto &entries = field(view, "entries").array();
-  const auto units = context_.units();
-  Value::Array out;
-  out.reserve(units.size());
-  for (const auto &u : units) {
-    Value::Array ids;
-    std::size_t bytes = 0;
-    for (const auto pos : u.entries) {
-      if (pos >= entries.size())
-        continue;
-      ids.push_back(field(entries[pos], "id"));
-      if (const auto encoded = encode_packet_string(field(entries[pos], "item"));
-          encoded.has_value())
-        bytes += encoded.value().size();
+std::size_t parse_nonneg_size(const Value &v) {
+  const auto *n = std::get_if<Number>(&v.value());
+  if (!n || n->text().empty())
+    throw Error{ErrorCode::invalid_range};
+  std::size_t out = 0;
+  const auto &s = n->text();
+  const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+  if (r.ec != std::errc{} || r.ptr != s.data() + s.size())
+    throw Error{ErrorCode::invalid_range};
+  return out;
+}
+} // namespace
+
+Value CodingEngine::context_list(bool include_archived) const {
+  auto result = context_.list(include_archived);
+  result.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
+  result.object().emplace_back("pending_edits",
+                               Value{Number{pending_compactions_.size()}});
+  if (telemetry_.context_window_tokens)
+    result.object().emplace_back("context_window_tokens",
+                                 Value{Number{*telemetry_.context_window_tokens}});
+  return result;
+}
+
+Value CodingEngine::context_compact(const Value &arguments) {
+  if (!std::holds_alternative<Value::Object>(arguments.value()))
+    throw Error{ErrorCode::invalid_range};
+  const auto op_parsed = parse_compact_op(string_field(arguments, "op"));
+  if (!op_parsed)
+    throw Error{ErrorCode::invalid_range};
+  CompactRequest req;
+  req.op = *op_parsed;
+  if (const auto *ids = arguments.find("ids")) {
+    if (!std::holds_alternative<Value::Array>(ids->value()))
+      throw Error{ErrorCode::invalid_range};
+    for (const auto &v : ids->array())
+      req.ids.push_back(parse_block_id(v));
+  }
+  if (const auto *from = arguments.find("from"))
+    req.from = parse_block_id(*from);
+  if (const auto *to = arguments.find("to"))
+    req.to = parse_block_id(*to);
+  if (req.ids.empty() && !req.from.has_value() && !req.to.has_value())
+    throw Error{ErrorCode::invalid_range};
+  if (const auto *summary = arguments.find("summary")) {
+    if (!std::holds_alternative<std::string>(summary->value()))
+      throw Error{ErrorCode::invalid_range};
+    req.summary = summary->string();
+  }
+  if (req.op == CompactOp::summarize && req.summary.empty())
+    throw Error{ErrorCode::invalid_range};
+
+  std::string apply = "auto";
+  if (const auto *ap = arguments.find("apply")) {
+    if (!std::holds_alternative<std::string>(ap->value()))
+      throw Error{ErrorCode::invalid_range};
+    apply = ap->string();
+    if (apply != "auto" && apply != "now")
+      throw Error{ErrorCode::invalid_range};
+  }
+
+  // pin/unpin do not alter wire bytes; restore is needed immediately.
+  if (req.op == CompactOp::pin || req.op == CompactOp::unpin ||
+      req.op == CompactOp::restore) {
+    auto res = context_.compact(req);
+    if (req.op == CompactOp::restore && res.find("ok") &&
+        field(res, "ok") == Value{true}) {
+      ++upstream_epoch_;
+      res.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
     }
-    out.push_back(
-        Value::object({{"handle", Value{u.handle}},
-                       {"unit_class", Value{std::string{class_name(u.unit_class)}}},
-                       {"open", Value{u.open}},
-                       {"superseded", Value{u.superseded}},
-                       {"pinned", Value{u.pinned}},
-                       {"ids", Value{std::move(ids)}},
-                       {"bytes", Value{Number{bytes}}}}));
+    res.object().emplace_back("applied", Value{"now"});
+    return res;
   }
-  return Value::object(
-      {{"revision", Value{context_.head()}},
-       {"upstream_epoch", Value{Number{upstream_epoch_}}},
-       {"note", Value{"Omit proposal.base when calling context_manage as a tool "
-                      "(the current snapshot binds automatically)."}},
-       {"units", Value{std::move(out)}}});
-}
-Value CodingEngine::commit_pending_context() {
-  if (context_.pending_proposal() == Value{})
-    return Value{};
-  if (has_open_tool_calls()) {
-    commit_pending_next_request_ = true;
-    return Value::object({{"accepted", Value{false}},
-                          {"deferred", Value{true}},
-                          {"reason", Value{"open-tool-call"}},
-                          {"apply", Value{"next_request"}}});
+
+  const auto now = std::chrono::steady_clock::now();
+  const bool cache_warm = turn_running_ && last_provider_request_at_.has_value() &&
+                          (now - *last_provider_request_at_) < cache_ttl_;
+  if (apply == "auto" && cache_warm) {
+    pending_compactions_.push_back(req);
+    Value::Array queued;
+    for (const auto id : req.ids)
+      queued.push_back(Value{Number{id}});
+    Value::Object out{{"ok", Value{true}},
+                      {"op", Value{std::string{compact_op_name(req.op)}}},
+                      {"applied", Value{"deferred"}},
+                      {"pending_edits", Value{Number{pending_compactions_.size()}}},
+                      {"note", Value{"Queued while prompt cache is warm; flushes "
+                                     "automatically on cold cache, route switch, "
+                                     "overflow, or turn end. Pass apply='now' to flush "
+                                     "immediately and roll a fresh cache epoch."}}};
+    if (!queued.empty())
+      out.emplace_back("queued", Value{std::move(queued)});
+    return Value::object(std::move(out));
   }
-  commit_pending_next_request_ = false;
-  auto settled = context_.commit_pending();
-  if (settled.find("accepted") && field(settled, "accepted") == Value{true}) {
+
+  // apply == "now" or cache is cold / outside a turn: apply immediately.
+  auto res = context_.compact(req);
+  if (res.find("ok") && field(res, "ok") == Value{true}) {
     ++upstream_epoch_;
-    settled.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
+    res.object().emplace_back("applied", Value{"now"});
+    res.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
   }
-  return settled;
+  return res;
 }
-bool CodingEngine::auto_compact_for_overflow() {
-  if (context_.read_only())
-    return false;
-  if (const auto pending = context_.pending_proposal(); pending != Value{}) {
-    const auto *mode = pending.find("mode");
-    const bool shrinking = mode && std::holds_alternative<std::string>(mode->value()) &&
-                           mode->string() != "restore";
-    if (shrinking && !has_open_tool_calls()) {
-      const auto before_bytes =
-          unwrap(encode_packet_string(Value{context_.items()})).size();
-      const auto settled = commit_pending_context();
-      if (settled.find("accepted") && field(settled, "accepted") == Value{true}) {
-        const auto after_bytes =
-            unwrap(encode_packet_string(Value{context_.items()})).size();
-        if (after_bytes < before_bytes)
-          return true;
-      }
+
+Value CodingEngine::context_read(const Value &arguments) const {
+  if (!std::holds_alternative<Value::Object>(arguments.value()))
+    throw Error{ErrorCode::invalid_range};
+  const auto id = parse_block_id(field(arguments, "id"));
+  ReadBlockOptions opts;
+  if (const auto *off = arguments.find("offset"))
+    opts.offset = parse_nonneg_size(*off);
+  if (const auto *lim = arguments.find("limit"))
+    opts.limit = parse_nonneg_size(*lim);
+  return context_.read_block(id, opts);
+}
+
+std::size_t CodingEngine::flush_pending_compactions(std::string_view reason) {
+  if (pending_compactions_.empty())
+    return 0;
+  auto queued = std::move(pending_compactions_);
+  pending_compactions_.clear();
+  std::size_t applied = 0;
+  for (const auto &req : queued) {
+    const auto res = context_.compact(req);
+    if (res.find("ok") && field(res, "ok") == Value{true})
+      ++applied;
+  }
+  if (applied > 0) {
+    ++upstream_epoch_;
+    if (!reason.empty() && (notice || display)) {
+      (notice ? notice : display)("\n[applied " + std::to_string(applied) +
+                                  " deferred compaction(s) on " + std::string{reason} +
+                                  "; upstream epoch " +
+                                  std::to_string(upstream_epoch_) + "]\n");
     }
   }
-  const auto view = context_.view();
-  const auto &entries = field(view, "entries").array();
-  const auto units = context_.units();
+  return applied;
+}
+
+bool CodingEngine::auto_compact_for_overflow() {
+  const auto before_bytes = context_.total_bytes();
+  if (!pending_compactions_.empty()) {
+    (void)flush_pending_compactions("overflow");
+    if (context_.total_bytes() < before_bytes)
+      return true;
+  }
+  const auto &blocks = context_.blocks();
   const bool anthropic = provider_.provider_identity() == "anthropic-messages" ||
                          provider_.provider_identity().starts_with("anthropic");
-  std::vector<const Unit *> removable;
-  for (const auto &u : units) {
-    if (u.open || u.pinned || u.unit_class == UnitClass::tool_state)
+  std::vector<std::uint64_t> removable;
+  for (const auto &b : blocks) {
+    if (b.open || b.pinned || b.kind == BlockKind::instruction)
       continue;
-    if (u.unit_class == UnitClass::instruction && !u.superseded)
-      continue;
-    if (u.entries.empty())
-      continue;
-    removable.push_back(&u);
+    removable.push_back(b.id);
   }
   if (removable.empty())
     return false;
   const std::size_t drop_count = std::max<std::size_t>(1, (removable.size() + 1) / 2);
-  std::set<std::size_t> drop_positions;
-  std::vector<const Unit *> chosen;
-  chosen.reserve(drop_count);
-  for (std::size_t i = 0; i < drop_count; ++i) {
-    chosen.push_back(removable[i]);
-    for (const auto pos : removable[i]->entries)
-      drop_positions.insert(pos);
-  }
-  if (anthropic && !chosen.empty()) {
-    // Anthropic requires the first wire message to have role "user". If archiving
-    // the leading unit would expose a non-user message first, spare that unit.
+  removable.resize(drop_count);
+  if (anthropic && !removable.empty()) {
+    std::set<std::uint64_t> dropping(removable.begin(), removable.end());
     auto first_remaining_is_user = [&] {
-      for (std::size_t pos = 0; pos < entries.size(); ++pos) {
-        if (drop_positions.contains(pos))
+      for (const auto &b : blocks) {
+        if (dropping.contains(b.id))
           continue;
-        const auto &item = field(entries[pos], "item");
-        const auto *type = item.find("type");
-        if (type && *type == Value{"reasoning"})
-          continue;
-        const auto *role = item.find("role");
-        return role != nullptr &&
-               (*role == Value{"user"} || *role == Value{"developer"} ||
-                *role == Value{"system"});
+        for (const auto &item : b.items) {
+          if (const auto *type = item.find("type"); type && *type == Value{"reasoning"})
+            continue;
+          const auto *role = item.find("role");
+          return role != nullptr &&
+                 (*role == Value{"user"} || *role == Value{"developer"} ||
+                  *role == Value{"system"});
+        }
       }
       return false;
     };
-    while (!chosen.empty() && !first_remaining_is_user()) {
-      for (const auto pos : chosen.front()->entries)
-        drop_positions.erase(pos);
-      chosen.erase(chosen.begin());
+    while (!removable.empty() && !first_remaining_is_user()) {
+      dropping.erase(removable.front());
+      removable.erase(removable.begin());
     }
   }
-  if (chosen.empty())
+  if (removable.empty())
     return false;
-  Value::Array ids;
-  for (const auto *unit : chosen) {
-    for (const auto pos : unit->entries) {
-      if (pos < entries.size())
-        ids.push_back(field(entries[pos], "id"));
-    }
-  }
-  if (ids.empty())
-    return false;
-  auto proposal =
-      Value::object({{"base", Value{context_.head()}},
-                     {"mode", Value{"archive"}},
-                     {"ids", Value{std::move(ids)}},
-                     {"reason", Value{"provider-context-overflow-recovery"}},
-                     {"source", Value{"native-overflow-recovery"}}});
-  const auto res = context_.manage(proposal);
-  if (res.find("staged") && field(res, "staged") == Value{true}) {
-    const auto committed = commit_pending_context();
-    return committed.find("accepted") && field(committed, "accepted") == Value{true};
-  }
-  if (res.find("accepted") && field(res, "accepted") == Value{true}) {
+  CompactRequest drop_req;
+  drop_req.ids = std::move(removable);
+  drop_req.op = CompactOp::drop;
+  const auto res = context_.compact(drop_req);
+  if (res.find("ok") && field(res, "ok") == Value{true}) {
     ++upstream_epoch_;
     return true;
   }
@@ -5009,9 +4833,6 @@ Value CodingEngine::request_impl(Value options) {
     assembly.start(1);
     if (request_group_active_ || provider_.request_group_owned_)
       throw Error{ErrorCode::busy};
-    // No request leaves a read-only context.
-    if (context_.read_only())
-      throw Error{ErrorCode::audit_unavailable};
     assembly.stage(10);
     RawRegion preparation{raw_regions::provider_prepare};
     if (restart_note_)
@@ -5076,7 +4897,7 @@ Value CodingEngine::request_impl(Value options) {
                  : string_field(program_config_, "model");
     }();
     const auto target_identity = provider_.provider_identity();
-    if (context_.pending_proposal() != Value{}) {
+    if (!pending_compactions_.empty()) {
       const auto now = std::chrono::steady_clock::now();
       const bool cold_cache = last_provider_request_at_.has_value() &&
                               (now - *last_provider_request_at_) >= cache_ttl_;
@@ -5084,18 +4905,8 @@ Value CodingEngine::request_impl(Value options) {
           (!last_provider_model_.empty() && last_provider_model_ != target_model) ||
           (!last_provider_identity_.empty() &&
            last_provider_identity_ != target_identity);
-      const bool explicit_now = commit_pending_next_request_;
-      if (explicit_now || cold_cache || route_switched) {
-        const auto settled = commit_pending_context();
-        if (settled.find("accepted") && field(settled, "accepted") == Value{true} &&
-            (notice || display)) {
-          const char *why = explicit_now     ? "explicit apply=now"
-                            : route_switched ? "route switch"
-                                             : "cold cache";
-          (notice ? notice : display)("\n[staged context committed on " +
-                                      std::string{why} + "; upstream epoch " +
-                                      std::to_string(upstream_epoch_) + "]\n");
-        }
+      if (cold_cache || route_switched) {
+        (void)flush_pending_compactions(route_switched ? "route switch" : "cold cache");
       }
     }
     auto items = context_.items();
@@ -5183,41 +4994,11 @@ Value CodingEngine::request_impl(Value options) {
     validate_protocol(field(request, "input").array(), assembly.reference());
     const auto input_bytes =
         unwrap(encode_packet_string(field(request, "input"))).size();
-    const auto budget = budget_view(string_field(request, "model"), input_bytes);
-    const bool triggered = std::get<bool>(field(budget, "triggered").value());
-    // The model always knows its context size (a1v C2). A provider that retains
-    // request state appends this item to context on every request, so there the
-    // line rides only with the trigger rather than accumulating stale sizes.
-    if (state_context && (!provider_.retain_request_state() || triggered)) {
-      const auto &policy = field(budget, "effective");
-      const bool enabled = std::get<bool>(field(policy, "enabled").value());
-      operational_state +=
-          "CONTEXT_SIZE input_bytes=" + std::to_string(input_bytes) +
-          " entries=" + std::to_string(field(request, "input").array().size()) +
-          (enabled
-               ? " trigger_bytes=" + field(policy, "trigger_bytes").number().text() +
-                     " target_bytes=" + field(policy, "target_bytes").number().text()
-               : std::string{" budget=off"}) +
-          " (native packet bytes, not tokens)\n";
-    }
-    if (state_context && triggered) {
-      operational_state +=
-          "CONTEXT_BUDGET basis=selected_input_before_state " +
-          unwrap(format_value(budget)) +
-          "\nThe configured advisory trigger is reached. Inspect the working map "
-          "and propose managed context "
-          "with context_manage or Lua toward target_bytes, or revise/defer policy "
-          "with context_budget and a reason. "
-          "Do not discard live instructions or incomplete tool groups. Destructive "
-          "proposals remain model-authored; "
-          "native acceptance checks structure, not summary quality. Managed "
-          "proposals and policy changes activate only "
-          "after successful workflow completion: finish this workflow to use them "
-          "on the next turn. "
-          "Repair may exceed the target; retrieve bounded originals and restore "
-          "when useful. "
-          "Neither target nor trigger is a token estimate, hard provider limit, or "
-          "audit reclamation.";
+    if (state_context && !provider_.retain_request_state()) {
+      operational_state += "CONTEXT_SIZE input_bytes=" + std::to_string(input_bytes) +
+                           " blocks=" + std::to_string(context_.blocks().size()) +
+                           " upstream_epoch=" + std::to_string(upstream_epoch_) +
+                           " (native packet bytes, not tokens)\n";
     }
     auto reusable_input_items = field(request, "input").array().size();
     // Before anything enters context (a provider that retains request state appends
@@ -6104,15 +5885,6 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           const auto limits = log_.root().journal_limits();
           if (limits.max_payload < 2048 || limits.max_batch_bytes < 4096)
             throw Error{ErrorCode::capacity};
-          auto credit = context_.cancellation_budget(
-              field(context_.view(), "entries").array(), context_.pending_proposal());
-          credit.max_file_bytes +=
-              (operation_depth_ + command_jobs_->debt() + 2) * 8192;
-          credit.max_records += (operation_depth_ + command_jobs_->debt() + 2) * 16;
-          if (!settlement_)
-            settlement_ = unwrap(log_.root().protect_settlement(credit));
-          else
-            unwrap(log_.root().refresh_settlement(credit));
           JobWaitOptions options;
           if (arguments.find("yield_ms"))
             options.yield_ms = command_number(arguments, "yield_ms", 3600000);
@@ -6203,13 +5975,11 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
         }
 
         if (name == "workflow_registry") {
-          const auto origin =
-              program_origin(operation_trace_, turn_trace_, generation_);
+          const auto origin = program_origin(operation_trace_, generation_);
           return workflows_->discover(&origin);
         }
         if (name == "workflow_invoke") {
-          const auto origin =
-              program_origin(operation_trace_, turn_trace_, generation_);
+          const auto origin = program_origin(operation_trace_, generation_);
           RawProgramCall selection_trace{7, &origin};
           return selection_trace.run([&] {
             const auto selected_origin = selection_trace.context();
@@ -6232,9 +6002,7 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
             log_.original(
                 {"workflow.selection", string_field(definition, "source"), selection});
             log_.record(ApplicationChannel::program, selection);
-            const auto unanswered = ContextStore::stop_outputs(
-                field(context_.view(), "entries").array(), false);
-            if (!unanswered.empty()) {
+            if (context_.has_open_exchanges()) {
               if (workflow_continuations_.size() >= 8)
                 throw Error{ErrorCode::capacity};
               if (selection_trace.enabled() && !program_issuer_)
@@ -6282,8 +6050,7 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
         for (const auto &definition : lua_tools_.array()) {
           if (string_field(definition, "name") != name)
             continue;
-          const auto origin =
-              program_origin(operation_trace_, turn_trace_, generation_);
+          const auto origin = program_origin(operation_trace_, generation_);
           const auto revision_size = tools_revision_.size();
           const auto source_size = string_field(definition, "source").size();
           RawProgramCall tool_trace{3827, 3828, &origin,
@@ -6332,102 +6099,19 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
             throw Error{ErrorCode::invalid_range};
           return retained_process_output(arguments);
         }
-        if (name == "context_repair") {
-          if (string_field(arguments, "base") != context_.head() ||
-              operation_depth_ != 1 || detail::owned_children.load() != 0 ||
-              log_.root().state() != JournalWriterState::live)
-            throw Error{ErrorCode::conflict};
-          auto outputs = ContextStore::stop_outputs(
-              field(context_.view(), "entries").array(), false);
-          for (auto &output : outputs) {
-            const auto &id = string_field(output, "call_id");
-            if (id.empty())
-              throw Error{ErrorCode::conflict};
-            const auto eligible = std::any_of(
-                repairable_outputs_.begin(), repairable_outputs_.end(),
-                [&](const Value &old) { return string_field(old, "call_id") == id; });
-            if (!eligible)
-              throw Error{ErrorCode::conflict};
-            output = Value::object(
-                {{"type", Value{"function_call_output"}},
-                 {"call_id", Value{id}},
-                 {"output",
-                  Value::object(
-                      {{"error", Value{"workflow_result_missing"}},
-                       {"effect_outcome", Value{"unknown"}},
-                       {"replayed", Value{false}},
-                       {"detail", Value{"Protocol placeholder only. Inspect retained "
-                                        "program, tool results and audit for actual "
-                                        "effects; no automatic retry."}}})}});
-          }
-          auto candidate = context_.items();
-          candidate.insert(candidate.end(), outputs.begin(), outputs.end());
-          // Reject duplicates/orphan outputs before publishing anything.
-          validate_protocol(candidate);
-          const auto count = outputs.size();
-          note_answered(outputs);
-          if (!outputs.empty())
-            context_.append(std::move(outputs), "workflow.protocol-repair");
-          return Value::object({{"repaired", Value{Number{count}}},
-                                {"base", Value{context_.head()}},
-                                {"effect_outcome", Value{"unknown"}},
-                                {"replayed", Value{false}}});
-        }
-        if (name == "context_budget")
-          return context_budget(arguments);
-        if (name == "context_manage") {
-          auto proposal = field(arguments, "proposal");
-          std::string apply = "staged";
-          if (const auto *mode = arguments.find("apply")) {
-            if (!std::holds_alternative<std::string>(mode->value()))
+        if (name == "context_list") {
+          bool include_archived = false;
+          if (const auto *inc = arguments.find("include_archived")) {
+            if (!std::holds_alternative<bool>(inc->value()))
               throw Error{ErrorCode::invalid_range};
-            apply = mode->string();
-            if (apply != "staged" && apply != "now")
-              throw Error{ErrorCode::invalid_range};
+            include_archived = std::get<bool>(inc->value());
           }
-          // Explicit invocation-time snapshot convenience. Supplied bases remain strict
-          // CAS.
-          if (std::holds_alternative<Value::Object>(proposal.value()) &&
-              !proposal.find("base"))
-            proposal.object().emplace_back("base", Value{context_.head()});
-          auto res = context_.manage(proposal);
-          if (res.find("reason") && field(res, "reason") == Value{"stale-base"} &&
-              has_open_tool_calls()) {
-            res.object().emplace_back(
-                "hint",
-                Value{"Omit proposal.base when calling context_manage as a tool "
-                      "so Blackbird binds the current revision automatically."});
-          }
-          if (apply == "now") {
-            if (res.find("staged") && field(res, "staged") == Value{true}) {
-              if (has_open_tool_calls()) {
-                commit_pending_next_request_ = true;
-                res.object().emplace_back("apply", Value{"next_request"});
-                return res;
-              }
-              auto committed = commit_pending_context();
-              if (committed.find("accepted") &&
-                  field(committed, "accepted") == Value{true})
-                committed.object().emplace_back("applied", Value{"now"});
-              return committed;
-            }
-            if (res.find("accepted") && field(res, "accepted") == Value{true}) {
-              ++upstream_epoch_;
-              res.object().emplace_back("applied", Value{"now"});
-              res.object().emplace_back("upstream_epoch",
-                                        Value{Number{upstream_epoch_}});
-            }
-          } else if (res.find("accepted") && field(res, "accepted") == Value{true}) {
-            ++upstream_epoch_;
-          }
-          return res;
+          return context_list(include_archived);
         }
-        if (name == "context_pin")
-          return context_.pin(string_field(arguments, "selection"));
-        if (name == "context_unpin")
-          return context_.unpin(string_field(arguments, "selection"));
-        if (name == "context_units")
-          return format_context_units();
+        if (name == "context_compact")
+          return context_compact(arguments);
+        if (name == "context_read")
+          return context_read(arguments);
         if (name == "rageshake") {
           const RawAdapterContext origin{
               nullptr,
@@ -6751,27 +6435,6 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
                                                      : Value::object({}));
         if (name == "tasks_edit")
           return tasks_.edit(arguments, {}, &domain_admission);
-        if (name == "context_inspect")
-          return context_.inspect(field(arguments, "query"));
-        if (name == "context_stats")
-
-          return stats();
-        if (name == "context_view")
-          return context_.view();
-        if (name == "context_edit") {
-          auto res = context_.edit(field(arguments, "candidate"), {},
-                                   ContextStore::EditKeys::strict);
-          if (res.find("accepted") && field(res, "accepted") == Value{true})
-            ++upstream_epoch_;
-          return res;
-        }
-        if (name == "context_originals")
-          return context_.originals();
-        if (name == "context_restore") {
-          context_.restore(string_field(arguments, "entry"));
-          ++upstream_epoch_;
-          return context_.view();
-        }
         if (name == "lua") {
           if (runtime_)
             runtime_->error.clear();
@@ -6875,15 +6538,11 @@ Value CodingEngine::stats() const {
                         Value{std::string{error_name(journal.extent_error->code)}}},
                        {"detail", Value{Number{journal.extent_error->detail}}}})
                 : Value{}}}));
-  result.object().emplace_back(
-      "context_budget",
-      budget_view(string_field(program_config_, "model").empty()
-                      ? model_
-                      : string_field(program_config_, "model"),
-                  unwrap(encode_packet_string(Value{context_.items()})).size()));
   result.object().emplace_back("last_request_bytes", last_request_bytes_);
   result.object().emplace_back("usage", usage_);
   result.object().emplace_back("upstream_epoch", number(upstream_epoch_));
+  result.object().emplace_back("pending_compactions",
+                               number(pending_compactions_.size()));
   Value::Object session_usage{
       {"requests", number(telemetry_.requests)},
       {"input_tokens", number(telemetry_.input_tokens)},
@@ -7143,39 +6802,12 @@ bool CodingEngine::operator_turn(std::string_view prompt, std::string_view fallb
   });
 }
 void CodingEngine::turn(TurnInput input) {
-  RawTurnTrace trace{turn_running_, backstop_claimed_, generation_, context_.head()};
-  std::uint8_t branch = 4, stage = 0;
-  std::optional<Error> terminal_error;
-  struct Terminal {
-    RawTurnTrace &trace;
-    std::uint8_t &branch, &stage;
-    std::optional<Error> &error;
-    ~Terminal() { trace.finish(branch, stage, error); }
-  } terminal{trace, branch, stage, terminal_error};
-  if (backstop_claimed_ || turn_running_) {
-    branch = 1;
-    terminal_error = Error{ErrorCode::conflict};
-    throw *terminal_error;
-  }
-  if (file_effect_unretained_) {
-    branch = 1;
-    terminal_error = Error{ErrorCode::incomplete};
-    throw *terminal_error;
-  }
-  if (context_.read_only()) {
-    branch = 1;
-    terminal_error = Error{ErrorCode::audit_unavailable};
-    throw *terminal_error;
-  }
+  if (backstop_claimed_ || turn_running_)
+    throw Error{ErrorCode::conflict};
+  if (file_effect_unretained_)
+    throw Error{ErrorCode::incomplete};
   const auto is_null = [](const Value &value) noexcept {
     return std::holds_alternative<std::nullptr_t>(value.value());
-  };
-  const auto state = [&](std::uint8_t reached) noexcept {
-    trace.state(reached, {turn_running_, backstop_claimed_, capacity_stopped_,
-                          !is_null(pending_budget_), !is_null(pending_program_config_),
-                          !is_null(pending_lua_tools_), bool(pending_workflows_),
-                          workflow_depth_, workflow_invocations_, operation_depth_,
-                          unretained_bytes_});
   };
   const auto clear_value = [](Value &value) noexcept {
     const auto discarded = std::move(value);
@@ -7183,189 +6815,95 @@ void CodingEngine::turn(TurnInput input) {
   const auto clear_pending = [&]() noexcept {
     pending_program_trace_.finish(2);
     pending_tools_trace_.finish(2);
-    clear_value(pending_budget_);
     pending_workflows_.reset();
     clear_value(pending_program_config_);
     pending_program_revision_.clear();
     clear_value(pending_lua_tools_);
     pending_tools_revision_.clear();
-    pending_budget_revision_.clear();
   };
-  auto *previous_trace = turn_trace_;
-  turn_trace_ = &trace;
   turn_running_ = true;
   struct Running {
     CodingEngine &engine;
-    RawTurnTrace *previous;
-    const decltype(state) &capture;
     ~Running() {
       engine.turn_running_ = false;
-      if (!previous) {
-        // Model calls and the decoded result_ref page source live for one turn.
-        engine.model_calls_.clear();
-        engine.answered_calls_.clear();
-        engine.declared_turn_ = false;
-        engine.shaped_texts_.clear();
-        engine.cached_result_ref_.clear();
-        engine.cached_result_text_ = std::string{};
-      }
+      engine.model_calls_.clear();
+      engine.answered_calls_.clear();
+      engine.declared_turn_ = false;
+      engine.shaped_texts_.clear();
+      engine.cached_result_ref_.clear();
+      engine.cached_result_text_ = std::string{};
       for (auto &continuation : engine.workflow_continuations_)
         continuation.parked.finish(1);
       engine.workflow_continuations_.clear();
       engine.operator_arguments_.reset();
-      capture(5);
-      engine.turn_trace_ = previous;
-    }
-  } running{*this, previous_trace, state};
-  auto &root = log_.root();
-  const RawContextOrigin origin{trace.reference()};
-  const RawContextOrigin stop_origin{trace.reference(), trace.context_bank(),
-                                     trace.region_bank(),
-                                     RawContextOrigin::Input::no_new};
-  WorkflowAcceptance acceptance;
-  bool workflow_began = false, activation_applied = false;
-  bool activate_program = false, activate_tools = false, activate_budget = false;
-  const auto apply_activation = [&]() noexcept {
-    if (!acceptance.boundary_program_accepted || activation_applied)
-      return;
-    if (activate_program) {
-      program_config_.swap(pending_program_config_);
-      program_revision_.swap(pending_program_revision_);
-      workflows_.swap(pending_workflows_);
-    }
-    if (activate_tools) {
-      lua_tools_.swap(pending_lua_tools_);
-      tools_revision_.swap(pending_tools_revision_);
-    }
-    if (activate_budget) {
-      budget_.swap(pending_budget_);
-      budget_revision_.swap(pending_budget_revision_);
-    }
-    activation_applied = true;
-    if (activate_program)
-      pending_program_trace_.finish(0, nullptr, trace.activation(0, program_revision_));
-    if (activate_tools)
-      pending_tools_trace_.finish(0, nullptr, trace.activation(1, tools_revision_));
-    if (activate_budget)
-      trace.activation(2, budget_revision_);
-    clear_pending();
-  };
-  const auto placeholders = [&](bool interrupted, RawContextOrigin context_origin) {
-    const auto request = trace.placeholder_request(interrupted, context_.head());
-    try {
-      auto result = ContextStore::stop_outputs(
-          field(context_.view(context_origin), "entries").array(), interrupted);
-      trace.placeholder_return(request, RawPlaceholderOutcome::returned, result.size());
-      return result;
-    } catch (const Error &error) {
-      trace.placeholder_return(request, RawPlaceholderOutcome::error, 0, error);
-      throw;
-    } catch (const std::bad_alloc &) {
-      trace.placeholder_return(request, RawPlaceholderOutcome::allocation);
-      throw;
-    } catch (...) {
-      trace.placeholder_return(request, RawPlaceholderOutcome::unknown);
-      throw;
-    }
-  };
-  struct SettlementRelease {
-    CodingEngine &engine;
-    ~SettlementRelease() {
       if (!engine.command_jobs_->debt())
         engine.settlement_.reset();
     }
-  } settlement_release{*this};
-  struct Reset {
-    ContextStore &context;
-    ~Reset() { context.protect = {}; }
-  } reset{context_};
+  } running{*this};
+
+  auto &root = log_.root();
   try {
-    // The null business value is prepared before effects; cleanup uses moves.
-    const Value empty;
     const auto rollback = [&](const Error *error) {
-      commit_pending_next_request_ = false;
-      apply_activation();
+      pending_compactions_.clear();
       clear_pending();
-      context_.protect = {};
-      stage = 4;
-      state(stage);
-      RetainedState::MaintenanceScope maintenance{root};
-      std::optional<RawRetainedScope> stop;
-      if (auto *bundle = root.raw_stop_bundle(); bundle && bundle->semantic)
-        stop.emplace(root, *bundle->semantic, bundle->physical.get(),
-                     trace.reference());
-      if (workflow_began)
-        (void)context_.finish_workflow(false, empty, stop_origin);
       restart_note_.reset();
       if (error &&
           (error->code == ErrorCode::interrupted ||
            error->code == ErrorCode::capacity) &&
           root.state() == JournalWriterState::live) {
-        auto results = placeholders(error->code == ErrorCode::interrupted, stop_origin);
-        if (!results.empty())
-          context_.append(std::move(results), "stop.linkage", stop_origin);
+        RetainedState::MaintenanceScope maintenance{root};
+        (void)context_.close_open_exchanges(error->code == ErrorCode::interrupted);
       }
     };
     try {
       failed_turn_.reset();
-      commit_pending_next_request_ = false;
+      pending_compactions_.clear();
       clear_value(workflow_result_);
       workflow_continuations_.clear();
       workflow_invocations_ = 0;
       workflow_failure_.reset();
       clear_pending();
-      repairable_outputs_ = placeholders(false, origin);
       restart_note_.reset();
       capacity_stopped_ = false;
       unretained_bytes_ = 0;
-      state(stage);
-      const bool existed = bool(settlement_);
-      auto credit = context_.cancellation_budget(
-          field(context_.view(origin), "entries").array(), empty, origin);
-      credit.max_file_bytes += (1 + command_jobs_->debt()) * 8192;
-      credit.max_records += (1 + command_jobs_->debt()) * 16;
-      if (!settlement_)
-        settlement_ = unwrap(root.protect_settlement(credit));
-      else
-        unwrap(root.refresh_settlement(credit));
-      trace.admission(existed, credit, root.cursor());
-      context_.protect = [this](const Value::Array &entries, const Value &proposal,
-                                const RawEventRef &parent) {
-        protect_workflow(entries, proposal, parent);
-      };
-      context_.begin_workflow(origin);
-      workflow_began = true;
-      stage = 1;
-      state(stage);
-      generation_ = unwrap(root.issue<DefinitionGenerationId>());
-      root_source_.reset();
-      const auto source_request = trace.source_request(generation_, input.program);
-      try {
-        root_source_ = log_.retain_program(input.program, generation_);
-        trace.source_return(source_request, 0, root_source_);
-      } catch (const Error &error) {
-        trace.source_return(source_request, 1, {}, error);
-        throw;
-      } catch (const std::bad_alloc &) {
-        trace.source_return(source_request, 2);
-        throw;
-      } catch (...) {
-        trace.source_return(source_request, 3);
-        throw;
+
+      // Reserve a small fixed headroom so an out-of-space or interrupted turn can
+      // still record its terminal observation and stop linkage without closing the log.
+      {
+        const std::uint64_t active = 1 + command_jobs_->debt();
+        const JournalCapacity floor{16 * 1024 + active * 8192, 16 + active * 16};
+        if (settlement_) {
+          (void)root.refresh_settlement(floor);
+        } else if (auto guard = root.protect_settlement(floor); guard.has_value()) {
+          settlement_ = std::move(guard).value();
+        }
       }
-      root_source_length_ = input.program.size();
+
+      // Close any dangling unanswered tool calls left over from an earlier crash/abort.
+      if (context_.has_open_exchanges())
+        (void)context_.close_open_exchanges(false);
+
+      // Retain governing program source only when it changes (avoids repeating the
+      // exact same turn.lua into the audit journal on every single turn).
+      if (input.program != last_retained_program_ || !root_source_.has_value()) {
+        generation_ = unwrap(root.issue<DefinitionGenerationId>());
+        root_source_ = log_.retain_program(input.program, generation_);
+        root_source_length_ = input.program.size();
+        last_retained_program_ = std::string{input.program};
+      }
+
       if (!input.prompt.empty())
         context_.append(
             {Value::object({{"role", Value{"user"}},
                             {"content", Value{std::string{input.prompt}}}})},
-            "operator", origin);
-      stage = 2;
-      state(stage);
+            "operator", BlockKind::instruction);
+
       runtime_ = std::make_unique<Runtime>(*this);
       workflow_result_ = runtime_->eval(
           input.program, operator_arguments_ ? &*operator_arguments_ : nullptr);
       operator_arguments_.reset();
       drain_workflows();
+
       if (workflow_failure_)
         throw *workflow_failure_;
       if (capacity_stopped_)
@@ -7373,39 +6911,39 @@ void CodingEngine::turn(TurnInput input) {
       if (cancelled && cancelled())
         throw Error{ErrorCode::interrupted};
       if (restart_note_)
-        validate_protocol(context_.items(origin), trace.reference());
-      activate_program = !is_null(pending_program_config_);
-      activate_tools = !is_null(pending_lua_tools_);
-      activate_budget = !is_null(pending_budget_);
-      const auto boundary_program =
-          !activate_budget && !activate_tools && !activate_program
-              ? empty
-              : Value::object(
-                    {{"label", Value{"workflow-config-effective-v1"}},
-                     {"program_config",
-                      activate_program ? pending_program_config_ : program_config_},
-                     {"program_revision",
-                      Value{activate_program ? pending_program_revision_
-                                             : program_revision_}},
-                     {"policy", activate_budget ? pending_budget_ : budget_},
-                     {"revision", Value{activate_budget ? pending_budget_revision_
-                                                        : budget_revision_}},
-                     {"tools", activate_tools ? pending_lua_tools_ : lua_tools_},
-                     {"tools_revision", Value{activate_tools ? pending_tools_revision_
-                                                             : tools_revision_}},
-                     {"activation", Value{"successful-workflow-boundary"}}});
-      stage = 3;
-      state(stage);
-      auto settlement =
-          context_.finish_workflow(true, boundary_program, origin, &acceptance);
-      if (settlement.find("accepted") && field(settlement, "accepted") == Value{true})
-        ++upstream_epoch_;
-      apply_activation();
-      if (!is_null(settlement) && display) {
-        try {
-          display("Managed context: " + unwrap(format_value(settlement)) + "\n");
-        } catch (...) { /* Notification cannot undo committed workflow work. */
+        validate_protocol(context_.items());
+
+      // Flush any deferred context compactions cleanly at the turn boundary.
+      (void)flush_pending_compactions("turn end");
+
+      // Activate any pending Lua program config or tool definitions cleanly at turn
+      // end.
+      const bool activate_program = !is_null(pending_program_config_);
+      const bool activate_tools = !is_null(pending_lua_tools_);
+      if (activate_program || activate_tools) {
+        const auto boundary_program = Value::object(
+            {{"label", Value{"workflow-config-effective-v1"}},
+             {"program_config",
+              activate_program ? pending_program_config_ : program_config_},
+             {"program_revision",
+              Value{activate_program ? pending_program_revision_ : program_revision_}},
+             {"tools", activate_tools ? pending_lua_tools_ : lua_tools_},
+             {"tools_revision",
+              Value{activate_tools ? pending_tools_revision_ : tools_revision_}},
+             {"activation", Value{"turn-boundary"}}});
+        (void)log_.record(ApplicationChannel::program, boundary_program);
+        if (activate_program) {
+          program_config_.swap(pending_program_config_);
+          program_revision_.swap(pending_program_revision_);
+          workflows_.swap(pending_workflows_);
+          pending_program_trace_.finish(0);
         }
+        if (activate_tools) {
+          lua_tools_.swap(pending_lua_tools_);
+          tools_revision_.swap(pending_tools_revision_);
+          pending_tools_trace_.finish(0);
+        }
+        clear_pending();
       }
     } catch (const Error &error) {
       rollback(&error);
@@ -7414,19 +6952,14 @@ void CodingEngine::turn(TurnInput input) {
       rollback(nullptr);
       throw;
     }
-    branch = 0;
   } catch (const Error &error) {
     failed_turn_ = error;
-    terminal_error = error;
-    branch = 2;
     throw;
   } catch (const std::bad_alloc &) {
     failed_turn_ = Error{ErrorCode::allocation};
-    branch = 3;
     throw;
   } catch (...) {
     failed_turn_ = Error{ErrorCode::external_unknown};
-    branch = 4;
     throw;
   }
 }

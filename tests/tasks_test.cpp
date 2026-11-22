@@ -170,11 +170,7 @@ int main() {
                     "note") == "Lua update",
             "model task projection absent");
       check(tasks.snapshot() == viewer.snapshot(), "viewer diverged from owner");
-      auto compacted = context.view();
-      for (auto &[key, value] : compacted.object())
-        if (key == "entries")
-          value = Value{Value::Array{}};
-      check(std::get<bool>(field(context.edit(compacted), "accepted").value()),
+      check(field(context.replace_blocks(Value{Value::Array{}}), "ok") == Value{true},
             "fixture compaction rejected");
       engine.turn({"after compaction", "blackbird.request()"});
       const auto &compacted_state = field(provider.request, "input").array().back();

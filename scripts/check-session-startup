@@ -88,10 +88,10 @@ with tempfile.TemporaryDirectory(prefix='blackbird-startup-') as temporary:
         assert directories() == before
 
     # The wrapper must retain its newly allocated path across exit-75 refit.
-    workflow.write_text('''local items=blackbird.context().entries
-local last=items[#items].item.content
+    workflow.write_text('''local bs=blackbird.blocks().blocks
+local last=blackbird.read_block(bs[#bs].id).content
 if last:find("Restart/resume note:",1,true) then
-  assert(#items==2 and items[1].item.content=="START_FRESH")
+  assert(#bs==2 and blackbird.read_block(bs[1].id).content:find("START_FRESH",1,true))
   assert(last:find("SAME_FRESH_SESSION",1,true))
   print("FRESH_RESTART_OK")
 else

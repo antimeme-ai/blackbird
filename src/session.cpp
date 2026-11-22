@@ -571,12 +571,8 @@ bool SessionStore::resume(ContextStore &context, const RawAdapterContext *captur
       const auto origin = "rrc:" + token;
       (void)raw_restart_source(call, 3, origin, origin_credit);
       call.stage(2);
-      // A note injected before a crash is a live entry whose creating record carries
-      // this origin, read by identity lookup (design §19): a checkpoint between the
-      // note and `consumed` cannot hide it from a compact reopen's tail.
-      const bool injected = raw_restart_predicate(call, 4, [&] {
-        return context.live_origin(origin, RawContextOrigin{call.reference()});
-      });
+      const bool injected =
+          raw_restart_predicate(call, 4, [&] { return context.live_origin(origin); });
       if (!raw_restart_predicate(call, 5, [&] { return injected; })) {
         constexpr std::string_view prefix = "continue\n\nRestart/resume note:\n";
         const auto &note = string_field(restart_, "note");
@@ -587,7 +583,7 @@ bool SessionStore::resume(ContextStore &context, const RawAdapterContext *captur
         (void)raw_restart_source(call, 4, message, message_credit);
         context.append({Value::object({{"role", Value{"user"}},
                                        {"content", Value{std::move(message)}}})},
-                       origin, RawContextOrigin{call.reference()});
+                       origin, BlockKind::instruction);
       }
       call.stage(3);
       (void)raw_restart_source(call, 5, "consumed");

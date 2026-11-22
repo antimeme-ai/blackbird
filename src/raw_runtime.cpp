@@ -12,7 +12,6 @@
 #include "blackbird/raw_candidate.hpp"
 #include "blackbird/raw_command.hpp"
 #include "blackbird/raw_complaint.hpp"
-#include "blackbird/raw_context.hpp"
 #include "blackbird/raw_file.hpp"
 #include "blackbird/raw_input.hpp"
 #include "blackbird/raw_operation.hpp"
@@ -28,7 +27,6 @@
 #include "blackbird/raw_station.hpp"
 #include "blackbird/raw_storage.hpp"
 #include "blackbird/raw_tasks.hpp"
-#include "blackbird/raw_turn.hpp"
 #include "blackbird/raw_ui.hpp"
 
 #include <algorithm>
@@ -464,8 +462,6 @@ void write_descriptions(const std::string &path) {
   write_description(file.value, provider_original_description());
   write_description(file.value, raw_participants_description());
   write_description(file.value, raw_query_description());
-  write_description(file.value, raw_turn_description());
-  write_description(file.value, raw_context_description());
   write_description(file.value, raw_operation_description());
   write_description(file.value, raw_storage_description());
   write_description(file.value, raw_retained_description());

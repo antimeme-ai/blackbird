@@ -13,12 +13,12 @@ environment = dict(os.environ, ARCO_EXECUTABLE=binary)
 with tempfile.TemporaryDirectory(prefix="arco-rrc-") as tmp:
     root = Path(tmp)
     workflow = root / 'turn.lua'
-    workflow.write_text('''local items=arco.context().entries
-local last=items[#items].item.content
+    workflow.write_text('''local bs=arco.blocks().blocks
+local last=arco.read_block(bs[#bs].id).content
 local pid=arco.call("exec", {command='printf "%s" "$PPID"'}).output
 if last:find("Restart/resume note:",1,true) then
   assert(last:find("CHECKS_PASSED_NEXT_VERIFY",1,true))
-  assert(#items==2 and items[1].item.content=="FIRST_PROMPT")
+  assert(#bs==2 and arco.read_block(bs[1].id).content:find("FIRST_PROMPT",1,true))
   print("NEW_PID="..pid)
   print("RRC_OK")
 else

@@ -85,10 +85,7 @@ void exercise(const std::filesystem::path &path) {
   ContextStore context{log};
   Provider provider;
   CodingEngine engine{log, context, provider, "gpt-6.1-sol"};
-  engine.turn({"", R"(
-    assert(blackbird.call('context_budget',{proposal={enabled=true,trigger_bytes=100,
-      target_bytes=50,reason='specification'}}).staged)
-  )"});
+  (void)engine.tasks().operator_command("add CACHE_STATE_FIXTURE");
   constexpr std::string_view request = R"(
     blackbird.request({instructions='unchanged instruction',cache_policy='stable_prefix',
       input={{type='function_call',call_id='c',name='fixture',arguments={x=1}},
@@ -98,7 +95,7 @@ void exercise(const std::filesystem::path &path) {
   check(string_field(provider.native, "instructions") == "unchanged instruction");
   const auto &items = field(provider.native, "input").array();
   check(items.size() == 3 && string_field(items.back(), "role") == "developer");
-  check(string_field(items.back(), "content").find("CONTEXT_BUDGET") !=
+  check(string_field(items.back(), "content").find("CURRENT_TASKS") !=
         std::string::npos);
   check(context.items().empty());
   check(!provider.wire.find("blackbird_cache_policy") &&

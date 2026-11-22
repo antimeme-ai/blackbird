@@ -336,10 +336,11 @@ void append_marker(RetainedState &root, const char *label) {
   log.record(ApplicationChannel::program, Value::object({{"label", Value{label}}}));
 }
 Value saved_context() {
-  return Value::object({{"version", Value{Number{"1"}}},
-                        {"base", Value{std::string(32, '0')}},
-                        {"entries", Value{Value::Array{}}},
-                        {"live_originals", Value{Value::Array{}}}});
+  return Value::object({{"version", Value{Number{std::uint64_t{3}}}},
+                        {"head", Value{std::string(32, '0')}},
+                        {"next_id", Value{Number{std::uint64_t{1}}}},
+                        {"blocks", Value{Value::Array{}}},
+                        {"archived", Value{Value::Array{}}}});
 }
 void saved_selection() {
   Directory directory;
@@ -678,17 +679,6 @@ void canceled_context_loan() {
     context.append({Value::object({{"role", Value{"user"}},
                                    {"content", Value{"native held stop"}}})},
                    "before.stop");
-    const auto view = context.view();
-    const auto entry = string_field(field(view, "entries").array().front(), "id");
-    context.begin_workflow();
-    const auto proposal =
-        Value::object({{"base", Value{context.head()}},
-                       {"mode", Value{"select"}},
-                       {"reason", Value{"native canceled settlement"}},
-                       {"source", Value{"native.fixture"}},
-                       {"ids", Value{Value::Array{Value{entry}}}}});
-    require(field(context.manage(proposal), "staged") == Value{true},
-            "real context proposal is pending before cancellation");
     context.append({Value::object({{"type", Value{"function_call"}},
                                    {"call_id", Value{"native.call"}},
                                    {"name", Value{"native"}},
@@ -698,9 +688,7 @@ void canceled_context_loan() {
     auto *bundle = root->raw_stop_bundle();
     require(bundle && bundle->semantic && bundle->physical,
             "complete semantic and physical stop banks preadmitted");
-    auto held = unwrap(raw_claim_control(9198));
-    auto control = unwrap(held.split(2286));
-    auto regions = unwrap(held.split(6912));
+    auto regions = unwrap(raw_claim_control(6912));
     const auto cancellation = unwrap(raw_socket_pair());
     struct Close {
       std::array<int, 2> descriptors;
@@ -732,7 +720,6 @@ void canceled_context_loan() {
     require(::shutdown(cancellation[1], SHUT_WR) == 0,
             "actual sticky native cancellation EOF");
     const auto before = root->cursor();
-    WorkflowAcceptance accepted;
     const char *stage = "held scope activation";
     try {
       {
@@ -751,23 +738,12 @@ void canceled_context_loan() {
                     !denied_read.has_value() &&
                     denied_read.error().code == ErrorCode::capacity,
                 "resident public inspection refuses before stealing prepaid stop loan");
-        const RawContextOrigin origin{
-            {}, &control, &regions, RawContextOrigin::Input::no_new};
-        stage = "held context rejection";
-        (void)context.finish_workflow(false, Value{}, origin, &accepted);
-        stage = "held context view";
-        const auto stopping = context.view(origin);
-        auto outputs =
-            ContextStore::stop_outputs(field(stopping, "entries").array(), true);
-        require(outputs.size() == 1,
-                "native canceled tool has one existing unanswered output");
         stage = "held stop linkage publication";
-        context.append(std::move(outputs), "stop.linkage", origin);
-        require(accepted.context_settlement_accepted &&
-                    !accepted.boundary_program_accepted &&
-                    root->cursor().sequence > before.sequence,
-                "actual canceled context rejection and stop linkage preserve accepted "
-                "custody using held banks");
+        RawRegionPrepaidScope paid{&regions};
+        const auto closed = context.close_open_exchanges(true);
+        require(
+            closed == 1 && root->cursor().sequence > before.sequence,
+            "actual canceled stop linkage preserves accepted custody using held banks");
       }
     } catch (const Error &error) {
       std::cerr << "canceled semantic native stage=" << stage
@@ -778,7 +754,7 @@ void canceled_context_loan() {
                 unwrap(root->fact(resident)).record,
             "ordinary authorized resident readers remain available after stop scope "
             "restoration");
-    require(context.pending_proposal() == Value{} &&
+    require(!context.has_open_exchanges() &&
                 string_field(context.items().back(), "type") == "function_call_output",
             "semantic scope restoration leaves exact business stop output available");
   }

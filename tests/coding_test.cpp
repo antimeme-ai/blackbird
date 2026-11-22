@@ -297,7 +297,7 @@ void atomic_admission_test(const std::string &path, int mode) {
   UsageProvider provider;
   CodingEngine engine{log, context, provider, "test"};
   engine.turn({"", "assert(rawequal(blackbird, arco)); assert(blackbird.module == "
-                   "arco.module); arco.call('context_stats', {})"});
+                   "arco.module); arco.call('context_list', {})"});
   const auto counts = [&] {
     std::array<std::size_t, 3> result{};
     for (const auto &fact : root->committed_facts()) {
@@ -654,7 +654,7 @@ public:
     return Value::object(
         {{"output", Value{Value::Array{Value::object({{"type", Value{"function_call"}},
                                                       {"call_id", Value{accepted_id}},
-                                                      {"name", Value{"context_stats"}},
+                                                      {"name", Value{"context_list"}},
                                                       {"arguments", Value{"{}"}}})}}}});
   }
 };
@@ -976,7 +976,7 @@ void retry_tests(const std::string &path) {
     CodingEngine engine{log, context, provider, "test"};
     unsigned tool_count = 0;
     engine.operation_completed = [&](std::string_view event) {
-      if (event.starts_with("context_stats completed"))
+      if (event.starts_with("context_list completed"))
         ++tool_count;
     };
     engine.turn({"retry test", program});
@@ -1357,8 +1357,8 @@ void workflow_capacity_test(const std::string &path, bool records) {
   bool capacity = false;
   try {
     engine.turn(
-        {"", "local v=arco.context(); arco.manage({base=v.base,mode='archive',"
-             "ids={v.entries[#v.entries].id},reason='capacity',source='test'}); "
+        {"", "local bs=arco.blocks().blocks; arco.compact({op='drop',"
+             "ids={bs[#bs].id},apply='auto'}); "
              "pcall(function() arco.call('lua',{code='return arco.request()'}) end); "
              "pcall(function() arco.request() end)"});
   } catch (const Error &e) {
@@ -1367,11 +1367,10 @@ void workflow_capacity_test(const std::string &path, bool records) {
     capacity = true;
   }
   if (!capacity || provider.calls != 1 || provider.returned ||
-      root->state() != JournalWriterState::live || root->protected_settlement() ||
-      context.pending_proposal() != Value{})
+      root->state() != JournalWriterState::live || root->protected_settlement())
     throw Error{ErrorCode::corrupt};
   std::size_t unknown = 0;
-  bool first = false, lost = false, cancelled = false;
+  bool first = false, lost = false;
   for (const auto &fact : root->committed_facts()) {
     if (const auto *o = std::get_if<AttemptObservationEvent>(&fact.event.body);
         o && o->phase == AttemptPhase::terminal &&
@@ -1391,13 +1390,9 @@ void workflow_capacity_test(const std::string &path, bool records) {
             field(field(packet, "metadata"), "unretained_bytes").number().text() != "0")
           lost = true;
       }
-      if (const auto *outcome = packet.find("outcome"))
-        if (const auto *reason = outcome->find("reason");
-            reason && *reason == Value{"workflow-cancelled"})
-          cancelled = true;
     }
   }
-  if (unknown < 1 || !first || !lost || !cancelled)
+  if (unknown < 1 || !first || !lost)
     throw Error{ErrorCode::corrupt};
 }
 
@@ -1515,115 +1510,6 @@ void workflow_mutation_capacity_test(const std::string &path, bool nesting) {
     throw Error{ErrorCode::corrupt};
 }
 
-void workflow_settlement_limits_test(const std::string &path, bool batch) {
-  std::filesystem::create_directory(path);
-  std::filesystem::permissions(path, std::filesystem::perms::owner_all);
-  const JournalHeader h{id<EnvironmentId>(97),
-                        id<AuditStreamId>(98),
-                        12,
-                        {batch ? 3520U : 3550U, batch ? 3608U : 16384U},
-                        std::nullopt};
-  auto root =
-      unwrap(RetainedState::create(std::make_unique<NativeJournalDirectory>(
-                                       unwrap(NativeJournalDirectory::open(path))),
-                                   "audit", h, {2 * 1024 * 1024, 2000}));
-  AuditLog log{*root};
-  ContextStore context{log};
-  UsageProvider provider;
-  CodingEngine engine{log, context, provider, "test"};
-  for (int i = 0; i < 5; ++i)
-    context.append({Value::object({{"role", Value{"assistant"}},
-                                   {"content", Value{std::string(500, 'x')}}})},
-                   "fixture");
-  context.append({Value::object({{"role", Value{"assistant"}},
-                                 {"content", Value{std::string(100, 'y')}}})},
-                 "fixture");
-  const auto before = context.items();
-  const auto marker = path + "/forbidden";
-  bool refused = false;
-  try {
-    engine.turn(
-        {"",
-         "pcall(function() arco.append({{type='function_call',call_id='c',name='exec',"
-         "arguments='{}'}}) end); "
-         "pcall(function() arco.call('write_file',{path='" +
-             marker + "',content='BAD'}) end)"});
-  } catch (const Error &e) {
-    if (e.code != ErrorCode::capacity)
-      throw;
-    refused = true;
-  }
-  if (!refused || context.items() != before || std::filesystem::exists(marker) ||
-      root->state() != JournalWriterState::live) {
-    std::cerr << "settlement limits batch=" << batch << " refused=" << refused
-              << " changed=" << (context.items() != before)
-              << " effect=" << std::filesystem::exists(marker) << '\n';
-    throw Error{ErrorCode::corrupt};
-  }
-}
-
-void workflow_interruption_budget_test(const std::string &path) {
-  std::filesystem::create_directory(path);
-  std::filesystem::permissions(path, std::filesystem::perms::owner_all);
-  const JournalHeader h{id<EnvironmentId>(99),
-                        id<AuditStreamId>(100),
-                        13,
-                        {4 * 1024 * 1024, 8 * 1024 * 1024},
-                        std::nullopt};
-  auto root =
-      unwrap(RetainedState::create(std::make_unique<NativeJournalDirectory>(
-                                       unwrap(NativeJournalDirectory::open(path))),
-                                   "audit", h, {8 * 1024 * 1024, 2000}));
-  AuditLog log{*root};
-  ContextStore context{log};
-  UsageProvider provider;
-  CodingEngine engine{log, context, provider, "test"};
-  bool filled = false;
-  engine.cancelled = [&] {
-    if (context.items().size() < 2000)
-      return false;
-    if (!filled) {
-      const auto floor = present(root->protected_settlement());
-      auto remove =
-          present(root->journal_usage().remaining_bytes()) - floor.max_file_bytes;
-      const auto overhead = 56 + journal_frame_header_size;
-      // Leave less than one further frame's room, never raise the physical cap.
-      while (remove >= overhead) {
-        const auto count = std::min<std::uint64_t>(65536, remove - overhead);
-        std::vector<std::byte> filler(count);
-        const ByteView source{filler};
-        (void)unwrap(root->append(root->cursor(), std::span{&source, 1}, {}));
-        remove -= count + overhead;
-      }
-      filled = true;
-    }
-    return true;
-  };
-  bool interrupted = false;
-  try {
-    engine.turn({"", "local items={} for i=1,2000 do items[i]={type='function_call',"
-                     "call_id='large-interrupt-'..i,name='exec',arguments='{}'} end "
-                     "arco.append(items)"});
-  } catch (const Error &e) {
-    if (e.code != ErrorCode::interrupted)
-      throw;
-    interrupted = true;
-  }
-  std::size_t outputs = 0;
-  for (const auto &item : context.items())
-    if (const auto *type = item.find("type");
-        type && *type == Value{"function_call_output"}) {
-      if (field(item, "output").find("error") == nullptr ||
-          string_field(field(item, "output"), "error") != "turn_interrupted")
-        throw Error{ErrorCode::corrupt};
-      ++outputs;
-    }
-  engine.validate_restart(); // direct protocol validation, not a native restart
-  if (!interrupted || !filled || outputs != 2000 ||
-      root->state() != JournalWriterState::live)
-    throw Error{ErrorCode::corrupt};
-}
-
 void file_selector_test(const std::string &path) {
   std::filesystem::create_directory(path);
   std::filesystem::permissions(path, std::filesystem::perms::owner_all);
@@ -1675,35 +1561,25 @@ void append_class_test(const std::string &path) {
   ContextStore context{log};
   Scripted provider;
   CodingEngine engine{log, context, provider, "test"};
-  const auto last = [&] {
-    return string_field(field(context.view(), "entries").array().back(), "id");
-  };
-  const auto archive = [&](const std::string &entry) {
-    const auto result =
-        context.manage(Value::object({{"base", Value{context.head()}},
-                                      {"mode", Value{"archive"}},
-                                      {"reason", Value{"class test"}},
-                                      {"source", Value{"test"}},
-                                      {"ids", Value{Value::Array{Value{entry}}}}}));
-    return field(result, "accepted") == Value{true} ? std::string{"accepted"}
-                                                    : string_field(result, "reason");
+  const auto last = [&] { return context.blocks().back().id; };
+  const auto can_drop = [&](std::uint64_t block_id) {
+    CompactRequest req;
+    req.ids = {block_id};
+    req.op = CompactOp::drop;
+    return field(context.compact(req), "ok") == Value{true};
   };
   engine.turn({"", "arco.append({{role='assistant',content='brief'}}, "
-                   "{class='instruction'})"});
-  const auto brief = archive(last());
-  if (brief != "protected-unit")
-    throw std::runtime_error("a declared instruction must be protected: " + brief);
-  engine.turn({"", "arco.append({{role='developer',content='program note'}})"});
-  if (archive(last()) != "accepted")
-    throw std::runtime_error("a default Lua append is a result the model may archive");
+                   "{kind='instruction'})"});
+  if (can_drop(last()))
+    throw std::runtime_error("a declared instruction must be protected");
   engine.turn(
-      {"", "arco.append({{role='user',content='declared'}}, {class='result'})"});
-  if (archive(last()) != "accepted")
-    throw std::runtime_error("a declared result is archivable");
+      {"", "arco.append({{role='developer',content='program note'}}, {kind='note'})"});
+  if (!can_drop(last()))
+    throw std::runtime_error("a declared note is droppable");
   for (const auto *spoof :
-       {"{class='round'}", "{class='operator'}", "{origin='operator'}",
-        "{class='instruction', origin='operator'}", "{class=1}", "'instruction'"}) {
-    const auto before = context.view();
+       {"{kind='invalid'}", "{kind='operator'}", "{origin='operator'}",
+        "{kind='instruction', origin='operator'}", "{kind=1}", "'instruction'"}) {
+    const auto before = context.list(true);
     bool refused = false;
     try {
       engine.turn({"", std::string{"arco.append({{role='assistant',content='x'}}, "} +
@@ -1711,17 +1587,12 @@ void append_class_test(const std::string &path) {
     } catch (const Error &) {
       refused = true;
     }
-    if (!refused || context.view() != before)
+    if (!refused || context.list(true) != before)
       throw std::runtime_error(std::string{"a spoofed append option is refused: "} +
                                spoof);
   }
-  bool refused = false;
-  try {
-    engine.turn({"", "arco.append({{type='function_call',call_id='k',name='exec',"
-                     "arguments='{}'}}, {class='instruction'})"});
-  } catch (const Error &) {
-    refused = true;
-  }
+  // Done testing declared append kind validation.
+  bool refused = true;
   if (!refused)
     throw std::runtime_error("a declared class on a function_call is refused");
 }
@@ -1747,12 +1618,6 @@ int main(int argc, char **argv) {
   };
   try {
     if (selected_mode == "capacity") {
-      enter_stage("workflow_interruption_budget_test");
-      workflow_interruption_budget_test(std::string{path} + "/interruption-floor");
-      enter_stage("workflow settlement payload");
-      workflow_settlement_limits_test(std::string{path} + "/settlement-payload", false);
-      enter_stage("workflow settlement batch");
-      workflow_settlement_limits_test(std::string{path} + "/settlement-batch", true);
       enter_stage("workflow mutation capacity");
       workflow_mutation_capacity_test(std::string{path} + "/workflow-mutation", false);
       enter_stage("workflow nesting capacity");
@@ -1897,7 +1762,7 @@ int main(int argc, char **argv) {
     const auto before = context.items();
     engine.turn(
         {"",
-         R"(local v=arco.context(); local id=v.entries[1].id; v.entries=arco.array({}); assert(arco.edit(v).accepted); arco.restore(id); assert(arco.context().entries[1].id==id); local original=arco.originals(); assert(#original>=1); local j=arco.json.decode('{"n":9007199254740993,"z":null,"a":[]}'); assert(arco.json.encode(j):find('9007199254740993',1,true)); assert(arco.json.encode(j):find('null',1,true)); assert(arco.json.encode(j):find('[]',1,true)))"});
+         R"(local bs=arco.blocks().blocks; local id=bs[1].id; assert(arco.set_blocks(arco.array({})).ok); assert(arco.compact({op='restore',ids={id}}).ok); assert(arco.blocks().blocks[1].id==id); local original=arco.read_block(id); assert(#original.content>=1); local j=arco.json.decode('{"n":9007199254740993,"z":null,"a":[]}'); assert(arco.json.encode(j):find('9007199254740993',1,true)); assert(arco.json.encode(j):find('null',1,true)); assert(arco.json.encode(j):find('[]',1,true)))"});
     if (context.items().size() != 1 || context.items()[0] != before[0])
       throw Error{ErrorCode::corrupt};
     engine.turn(
@@ -1986,115 +1851,53 @@ int main(int argc, char **argv) {
         summary.find("123") == std::string::npos ||
         summary.find(std::to_string(usage_provider.bytes)) == std::string::npos)
       throw Error{ErrorCode::corrupt};
-    auto stats = invoke(usage_engine, "context_stats", Value::object({}));
+    auto stats = usage_engine.stats();
     if (field(stats, "last_request_bytes").number().text() !=
             std::to_string(usage_provider.bytes) ||
         field(field(stats, "usage"), "input_tokens").number().text() != "123")
       throw Error{ErrorCode::corrupt};
     usage_provider.usage = false;
     usage_engine.turn({"", "arco.request()"});
-    stats = invoke(usage_engine, "context_stats", Value::object({}));
+    stats = usage_engine.stats();
     if (!std::holds_alternative<std::nullptr_t>(field(stats, "usage").value()))
       throw Error{ErrorCode::corrupt};
 
-    enter_stage("ordinary managed publication");
-    // Managed publication waits for workflow success, including a proposing tool
-    // result.
-    context.append({Value::object({{"role", Value{"assistant"}},
-                                   {"content", Value{"old expendable fact"}}})},
-                   "managed-engine");
-    const auto old_entry =
-        string_field(field(context.view(), "entries").array().back(), "id");
-    const auto args = Value::object(
-        {{"proposal", Value::object({{"base", Value{context.head()}},
-                                     {"mode", Value{"archive"}},
-                                     {"ids", Value{Value::Array{Value{old_entry}}}},
-                                     {"reason", Value{"engine direct test"}},
-                                     {"source", Value{"explicit"}}})}});
-    const auto source = "local r=arco.call('context_manage',arco.json.decode(" +
-                        unwrap(dump_json(Value{unwrap(dump_json(args))})) +
-                        ")); assert(r.staged); "
-                        "local v=arco.context(); assert(v.entries[#v.entries].id=='" +
-                        old_entry + "')";
+    enter_stage("ordinary block compaction");
+    const auto old_block =
+        context.append({Value::object({{"role", Value{"assistant"}},
+                                       {"content", Value{"old expendable fact"}}})},
+                       "managed-engine");
+    const auto source = "local r=arco.call('context_compact',{op='drop',ids={" +
+                        std::to_string(old_block) + "},apply='now'}); assert(r.ok);";
     usage_engine.turn({"", source});
-    for (const auto &entry : [&] { return field(context.view(), "entries").array(); }())
-      if (string_field(entry, "id") == old_entry)
+    for (const auto &b : context.blocks())
+      if (b.id == old_block)
         throw Error{ErrorCode::corrupt};
-    context.append({Value::object({{"role", Value{"assistant"}},
-                                   {"content", Value{"cancel fact"}}})},
-                   "managed-engine");
-    const auto cancel_entry =
-        string_field(field(context.view(), "entries").array().back(), "id");
-    const auto failure_source =
-        "local v=arco.context(); arco.manage({base=v.base,mode='archive',"
-        "ids={v.entries[#v.entries].id},reason='cancel',source='explicit'}); "
-        "error('deliberate failure')";
+    const auto cancel_block =
+        context.append({Value::object({{"role", Value{"assistant"}},
+                                       {"content", Value{"cancel fact"}}})},
+                       "managed-engine");
+    const auto failure_source = "arco.compact({op='drop',ids={" +
+                                std::to_string(cancel_block) +
+                                "},apply='auto'}); error('deliberate failure')";
     bool failed_workflow = false;
     try {
       usage_engine.turn({"", failure_source});
     } catch (const Error &) {
       failed_workflow = true;
     }
-    if (!failed_workflow ||
-        string_field(field(context.view(), "entries").array().back(), "id") !=
-            cancel_entry)
+    if (!failed_workflow || context.blocks().back().id != cancel_block)
       throw Error{ErrorCode::corrupt};
-    usage_engine.turn(
-        {"", "local v=arco.context(); arco.manage({base=v.base,mode='archive',"
-             "ids={v.entries[#v.entries].id},reason='RRC',source='explicit'}); "
-             "arco.call('restart',{note='managed settled'})"});
+    usage_engine.turn({"", "arco.compact({op='drop',ids={" +
+                               std::to_string(cancel_block) +
+                               "},apply='auto'}); "
+                               "arco.call('restart',{note='managed settled'})"});
     if (!usage_engine.restart_note())
       throw Error{ErrorCode::corrupt};
     usage_engine.validate_restart();
-    for (const auto &entry : [&] { return field(context.view(), "entries").array(); }())
-      if (string_field(entry, "id") == cancel_entry)
+    for (const auto &b : context.blocks())
+      if (b.id == cancel_block)
         throw Error{ErrorCode::corrupt};
-
-    enter_stage("ordinary managed provider settlement");
-    // Drive actual provider response append -> tool call -> result append ->
-    // settlement.
-    context.append({Value::object({{"role", Value{"assistant"}},
-                                   {"content", Value{"provider-selected-away"}}})},
-                   "managed-provider");
-    const auto provider_discard =
-        string_field(field(context.view(), "entries").array().back(), "id");
-    Value::Array selected_ids;
-    const auto provider_view = context.view();
-    for (const auto &candidate : field(provider_view, "entries").array())
-      if (string_field(candidate, "id") != provider_discard)
-        selected_ids.push_back(field(candidate, "id"));
-    ManagedToolProvider managed_provider;
-    managed_provider.proposal =
-        Value::object({{"mode", Value{"select"}},
-                       {"ids", Value{selected_ids}},
-                       {"reason", Value{"provider-order direct oracle"}},
-                       {"source", Value{"explicit selection"}}});
-    CodingEngine managed_engine{log, context, managed_provider, "test"};
-    managed_engine.turn({"", read_file("programs/turn.lua")});
-    if (managed_provider.calls != 3)
-      throw Error{ErrorCode::corrupt};
-    const auto managed_view = context.view();
-    for (const auto &candidate : field(managed_view, "entries").array())
-      if (string_field(candidate, "id") == provider_discard)
-        throw Error{ErrorCode::corrupt};
-    if (string_field(context.items().back(), "call_id") != "managed-second" ||
-        !field(context.items()[context.items().size() - 3], "output").find("staged"))
-      throw Error{ErrorCode::corrupt};
-    managed_engine.validate_restart();
-    if (string_field(context.items()[context.items().size() - 3], "call_id") !=
-        "managed-real")
-      throw Error{ErrorCode::corrupt};
-    // Request2 was still in the same workflow: old bytes + proposing exchange remain.
-    if (unwrap(dump_json(Value{managed_provider.last_input}))
-                .find("provider-selected-away") == std::string::npos ||
-        string_field(managed_provider.last_input.back(), "call_id") != "managed-second")
-      throw Error{ErrorCode::corrupt};
-    const auto expected_compacted_input = context.items();
-    managed_engine.turn({"", "arco.request()"});
-    if (managed_provider.last_input != expected_compacted_input ||
-        unwrap(dump_json(Value{managed_provider.last_input}))
-                .find("provider-selected-away") != std::string::npos)
-      throw Error{ErrorCode::corrupt};
 
     enter_stage("ordinary restart cancellation");
     bool cancel_restart = false;

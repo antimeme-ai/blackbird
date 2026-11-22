@@ -1,7 +1,7 @@
 #include "blackbird/saved_state.hpp"
 #include "blackbird/packet.hpp"
-#include "blackbird/saved_context.hpp"
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <limits>
 
@@ -55,6 +55,29 @@ Result<void> write_all(Storage &file, ByteView in) {
 Error file_fault(SavedFileFault which) {
   return {ErrorCode::corrupt, static_cast<std::int64_t>(which)};
 }
+Result<void> validate_saved_block_context(const Value &ctx) {
+  if (!std::holds_alternative<Value::Object>(ctx.value()))
+    return Result<void>::failure({ErrorCode::corrupt});
+  const auto *ver = ctx.find("version");
+  const auto *head = ctx.find("head");
+  const auto *next_id = ctx.find("next_id");
+  const auto *blocks = ctx.find("blocks");
+  const auto *archived = ctx.find("archived");
+  if (!ver || !std::holds_alternative<Number>(ver->value()) ||
+      ver->number().text() != "3" || !head ||
+      !std::holds_alternative<std::string>(head->value()) || !next_id ||
+      !std::holds_alternative<Number>(next_id->value()) || !blocks ||
+      !std::holds_alternative<Value::Array>(blocks->value()) ||
+      (archived && !std::holds_alternative<Value::Array>(archived->value())))
+    return Result<void>::failure({ErrorCode::corrupt});
+  for (const auto &b : blocks->array()) {
+    if (!std::holds_alternative<Value::Object>(b.value()) || !b.find("id") ||
+        !b.find("kind") || !b.find("items") || !b.find("pinned") || !b.find("open") ||
+        !std::holds_alternative<Value::Array>(b.find("items")->value()))
+      return Result<void>::failure({ErrorCode::corrupt});
+  }
+  return Result<void>::success();
+}
 } // namespace
 Result<SavedPayload> decode_saved_payload(ByteView body, std::uint64_t file_version,
                                           std::uint64_t context_size,
@@ -97,7 +120,7 @@ Result<SavedPayload> decode_saved_payload(ByteView body, std::uint64_t file_vers
       // single packet carries the whole context. A list is written as its count
       // plus one; zero means the key is not streamed (absent, or kept in the core
       // for the validator to judge).
-      for (const auto *key : {"entries", "sections"}) {
+      for (const auto *key : {"blocks", "archived"}) {
         if (body.size() - offset < 8)
           return fail(SavedFileFault::parts);
         const auto stored = get(body.subspan(offset, 8));
@@ -154,9 +177,9 @@ Result<SavedPayloadSizes> append_saved_payload(std::vector<std::byte> &out,
     Value::Object core_fields;
     std::array<const Value::Array *, 2> parts{};
     for (const auto &[key, value] : context.object()) {
-      if ((key == "entries" || key == "sections") &&
+      if ((key == "blocks" || key == "archived") &&
           std::holds_alternative<Value::Array>(value.value()))
-        parts[key == "entries" ? 0 : 1] = &value.array();
+        parts[key == "blocks" ? 0 : 1] = &value.array();
       else
         core_fields.emplace_back(key, value);
     }
@@ -323,7 +346,7 @@ load_slot(JournalDirectory &directory, std::string_view name, FramedJournal &jou
         return Answer::failure(payload.error());
       return refused(payload.error());
     }
-    if (const auto valid = validate_saved_context(payload.value().context);
+    if (const auto valid = validate_saved_block_context(payload.value().context);
         !valid.has_value()) {
       // Only the validator's corrupt is a refusal; another error fails the load.
       if (valid.error().code != ErrorCode::corrupt)

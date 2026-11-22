@@ -410,24 +410,7 @@ return res)lua")}}}})}});
     check(field(next, "result_ref") == Value{big.ref} &&
           field(next, "byte_start") == number(big.head + 8192) &&
           field(next, "byte_end") == number(big.head + 16384));
-    // The failed selector reads the recorded status of a shaped failure.
-    const auto pinned = context.pin("failed");
-    std::string failing;
-    for (const auto &unit : context.units()) {
-      for (const auto position : unit.entries) {
-        const auto &item =
-            field(field(context.view(), "entries").array()[position], "item");
-        if (const auto *id_value = item.find("call_id");
-            id_value && *id_value == Value{"failing"})
-          failing = unit.handle;
-      }
-    }
-    check(!failing.empty() &&
-          std::holds_alternative<std::string>(outputs(second).at("failing").value()));
-    const auto &accepted = field(pinned, "accepted").array();
-    check(std::find(accepted.begin(), accepted.end(), Value{failing}) !=
-          accepted.end());
-    (void)context.unpin("failed");
+    check(std::holds_alternative<std::string>(outputs(second).at("failing").value()));
 
     // 3. The applied shape is recorded in each boundary's settlement.
     {

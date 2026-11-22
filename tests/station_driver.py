@@ -41,7 +41,9 @@ local n = 0
 local ok, v = pcall(arco.call, 'read_file', {path=p})
 if ok then n = tonumber(v.content) or 0 end
 arco.call('write_file', {path=p,content=tostring(n+1)})
-local c=arco.context()
+local bs=arco.blocks().blocks
+local c={}
+for _,b in ipairs(bs) do c[#c+1]=arco.read_block(b.id).content end
 arco.call('write_file',{path=%s,content=arco.json.encode(c)})
 if tostring(arco.json.encode(c)):find('FAIL_EVENT',1,true) then error('unknown after effect') end
 """ % (json.dumps(str(effect)), json.dumps(str(root / "context.json"))))

@@ -13543,3 +13543,40 @@ coverage in `scripts/check-install-blackbird`:
 - `--prune [--keep N] [--prefix DIR]`: atomically prunes excess older generations
   (default `--keep 3`), always preserving the active `current` generation even when
   rolled back to an older generation.
+
+
+## 2026-11-21 — Clean-Slate Block Context & Turn Accounting Simplification
+
+Replaced the dual-API context machinery (`context_units`, `context_cut`, `saved_context`,
+`raw_context`, `raw_turn`, 12 overlapping `context_*` tools, and transactional staging
+in `CodingEngine::turn()`) with a single unified Block model and clean turn execution
+(net **-14,381 LOC** across 59 files):
+
+1. **Unified Block Context (`include/blackbird/context.hpp`, `src/context.cpp`,
+   `ContextStore::format_level = 2`, snapshot `version = 3`, packet `v = 3`):**
+   - One monotonic integer block ID (`1, 2, 3...`) across live and archived blocks.
+   - Automatic exchange folding: appending `function_call_output` items folds them
+     into the matching open `exchange` block by `call_id` and marks `open = false`
+     once all calls are answered; `close_open_exchanges(interrupted)` appends synthetic
+     outputs (`"turn_interrupted"` / `"turn_stopped"`) for unanswered calls.
+   - Zero-RAM-bloat archival: `ArchivedBlock` stores metadata and journal record
+     identities only, loading originals on demand from `RetainedState`.
+   - Clean format break (`format_level = 2`, snapshot `version = 3`) with no legacy
+     replay shim; older or newer session levels are refused cleanly before recovery.
+2. **3-Tool Model Surface & Lua Parity (`src/tools.cpp`, `src/coding.cpp`):**
+   - Collapsed 12 `context_*` tools to `context_list`, `context_compact` (`drop`,
+     `summarize`, `restore`, `pin`, `unpin` on `ids` and/or `from..to`, with
+     `apply = "auto" | "now"`), and `context_read` (bounded JSON UTF-8 reads of live
+     or archived originals).
+   - Matching Lua helpers: `blackbird.blocks()`, `blackbird.compact()`,
+     `blackbird.read_block()`, `blackbird.set_blocks()`, `blackbird.pin()`,
+     `blackbird.flush_context()`, and compact `blackbird.append()` return values.
+3. **Clean `CodingEngine::turn()` & Deferred Compaction (`src/coding.cpp`):**
+   - Removed `RawTurnTrace`, `WorkflowAcceptance`, `cancellation_budget`,
+     `repairable_outputs_`, `context_repair`, `context_budget`, and per-turn
+     re-retention of unchanged `turn.lua` source.
+   - Replaced heavy staged-context transactions with simple in-memory
+     `pending_compactions_` (flushing free on cold cache, route switch, overflow, or
+     turn end; `apply = "now"` applies immediately and bumps `upstream_epoch_`).
+   - Kept O(1) `SettlementScope` headroom refreshed per admitted operation and held
+     across turns while background command jobs remain active.

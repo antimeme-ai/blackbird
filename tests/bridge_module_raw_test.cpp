@@ -245,24 +245,9 @@ Entry entry(const std::vector<Row> &rows, const Row &row) {
   require(native<bool>(vm));
   const auto journal = native<IdentityBytes>(vm);
   const auto sequence = native<std::uint64_t>(vm);
+  (void)journal;
+  (void)sequence;
   require(vm.empty());
-  bool source_generation = false;
-  for (const auto &source : rows)
-    if (source.site == 1902) {
-      ByteView fields{source.body};
-      (void)ref(fields);
-      if (native<IdentityBytes>(fields) != value.generation)
-        continue;
-      const auto size = native<std::size_t>(fields);
-      require(size == fields.size() && size != 0);
-      ByteView preserved{returned(rows, source.own, 1903).body};
-      (void)ref(preserved);
-      require(native<std::uint8_t>(preserved) == 0);
-      require(native<IdentityBytes>(preserved) == journal &&
-              native<std::uint64_t>(preserved) == sequence && preserved.empty());
-      source_generation = true;
-    }
-  require(source_generation);
   if (row.site == 4800) {
     value.operation = native<int>(body);
     value.arguments = native<int>(body);

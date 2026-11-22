@@ -91,8 +91,8 @@ Snapshot snapshot(const std::string &path, bool indexed, bool expected_used) {
   CHECK(!root->dispatch(id<OperationAttemptId>(15), effect).has_value());
   CHECK(effect.calls == 0);
   return {{root->committed_facts().begin(), root->committed_facts().end()},
-          context.view(),
-          context.originals(),
+          context.list(true),
+          context.read_block(1),
           root->issuer_counter(),
           attempt};
 }
@@ -114,16 +114,19 @@ void reduction_and_corruption() {
   {
     AuditLog log{*root};
     ContextStore context{log};
-    context.append(
-        {Value::object({{"role", Value{"user"}}, {"content", Value{"original"}}})},
+    const auto block_id = context.append(
+        {Value::object({{"role", Value{"assistant"}}, {"content", Value{"original"}}})},
         "fixture");
-    const auto view = context.view();
-    const auto entry = string_field(field(view, "entries").array()[0], "id");
-    const auto edit = Value::object(
-        {{"base", field(view, "base")}, {"entries", Value{Value::Array{}}}});
-    CHECK(std::get<bool>(field(context.edit(edit), "accepted").value()));
-    CHECK(!std::get<bool>(field(context.edit(edit), "accepted").value()));
-    context.restore(entry); // original repair across checkpoint
+    CompactRequest drop_req;
+    drop_req.ids = {block_id};
+    drop_req.op = CompactOp::drop;
+    CHECK(field(context.compact(drop_req), "ok") == Value{true});
+    CHECK(field(context.compact(drop_req), "ok") == Value{false});
+    CompactRequest restore_req;
+    restore_req.ids = {block_id};
+    restore_req.op = CompactOp::restore;
+    CHECK(field(context.compact(restore_req), "ok") ==
+          Value{true}); // original repair across checkpoint
     unwrap(root->publish_scan_checkpoint());
     const auto d = id<DecisionId>(10);
     const auto v = id<InvocationId>(11);
@@ -144,7 +147,7 @@ void reduction_and_corruption() {
     unwrap(root->publish_scan_checkpoint());
     // Durable highwater and no-op/rejected context records in recovery tail.
     unwrap(root->submit({{}, IssuerReservationEvent{root->issuer_counter() + 1000}}));
-    CHECK(!std::get<bool>(field(context.edit(edit), "accepted").value()));
+    CHECK(field(context.compact(restore_req), "ok") == Value{false});
     context.append({}, "no-op");
   }
   const auto complete_end = root->cursor().end_offset;

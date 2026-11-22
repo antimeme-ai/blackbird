@@ -110,7 +110,7 @@ public:
             "provider missed exact ordinary domain refusal");
       output.push_back(Value::object({{"type", Value{"function_call"}},
                                       {"call_id", Value{"later-read"}},
-                                      {"name", Value{"context_stats"}},
+                                      {"name", Value{"context_list"}},
                                       {"arguments", Value{"{}"}}}));
     } else {
       check(calls == 3, "unexpected provider repeat");
@@ -248,7 +248,7 @@ void exercise(const std::string &mode) {
           "refusal-result write failure was treated as recoverable");
     bool blocked = false;
     try {
-      engine.operator_call("context_stats", Value::object({}));
+      engine.operator_call("context_list", Value::object({}));
     } catch (const Error &) {
       blocked = true;
     }

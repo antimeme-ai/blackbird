@@ -278,43 +278,27 @@ Value run_backstop(CodingEngine &source_engine, AuditLog &source_log,
          {"reason", Value{"Cooperative backstop: remote effects remain unknown; no "
                           "inherited admissions"}}});
     Value::Array selected;
-    const auto view = source_engine.context().view(RawContextOrigin{whole.reference()});
-    // Each selected entry carries its source unit, so the successor keeps the
-    // predecessor's units (unit S2) whatever records they now share.
-    std::map<std::string, std::string> unit_of;
-    {
-      const auto &live = field(view, "entries").array();
-      for (const auto &unit :
-           source_engine.context().units(RawContextOrigin{whole.reference()}))
-        for (const auto position : unit.entries)
-          unit_of.emplace(string_field(live[position], "id"), entry_id(unit.key));
-    }
-    const auto with_unit = [&](const Value &entry) {
-      auto copy = entry;
-      if (const auto found = unit_of.find(string_field(entry, "id"));
-          found != unit_of.end())
-        copy.object().emplace_back("unit", Value{found->second});
-      return copy;
-    };
     // Preserve all governing messages and the latest operator prompt, not the huge
     // predecessor working presentation. Refuse oversized authority, never truncate.
-    const auto &entries = field(view, "entries").array();
     const Value *last_user = nullptr;
-    for (const auto &entry : entries) {
-      if (const auto *entry_id = entry.find("id"))
-        (void)source(whole, 20, entry_id->string());
-      const auto &item = field(entry, "item");
-      const auto *role = item.find("role");
-      if (!role)
-        continue;
-      (void)source(whole, 15, role->string());
-      if (role->string() == "system" || role->string() == "developer")
-        selected.push_back(with_unit(entry));
-      if (role->string() == "user")
-        last_user = &entry;
+    for (const auto &block : source_engine.context().blocks()) {
+      for (const auto &item : block.items) {
+        const auto *role = item.find("role");
+        if (!role)
+          continue;
+        (void)source(whole, 15, role->string());
+        if (role->string() == "system" || role->string() == "developer")
+          selected.push_back(Value::object({{"kind", Value{"instruction"}},
+                                            {"label", Value{"seed.instruction"}},
+                                            {"items", Value{Value::Array{item}}}}));
+        if (role->string() == "user")
+          last_user = &item;
+      }
     }
     if (predicate(whole, 44, [&] { return last_user != nullptr; }))
-      selected.push_back(with_unit(*last_user));
+      selected.push_back(Value::object({{"kind", Value{"instruction"}},
+                                        {"label", Value{"seed.instruction"}},
+                                        {"items", Value{Value::Array{*last_user}}}}));
     if (predicate(whole, 5, [&] { return selected.empty(); }) ||
         predicate(whole, 6,
                   [&] { return encoded(whole, 4, Value{selected}).size() > 65536; }))
@@ -390,17 +374,15 @@ Value run_backstop(CodingEngine &source_engine, AuditLog &source_log,
         {64ULL * 1024 * 1024, 20000}, storage_owner));
     mutation(whole, 2, root_mutation);
     AuditLog log{*root};
-    ContextStore context{log, RawContextOrigin{whole.reference()}};
+    ContextStore context{log};
     auto seed_mutation = whole.control(41);
-    context.seed_successor(Value::object({{"version", number(1)},
-                                          {"source", lineage},
-                                          {"entries", Value{selected}}}),
-                           RawContextOrigin{whole.reference()});
+    context.seed_successor(Value::object(
+        {{"version", number(2)}, {"source", lineage}, {"blocks", Value{selected}}}));
     mutation(whole, 3, seed_mutation);
     auto instruction_mutation = whole.control(41);
     context.append({Value::object({{"role", Value{"developer"}},
                                    {"content", Value{std::string{instruction}}}})},
-                   "backstop.instructions", RawContextOrigin{whole.reference()});
+                   "backstop.instructions", BlockKind::instruction);
     mutation(whole, 4, instruction_mutation);
     log.original({"backstop.packet", encoded(whole, 26, packet), Value{}});
     auto restore_credit = whole.control(41);

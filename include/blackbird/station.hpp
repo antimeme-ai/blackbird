@@ -1,5 +1,6 @@
 #pragma once
 #include "blackbird/context.hpp"
+#include <map>
 #include <set>
 namespace blackbird {
 struct RawAdapterContext;

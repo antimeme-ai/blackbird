@@ -515,9 +515,7 @@ void normal_fields(const std::vector<Record> &records, RetainedState &root,
                          input.begin(), input.end()),
           "native operation IDs match actual retained decision/invocation/attempt");
   ByteView request{request_record.bytes};
-  require(read<bool>(request) &&
-              same(reference(request), only(records, 1900).reference),
-          "whole operation parent is actual turn request");
+  require(!read<bool>(request), "top-level operation has no turn-trace parent");
   require(read<IdentityBytes>(request) == ids[3] && read<std::size_t>(request) == 0 &&
               !read<bool>(request) && !read<bool>(request) && request.size() == 57,
           "whole request copies exact preflight native state/clocks");
@@ -1491,10 +1489,8 @@ void maintenance_loan() {
     AuditLog log{*fixture.root};
     ContextStore context{log};
     (void)session_identity(log);
-    require(field(context.edit(Value::object({{"base", Value{context.head()}},
-                                              {"entries", Value{Value::Array{}}}})),
-                  "accepted") == Value{true},
-            "actual Context edit establishes a valid saved revision");
+    require(field(context.replace_blocks(Value{Value::Array{}}), "ok") == Value{true},
+            "actual Context replace establishes a valid saved revision");
     std::cerr << "maintenance initial state="
               << static_cast<unsigned>(fixture.root->state())
               << " seq=" << fixture.root->cursor().sequence << "\n";
@@ -1530,14 +1526,14 @@ void maintenance_loan() {
     std::cerr << "maintenance owner claim\n";
     auto bank = unwrap(raw_claim_control(1024));
     const auto before = bank.remaining();
-    fixture.root->set_maintenance_checkpoint([&](const RawEventRef &parent) {
+    fixture.root->set_maintenance_checkpoint([&](const RawEventRef &) {
       std::cerr << "maintenance actual callback loan=" << bank.remaining()
                 << " before=" << before << "\n";
       require(!called && raw_region_prepaid_bank() == nullptr &&
                   bank.remaining() == before - 328,
               "actual maintenance begins with caller loan suspended");
       called = true;
-      const auto outcome = context.checkpoint({parent});
+      const auto outcome = context.checkpoint();
       require(
           raw_region_prepaid_bank() == nullptr && bank.remaining() == before - 328,
           "actual Context checkpoint uses its own bank and restores absent selection");

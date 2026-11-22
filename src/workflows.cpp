@@ -289,7 +289,7 @@ Value default_workflows() {
        {"source",
         Value{
             R"lua(local brief={role='developer',content='Ultracode: implement useful working code. Read targeted sources, state concrete tasks and a fixed allowance before hardening. Preserve the operator prompt. Use direct specification oracles and fake effects where possible. One independent review and one findings recheck within the allowance; never reset it. Report actual outcomes and gaps; no invented scheduler or performance claims.'}
-if not blackbird.live_instruction(brief) then blackbird.append({brief}, {class='instruction'}) end
+if not blackbird.live_instruction(brief) then blackbird.append({brief}, {kind='instruction'}) end
 local step=0
 while true do
  step=step+1

@@ -625,9 +625,8 @@ if arguments.case in ('all', 'context'):
             wait_for(b"APPENDED")
             pump(0.3)
             assert badge_style()[0] is None, "an append is not a context revision"
-            send(b"/lua local v=arco.context(); local id=v.entries[#v.entries].id; "
-                 b"assert(arco.manage({base=v.base,mode='summarize',ids={id},reason='indicator oracle',"
-                 b"source='pty',summary={role='assistant',content='short'}}).staged); print('STA' .. 'GED')\r")
+            send(b"/lua local bs=arco.blocks().blocks; local id=bs[#bs].id; "
+                 b"assert(arco.compact({op='summarize',ids={id},summary='short',apply='now'}).ok); print('STA' .. 'GED')\r")
             wait_for(b"STAGED")
             wait_for(b"CONTEXT compacted", predicate=lambda: badge_style()[0] is not None)
             text, _ = badge_style()

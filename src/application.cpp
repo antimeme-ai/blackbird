@@ -452,8 +452,7 @@ int ApplicationConnection::run(CodingEngine &engine, AuditLog &log,
   // report; it does not fail the close. An unresolved attempt would leave the
   // snapshot without semantic coverage, so recovery settles it from the tail.
   // A read-only context writes no snapshot (design §4.5).
-  const bool unresolved =
-      !unwrap(log.root().unresolved_attempts()).empty() || engine.context().read_only();
+  const bool unresolved = !unwrap(log.root().unresolved_attempts()).empty();
   if (const auto saved =
           unresolved ? Result<void>::success() : engine.context().checkpoint();
       !saved.has_value())

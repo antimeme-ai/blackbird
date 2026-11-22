@@ -1,15 +1,13 @@
 #pragma once
-#include "blackbird/context_cut.hpp"
-#include "blackbird/context_units.hpp"
 #include "blackbird/packet.hpp"
-#include "blackbird/raw_context.hpp"
 #include "blackbird/retained_state.hpp"
 #include "blackbird/value.hpp"
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <optional>
-#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace blackbird {
 template <class T> T unwrap(Result<T> result) {
@@ -23,34 +21,24 @@ inline void unwrap(Result<void> result) {
 }
 std::string read_text(const ImmutableBytes &bytes);
 Result<Value> read_packet(const ImmutableBytes &bytes, ValueLimits limits = {});
-// Dispatch by the declared channel, not by guessing the payload format.
 Result<Value> read_application_packet(const ApplicationRecordEvent &record);
 std::string hex_identity(const IdentityBytes &bytes);
 const Value &field(const Value &value, std::string_view name);
 const std::string &string_field(const Value &value, std::string_view name);
+
 struct OriginalCapture {
   std::string_view label;
   std::string_view bytes;
   Value metadata;
 };
+
 class AuditLog {
 public:
   explicit AuditLog(RetainedState &root) : root_(root) {}
   ApplicationRecordId issue() { return unwrap(root_.issue<ApplicationRecordId>()); }
   std::string record(ApplicationChannel channel, const Value &packet);
-  // Every record (identity reservations included) between begin_reserved and
-  // end_reserved goes outside the resident-tail cap: a read-only open, whose
-  // snapshot is withheld, must never fail on the cap before /repair.
-  void begin_reserved();
-  void end_reserved() noexcept { reserved_.reset(); }
   RecordReference record(ApplicationRecordId identity, ApplicationChannel channel,
-                         const Value &packet,
-                         RawContextPublication *publication = nullptr);
-  // Atomically append managed context plus a native successful-boundary program record.
-  JournalCursor record_boundary(ApplicationRecordId identity,
-                                const Value &context_packet,
-                                const Value &program_packet,
-                                RawContextPublication *publication = nullptr);
+                         const Value &packet);
   std::string original(OriginalCapture capture);
   std::optional<SourceReference> original(ApplicationRecordId identity,
                                           OriginalCapture capture);
@@ -63,319 +51,161 @@ public:
 
 private:
   RetainedState &root_;
-  std::optional<RetainedState::MaintenanceScope> reserved_;
 };
+
+enum class BlockKind : std::uint8_t { instruction = 0, exchange = 1, note = 2 };
+std::string_view block_kind_name(BlockKind kind) noexcept;
+std::optional<BlockKind> parse_block_kind(std::string_view name) noexcept;
+
+// One self-contained semantic unit in working context.
+// - instruction: operator prompt, system/developer brief, restart note
+// - exchange: one model round (reasoning + assistant text + function_calls + their
+//   matching function_call_outputs grouped automatically by call_id)
+// - note: summary, compaction note, or synthetic context block
+struct Block {
+  std::uint64_t id = 0;
+  std::vector<Value> items;
+  std::vector<std::uint64_t> replaces;
+  std::vector<IdentityBytes> records; // journal record identities that built this block
+  std::string label;
+  std::uint64_t bytes = 0;
+  BlockKind kind = BlockKind::note;
+  bool pinned = false;
+  bool open = false;
+};
+
+// Metadata for a dropped/summarized block; original payload stays on disk in the
+// append-only journal and is loaded on demand for read_block() / restore.
+struct ArchivedBlock {
+  std::uint64_t id = 0;
+  std::vector<IdentityBytes> records;
+  std::string label;
+  std::string preview;
+  std::uint64_t bytes = 0;
+  BlockKind kind = BlockKind::note;
+};
+
 enum class ContextChangeKind : std::uint8_t { edited, restored, managed };
-// One published context revision: an edit, a restore or an activated managed
-// proposal (mode is its proposal mode). Sizes are encoded input bytes, as stats;
-// a size that could not be measured is empty, never a reason to fail publication.
 struct ContextChange {
-  ContextChangeKind kind = ContextChangeKind::edited;
-  std::string revision, mode;
-  std::optional<std::size_t> bytes_before, bytes_after;
+  std::string revision;
+  std::string mode;
+  std::optional<std::size_t> bytes_before;
+  std::optional<std::size_t> bytes_after;
+  ContextChangeKind kind = ContextChangeKind::managed;
 };
-// How an open established the context (CONTEXT_LIFECYCLE.md §4.5).
-struct ContextOpenReport {
-  enum class Playback : std::uint8_t {
-    journal,      // no snapshot existed: the whole journal was played back
-    suffix,       // the snapshot was restored and the frames after it played back
-    whole_history // a snapshot was refused: whole-history playback from fact 0
-  };
-  Playback playback = Playback::journal;
-  // The refusal: the shared validator's (by the loader or the store) or the
-  // store's resolution of the snapshot against the journal.
-  std::optional<Error> snapshot_refusal;
-  bool refused_by_store = false;
-  // Every slot the loader refused (slot, reason), a catalogue that does not open
-  // included; and whether the older accepted slot was restored instead.
-  std::vector<std::pair<unsigned, Error>> slot_refusals;
-  // Every slot the store refused when it restored it, with its slot.
-  std::vector<std::pair<unsigned, Error>> store_refusals;
-  // Accepted slots whose archive catalogue did not open; restored_slot says
-  // whether that slot was still the one used.
-  std::vector<std::pair<unsigned, Error>> catalogue_faults;
-  std::optional<unsigned> restored_slot;
-  bool older_slot = false;
-  // Anything to report as a recovery: a refused slot or snapshot, a catalogue
-  // fault, or read-only.
-  bool recovery() const noexcept {
-    return snapshot_refusal || !slot_refusals.empty() || !catalogue_faults.empty() ||
-           read_only;
-  }
-  std::uint64_t frames = 0;  // context frames played back
-  std::uint64_t skipped = 0; // frames named by repair frames
-  // The read-only state: playback stopped at this frame.
-  bool read_only = false;
-  std::string bad_revision;
-  Error bad_error{ErrorCode::corrupt};
-  std::uint64_t after_bad = 0; // later context frames not played
+
+enum class CompactOp : std::uint8_t { drop, summarize, restore, pin, unpin };
+std::string_view compact_op_name(CompactOp op) noexcept;
+std::optional<CompactOp> parse_compact_op(std::string_view name) noexcept;
+
+struct CompactRequest {
+  std::vector<std::uint64_t> ids;
+  std::optional<std::uint64_t> from;
+  std::optional<std::uint64_t> to;
+  std::string summary;
+  CompactOp op = CompactOp::drop;
 };
+
+struct ReadBlockOptions {
+  std::size_t offset = 0;
+  std::size_t limit = 16384;
+};
+
 struct ContextOpen {
-  // Run the open-time maintenance snapshot later, with finish_open().
-  bool defer_checkpoint = false;
-  // Ignore the snapshot and play back the whole history (tests, inspection).
-  bool whole_history = false;
-  // Install no maintenance hook and write nothing at open (a second reader).
-  bool probe = false;
-  // Automatic whole-history playback after a refused snapshot is allowed up to
-  // this journal size, as the launcher's full replay (src/main.cpp).
   std::uint64_t whole_history_limit = 64ULL * 1024 * 1024;
+  bool defer_checkpoint = false;
+  bool whole_history = false;
+  bool probe = false;
 };
+
+// Lightweight block-based working context backed by the append-only audit journal.
 class ContextStore {
 public:
-  // The highest context-format-level this binary reads and writes. Level 1: cut
-  // and repair frames.
-  static constexpr std::uint64_t format_level = 1;
-  // Error{unsupported} details from the open: the session's level is higher than
-  // format_level, or whole-history playback exceeds ContextOpen's bound.
-  static constexpr std::int64_t level_refused = 1, whole_history_refused = 2;
-  explicit ContextStore(AuditLog &log, RawContextOrigin origin = {});
-  ContextStore(AuditLog &log, ContextOpen open, RawContextOrigin origin = {});
-  // Opens without the open-time maintenance snapshot. The caller runs it with
-  // finish_open() once it has recorded what the open found and validated its
-  // invocation, so a refused invocation cannot move the saved boundary.
-  struct DeferOpenCheckpoint {};
-  ContextStore(AuditLog &log, DeferOpenCheckpoint, RawContextOrigin origin = {});
-  void finish_open(RawContextOrigin origin = {});
+  // Level 2: clean block-based context format.
+  static constexpr std::uint64_t format_level = 2;
+  static constexpr std::int64_t level_refused = 1;
+  static constexpr std::int64_t whole_history_refused = 2;
+
+  explicit ContextStore(AuditLog &log);
+  ContextStore(AuditLog &log, ContextOpen open);
   ~ContextStore();
   ContextStore(const ContextStore &) = delete;
   ContextStore &operator=(const ContextStore &) = delete;
-  Result<void> checkpoint(RawContextOrigin origin = {});
+
+  void finish_open();
+  Result<void> checkpoint();
   const std::optional<Error> &checkpoint_error() const noexcept {
     return checkpoint_error_;
   }
+
   const std::string &head() const noexcept { return head_; }
-  const ContextOpenReport &open_report() const noexcept { return report_; }
-  // After a frame that does not apply: no context writes, no snapshot, until an
-  // approved repair frame is accepted.
-  bool read_only() const noexcept { return read_only_; }
-  // Originals of the skipped frames, {id, item}, that a repair may carry.
-  Value::Array skipped_originals() const;
-  // Writes the repair frame: it skips the bad frame and every later context frame,
-  // continues from the last good head and appends copies of the picked originals.
-  Value repair(const Value::Array &picks, RawContextOrigin origin = {});
-  // What /repair would do: the bad frame, the revisions it skips, the pairing
-  // faults the head already has (kept as they are), and the skipped originals it
-  // may keep, each with whether it alone adds no pairing fault. Null when the
-  // context is not read-only.
-  Value repair_preview() const;
-  // Error{conflict} detail: the picks add an unpaired call or output the head did
-  // not already have.
-  static constexpr std::int64_t repair_unpaired = 3;
-  // The cut writer (design §4.3). It applies the frame through the shared apply,
-  // measures the result and records it. Staging and settlement come with S3b; S1
-  // has no production caller.
-  Value cut(CutFrame frame, RawContextOrigin origin = {});
-  // The value a registered snapshot section held at open, or null.
-  const Value *restored_section(std::string_view name) const noexcept;
-  // Snapshot section writers, one per owning unit; each name must be registered.
-  struct SectionWriter {
-    std::string name;
-    std::function<Value()> write;
-  };
-  std::vector<SectionWriter> section_writers;
-  Value view(RawContextOrigin origin = {}) const;
-  Value stats(RawContextOrigin origin = {}) const;
-  Value::Array items(RawContextOrigin origin = {}) const;
-  void append(Value::Array items, std::string_view label, RawContextOrigin origin = {});
-  // An append whose class the program declares (design §5.2): instruction or
-  // result, never on function_call, function_call_output or reasoning items
-  // (Error{invalid_range}). The record carries the class.
-  void append(Value::Array items, std::string_view label, UnitClass declared,
-              RawContextOrigin origin = {});
-  // The live units (design §3, §5.1): handles, classes, open, superseded, pinned.
-  std::vector<Unit> units(RawContextOrigin origin = {}) const;
-  // Whether a live entry whose creating record classes it an instruction holds an
-  // item equal to this one, the order of object keys at any depth aside: both are
-  // compared with keys sorted (the built-in ultracode appends its brief only when
-  // none does).
-  bool live_instruction(const Value &item, RawContextOrigin origin = {}) const;
-  // Pins (design §5.4): expand the selection (Error{invalid_range} when it does not
-  // parse) and record the live pinned units at once as the latest-wins program
-  // record context-pins-v1. Returns {accepted: [handle], refused: [{unit, reason}],
-  // pinned: count}. A pin changes no context bytes.
-  Value pin(std::string_view selection, RawContextOrigin origin = {});
-  Value unpin(std::string_view selection, RawContextOrigin origin = {});
-  const std::set<ContextRef> &pins() const noexcept { return pins_; }
-  // Whether a live entry's creating record carries this origin label, read by
-  // identity lookup (the RRC check, design §19).
-  bool live_origin(std::string_view label, RawContextOrigin origin = {}) const;
-  static void validate_successor_seed(const Value &seed, RawContextOrigin origin = {});
-  void seed_successor(const Value &seed, RawContextOrigin origin = {});
-  // strict (the model's context_edit and Lua's blackbird.edit): a new or changed
-  // entry with a key other than id, item and an array ancestry is refused, reason
-  // "unknown-entry-key". An entry byte-identical to the current entry under its ID
-  // passes through unchanged, legacy keys included.
-  enum class EditKeys : std::uint8_t { carried, strict };
-  Value edit(const Value &candidate, RawContextOrigin origin = {},
-             EditKeys keys = EditKeys::carried);
-  void restore(std::string_view entry, RawContextOrigin origin = {});
-  Value originals(RawContextOrigin origin = {}) const;
-  Value manage(const Value &proposal, RawContextOrigin origin = {});
-  Value inspect(const Value &query, RawContextOrigin origin = {}) const;
-  // Native workflow owner validates prospective obligations before publication.
-  std::function<void(const Value::Array &, const Value &, const RawEventRef &)> protect;
-  // Presentation of each published revision, after its record is complete. A
-  // listener failure never affects the publication.
+  std::uint64_t next_id() const noexcept { return next_id_; }
+  const std::vector<Block> &blocks() const noexcept { return blocks_; }
+  const std::vector<ArchivedBlock> &archived() const noexcept { return archived_; }
+  std::uint64_t total_bytes() const noexcept;
+  Value::Array items() const;
+  bool has_open_exchanges() const noexcept;
+
+  // Append wire items. function_call_outputs whose call_id matches an open exchange
+  // automatically fold into that exchange block and close it once all calls are
+  // answered. Returns the ID of the created or extended block (0 when items is empty).
+  std::uint64_t append(Value::Array items, std::string_view label,
+                       std::optional<BlockKind> declared = std::nullopt);
+
+  // Close any open exchange blocks by appending synthetic function_call_output items
+  // for unanswered call_ids. Returns the number of synthetic outputs appended.
+  std::size_t close_open_exchanges(bool interrupted);
+
+  // Drop, summarize, restore, pin, or unpin blocks by simple integer IDs / range.
+  Value compact(const CompactRequest &request);
+
+  // Full programmatic block replacement (Lua escape hatch).
+  Value replace_blocks(const Value &blocks_value);
+
+  // Model/UI inspection: live blocks with previews (optionally archived metadata too).
+  Value list(bool include_archived = false) const;
+
+  // Read exact original content of a live or archived block as bounded JSON UTF-8.
+  Value read_block(std::uint64_t id, ReadBlockOptions options = {}) const;
+
+  // Compact stats summary.
+  Value stats() const;
+
+  // True if a live block carries this origin label (used for restart/resume
+  // idempotency).
+  bool live_origin(std::string_view label) const;
+
+  // True if a live instruction block contains an item equal to item (key order
+  // ignored).
+  bool live_instruction(const Value &item) const;
+
+  // Seed a fresh successor session (backstop / --seed-session).
+  static void validate_successor_seed(const Value &seed);
+  void seed_successor(const Value &seed);
+
+  // Optional callback invoked after mutating publications (compact/restore/replace).
   std::function<void(const ContextChange &)> changed;
-  static Value::Array stop_outputs(const Value::Array &entries, bool interrupted);
-  JournalCapacity cancellation_budget(const Value::Array &entries,
-                                      const Value &proposal,
-                                      RawContextOrigin origin = {}) const;
-  Value pending_proposal(RawContextOrigin origin = {}) const;
-  // Publish any staged managed-context proposal immediately while keeping the
-  // current workflow open (returns null when nothing is pending).
-  Value commit_pending(RawContextOrigin origin = {});
-  void begin_workflow(RawContextOrigin origin = {});
-  Value finish_workflow(bool success, const Value &boundary_program = Value{},
-                        RawContextOrigin origin = {},
-                        WorkflowAcceptance *acceptance = nullptr);
 
 private:
-  void restore_snapshot(const SavedState &saved, RawContextTrace &trace);
-  void play_facts(RawContextTrace &trace, const SavedState *restored);
-  void play_frame(const RetainedFact &fact, const ApplicationRecordEvent &record,
-                  RawContextTrace &trace);
-  // differing_ for next, against entries_: an entry sharing storage with, or
-  // encoding exactly like, its predecessor keeps its status; any other is compared
-  // with its original's exact encoding. Computed before a record is written and
-  // assigned after it, so a failed read never follows a write.
-  // created: the frame's own fresh entries, equal to their originals by
-  // construction (their originals are merged only after the record).
-  std::set<std::string>
-  settle(const Value::Array &next, RawContextOrigin origin,
-         const std::map<std::string, Value> *created = nullptr) const;
-  std::optional<std::vector<std::byte>>
-  original_bytes(const std::string &id, std::map<IdentityBytes, Value> &decoded,
-                 RawContextOrigin origin) const;
-  // A frame that applies nothing: named by an accepted repair, or set aside in
-  // the read-only state.
-  bool skipped_frame(std::string_view revision) const noexcept;
-  // The one apply shared by the writers and playback: apply_frame, then every
-  // entry has an original (fresh ones from the frame).
-  Value::Array apply_cut(const CutFrame &frame, const Value::Array &entries,
-                         const std::map<std::string, Value> &fresh,
-                         RawContextOrigin origin) const;
-  void require_writable() const;
-  void write_format_level(RawContextTrace &trace);
-  static Value recordable(const CutFrame &frame);
-  ContextOpen open_;
-  ContextOpenReport report_;
-  bool read_only_ = false;
-  std::uint64_t level_ = 0;
-  std::vector<std::string> skipped_revisions_;
-  // Revisions accepted repair frames skip: from the snapshot and playback.
-  std::set<std::string> skipped_;
-  // Live entries whose encoding differs from their original's: written inline at a
-  // checkpoint; every other entry is a ref (no decode at checkpoint).
-  std::set<std::string> differing_;
-  // Archive lookups of originals reach records up to this boundary: the snapshot
-  // this store restored or last wrote, never a newer slot it did not restore.
-  std::optional<JournalCursor> lookup_boundary_;
-  std::vector<Value> skipped_originals_;
-  Value::Array restored_sections_;
-  std::optional<std::size_t> input_bytes() const noexcept;
-  void notify(std::optional<ContextChange> change) const noexcept;
-  ContextChangeKind next_kind_ = ContextChangeKind::edited;
-  std::optional<Value> original_entry(std::string_view id,
-                                      RawContextOrigin origin = {}) const;
-  void maybe_checkpoint(RawContextOrigin origin = {});
-  void refresh_history() const;
-  RawContextState raw_state() const noexcept;
-  mutable bool history_stale_ = false;
-  mutable bool archive_loaded_ = true;
-  std::optional<Error> checkpoint_error_;
+  void load_from_snapshot(const SavedState &saved);
+  void replay_facts(const SavedState *restored);
+  void apply_record(const ApplicationRecordEvent &record);
+  std::optional<Value::Array>
+  load_block_items(std::uint64_t id, const std::vector<IdentityBytes> &records) const;
+  void write_format_level();
+  void maybe_checkpoint();
+  void notify_changed(ContextChangeKind kind, std::string_view mode,
+                      std::uint64_t before_bytes, std::uint64_t after_bytes) const;
+
   AuditLog &log_;
   std::weak_ptr<void> root_lifetime_;
-  mutable RetainedState::FactHistory historical_;
+  ContextOpen open_;
   std::string head_;
-  Value::Array entries_;
-  struct Original {
-    ImmutableBytes payload;
-    std::size_t index = 0;
-    bool packet = false;
-    std::string id;
-    std::optional<RecordReference> record;
-    std::optional<ApplicationRecordId> application;
-    Original(const Value &entry, std::optional<ApplicationRecordId> application = {});
-    Original(ImmutableBytes source, std::size_t ordinal, std::string identity,
-             RecordReference reference, ApplicationRecordId application_identity)
-        : payload(std::move(source)), index(ordinal), packet(true),
-          id(std::move(identity)), record(reference),
-          application(application_identity) {}
-    Value entry(RawContextOrigin origin) const;
-    // The whole creating packet, decoded once (packet-backed originals only).
-    Value packet_value(RawContextOrigin origin) const;
-  };
-  mutable std::map<std::string, Original> originals_;
-  mutable std::vector<Original> captured_;
-  // With classes, also the classes of every record visited, from the packets the
-  // visit decodes anyway (restore-mode manage).
-  Value::Array captured_entries(RawContextOrigin origin = {},
-                                ClassMap *classes = nullptr) const;
-  bool workflow_ = false;
-  struct Pending {
-    Value proposal;
-    Value::Array snapshot;
-    std::string expected, stage;
-  };
-  std::optional<Pending> pending_;
-  Value publish_managed(const Value &proposal, const Value::Array &basis,
-                        std::string_view stage, const Value &boundary_program = Value{},
-                        RawContextOrigin origin = {},
-                        WorkflowAcceptance *acceptance = nullptr);
-  Value reject_managed(const Value &proposal, std::string_view reason,
-                       RawContextOrigin origin = {}, bool *settled = nullptr);
-  bool valid_entries(const Value &entries, RawContextOrigin origin) const;
-  void append_impl(Value::Array items, std::string_view label, const Value *lineage,
-                   RawContextOrigin origin, std::optional<UnitClass> declared = {});
-  // Classes of live creating records (design §5.2): set by every writer and by
-  // playback from the record, restored from the classes section, derived on demand
-  // by identity lookup for a record the map does not hold.
-  mutable ClassMap classes_;
-  std::set<ContextRef> pins_;
-  // The creating record, decoded for its class fields (op, origin, class,
-  // originals, lineage): from a held packet, else by identity lookup. Empty when it
-  // cannot be read, did not publish or was skipped.
-  // skipped: read a frame a repair skipped too (its originals were never live).
-  std::optional<Value> creating_record(const IdentityBytes &record,
-                                       RawContextOrigin origin,
-                                       bool skipped = false) const;
-  const RecordClasses &record_classes_of(const IdentityBytes &record,
-                                         const Value::Array &entries,
-                                         RawContextOrigin origin) const;
-  std::vector<Unit> live_units(RawContextOrigin origin) const;
-  // Derives and keeps the classes of every live record the map does not hold, by
-  // identity lookup; a record that cannot be read is classed by the role of its
-  // live originals (a version-1 restore).
-  void derive_live_classes(RawContextOrigin origin);
-  Value write_pins(std::string_view selection, bool pin, RawContextOrigin origin);
-  // Records classed by role, for one pass over one entry list (by_role_source_):
-  // each such record is classed once per pass.
-  mutable std::map<IdentityBytes, RecordClasses> by_role_;
-  mutable const Value::Array *by_role_source_ = nullptr;
-  // The live items of each record in by_role_source_, grouped once per pass.
-  mutable std::map<IdentityBytes, std::map<std::uint32_t, Value>> by_role_live_;
-  void begin_class_pass() const noexcept {
-    by_role_.clear();
-    by_role_live_.clear();
-    by_role_source_ = nullptr;
-  }
-  // Records no read found: classed by role on every call without a new lookup.
-  mutable std::set<IdentityBytes> unreadable_;
-  // Fingerprints of instruction items by entry ID, kept while the entry holds the
-  // same item storage (units() compares them for superseded copies).
-  struct Print {
-    Value item;
-    ItemPrint print;
-  };
-  mutable std::map<std::string, Print, std::less<>> prints_;
-  // Prints of instruction items with object keys sorted, by entry ID, kept the same
-  // way (live_instruction compares them).
-  mutable std::map<std::string, Print, std::less<>> sorted_prints_;
-  // A shaped output is text; its failure (an error key or a nonzero exit_code before
-  // shaping) is read from its original's metadata, found by the marker's result_ref
-  // with one indexed lookup, so the failed selector still matches it (T1).
-  bool recorded_failure(const Value &item) const;
+  std::uint64_t next_id_ = 1;
+  std::vector<Block> blocks_;
+  std::vector<ArchivedBlock> archived_;
+  std::optional<Error> checkpoint_error_;
+  bool format_level_written_ = false;
 };
+
 } // namespace blackbird

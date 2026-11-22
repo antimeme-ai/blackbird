@@ -1501,212 +1501,86 @@ Value tool_definitions() {
                  {"required", Value{Value::Array{Value{"observation"}}}}})}}),
       Value::object(
           {{"type", Value{"function"}},
-           {"name", Value{"context_budget"}},
+           {"name", Value{"context_list"}},
            {"description",
-            Value{"Inspect effective/pending opt-in context byte policy and native "
-                  "provider/model capability provenance. A valid proposal stages until "
-                  "successful workflow completion; failure cancels it. Trigger invites "
-                  "model-authored managed compaction, never forces shrink. Target is "
-                  "advisory; original repair can grow context. Omitted base binds "
-                  "current policy revision. No token estimates or physical audit "
-                  "reclamation."}},
+            Value{
+                "List current working context blocks with integer IDs, kind "
+                "(instruction/exchange/note), pinned/open flags, byte sizes, short "
+                "previews, total bytes, and current upstream cache epoch. Pass "
+                "include_archived=true to also list archived block IDs and previews."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
                  {"properties",
-                  Value::object(
-                      {{"proposal",
-                        Value::object(
-                            {{"type", Value{"object"}},
-                             {"properties",
-                              Value::object(
-                                  {{"base", Value::object({{"type", Value{"string"}}})},
-                                   {"enabled",
-                                    Value::object({{"type", Value{"boolean"}}})},
-                                   {"trigger_bytes",
-                                    Value::object(
-                                        {{"type", Value{"integer"}},
-                                         {"minimum", Value{Number{1}}},
-                                         {"maximum", Value{Number{67108864}}}})},
-                                   {"target_bytes",
-                                    Value::object(
-                                        {{"type", Value{"integer"}},
-                                         {"minimum", Value{Number{1}}},
-                                         {"maximum", Value{Number{67108864}}}})},
-                                   {"reason",
-                                    Value::object({{"type", Value{"string"}}})}})},
-                             {"required", Value{Value::Array{
-                                              Value{"enabled"}, Value{"trigger_bytes"},
-                                              Value{"target_bytes"}, Value{"reason"}}}},
-                             {"additionalProperties", Value{false}}})}})},
+                  Value::object({{"include_archived",
+                                  Value::object({{"type", Value{"boolean"}}})}})},
                  {"additionalProperties", Value{false}}})}}),
       Value::object(
           {{"type", Value{"function"}},
-           {"name", Value{"context_stats"}},
-           {"description",
-            Value{"Report context entry counts and native binary packet byte sizes, "
-                  "last request bytes and actual provider usage in this process (null "
-                  "if unavailable). No token estimates."}},
-           {"parameters", Value::object({{"type", Value{"object"}},
-                                         {"properties", Value::object({})}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_view"}},
-           {"description", Value{"Inspect current editable context, base revision and "
-                                 "stable entry IDs."}},
-           {"parameters", Value::object({{"type", Value{"object"}},
-                                         {"properties", Value::object({})}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_edit"}},
-           {"description",
-            Value{"Publish candidate {base,entries:[{id,item[,ancestry]}]} with CAS. "
-                  "Reorder, replace or remove entries. A new or changed entry has only "
-                  "id, item and an array ancestry; an entry identical to the current "
-                  "one passes as it is. Retained originals are immutable. Keep active "
-                  "tool call/result pairs in context."}},
-           {"parameters",
-            Value::object(
-                {{"type", Value{"object"}},
-                 {"properties",
-                  Value::object(
-                      {{"candidate", Value::object({{"type", Value{"object"}}})}})},
-                 {"required", Value{Value::Array{Value{"candidate"}}}}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_manage"}},
+           {"name", Value{"context_compact"}},
            {"description",
             Value{
-                "Explicit managed summarize/select/archive/restore. Proposal: mode, "
-                "ids "
-                "(whole units), reason, source; summarize also summary {role:assistant "
-                "or developer,content}. Omit base when calling context_manage as a "
-                "tool "
-                "(tool calls/outputs advance context revision, so omitting base binds "
-                "the current snapshot automatically; supplied base is strict CAS). "
-                "Never archives, summarizes or leaves out instructions (operator "
-                "prompts, restart notes, the built-in ultracode brief, appends "
-                "declared class instruction, and user/system/developer entries of "
-                "Lua appends from before units) or pinned units, except that an "
-                "older byte-identical copy of an instruction repeated later may be "
-                "archived or left out by select; other workflow briefs, external "
-                "data and tool results are not instructions. ids "
-                "cover whole units: a response round (reasoning, messages, calls and "
-                "the outputs that answer them, wherever those sit) goes together. "
-                "A refusal names partial-tool-group or partial-round, else the first "
-                "unit in context order that is protected-unit, pinned-unit or "
-                "partial-unit. Stages until "
-                "successful workflow completion by default (or commits automatically "
-                "on "
-                "cold cache / route switch); pass apply='now' to commit immediately "
-                "mid-turn and roll a fresh upstream cache epoch. Appended current tool "
-                "exchange is retained. One pending; failed/interrupted workflows "
-                "cancel. "
-                "Structural acceptance does not certify accuracy."}},
+                "Manage working context blocks by integer block IDs (ids array and/or "
+                "inclusive from..to range). op: 'drop' (archive closed unpinned "
+                "blocks), 'summarize' (replace closed unpinned blocks with one summary "
+                "note; requires summary text), 'restore' (bring archived block IDs "
+                "back "
+                "from immutable history), 'pin' or 'unpin' (protect/unprotect blocks "
+                "across compaction and overflow recovery). Instructions, open tool "
+                "exchanges, and pinned blocks are skipped automatically on drop/"
+                "summarize. apply: 'auto' (default: queues when upstream prompt cache "
+                "is warm and flushes free on cold cache, route switch, overflow, or "
+                "turn end) or 'now' (flushes before the next provider request and "
+                "rolls a fresh upstream cache epoch)."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
                  {"properties",
                   Value::object(
-                      {{"proposal", Value::object({{"type", Value{"object"}}})},
+                      {{"op", Value::object({{"type", Value{"string"}},
+                                             {"enum",
+                                              Value{Value::Array{
+                                                  Value{"drop"},
+                                                  Value{"summarize"}, Value{"restore"},
+                                                  Value{"pin"}, Value{"unpin"}}}}})},
+                       {"ids", Value::object(
+                                   {{"type", Value{"array"}},
+                                    {"items",
+                                     Value::object({{"type", Value{"integer"}},
+                                                    {"minimum", Value{Number{1}}}})}})},
+                       {"from", Value::object({{"type", Value{"integer"}},
+                                               {"minimum", Value{Number{1}}}})},
+                       {"to", Value::object({{"type", Value{"integer"}},
+                                             {"minimum", Value{Number{1}}}})},
+                       {"summary", Value::object({{"type", Value{"string"}}})},
                        {"apply", Value::object(
                                      {{"type", Value{"string"}},
-                                      {"enum", Value{Value::Array{Value{"staged"},
+                                      {"enum", Value{Value::Array{Value{"auto"},
                                                                   Value{"now"}}}}})}})},
-                 {"required", Value{Value::Array{Value{"proposal"}}}}})}}),
+                 {"required", Value{Value::Array{Value{"op"}}}},
+                 {"additionalProperties", Value{false}}})}}),
       Value::object(
           {{"type", Value{"function"}},
-           {"name", Value{"context_pin"}},
-           {"description",
-            Value{"Pin live context units against compaction and overflow archival. "
-                  "selection accepts unit handles or ranges (e.g. 'r1,r3' or 'r1-r4'). "
-                  "Pinned units stay live across context_manage and automatic overflow "
-                  "recovery."}},
-           {"parameters",
-            Value::object(
-                {{"type", Value{"object"}},
-                 {"properties",
-                  Value::object(
-                      {{"selection", Value::object({{"type", Value{"string"}}})}})},
-                 {"required", Value{Value::Array{Value{"selection"}}}}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_unpin"}},
-           {"description",
-            Value{"Unpin previously pinned live context units. selection accepts unit "
-                  "handles or selectors."}},
-           {"parameters",
-            Value::object(
-                {{"type", Value{"object"}},
-                 {"properties",
-                  Value::object(
-                      {{"selection", Value::object({{"type", Value{"string"}}})}})},
-                 {"required", Value{Value::Array{Value{"selection"}}}}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_units"}},
-           {"description", Value{"List current live context units with handles, "
-                                 "classes, open/superseded/"
-                                 "pinned flags, entry IDs, byte sizes, and current "
-                                 "upstream cache epoch."}},
-           {"parameters", Value::object({{"type", Value{"object"}},
-                                         {"properties", Value::object({})}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_inspect"}},
-           {"description",
-            Value{"Bounded recoverable original/history/index inspection. Native BBM2 "
-                  "stream by default; format=json explicitly exports JSON. query: kind "
-                  "originals|history|index, optional entry (original ID), revision "
-                  "(strict per-kind snapshot guard; stale returns conflict, restart "
-                  "pagination), offset byte index, limit 1..65536 (default 4096). "
-                  "Returns hex-bbm2-stream bytes (or hex-json-utf8 for explicit "
-                  "export), total_bytes, next, revision (bind subsequent pages) and "
-                  "context_revision. No token estimates."}},
-           {"parameters",
-            Value::object(
-                {{"type", Value{"object"}},
-                 {"properties",
-                  Value::object(
-                      {{"query", Value::object({{"type", Value{"object"}}})}})},
-                 {"required", Value{Value::Array{Value{"query"}}}}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_originals"}},
-           {"description", Value{"Retrieve retained original context entries, "
-                                 "including entries removed from presentation."}},
-           {"parameters", Value::object({{"type", Value{"object"}},
-                                         {"properties", Value::object({})}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_repair"}},
+           {"name", Value{"context_read"}},
            {"description",
             Value{
-                "Explicit protocol repair for calls already unanswered when this "
-                "workflow began. Requires current context base. Appends unknown-result "
-                "placeholders without dispatch/replay or settling actual effects; "
-                "preserves originals and existing outputs. Refuses active-workflow "
-                "calls, malformed linkage and live owned children. Use from an "
-                "explicit recovery Lua workflow before the next provider request."}},
+                "Read exact original JSON content of a live or archived context block "
+                "by integer ID with optional byte offset and limit (default 16384, max "
+                "65536)."}},
            {"parameters",
             Value::object(
                 {{"type", Value{"object"}},
                  {"properties",
                   Value::object(
-                      {{"base", Value::object({{"type", Value{"string"}}})}})},
-                 {"required", Value{Value::Array{Value{"base"}}}}})}}),
-      Value::object(
-          {{"type", Value{"function"}},
-           {"name", Value{"context_restore"}},
-           {"description",
-            Value{"Restore an original context entry by stable entry ID."}},
-           {"parameters",
-            Value::object(
-                {{"type", Value{"object"}},
-                 {"properties",
-                  Value::object(
-                      {{"entry", Value::object({{"type", Value{"string"}}})}})},
-                 {"required", Value{Value::Array{Value{"entry"}}}}})}}),
+                      {{"id", Value::object({{"type", Value{"integer"}},
+                                             {"minimum", Value{Number{1}}}})},
+                       {"offset", Value::object({{"type", Value{"integer"}},
+                                                 {"minimum", Value{Number{0}}}})},
+                       {"limit", Value::object({{"type", Value{"integer"}},
+                                                {"minimum", Value{Number{1}}},
+                                                {"maximum", Value{Number{65536}}}})}})},
+                 {"required", Value{Value::Array{Value{"id"}}}},
+                 {"additionalProperties", Value{false}}})}}),
       Value::object(
           {{"type", Value{"function"}},
            {"name", Value{"restart"}},
@@ -1727,22 +1601,13 @@ Value tool_definitions() {
            {"name", Value{"lua"}},
            {"description",
             Value{"Run a Lua transformation or experiment in the current workflow. "
-                  "blackbird.context(), blackbird.stats(), blackbird.edit(candidate) "
-                  "(entries as context_edit), "
-                  "blackbird.originals(), blackbird.restore(id), "
-                  "blackbird.append(items[, {class='instruction'}]) (context_manage "
-                  "never archives an instruction, except that an older copy of one "
-                  "repeated byte-identically later may be archived or left out by "
-                  "select; messages default to class "
-                  "result; an append of function calls or reasoning takes no class "
-                  "and is a round, atomic with the outputs answering its calls), "
-                  "blackbird.json.encode/decode, "
-                  "blackbird.live_instruction(item) (true when a live entry whose "
-                  "creating record makes it an instruction holds an item equal to "
-                  "item, object key order ignored at every depth; a result entry "
-                  "does not count), blackbird.now(), safe read-only os.time/clock/"
-                  "difftime, blackbird.pin(sel), blackbird.unpin(sel), "
-                  "blackbird.units(), blackbird.commit_context(), "
+                  "blackbird.blocks([include_archived]), blackbird.compact(args), "
+                  "blackbird.read_block(id[, {offset,limit}]), "
+                  "blackbird.set_blocks(list), "
+                  "blackbird.stats(), blackbird.append(items[, "
+                  "{kind='instruction'|'note'}]), "
+                  "blackbird.live_instruction(item), blackbird.now(), safe read-only "
+                  "os.time/clock/difftime, blackbird.json.encode/decode, "
                   "blackbird.call(name,args[, {call_id=ID}]) are available; calls "
                   "inside the code get whole results (exec, process and file reads "
                   "keep their own defaults), only this tool's own result is shaped. "

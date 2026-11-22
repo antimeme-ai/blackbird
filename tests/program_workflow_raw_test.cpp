@@ -1203,12 +1203,7 @@ int main() {
       if (site == 3832) {
         const auto parent = reference(bytes);
         require(find(all, parent, 3830).ref.lane == record.ref.lane);
-        require(native<std::uint8_t>(bytes) == 0 && native<bool>(bytes));
-        const auto activation = reference(bytes);
-        ByteView activated{find(all, activation, 1905).body};
-        (void)reference(activated);
-        require(native<std::uint8_t>(activated) == 0);
-        require(text(activated) == expected_revision && activated.empty());
+        require(native<std::uint8_t>(bytes) == 0 && !native<bool>(bytes));
         require(!native<bool>(bytes) && bytes.empty());
         ++pending_ends;
       }

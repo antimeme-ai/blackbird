@@ -17,9 +17,7 @@
 #include <map>
 #include <memory>
 namespace blackbird {
-class RawTurnTrace;
 class RawOperationTrace;
-class RawPolicyTrace;
 class CodingProvider {
   friend class CodingEngine;
   bool request_group_owned_ = false;
@@ -214,8 +212,6 @@ private:
   using CommandTaskMap = std::map<std::string, CommandTaskActivity>;
   bool turn_running_ = false, backstop_claimed_ = false;
   bool request_group_active_ = false;
-  bool commit_pending_next_request_ = false;
-  RawTurnTrace *turn_trace_ = nullptr;
   RawOperationTrace *operation_trace_ = nullptr;
   std::optional<Error> failed_turn_;
   Value workflow_result_;
@@ -256,7 +252,6 @@ private:
   // original again (released at turn end or on another reference).
   std::string cached_result_ref_, cached_result_text_;
   std::shared_ptr<CommandJobs> command_jobs_;
-  std::unique_ptr<RetainedState::SettlementScope> settlement_;
   CommandTaskMap command_tasks_;
   std::optional<Error> command_failure_;
   bool pumping_commands_ = false;
@@ -265,8 +260,6 @@ private:
   bool file_effect_unretained_ = false;
   std::size_t operation_depth_ = 0;
   std::size_t unretained_bytes_ = 0;
-  void protect_workflow(const Value::Array &entries, const Value &proposal,
-                        std::optional<RawEventRef> parent = {});
   AuditLog &log_;
   ContextStore &context_;
   TaskStore tasks_;
@@ -286,9 +279,6 @@ private:
   static ProfileResult<Value> session_binding(SessionProfiles &profiles,
                                               const RawAuthParent *parent);
   Value last_request_bytes_, usage_;
-  // Calls already unanswered at workflow admission. Repair never closes calls
-  // introduced by the currently running workflow.
-  Value::Array repairable_outputs_;
   std::optional<HostToolCatalog> host_tools_;
   HostToolCallback host_call_;
   std::string host_tools_source_;
@@ -320,15 +310,6 @@ private:
   Value tool_registry() const;
   Value define_tool(const Value &arguments);
   Value request_tools() const;
-  Value budget_, pending_budget_;
-
-  // The built-in policy has its own revision so restore follows the current
-  // default rather than freezing whichever default was active when recorded.
-  std::string budget_revision_ = "builtin-default", pending_budget_revision_;
-  Value context_budget(const Value &arguments);
-  Value budget_view(std::string_view model, std::size_t input_bytes) const;
-  Value budget_view(std::string_view model, std::size_t input_bytes,
-                    RawPolicyTrace &trace) const;
   std::map<std::string, std::string> previewed_;
   void present(const Value &item);
 
@@ -337,19 +318,23 @@ private:
   SessionIdentity identity_;
   std::optional<std::string> restart_note_;
   DefinitionGenerationId generation_;
+  std::string last_retained_program_;
   std::optional<SourceReference> root_source_;
   std::size_t root_source_length_ = 0;
   std::unique_ptr<Observations> observations_;
   std::unique_ptr<Runtime> runtime_;
+  std::unique_ptr<RetainedState::SettlementScope> settlement_;
   std::uint64_t upstream_epoch_ = 0;
   std::optional<std::chrono::steady_clock::time_point> last_provider_request_at_;
   std::chrono::seconds cache_ttl_{300};
   std::string last_provider_model_;
   std::string last_provider_identity_;
   SessionTelemetry telemetry_;
-  bool has_open_tool_calls() const;
-  Value format_context_units() const;
-  Value commit_pending_context();
+  std::vector<CompactRequest> pending_compactions_;
+  Value context_list(bool include_archived = false) const;
+  Value context_compact(const Value &arguments);
+  Value context_read(const Value &arguments) const;
+  std::size_t flush_pending_compactions(std::string_view reason = {});
   bool auto_compact_for_overflow();
   Value request(Value options = Value::object({}));
   Value request_impl(Value options);

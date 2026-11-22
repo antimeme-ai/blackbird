@@ -24,6 +24,7 @@
 #include "blackbird/trace_archive.hpp"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -597,12 +598,21 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           if (!number || number->text().empty() || number->text()[0] == '-' ||
               number->text().size() > 19 ||
               number->text().find_first_not_of("0123456789") != std::string::npos ||
-              std::stoull(number->text()) > ContextStore::format_level) {
-            warning("Session was written by a newer Blackbird (context format level " +
+              std::stoull(number->text()) != ContextStore::format_level) {
+            const bool newer =
+                number && !number->text().empty() && number->text()[0] != '-' &&
+                number->text().size() <= 19 &&
+                number->text().find_first_not_of("0123456789") == std::string::npos &&
+                std::stoull(number->text()) > ContextStore::format_level;
+            warning("Session uses context format level " +
                     (number ? number->text() : std::string{"unknown"}) +
-                    "; this binary reads up to " +
+                    "; this Blackbird reads level " +
                     std::to_string(ContextStore::format_level) +
-                    "). Open it with that Blackbird. Session files left intact.\n");
+                    (newer
+                         ? ". Open it with a newer Blackbird or start a fresh session "
+                           "directory. Session files left intact.\n"
+                         : ". Start a fresh session directory. Session files left "
+                           "intact.\n"));
             return 1;
           }
         }
@@ -699,9 +709,15 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     std::optional<ContextStore> opened_context;
     try {
       opened_context.emplace(log,
-                             ContextOpen{.defer_checkpoint = true,
-                                         .whole_history_limit = whole_history_limit});
+                             ContextOpen{.whole_history_limit = whole_history_limit,
+                                         .defer_checkpoint = true});
     } catch (const Error &error) {
+      if (error.code == ErrorCode::unsupported &&
+          error.detail == ContextStore::level_refused) {
+        warning("Session uses a legacy or incompatible context format; start a fresh "
+                "session directory. Session files left intact.\n");
+        return 1;
+      }
       if (error.code != ErrorCode::unsupported ||
           error.detail != ContextStore::whole_history_refused || rebuild_session)
         throw;
@@ -712,36 +728,11 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       return 1;
     }
     ContextStore &context = *opened_context;
-    // A read-only open writes only bounded records, and every one of them, through
-    // the engine's construction, goes outside the resident-tail cap: the withheld
-    // snapshot cannot clear the tail, and /repair must stay reachable.
-    struct ReservedOpen {
-      AuditLog &log;
-      bool held = false;
-      void release() noexcept {
-        if (held)
-          log.end_reserved();
-        held = false;
-      }
-      ~ReservedOpen() { release(); }
-    } reserved_open{log};
-    if (context.read_only()) {
-      log.begin_reserved();
-      reserved_open.held = true;
-    }
     // Set once this process records a restart: that exit is a handoff.
     std::atomic_bool restart_pending{false};
-    // Every clean return arms this guard with arm(); an exception after the
-    // open's first write marks it with orderly_error() (OrderlyErrors below).
-    // Declared before the engine, the participant and command shutdown and the
-    // UI, it runs after their teardown records, so the snapshot is the last
-    // journal write. It writes only into a quiescent journal with no unresolved
-    // attempt, and never after this process recorded a restart, which its
-    // successor plays back. A failed snapshot is reported and keeps the status.
     struct CleanStop {
       RetainedState &root;
       ContextStore &context;
-      const RawAdapterContext &capture;
       const std::atomic_bool &restart_recorded;
       const decltype(warning) &report;
       const int exceptions = std::uncaught_exceptions();
@@ -756,15 +747,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             (mode == Mode::clean && std::uncaught_exceptions() > exceptions))
           return;
         try {
-          // An unresolved attempt would leave the snapshot without semantic
-          // coverage and force a full replay; recovery settles it from the tail.
-          // A read-only context writes no snapshot until a repair is accepted.
-          if (!root.quiescent() || restart_recorded.load() || context.read_only())
+          if (!root.quiescent() || restart_recorded.load())
             return;
-          // An interrupt during the TUI worker join's owner admission refuses
-          // it and leaves joined-child debt (the root's raw origin then admits
-          // no new input). That wait scope is gone here; settle the debt as the
-          // next launch would, or report and skip.
           if (const auto resumed = root.resume_raw_owner(); !resumed.has_value()) {
             report(std::string{"Clean-stop snapshot skipped (raw owner "} +
                    error_name(resumed.error().code) +
@@ -778,8 +762,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           if (saved && saved->boundary.sequence == end.sequence &&
               saved->boundary.end_offset == end.end_offset)
             return; // the current snapshot already ends the journal
-          const auto result = context.checkpoint(
-              RawContextOrigin{capture.parent.value_or(RawEventRef{})});
+          const auto result = context.checkpoint();
           if (!result.has_value())
             report(std::string{"Clean-stop snapshot failed ("} +
                    error_name(result.error().code) +
@@ -790,7 +773,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           (void)!::write(STDERR_FILENO, fallback.data(), fallback.size());
         }
       }
-    } clean_stop{*root, context, session_capture, restart_pending, warning};
+    } clean_stop{*root, context, restart_pending, warning};
     // Marks an exception leaving its scope as an orderly failure: the exception
     // still leaves, and the guard snapshots a quiescent journal first.
     struct OrderlyErrors {
@@ -802,8 +785,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       }
     };
     if (!seed_path.empty())
-      context.seed_successor(
-          seed, RawContextOrigin{session_capture.parent.value_or(RawEventRef{})});
+      context.seed_successor(seed);
     // Restore station scheduling only for an explicit native RRC resume. Ordinary
     // campaign/once invocations never acquire feed admissions by implication.
     if (resume_requested && station_path.empty())
@@ -937,123 +919,6 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     // pending, and a torn tail is reported either way.
     std::string reopen_notice;
     const bool pending_restart = restart_handoff_pending(*root);
-    const auto &report = context.open_report();
-    const bool read_only = report.read_only;
-    // How the context was established, when it was not simply the selected
-    // snapshot plus its suffix: a refused slot or snapshot, a catalogue that does
-    // not open, or the read-only state. Every error is kept with its detail.
-    Value::Object observation;
-    std::string recovery_notice;
-    if (report.recovery()) {
-      const auto slot_list = [&](const std::vector<std::pair<unsigned, Error>> &list,
-                                 bool catalogue) {
-        Value::Array out;
-        for (const auto &[slot, error] : list) {
-          Value::Object one{{"slot", Value{Number{slot}}},
-                            {"error", Value{error_name(error.code)}},
-                            {"detail", Value{Number{error.detail}}}};
-          if (catalogue)
-            one.emplace_back("slot_used", Value{report.restored_slot == slot});
-          out.push_back(Value{std::move(one)});
-        }
-        return Value{std::move(out)};
-      };
-      const auto describe = [](const Error &error) {
-        return std::string{error_name(error.code)} + " " + std::to_string(error.detail);
-      };
-      observation = {
-          {"playback",
-           Value{report.playback == ContextOpenReport::Playback::whole_history
-                     ? "whole-history"
-                 : report.playback == ContextOpenReport::Playback::suffix
-                     ? (report.older_slot ? "older-snapshot-suffix" : "snapshot-suffix")
-                     : "journal"}},
-          {"frames", Value{Number{report.frames}}},
-          {"skipped", Value{Number{report.skipped}}},
-          {"read_only", Value{report.read_only}},
-          {"torn_bytes", Value{Number{reopen_suffix ? reopen_suffix->torn_bytes : 0}}}};
-      if (!report.slot_refusals.empty())
-        observation.emplace_back("slot_refusals",
-                                 slot_list(report.slot_refusals, false));
-      if (!report.store_refusals.empty())
-        observation.emplace_back("store_refusals",
-                                 slot_list(report.store_refusals, false));
-      if (!report.catalogue_faults.empty())
-        observation.emplace_back("catalogue_faults",
-                                 slot_list(report.catalogue_faults, true));
-      for (const auto &[slot, error] : report.slot_refusals)
-        recovery_notice += "Snapshot slot " + std::to_string(slot) + " refused (" +
-                           describe(error) + ").\n";
-      for (const auto &[slot, error] : report.store_refusals)
-        recovery_notice += "Snapshot slot " + std::to_string(slot) +
-                           " refused when restored (" + describe(error) + ").\n";
-      for (const auto &[slot, error] : report.catalogue_faults)
-        recovery_notice +=
-            "Snapshot slot " + std::to_string(slot) +
-            "'s archive catalogue does not open (" + describe(error) +
-            (report.restored_slot == slot ? "); the slot was used.\n"
-                                          : "); the slot was not used.\n");
-      if (report.snapshot_refusal) {
-        observation.emplace_back(
-            "snapshot_refusal",
-            Value{std::string{error_name(report.snapshot_refusal->code)}});
-        observation.emplace_back("snapshot_fault",
-                                 Value{Number{report.snapshot_refusal->detail}});
-        observation.emplace_back("refused_by",
-                                 Value{report.refused_by_store ? "store" : "loader"});
-      }
-      if (report.older_slot)
-        recovery_notice += "The context was restored from the older snapshot and the " +
-                           std::to_string(report.frames) + " frames after it.\n";
-      else if (report.playback == ContextOpenReport::Playback::whole_history)
-        recovery_notice += "The context was played back from the whole history (" +
-                           std::to_string(report.frames) + " frames).\n";
-      if (report.read_only) {
-        observation.emplace_back("bad_revision", Value{report.bad_revision});
-        observation.emplace_back("bad_error",
-                                 Value{std::string{error_name(report.bad_error.code)}});
-        observation.emplace_back("bad_detail", Value{Number{report.bad_error.detail}});
-        observation.emplace_back("after_bad", Value{Number{report.after_bad}});
-        recovery_notice += "Context frame " + report.bad_revision +
-                           " does not apply (" + describe(report.bad_error) +
-                           "): the session is read-only, with " +
-                           std::to_string(report.after_bad) +
-                           " later context frames set aside. No request, context write "
-                           "or snapshot happens until /repair [ENTRY...] approves a "
-                           "repair frame; /repair --list shows what it skips and "
-                           "keeps.\n";
-      }
-    }
-    // A read-only session withholds every snapshot, so each open would repeat its
-    // records. An open records them only when its observation (the bad frame, a
-    // torn tail, the refused slots and catalogues) differs from the last one
-    // recorded; any new observation is recorded once.
-    const auto observed = [](const Value::Object &metadata) {
-      Value::Object out;
-      for (const auto &[key, value] : metadata)
-        if (key == "bad_revision" || key == "torn_bytes" || key == "slot_refusals" ||
-            key == "store_refusals" || key == "catalogue_faults" ||
-            key == "snapshot_refusal" || key == "snapshot_fault")
-          out.emplace_back(key, value);
-      return Value{std::move(out)};
-    };
-    const bool repeated = read_only && [&] {
-      std::optional<Value> last;
-      for (const auto &fact : root->tail_facts()) {
-        const auto *record = std::get_if<ApplicationRecordEvent>(&fact.event.body);
-        if (!record || record->channel != ApplicationChannel::log)
-          continue;
-        auto packet = read_packet(record->payload);
-        if (!packet.has_value())
-          continue;
-        const auto *label = packet.value().find("label");
-        const auto *metadata = packet.value().find("metadata");
-        if (label && *label == Value{"context.recovery"} && metadata &&
-            std::holds_alternative<Value::Object>(metadata->value()))
-          last = observed(metadata->object());
-      }
-      return last && *last == observed(observation);
-    }();
     if (reopen_suffix &&
         !(resume_requested && pending_restart && reopen_suffix->torn_bytes == 0)) {
       const bool accepted = reopen_suffix->snapshot == std::string_view{"accepted"};
@@ -1064,12 +929,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                              {"torn_bytes", Value{Number{reopen_suffix->torn_bytes}}}};
       if (pending_restart)
         metadata.emplace_back("pending_restart", Value{true});
-      if (read_only)
-        metadata.emplace_back("read_only", Value{true});
-      if (!repeated)
-        log.record(ApplicationChannel::log,
-                   Value::object({{"label", Value{"session.reopen-suffix"}},
-                                  {"metadata", Value{std::move(metadata)}}}));
+      log.record(ApplicationChannel::log,
+                 Value::object({{"label", Value{"session.reopen-suffix"}},
+                                {"metadata", Value{std::move(metadata)}}}));
       reopen_notice =
           std::to_string(reopen_suffix->frames) + " journal frames (" +
           std::to_string(reopen_suffix->bytes) + " bytes)" +
@@ -1080,30 +942,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
            : reopen_suffix->snapshot == std::string_view{"rejected"}
                ? " after a rejected snapshot"
                : " with no snapshot") +
-          (read_only ? ": snapshots are withheld while the session is read-only.\n"
-           : pending_restart
+          (pending_restart
                ? ": a restart was left pending and not resumed, or the last stop was "
                  "not clean.\n"
                : ": the last stop was not clean, or the session predates this "
                  "Blackbird.\n");
       if (!tui)
         warning(reopen_notice);
-    }
-    {
-      if (report.recovery()) {
-        if (!repeated)
-          log.record(ApplicationChannel::log,
-                     Value::object({{"label", Value{"context.recovery"}},
-                                    {"metadata", Value{std::move(observation)}}}));
-        reopen_notice += recovery_notice;
-        if (!tui)
-          warning(recovery_notice);
-      }
-      if (report.read_only && (one || application || !station_path.empty())) {
-        warning("A read-only session cannot run unattended; open it interactively "
-                "to review and /repair.\n");
-        throw Error{ErrorCode::audit_unavailable};
-      }
     }
     {
       auto station =
@@ -1113,13 +958,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                                : std::filesystem::absolute(station_path)
                                                      .lexically_normal()
                                                      .string()}}});
-      bool unchanged = false;
-      if (read_only)
-        for (const auto &program : root->current_programs())
-          if (string_field(program, "label") == "station.profile")
-            unchanged = program == station;
-      if (!unchanged)
-        log.record(ApplicationChannel::program, std::move(station));
+      log.record(ApplicationChannel::program, std::move(station));
     }
     // The loaded set, latest wins; an unchanged set (a clean reopen) adds nothing.
     {
@@ -1145,15 +984,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       if (!recorded)
         log.record(ApplicationChannel::program, std::move(record));
     }
-    context.finish_open(
-        RawContextOrigin{session_capture.parent.value_or(RawEventRef{})});
+    context.finish_open();
     session_store.save(settings, &session_capture);
     model = settings.model;
     provider_name = settings.provider;
     effort = settings.effort;
     workflow = settings.workflow;
     bool resume_turn = resume_requested && !settings.effort_pending &&
-                       !context.read_only() &&
                        session_store.resume(context, &session_capture);
     if (resume_requested && !resume_turn && one)
       return clean_stop.arm(0);
@@ -1189,7 +1026,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               "backstop stay fenced. No old PID adopted or effect replayed.\n");
     // Convert an old derived state once, after the effective identity exists.
     // Unsupported station/restart states remain on independent full recovery.
-    if (!root->compact_recovery() && !context.read_only()) {
+    if (!root->compact_recovery()) {
       bool supported = unwrap(root->unresolved_attempts()).empty();
       for (const auto &packet : root->current_programs()) {
         const auto &label = string_field(packet, "label");
@@ -1317,9 +1154,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             change.kind == ContextChangeKind::edited ? "edited"
             : change.kind == ContextChangeKind::restored || change.mode == "restore"
                 ? "restored"
-            : change.mode == "summarize" || change.mode == "archive" ? "compacted"
-            : change.mode == "select"                                ? "selected"
-                                                                     : change.mode;
+            : change.mode == "summarize" || change.mode == "drop" ? "compacted"
+            : change.mode == "select"                             ? "selected"
+                                                                  : change.mode;
         ui.context_changed(kind, change.bytes_before, change.bytes_after);
       };
     engine.task_activity_native = [&, tui](const Value &event,
@@ -1698,8 +1535,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   emit("Already in this session.\n");
                 } else {
                   engine.validate_session_switch(&parent);
-                  if (!context.read_only())
-                    unwrap(context.checkpoint());
+                  unwrap(context.checkpoint());
                   handoff.select(selection);
                   const auto destination_text =
                       raw_restart_path(selection, destination);
@@ -1748,8 +1584,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 (void)raw_restart_source(selection, 6, session.native());
                 const auto parent = selection.context();
                 engine.validate_session_switch(&parent);
-                if (!context.read_only())
-                  unwrap(context.checkpoint());
+                unwrap(context.checkpoint());
                 const auto parent_path = session.parent_path();
                 auto template_credit = selection.source_credit(
                     raw_session_bound(parent_path.native().size(), 16));
@@ -1806,7 +1641,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               workflow = candidate.workflow;
             } else if (prompt == "/context") {
               raw_main_branch(dispatch, 27);
-              emit(unwrap(dump_json(context.view())) + "\n");
+              emit(unwrap(dump_json(context.list(true))) + "\n");
             } else if (prompt == "/sessions") {
               raw_main_branch(dispatch, 28);
               RawEventRef listing_source;
@@ -1818,101 +1653,37 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 emit(unwrap(dump_json(listing)) + "\n");
             } else if (prompt == "/checkpoint") {
               raw_main_branch(dispatch, 29);
-              if (context.read_only())
-                emit("The session is read-only after a context frame that does not "
-                     "apply; no snapshot is written until /repair is accepted.\n");
-              else {
-                unwrap(context.checkpoint());
-                emit("Session checkpoint saved.\n");
-              }
-            } else if (prompt == "/repair" || prompt.starts_with("/repair ")) {
-              raw_main_branch(dispatch, 43);
-              // The operator's approval of a repair frame: skip the bad frame and
-              // every later context frame, keeping the picked originals.
-              Value::Array picks;
-              for (std::size_t at = 7; at < prompt.size();) {
-                const auto start = prompt.find_first_not_of(' ', at);
-                if (start == std::string_view::npos)
-                  break;
-                const auto end = std::min(prompt.find(' ', start), prompt.size());
-                picks.push_back(Value{std::string{prompt.substr(start, end - start)}});
-                at = end;
-              }
-              if (!context.read_only())
-                emit("Nothing to repair: the context is not read-only.\n");
-              else if (picks.size() == 1 && picks.front() == Value{"--list"}) {
-                // The preview: the frames a repair skips, and what it may keep.
-                const auto preview = context.repair_preview();
-                std::string text =
-                    "Context frame " + string_field(preview, "bad_revision") +
-                    " does not apply (" + string_field(preview, "bad_error") + " " +
-                    unwrap(format_value(field(preview, "bad_detail"))) +
-                    "). /repair skips these context frames:\n";
-                for (const auto &revision : field(preview, "skipped").array())
-                  text += "  " + revision.string() + "\n";
-                const auto &offered = field(preview, "originals").array();
-                if (const auto &held = field(preview, "head_faults").array();
-                    !held.empty()) {
-                  text += "The context before the bad frame already has these "
-                          "unpaired calls or outputs; /repair keeps them as they "
-                          "are:\n";
-                  for (const auto &fault : held)
-                    text += "  " + fault.string() + "\n";
-                }
-                text += offered.empty()
-                            ? "They created no entry a repair can keep.\n"
-                            : "It may keep these entries (/repair ID ...):\n";
-                for (const auto &original : offered)
-                  text += "  " + string_field(original, "id") +
-                          (field(original, "pairs") == Value{true}
-                               ? ""
-                               : " (on its own it leaves a call or output unpaired)") +
-                          " " + unwrap(format_value(field(original, "item"))) + "\n";
-                emit(text);
-              } else {
-                const auto outcome = [&] {
-                  try {
-                    return context.repair(
-                        picks, RawContextOrigin{
-                                   command_context.parent.value_or(RawEventRef{})});
-                  } catch (const Error &error) {
-                    if (error.code == ErrorCode::conflict &&
-                        error.detail == ContextStore::repair_unpaired)
-                      emit("Repair refused: the picks would leave a function call "
-                           "without its output, or an output without its call, that "
-                           "the context did not already have. /repair --list marks "
-                           "the picks that do on their own.\n");
-                    else if (error.code == ErrorCode::invalid_identity)
-                      emit("Repair refused: a pick is not an original of the skipped "
-                           "frames, or is named twice. /repair --list shows them.\n");
-                    throw;
-                  }
-                }();
-                emit("Repair frame " + string_field(outcome, "revision") +
-                     " accepted; " + unwrap(format_value(field(outcome, "skipped"))) +
-                     " context frames skipped. The session is writable again.\n");
-              }
+              unwrap(context.checkpoint());
+              emit("Session checkpoint saved.\n");
             } else if (prompt == "/stats") {
               raw_main_branch(dispatch, 30);
               emit(unwrap(dump_json(engine.stats())) + "\n");
             } else if (prompt.starts_with("/compact ")) {
               raw_main_branch(dispatch, 31);
-              emit(unwrap(dump_json(
-                       context.manage(unwrap(parse_json(prompt.substr(9)))))) +
+              const auto args = unwrap(parse_json(prompt.substr(9)));
+              emit(unwrap(dump_json(engine.operator_call("context_compact", args))) +
                    "\n");
             } else if (prompt.starts_with("/inspect ")) {
               raw_main_branch(dispatch, 32);
-              emit(unwrap(dump_json(
-                       context.inspect(unwrap(parse_json(prompt.substr(9)))))) +
+              const auto args = unwrap(parse_json(prompt.substr(9)));
+              emit(unwrap(dump_json(engine.operator_call("context_read", args))) +
                    "\n");
             } else if (prompt == "/originals") {
               raw_main_branch(dispatch, 33);
-
-              emit(unwrap(dump_json(context.originals())) + "\n");
+              emit(unwrap(dump_json(context.list(true))) + "\n");
             } else if (prompt.starts_with("/restore ")) {
               raw_main_branch(dispatch, 34);
-              context.restore(prompt.substr(9));
-              emit("Original restored.\n");
+              const auto arg = prompt.substr(9);
+              std::uint64_t id = 0;
+              const auto parsed =
+                  std::from_chars(arg.data(), arg.data() + arg.size(), id);
+              if (parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size() ||
+                  id == 0)
+                throw Error{ErrorCode::invalid_range};
+              CompactRequest req;
+              req.ids = {id};
+              req.op = CompactOp::restore;
+              emit(unwrap(dump_json(context.compact(req))) + "\n");
             } else if (prompt.starts_with("/model ")) {
               raw_main_branch(dispatch, 35);
               auto candidate = session_store.settings();
@@ -2028,10 +1799,6 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             ui.failed();
           emit("\n" + std::string{error_name(e.code)} + " (" +
                std::to_string(e.detail) + "); context/audit retained\n");
-          if (context.read_only())
-            emit("The session is read-only after context frame " +
-                 context.open_report().bad_revision +
-                 " did not apply. /repair [ENTRY...] approves a repair frame.\n");
           if (root->maintenance_error())
             emit("Saved-state maintenance failed (" +
                  std::string{error_name(root->maintenance_error()->code)} +
@@ -2422,7 +2189,6 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                                      : 0);
     }
     // The open is over: commands while read-only are ordinary writes.
-    reserved_open.release();
     bool participant_retention_failed = false, command_retention_failed = false;
     if (tui) {
       ui.notice("/help lists commands. Workflow reloads each turn.\n");
