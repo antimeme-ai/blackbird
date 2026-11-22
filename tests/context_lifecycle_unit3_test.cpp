@@ -323,6 +323,11 @@ void test_mid_turn_cut_and_epoch_key() {
               std::string::npos,
           "archived original must remain recoverable");
 
+  const auto units_res = engine.operator_call("context_units", Value::object({}));
+  require(units_res.find("revision") != nullptr && units_res.find("base") == nullptr &&
+              units_res.find("note") != nullptr,
+          "context_units exposes revision + note without misleading base key");
+
   // Also verify model function_call -> context_manage(apply="now") through turn.lua:
   // with an open tool call, commit defers cleanly until tool output appends, then
   // activates automatically before the very next provider request in the same turn.

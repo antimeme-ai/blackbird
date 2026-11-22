@@ -1577,10 +1577,13 @@ Value tool_definitions() {
            {"name", Value{"context_manage"}},
            {"description",
             Value{
-                "Explicit managed summarize/select/archive/restore. Proposal: optional "
-                "base (omitted explicitly binds invocation snapshot; supplied is "
-                "strict CAS), mode, ids (whole units), reason, source; "
-                "summarize also summary {role:assistant or developer,content}. "
+                "Explicit managed summarize/select/archive/restore. Proposal: mode, "
+                "ids "
+                "(whole units), reason, source; summarize also summary {role:assistant "
+                "or developer,content}. Omit base when calling context_manage as a "
+                "tool "
+                "(tool calls/outputs advance context revision, so omitting base binds "
+                "the current snapshot automatically; supplied base is strict CAS). "
                 "Never archives, summarizes or leaves out instructions (operator "
                 "prompts, restart notes, the built-in ultracode brief, appends "
                 "declared class instruction, and user/system/developer entries of "

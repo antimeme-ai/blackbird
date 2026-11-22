@@ -4845,9 +4845,12 @@ Value CodingEngine::format_context_units() const {
                        {"ids", Value{std::move(ids)}},
                        {"bytes", Value{Number{bytes}}}}));
   }
-  return Value::object({{"base", Value{context_.head()}},
-                        {"upstream_epoch", Value{Number{upstream_epoch_}}},
-                        {"units", Value{std::move(out)}}});
+  return Value::object(
+      {{"revision", Value{context_.head()}},
+       {"upstream_epoch", Value{Number{upstream_epoch_}}},
+       {"note", Value{"Omit proposal.base when calling context_manage as a tool "
+                      "(the current snapshot binds automatically)."}},
+       {"units", Value{std::move(out)}}});
 }
 Value CodingEngine::commit_pending_context() {
   if (context_.pending_proposal() == Value{})
@@ -6388,6 +6391,13 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
               !proposal.find("base"))
             proposal.object().emplace_back("base", Value{context_.head()});
           auto res = context_.manage(proposal);
+          if (res.find("reason") && field(res, "reason") == Value{"stale-base"} &&
+              has_open_tool_calls()) {
+            res.object().emplace_back(
+                "hint",
+                Value{"Omit proposal.base when calling context_manage as a tool "
+                      "so Blackbird binds the current revision automatically."});
+          }
           if (apply == "now") {
             if (res.find("staged") && field(res, "staged") == Value{true}) {
               if (has_open_tool_calls()) {
