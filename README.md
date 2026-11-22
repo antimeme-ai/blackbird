@@ -321,7 +321,7 @@ The [participants and modes brief](docs/PARTICIPANTS_AND_MODES.md) and [integrat
 
 [Blackbird](BLACKBIRD.md) is the working doctrine. It asks for aggressive progress underwritten by discipline: read the literature and source, make the design and plan explicit, choose tests with real oracles, fix consequential findings, and finish useful conceptual units. We abhor ceremony and unsupported claims.
 
-The rigor stack includes strict compiler diagnostics, focused static analysis, debug and optimized builds, ASan/UBSan, TSan, fuzz tooling, and direct behavioral tests. Ordinary Linux checks run on Neuroses. Tool availability does not establish product correctness, and a sanitizer pass does not establish a protocol contract. Tests are selected for the fault class and the actual changed behavior. Mutation campaigns are deferred until a mature suite merits them; mutations run on the fleet, never the laptop.
+The rigor stack includes strict compiler diagnostics, focused static analysis, debug and optimized builds, ASan/UBSan, TSan, fuzz tooling, and direct behavioral tests. Ordinary Linux checks run on Wintermute. Tool availability does not establish product correctness, and a sanitizer pass does not establish a protocol contract. Tests are selected for the fault class and the actual changed behavior. Mutation campaigns are deferred until a mature suite merits them; mutations run on the fleet, never the laptop.
 
 Independent Kimi and ChatGPT reviews have found real defects. Unavailable credit, an authentication failure, or a timed-out reviewer is reported as such. Advisory Jev judgments are available for structured decisions and experiments; they do not replace exact checks or become approval gates.
 

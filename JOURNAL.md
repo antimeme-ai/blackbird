@@ -13580,3 +13580,26 @@ in `CodingEngine::turn()`) with a single unified Block model and clean turn exec
      turn end; `apply = "now"` applies immediately and bumps `upstream_epoch_`).
    - Kept O(1) `SettlementScope` headroom refreshed per admitted operation and held
      across turns while background command jobs remain active.
+
+
+## 2026-11-22 — Migrate Linux Checks to Wintermute (Clang 23.1.3 / libc++ 23.1.3 / Lua 5.5.1)
+
+Replaced the retired Neuroses host with `patrick@wintermute` (`Arch/Omarchy Linux x86_64`,
+48 cores) for ordinary Linux verification:
+- Provisioned `llvm`/`clang` `23.1.3`, `libc++`/`libc++abi` `23.1.3`, `compiler-rt`,
+  `lld`, `cmake` `4.4.4`, and `ninja` `1.13.2` on Wintermute alongside system `lua 5.5.1`.
+- Updated `CMakeLists.txt` (`linux-llvm23` -> `23.1.3`), `scripts/check-linux` (default
+  host `patrick@wintermute` with `BLACKBIRD_LINUX_HOST` override, system Lua 5.5.1,
+  `mise` shim `PATH` for `tui-test`, bundled `scripts/check-portable-runtime`, removed
+  retired `lua-5.4.8` archive and deleted `context_cut_fuzz`/`saved_payload_fuzz`), and
+  docs (`AGENTS.md`, `README.md`, `tooling/README.md`).
+- Fixed two cross-platform test issues surfaced on Arch Linux:
+  1. `tests/clean_stop_test.cpp` (`wrapper_sigquit_child_case`): switched fake `curl`
+     from `/bin/sh` to `python3` (`RLIMIT_CORE=0`, `os.kill(os.getpid(), SIGQUIT)`)
+     because GNU `bash` (Arch's `/bin/sh`) ignores `SIGQUIT` internally even when
+     inherited as `SIG_DFL`.
+  2. `scripts/check-terminal-pty` (`terminal_pty_comfort`): narrowed scroll-lock check
+     so echoed `NEW_TAIL` in the `/lua` command line and in-place tail sliding inside
+     collapsed tool cards do not trip false positives.
+- Qualified full `./scripts/check-linux --profiles debug release asan` on Wintermute:
+  **292/292 Debug, 292/292 Release, and 292/292 ASan+UBSan** passed (`context/linux/run-tg3yf6tc`).

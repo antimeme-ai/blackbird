@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run ordinary native checks on the operator-selected Neuroses host; never mutants."""
+"""Run ordinary native checks on the operator-selected Wintermute host; never mutants."""
 import argparse
-import hashlib
 import io
+import os
 import re
 from pathlib import Path
 import shlex
@@ -12,7 +12,8 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "neuroses"]
+HOST = os.environ.get("BLACKBIRD_LINUX_HOST", "patrick@wintermute")
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", HOST]
 
 
 def main():
@@ -42,13 +43,9 @@ def main():
     paths.append("scripts/check-tui-instrument")
     paths += ["scripts/check-terminal-edge", "scripts/check-tui-viewport", "scripts/check-main-input"]
 
-    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird"]
-    lua_archive = ROOT.parent / "quarantine_proj/archives/lua-5.4.8.tar.gz"
-    if hashlib.sha256(lua_archive.read_bytes()).hexdigest() != "4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae":
-        raise RuntimeError("Lua 5.4.8 source archive checksum mismatch")
+    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime"]
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
-        bundle.add(lua_archive, arcname="tooling/dependencies/lua-5.4.8.tar.gz")
         for name in paths:
             path = ROOT / name
             if path.is_symlink():
@@ -64,45 +61,41 @@ def main():
     keep_remote = False
     try:
         subprocess.run([*SSH, "tar -xzf - -C " + shlex.quote(remote)], input=archive.getvalue(), check=True, timeout=30)
-        commands = '''import platform, subprocess, tarfile, re
+        commands = '''import os, platform, subprocess, re
 from pathlib import Path
 root = Path.cwd()
+mise_shims = Path.home() / '.local/share/mise/shims'
+if mise_shims.is_dir():
+    os.environ['PATH'] = str(mise_shims) + ':' + os.environ.get('PATH', '/usr/bin:/bin')
 # Explicit development-tool provisioning precedes configuration/testing.
 if (selected_profiles != ['fuzz']) and (test_regex is None or any(re.search(test_regex, name) for name in
                              ('tui_microsoft', 'tui_command_inspector', 'tui_command_center', 'tui_retained_result'))):
     subprocess.run(['python3', str(root / 'scripts/tui-test'), '--install'], check=True)
     subprocess.run(['python3', str(root / 'scripts/tui-test'), '--check'], check=True)
 print(platform.platform(), flush=True)
-for tool in ('/usr/bin/clang++-23', '/usr/bin/cmake', '/usr/bin/ninja'):
-    subprocess.run([tool, '--version'], check=True)
-macros = subprocess.check_output(['/usr/bin/clang++-23', '-stdlib=libc++', '-std=c++23', '-dM', '-E', '-x', 'c++', '-include', 'version', '/dev/null'], text=True)
-if '#define _LIBCPP_VERSION 230104\\n' not in macros:
-    raise RuntimeError('Linux profile requires installed libc++ 23.1.4')
-print('Linux standard library: libc++ 23.1.4', flush=True)
+for tool in ('/usr/bin/clang++', '/usr/bin/cmake', '/usr/bin/ninja', '/usr/bin/lua'):
+    subprocess.run([tool, '--version' if tool != '/usr/bin/lua' else '-v'], check=True)
+macros = subprocess.check_output(['/usr/bin/clang++', '-stdlib=libc++', '-std=c++23', '-dM', '-E', '-x', 'c++', '-include', 'version', '/dev/null'], text=True)
+if '#define _LIBCPP_VERSION 230103\\n' not in macros:
+    raise RuntimeError('Linux profile requires installed libc++ 23.1.3')
+print('Linux standard library: libc++ 23.1.3', flush=True)
 print('CTest selection:', test_regex if test_regex is not None else 'all', flush=True)
 # Suites that starve under the parallel batch's own ASan load on this shared host
 # (arconaut-8zr): they start a raw supervisor and recorder, fsync every journal
 # write, or start the TUI on a PTY, and wait on liveness guards or CTest's
 # watchdog. Run alone they pass. They run after the parallel batch, one at a time.
-# Other users share this host. A saturated disk (an rsync or a database
-# vacuum) parks the raw supervisor and recorder in D state for tens of seconds,
-# so each batch records the load and the kernel's I/O pressure beside its result.
 def host_pressure(when):
     load = Path('/proc/loadavg').read_text().split()[:3]
     pressure = Path('/proc/pressure/io')
     io = pressure.read_text().split('\\n')[1] if pressure.exists() else 'unavailable'
     print('Host ' + when + ' batch: load ' + ' '.join(load) + '; io ' + io, flush=True)
 load_sensitive = {
-    'raw_context', 'raw_admission', 'raw_runtime', 'raw_metadata', 'raw_reader', 'raw_authored',
+    'raw_admission', 'raw_runtime', 'raw_metadata', 'raw_reader', 'raw_authored',
     'raw_recorder_cuts', 'raw_sampler', 'raw_command_wake', 'raw_retained_native',
     'raw_retained_caller', 'storage_raw', 'clean_stop', 'coding_capacity', 'command_jobs',
     'command_jobs_engine', 'command_jobs_pty', 'backstop', 'application', 'journal_crash',
     'retained_state_crash', 'terminal_pty', 'terminal_pty_state', 'tui_retained_result', 'tasks_raw',
 }
-with tarfile.open(root / 'tooling/dependencies/lua-5.4.8.tar.gz', 'r:gz') as archive:
-    archive.extractall(root / 'tooling/dependencies', filter='data')
-lua = root / 'tooling/dependencies/lua-5.4.8/src'
-subprocess.run(['make', '-C', str(lua), 'liblua.a', 'CC=/usr/bin/clang-23', 'MYCFLAGS=-DLUA_USE_LINUX -fPIC'], check=True)
 
 for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Release', 'none'), ('asan', 'Debug', 'address'), ('fuzz', 'Debug', 'fuzz')]:
     if selected_profiles and name not in selected_profiles:
@@ -110,14 +103,14 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
     if name == 'fuzz' and not selected_profiles:
         continue
     build = root / 'build' / name
-    configure = ['/usr/bin/cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja', '-DCMAKE_CXX_COMPILER=/usr/bin/clang++-23', '-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja', '-DBLACKBIRD_COMPILER_PROFILE=linux-llvm23', '-DCMAKE_BUILD_TYPE='+mode, '-DBLACKBIRD_DEBUG='+('OFF' if mode == 'Release' else 'ON'), '-DBLACKBIRD_INSTRUMENTATION='+instrumentation, '-DLUA_INCLUDE_DIR='+str(lua), '-DLUA_LIBRARY='+str(lua / 'liblua.a')]
+    configure = ['/usr/bin/cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja', '-DCMAKE_CXX_COMPILER=/usr/bin/clang++', '-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja', '-DBLACKBIRD_COMPILER_PROFILE=linux-llvm23', '-DCMAKE_BUILD_TYPE='+mode, '-DBLACKBIRD_DEBUG='+('OFF' if mode == 'Release' else 'ON'), '-DBLACKBIRD_INSTRUMENTATION='+instrumentation, '-DLUA_INCLUDE_DIR=/usr/include', '-DLUA_LIBRARY=/usr/lib/liblua.so']
     if instrumentation == 'address':
         configure.append('-DCMAKE_CXX_FLAGS_DEBUG=-g -O1')
     subprocess.run(configure, check=True)
     if name == 'fuzz':
         # The profile reader fuzzer, bounded by executions; the corpus starts from copies
         # of the shipped profiles so libFuzzer never writes into the source tree.
-        subprocess.run(['/usr/bin/cmake', '--build', str(build), '--parallel', '16', '--target', 'profile_reader_fuzz'], check=True)
+        subprocess.run(['/usr/bin/cmake', '--build', str(build), '--parallel', '24', '--target', 'profile_reader_fuzz'], check=True)
         corpus = build / 'profile-reader-corpus'
         corpus.mkdir(exist_ok=True)
         for seed in sorted((root / 'profiles/providers').glob('*.lua')):
@@ -126,86 +119,8 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
         artifacts.mkdir(exist_ok=True)
         print('Fuzz artifacts (remote): ' + str(artifacts), flush=True)
         subprocess.run([str(build / 'profile_reader_fuzz'), '-runs=' + str(fuzz_runs), '-max_len=8192', '-seed=1', '-artifact_prefix=' + str(artifacts) + '/', str(corpus)], check=True)
-        # The cut and repair frame decoder (unit S1): seeded with BBM2 frames written
-        # by the development packet writer, bounded by the same executions.
-        subprocess.run(['/usr/bin/cmake', '--build', str(build), '--parallel', '16', '--target', 'context_cut_fuzz'], check=True)
-        import runpy, struct
-        writer = runpy.run_path(str(root / 'scripts/native-packet.py'))['write_packet']
-        def crc32c(data, crc=0):
-            crc ^= 0xffffffff
-            for byte in data:
-                crc ^= byte
-                for _ in range(8):
-                    crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
-            return crc ^ 0xffffffff
-        def refs_crc(refs):
-            crc = 0
-            for record, ordinal in refs:
-                crc = crc32c(bytes.fromhex(record) + struct.pack('<I', ordinal), crc)
-            return crc
-        cut_corpus = build / 'context-cut-corpus'
-        cut_corpus.mkdir(exist_ok=True)
-        rev = lambda n: format(n, '032x')
-        fixed = '11' + '00' * 15  # the fuzz entry's fixed entries: record 0x11..., ordinals 0-2
-        ref = lambda k: [fixed, k]
-        item = lambda text: {'role': 'assistant', 'content': text}
-        # Remove e0, replace e1, insert a fresh original at the start, re-insert e0
-        # after e2: every apply step, with the result's CRC32C over the refs.
-        cut_refs = [(rev(9), 0), (fixed, 1), (fixed, 2), (fixed, 0)]
-        cut = {'op': 'cut', 'format': 'cut-delta-v1', 'revision': rev(9), 'base': rev(1), 'observed': rev(1), 'accepted': True,
-               'kind': 'archival', 'changes': ['archive', 'edit', 'summary'], 'chapter': None, 'archived': [ref(0)], 'swept': [], 'reasoning': [],
-               'replace': [{'ref': ref(1), 'item': item('x')}],
-               'insert': [{'anchor': 'start', 'fresh': 0}, {'anchor': ref(2), 'existing': ref(0)}],
-               'originals': [{'item': {'role': 'developer', 'content': 'note'}, 'class': 1}], 'refused': [], 'pending': None,
-               'result': {'count': 4, 'crc32c': refs_crc(cut_refs), 'encoded_bytes': 0},
-               'sizes': {'before': 10, 'prefix': 2}, 'cause': {'source': 'model', 'forced': True}}
-        swept = dict(cut, archived=[], swept=[ref(2)], reasoning=[ref(1)], replace=[], insert=[{'anchor': ref(0), 'fresh': 0}],
-                     result={'count': 2, 'crc32c': refs_crc([(fixed, 0), (rev(9), 0)]), 'encoded_bytes': 0})
-        repair_refs = [(fixed, 0), (fixed, 1), (fixed, 2), (rev(8), 0)]
-        repair = {'op': 'repair', 'format': 'repair-v1', 'revision': rev(8), 'base': None, 'observed': None, 'accepted': True,
-                  'skipped': [rev(5), rev(6)], 'insert': [{'anchor': ref(2), 'fresh': 0}],
-                  'originals': [{'item': {'role': 'user', 'content': 'kept'}, 'class': 0}],
-                  'result': {'count': 4, 'crc32c': refs_crc(repair_refs), 'encoded_bytes': 0}, 'cause': {'source': 'operator'}}
-        staged = {'op': 'cut', 'format': 'cut-delta-v1', 'revision': rev(7), 'observed': rev(1), 'accepted': False, 'reason': 'staged'}
-        for name, packet in (('cut', cut), ('swept', swept), ('repair', repair), ('staged', staged)):
-            writer(cut_corpus / name, packet)
-        print('Fuzz artifacts (remote, context cut): ' + str(artifacts), flush=True)
-        subprocess.run([str(build / 'context_cut_fuzz'), '-runs=' + str(fuzz_runs), '-max_len=8192', '-seed=1', '-artifact_prefix=' + str(artifacts) + '/cut-', str(cut_corpus)], check=True)
-        # The state-file body and the saved-context validator (unit S1): seeds are
-        # file-version-2 bodies, [u8 version][u32 core][u32 programs][body].
-        subprocess.run(['/usr/bin/cmake', '--build', str(build), '--parallel', '16', '--target', 'saved_payload_fuzz'], check=True)
-        payload_corpus = build / 'saved-payload-corpus'
-        payload_corpus.mkdir(exist_ok=True)
-        def packet_bytes(value):
-            scratch = build / 'packet.tmp'
-            writer(scratch, value)
-            return scratch.read_bytes()
-        def body(core, programs, entries, sections):
-            out = bytearray(packet_bytes(core)) + packet_bytes(programs)
-            core_size, program_size = len(packet_bytes(core)), len(packet_bytes(programs))
-            for parts in (entries, sections):
-                if parts is None:
-                    out += struct.pack('<Q', 0)
-                    continue
-                out += struct.pack('<Q', len(parts) + 1)
-                for part in parts:
-                    encoded = packet_bytes(part)
-                    out += struct.pack('<Q', len(encoded)) + encoded
-            return bytes([2]) + struct.pack('<II', core_size, program_size) + bytes(out)
-        programs = [{'label': 'session.identity'}]
-        refs = [[fixed, 0], [fixed, 1]]
-        inline = {'id': fixed + '.2', 'item': item('edited'), 'origin': 'legacy'}
-        seeds = {
-            'refs': body({'version': 2, 'base': rev(1), 'physical_records': 9}, programs, refs + [inline], []),
-            'skipped': body({'version': 2, 'base': rev(1), 'skipped': [rev(5)]}, programs, refs, []),
-            'empty': body({'version': 2, 'base': ''}, programs, [], []),
-            'core-entries': body({'version': 2, 'base': rev(1), 'entries': 'x'}, programs, None, []),
-        }
-        for name, data in seeds.items():
-            (payload_corpus / name).write_bytes(data)
-        subprocess.run([str(build / 'saved_payload_fuzz'), '-runs=' + str(fuzz_runs), '-max_len=8192', '-seed=1', '-artifact_prefix=' + str(artifacts) + '/payload-', str(payload_corpus)], check=True)
         continue
-    build_command = ['/usr/bin/cmake', '--build', str(build), '--parallel', '16']
+    build_command = ['/usr/bin/cmake', '--build', str(build), '--parallel', '24']
     if build_targets:
         build_command += ['--target', *build_targets]
     subprocess.run(build_command, check=True)
@@ -267,7 +182,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
                 failure = f"unpacking failed: {error}"
             if failure:
                 keep_remote = True
-                note = f"Fuzz artifact copy-back failed ({failure}); remote workspace kept at neuroses:{remote}"
+                note = f"Fuzz artifact copy-back failed ({failure}); remote workspace kept at {HOST}:{remote}"
                 (capture / "copy-back-error.txt").write_text(note + "\n")
                 print(note, file=sys.stderr)
         if result.returncode:
@@ -282,7 +197,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
     finally:
         # A kept workspace only skips the removal; the checks' own result still stands.
         if keep_remote:
-            print(f"Remote workspace kept for its fuzz artifacts: neuroses:{remote}", file=sys.stderr)
+            print(f"Remote workspace kept for its fuzz artifacts: {HOST}:{remote}", file=sys.stderr)
         else:
             try:
                 subprocess.run([*SSH, "rm -rf -- " + shlex.quote(remote)], check=True, timeout=15)

@@ -8,7 +8,7 @@ if(BLACKBIRD_COMPILER_PROFILE STREQUAL "macos-llvm23")
     message(FATAL_ERROR "macos-llvm23 requires its declared Darwin host")
   endif()
 elseif(BLACKBIRD_COMPILER_PROFILE STREQUAL "linux-llvm23")
-  set(BLACKBIRD_REQUIRED_CLANG "23.1.4")
+  set(BLACKBIRD_REQUIRED_CLANG "23.1.3")
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "linux-llvm23 requires its declared Linux host")
   endif()
@@ -1077,7 +1077,7 @@ foreach(profile_case schema effective layering match digest records shipped)
 endforeach()
 if(BLACKBIRD_DEBUG)
   # The libFuzzer entry compiles in every debug build; it links and runs only in the
-  # fuzz profile on Neuroses (scripts/check-linux --profiles fuzz), never on the laptop.
+  # fuzz profile on Wintermute (scripts/check-linux --profiles fuzz), never on the laptop.
   add_library(profile_reader_fuzz_entry OBJECT tests/profile_reader_fuzz.cpp)
   target_link_libraries(profile_reader_fuzz_entry PRIVATE blackbird_profiles)
 endif()

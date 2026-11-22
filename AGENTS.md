@@ -80,12 +80,12 @@ The [development tooling](tooling/README.md) is configured and locally qualified
 Use `scripts/rigor check PROFILE` for owned C++/Lua work, and requalify tooling
 changes with appropriate direct diagnostic cases. Tool capability does not qualify
 agent behavior. Ordinary Linux foundation checks run through `scripts/check-linux`
-on Neuroses with its explicit Clang 23.1.4/libc++ 23.1.4 C++23 profile. Lua production
+on Wintermute with its explicit Clang 23.1.3/libc++ 23.1.3 C++23 profile. Lua production
 embedding remains an owning-unit qualification. No production library is selected
 by the tool installation.
 Subsequent operator steering defers mutation campaigns until working Arconaut and
 a mature suite. Mutation/Runpod provisioning is not a blocker on the current plan.
-General Linux checks use Neuroses over Tailscale; future mutation uses Runpod, with
+General Linux checks use Wintermute over Tailscale; future mutation uses Runpod, with
 node termination the operator's responsibility. Never run mutants on this laptop.
 The installed owned `kimi-colleague` skill and [Kimi utility](tooling/KIMI.md)
 support independent direct CLI reviews and explicit-session rereview; do not use

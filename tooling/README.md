@@ -131,7 +131,7 @@ an independent behavioral oracle or authorize execution.
 ## Remaining qualifications
 
 `scripts/rigor fleet` fails explicitly because no fleet host/launcher is configured.
-The operator selected Neuroses over Tailscale for ordinary Linux checks, available
+The operator selected Wintermute (replacing the former Neuroses host) over Tailscale for ordinary Linux checks, available
 through `scripts/check-linux`. It archives the current native source scope into
 a temporary remote directory, runs debug/release/ASan+UBSan cases and retains logs
 under `context/linux/`.
@@ -141,10 +141,10 @@ have a 60-second watchdog for host scheduling/storage delays; their oracles asse
 bytes, signals and effects, not a production latency guarantee. CTest owns each
 test's watchdog; a complete three-profile build/test run has no fixed overall
 deadline.
-Compilation uses at most 16 parallel jobs on Neuroses.
+Compilation uses at most 24 parallel jobs on Wintermute (48 cores).
 
-Its explicit profile is Ubuntu 24.04 x86_64, Clang 23.1.4, libc++/libc++abi 23.1.4,
-CMake 3.28.3 and Ninja 1.11.1. The Linux ASan+UBSan profile keeps debug
+Its explicit profile is Arch/Omarchy Linux x86_64, Clang 23.1.3, libc++/libc++abi 23.1.3,
+Lua 5.5.1, CMake 4.4.4 and Ninja 1.13.2. The Linux ASan+UBSan profile keeps debug
 symbols and uses `-O1`, following [Clang guidance](https://clang.llvm.org/docs/AddressSanitizer.html),
 so unoptimized library calls do not dominate large-payload diagnostic cases.
 The first native foundation cases pass.

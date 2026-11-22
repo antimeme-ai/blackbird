@@ -1928,10 +1928,19 @@ void wrapper_sigquit_child_case() {
   const auto curl = fixture.bin / "curl";
   const auto started = fixture.root / "curl-started";
   const auto survived = fixture.root / "curl-survived-sigquit";
-  write_text(curl, "#!/bin/sh\ntouch '" + started.string() +
-                       "'\nkill -QUIT $$\ntouch '" + survived.string() +
-                       "'\ncat > /dev/null\nprintf "
-                       "'{\"error\":{\"message\":\"fixture\"}}\\n401'\n");
+  write_text(curl,
+             "#!/usr/bin/env python3\n"
+             "import os, pathlib, resource, signal, sys\n"
+             "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+             "pathlib.Path(r'" +
+                 started.string() +
+                 "').touch()\n"
+                 "os.kill(os.getpid(), signal.SIGQUIT)\n"
+                 "pathlib.Path(r'" +
+                 survived.string() +
+                 "').touch()\n"
+                 "sys.stdin.read()\n"
+                 "sys.stdout.write('{\"error\":{\"message\":\"fixture\"}}\\n401')\n");
   fs::permissions(curl, fs::perms::owner_all);
   fixture.extra = {"OPENROUTER_API_KEY=fixture-secret",
                    "BLACKBIRD_OPENROUTER_CURL=" + curl.string(),
