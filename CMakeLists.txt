@@ -207,7 +207,7 @@ if(NOT BLACKBIRD_BUILD_LABEL)
 endif()
 set(BLACKBIRD_VERSION_STRING
   "blackbird ${BLACKBIRD_GIT_COMMIT} (lua ${LUA_VERSION_STRING}, ${BLACKBIRD_BUILD_LABEL}, ${BLACKBIRD_COMPILER_PROFILE})")
-add_library(blackbird_coding src/coding.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
+add_library(blackbird_coding src/coding.cpp src/coding_lua.cpp src/coding_provider.cpp src/coding_dispatch.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
 target_sources(blackbird_coding PRIVATE src/openrouter.cpp src/responses_provider.cpp src/anthropic_provider.cpp src/application.cpp src/host_tools.cpp)
 add_executable(anthropic_provider_test tests/anthropic_provider_test.cpp)
 target_link_libraries(anthropic_provider_test PRIVATE blackbird_coding)

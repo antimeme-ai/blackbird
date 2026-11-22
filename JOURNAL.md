@@ -13603,3 +13603,18 @@ Replaced the retired Neuroses host with `patrick@wintermute` (`Arch/Omarchy Linu
      collapsed tool cards do not trip false positives.
 - Qualified full `./scripts/check-linux --profiles debug release asan` on Wintermute:
   **292/292 Debug, 292/292 Release, and 292/292 ASan+UBSan** passed (`context/linux/run-tg3yf6tc`).
+
+
+## 2026-11-22 — Track 1: Split `src/coding.cpp` into Focused Translation Units
+
+Split the 6,967-line `src/coding.cpp` monolith into five focused files with zero
+behavioral change and `<lua.h>` isolated exclusively to `src/coding_lua.cpp`:
+- `src/coding_internal.hpp` (`139` LOC): shared private helpers, `CommandTaskActivity`,
+  and pimpl `CodingEngine::Runtime` declaration.
+- `src/coding_lua.cpp` (`1,880` LOC): Lua 5.5.1 VM and `blackbird.*`/`arco.*` bridge.
+- `src/coding_provider.cpp` (`1,092` LOC): `OpenAiCodingProvider`, `request()` / retry /
+  profile resolution / cache-epoch / telemetry loop.
+- `src/coding_dispatch.cpp` (`1,657` LOC): tool schemas, `program_config`, `define_tool`,
+  `context_list`/`context_compact`/`context_read`, retained outputs, and `dispatch()`.
+- `src/coding.cpp` (`2,330` LOC): `CodingEngine` lifecycle, `recover_coding_session`,
+  `operation()`, workflows, `stats()`, and `turn()`.
