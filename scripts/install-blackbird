@@ -5,24 +5,182 @@ blackbird_source=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 blackbird_prefix=${HOME:?HOME must be set}/.local
 blackbird_jobs=6
 blackbird_cmake=${CMAKE:-cmake}
+blackbird_action=install
+blackbird_rollback_target=''
+blackbird_keep=3
+blackbird_set_action() {
+  if [ "$blackbird_action" != install ]; then
+    printf 'Choose at most one of --list, --rollback, or --prune.\n' >&2
+    exit 2
+  fi
+  blackbird_action=$1
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prefix|--source|--jobs)
+    --prefix|--source|--jobs|--keep)
       [ "$#" -ge 2 ] || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
       case "$1" in
         --prefix) blackbird_prefix=$2 ;;
         --source) blackbird_source=$2 ;;
         --jobs) blackbird_jobs=$2 ;;
+        --keep) blackbird_keep=$2 ;;
       esac
       shift 2 ;;
     --update) shift ;;
+    --list)
+      blackbird_set_action list
+      shift ;;
+    --rollback)
+      blackbird_set_action rollback
+      if [ "$#" -ge 2 ]; then
+        case "$2" in
+          -*) ;;
+          *) blackbird_rollback_target=$2; shift ;;
+        esac
+      fi
+      shift ;;
+    --prune)
+      blackbird_set_action prune
+      shift ;;
     --help)
-      printf 'Usage: install-blackbird [--update] [--prefix DIRECTORY] [--source CHECKOUT] [--jobs N]\nBuild and atomically activate the selected local source. Default prefix: ~/.local.\n'
+      printf 'Usage:\n  install-blackbird [--update] [--prefix DIR] [--source CHECKOUT] [--jobs N]\n  install-blackbird --list [--prefix DIR]\n  install-blackbird --rollback [GENERATION] [--prefix DIR]\n  install-blackbird --prune [--keep N] [--prefix DIR]\nBuild, inspect, roll back, or prune local Blackbird generations. Default prefix: ~/.local.\n'
       exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 case "$blackbird_jobs" in ''|*[!0-9]*|0) printf 'Jobs must be a positive integer.\n' >&2; exit 2 ;; esac
+case "$blackbird_keep" in ''|*[!0-9]*|0) printf 'Keep count must be a positive integer.\n' >&2; exit 2 ;; esac
+blackbird_atomic_switch() {
+  blackbird_switch_target=$1
+  blackbird_switch_link=$blackbird_home/.current-$$
+  rm -f -- "$blackbird_switch_link"
+  ln -s -- "$blackbird_switch_target" "$blackbird_switch_link"
+  case "$(uname -s)" in
+    Darwin) mv -fh -- "$blackbird_switch_link" "$blackbird_home/current" ;;
+    Linux) mv -fT -- "$blackbird_switch_link" "$blackbird_home/current" ;;
+    *) rm -f -- "$blackbird_switch_link"; printf 'Atomic install currently supports macOS and Linux.\n' >&2; exit 1 ;;
+  esac
+}
+blackbird_manifest_field() {
+  if [ -f "$1/MANIFEST" ]; then
+    sed -n "s/^$2=//p" "$1/MANIFEST" | head -n 1
+  fi
+}
+if [ "$blackbird_action" != install ]; then
+  if [ ! -d "$blackbird_prefix" ]; then
+    printf 'Install prefix not found: %s\n' "$blackbird_prefix" >&2
+    exit 1
+  fi
+  blackbird_prefix=$(CDPATH= cd -- "$blackbird_prefix" && pwd -P)
+  blackbird_home=$blackbird_prefix/lib/blackbird
+  if [ ! -d "$blackbird_home/releases" ]; then
+    printf 'No installed releases under %s\n' "$blackbird_home/releases" >&2
+    exit 1
+  fi
+  blackbird_current=''
+  if [ -L "$blackbird_home/current" ]; then
+    blackbird_current=$(readlink "$blackbird_home/current" 2>/dev/null || :)
+    if [ -n "$blackbird_current" ]; then
+      blackbird_current=$(basename -- "$blackbird_current")
+    fi
+  elif [ -e "$blackbird_home/current" ]; then
+    printf 'Refusing to operate on non-symlink: %s/current\n' "$blackbird_home" >&2
+    exit 1
+  fi
+  if [ "$blackbird_action" = list ]; then
+    blackbird_found=0
+    for blackbird_gen in $(CDPATH= cd -- "$blackbird_home/releases" && ls -1dt generation-* 2>/dev/null || :); do
+      [ -d "$blackbird_home/releases/$blackbird_gen" ] || continue
+      blackbird_found=1
+      blackbird_mark=' '
+      if [ "$blackbird_gen" = "$blackbird_current" ]; then blackbird_mark='*'; fi
+      blackbird_ver=$(blackbird_manifest_field "$blackbird_home/releases/$blackbird_gen" version)
+      blackbird_at=$(blackbird_manifest_field "$blackbird_home/releases/$blackbird_gen" installed_at)
+      [ -n "$blackbird_ver" ] || blackbird_ver='legacy'
+      [ -n "$blackbird_at" ] || blackbird_at='unknown'
+      printf '%s %s\t%s\t%s\n' "$blackbird_mark" "$blackbird_gen" "$blackbird_at" "$blackbird_ver"
+    done
+    if [ "$blackbird_found" -eq 0 ]; then
+      printf 'No generations installed under %s/releases.\n' "$blackbird_home"
+    fi
+    exit 0
+  fi
+  mkdir -- "$blackbird_home/install.lock" 2>/dev/null || {
+    printf 'Another install holds %s/install.lock (remove only after that installer exits).\n' "$blackbird_home" >&2
+    exit 1
+  }
+  blackbird_mgmt_cleanup() {
+    rm -f -- "$blackbird_home/.current-$$"
+    rmdir -- "$blackbird_home/install.lock" 2>/dev/null || :
+  }
+  trap blackbird_mgmt_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ "$blackbird_action" = rollback ]; then
+    if [ -n "$blackbird_rollback_target" ]; then
+      case "$blackbird_rollback_target" in
+        "$blackbird_home/releases/"*)
+          blackbird_rollback_target=${blackbird_rollback_target#"$blackbird_home/releases/"} ;;
+      esac
+      case "$blackbird_rollback_target" in
+        ''|*/*|*..*)
+          printf 'Invalid generation name: %s\n' "$blackbird_rollback_target" >&2
+          exit 2 ;;
+        generation-*) ;;
+        *)
+          printf 'Invalid generation name: %s\n' "$blackbird_rollback_target" >&2
+          exit 2 ;;
+      esac
+      blackbird_target_dir=$blackbird_home/releases/$blackbird_rollback_target
+    else
+      blackbird_target_dir=''
+      for blackbird_gen in $(CDPATH= cd -- "$blackbird_home/releases" && ls -1dt generation-* 2>/dev/null || :); do
+        if [ "$blackbird_gen" = "$blackbird_current" ]; then continue; fi
+        if [ -x "$blackbird_home/releases/$blackbird_gen/scripts/blackbird" ]; then
+          blackbird_target_dir=$blackbird_home/releases/$blackbird_gen
+          break
+        fi
+      done
+      if [ -z "$blackbird_target_dir" ]; then
+        printf 'No previous generation available to roll back to under %s/releases.\n' "$blackbird_home" >&2
+        exit 1
+      fi
+    fi
+    if [ ! -d "$blackbird_target_dir" ] || [ ! -x "$blackbird_target_dir/scripts/blackbird" ]; then
+      printf 'Generation is missing or incomplete: %s\n' "$blackbird_target_dir" >&2
+      exit 1
+    fi
+    blackbird_atomic_switch "$blackbird_target_dir"
+    blackbird_ver=$(blackbird_manifest_field "$blackbird_target_dir" version)
+    [ -n "$blackbird_ver" ] || blackbird_ver='legacy'
+    printf 'Rolled back Blackbird: %s/bin/blackbird\nVersion: %s\nGeneration: %s\n' \
+      "$blackbird_prefix" "$blackbird_ver" "$blackbird_target_dir"
+    exit 0
+  fi
+  if [ "$blackbird_action" = prune ]; then
+    blackbird_kept=0
+    blackbird_pruned=0
+    blackbird_keep_budget=$blackbird_keep
+    if [ -n "$blackbird_current" ] && [ -d "$blackbird_home/releases/$blackbird_current" ]; then
+      blackbird_kept=1
+    fi
+    for blackbird_gen in $(CDPATH= cd -- "$blackbird_home/releases" && ls -1dt generation-* 2>/dev/null || :); do
+      [ -d "$blackbird_home/releases/$blackbird_gen" ] || continue
+      if [ "$blackbird_gen" = "$blackbird_current" ]; then
+        continue
+      fi
+      if [ "$blackbird_kept" -lt "$blackbird_keep_budget" ]; then
+        blackbird_kept=$((blackbird_kept + 1))
+      else
+        rm -rf -- "$blackbird_home/releases/$blackbird_gen"
+        blackbird_pruned=$((blackbird_pruned + 1))
+      fi
+    done
+    printf 'Pruned %d generation(s); kept %d under %s/releases.\n' \
+      "$blackbird_pruned" "$blackbird_kept" "$blackbird_home"
+    exit 0
+  fi
+fi
 blackbird_source=$(CDPATH= cd -- "$blackbird_source" && pwd -P)
 for blackbird_required in CMakeLists.txt CMakePresets.json scripts/blackbird programs/turn.lua programs/instruments/results.lua assets/sr71.png profiles/providers/conservative.lua; do
   [ -f "$blackbird_source/$blackbird_required" ] || { printf 'Incomplete source: %s\n' "$blackbird_required" >&2; exit 1; }

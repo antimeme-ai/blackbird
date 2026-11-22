@@ -128,8 +128,45 @@ exec /bin/mv "$@"
     second = current.resolve(strict=True)
     assert second != first and first.is_dir(), 'update removed old running generation'
     assert not (prefix / 'lib/blackbird/install.lock').exists()
+
+    # --list marks active generation and reports MANIFEST version.
+    listed = install('--list')
+    assert f'* {second.name}' in listed.stdout, listed.stdout
+    assert f'  {first.name}' in listed.stdout, listed.stdout
+    assert 'blackbird fixture-version' in listed.stdout, listed.stdout
+
+    # --rollback (implicit previous) switches atomically back to first.
+    rb1 = install('--rollback')
+    assert current.resolve(strict=True) == first, rb1.stdout
+    assert f'Generation: {first}' in rb1.stdout, rb1.stdout
+    # Reject path traversal and nonexistent generation names.
+    install('--rollback', '../evil', success=False)
+    install('--rollback', 'generation-DOESNOTEXIST', success=False)
+    # Lock contention refuses rollback and prune cleanly.
+    lock.mkdir()
+    install('--rollback', second.name, success=False)
+    install('--prune', '--keep', '1', success=False)
+    lock.rmdir()
+    # Explicit --rollback switches back to second.
+    rb2 = install('--rollback', second.name)
+    assert current.resolve(strict=True) == second, rb2.stdout
+
+    # Install a 3rd generation, roll back to first, then prune --keep 1:
+    # active generation (first) MUST survive even though it is the oldest!
+    install('--update')
+    third = current.resolve(strict=True)
+    assert third not in (first, second)
+    install('--rollback', first.name)
+    assert current.resolve(strict=True) == first
+    install('--prune', '--keep', '0', success=False)
+    pruned = install('--prune', '--keep', '1')
+    assert 'Pruned 2 generation(s); kept 1' in pruned.stdout, pruned.stdout
+    remaining = sorted(p.name for p in (prefix / 'lib/blackbird/releases').iterdir())
+    assert remaining == [first.name], remaining
+    assert current.resolve(strict=True) == first
+
     (prefix / 'bin/blackbird').write_text('#!/bin/sh\n# operator wrapper\n')
     install(success=False)
     assert (prefix / 'bin/blackbird').read_text() == '#!/bin/sh\n# operator wrapper\n'
-    assert current.resolve() == second
-print('Install/update: packaged resources and profiles, exact arguments/cwd, generation switch, rollback and unrelated launcher preservation pass')
+    assert current.resolve() == first
+print('Install/update/list/rollback/prune: packaged resources and profiles, exact arguments/cwd, generation switch, rollback, prune and unrelated launcher preservation pass')

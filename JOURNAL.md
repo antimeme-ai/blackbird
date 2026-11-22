@@ -13529,3 +13529,17 @@ Built the live avionics telemetry HUD and cumulative session accounting
    fallback, fixed `gpt-4o` (128k) and boundary-matched `o3`/`kimi-k2`, separated
    `last_cost_usd` from cumulative `session_cost_usd`, and cleaned all `clang-tidy`
    parameter warnings.
+
+
+## 2026-11-21 — Unit (5b): Release & Packaging Polish
+
+Added generation management to `scripts/install-blackbird` and direct regression
+coverage in `scripts/check-install-blackbird`:
+- `--list [--prefix DIR]`: lists installed `generation-*` directories newest-first
+  with active `*` marker, install timestamp, and version from `MANIFEST`.
+- `--rollback [GENERATION] [--prefix DIR]`: atomically switches `current` (under
+  `install.lock`) to the previous or named generation while rejecting path traversal
+  and incomplete targets.
+- `--prune [--keep N] [--prefix DIR]`: atomically prunes excess older generations
+  (default `--keep 3`), always preserving the active `current` generation even when
+  rolled back to an older generation.
