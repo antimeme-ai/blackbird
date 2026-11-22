@@ -96,6 +96,10 @@ const std::array builtin_commands{
     ChatCommand{"/restore", "ENTRY", "Restore an original context entry", "Context"},
     ChatCommand{"/workbench", "",
                 "Open interactive context block workbench (local TUI)", "Context"},
+    ChatCommand{"/hooks",
+                "[list | history | enable NAME | disable NAME | explain JSON]",
+                "Inspect hooks, revisions and dispatch history (TUI view or plain)",
+                "Programs"},
     ChatCommand{"/lua", "CODE", "Run a Lua workflow", "Programs"},
     ChatCommand{"/workflow", "FILE", "Select the turn workflow", "Programs"},
     ChatCommand{"/restart", "NOTE", "Request native restart; build replacement first",
@@ -1951,6 +1955,17 @@ void TerminalUI::context_workbench(ContextWorkbenchSnapshot snapshot) {
     (void)::write(notification_, &byte, 1);
   }
 }
+void TerminalUI::hooks_view(HooksViewSnapshot snapshot) {
+  const std::lock_guard lock{mutex_};
+  Message message{Kind::hooks_view, "", Ink::muted, {}, {}, {}, {}};
+  message.hooks_snapshot =
+      std::make_shared<const HooksViewSnapshot>(std::move(snapshot));
+  messages_.push_back(std::move(message));
+  if (notification_ >= 0) {
+    const char byte = 1;
+    (void)::write(notification_, &byte, 1);
+  }
+}
 void TerminalUI::operation_started(bool provider) {
   post(provider ? Kind::provider_start : Kind::tool_start, {});
 }
@@ -2327,6 +2342,24 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (workbench && workbench->open())
       workbench->toggle();
   };
+  std::optional<HooksView> hooks_panel;
+  std::optional<HooksViewSnapshot> latest_hooks_snapshot;
+  auto ensure_hooks_panel = [&] {
+    if (hooks_panel)
+      return true;
+    try {
+      hooks_panel.emplace();
+      if (latest_hooks_snapshot)
+        hooks_panel->update(*latest_hooks_snapshot);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+  auto close_hooks_panel = [&] {
+    if (hooks_panel && hooks_panel->open())
+      hooks_panel->toggle();
+  };
   auto route = tui::ViewRoute::conversation;
   std::string_view route_notice;
   const auto select_view = [&](tui::ViewRoute requested, RawEventRef origin,
@@ -2354,6 +2387,10 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       route_notice = "Context workbench unavailable; native view could not be created";
       return false;
     }
+    if (next == tui::ViewRoute::hooks_fabric && !ensure_hooks_panel()) {
+      route_notice = "Hooks view unavailable; native view could not be created";
+      return false;
+    }
     if (next != tui::ViewRoute::command_runs)
       close_inspector();
     if (next != tui::ViewRoute::command_center)
@@ -2362,6 +2399,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       close_instrument();
     if (next != tui::ViewRoute::context_workbench)
       close_workbench();
+    if (next != tui::ViewRoute::hooks_fabric)
+      close_hooks_panel();
     const auto activate = [&](auto &view) {
       if (reset)
         view.first_page(origin);
@@ -2379,6 +2418,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       activate(*instrument);
     else if (next == tui::ViewRoute::context_workbench)
       activate(*workbench);
+    else if (next == tui::ViewRoute::hooks_fabric)
+      activate(*hooks_panel);
     route = next;
     route_notice = {};
     return true;
@@ -2388,7 +2429,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     return (instrument && instrument->open() && instrument->focused()) ||
            (center && center->open() && center->focused()) ||
            (inspector && inspector->open() && inspector->focused()) ||
-           (workbench && workbench->open() && workbench->focused());
+           (workbench && workbench->open() && workbench->focused()) ||
+           (hooks_panel && hooks_panel->open() && hooks_panel->focused());
   };
   auto visit_inspection = [&](auto &&action) {
     if (instrument && instrument->open())
@@ -2399,6 +2441,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       action(*inspector);
     else if (workbench && workbench->open())
       action(*workbench);
+    else if (hooks_panel && hooks_panel->open())
+      action(*hooks_panel);
   };
   auto instrument_refresh = std::chrono::steady_clock::time_point::min();
   auto center_refresh = std::chrono::steady_clock::time_point::min();
@@ -2972,6 +3016,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             if (workbench)
               workbench->update(*latest_workbench_snapshot);
           }
+          if (message.kind == Kind::hooks_view && message.hooks_snapshot) {
+            latest_hooks_snapshot = *message.hooks_snapshot;
+            if (hooks_panel)
+              hooks_panel->update(*latest_hooks_snapshot);
+          }
           if (message.kind == Kind::provider_start ||
               message.kind == Kind::tool_start) {
             live_provider = message.kind == Kind::provider_start;
@@ -3060,6 +3109,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       if (!busy && context_detail_reader)
         guarded_reader = context_detail_reader;
       redraw = workbench->refresh(guarded_reader) || redraw;
+    }
+    if (hooks_panel && hooks_panel->open() && hooks_panel->needs_refresh()) {
+      redraw = hooks_panel->refresh() || redraw;
     }
     if (commands) {
       pollfd child_input_ready{STDIN_FILENO, POLLIN, 0};
@@ -3449,23 +3501,27 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           const bool centered = center && center->open();
           const bool authored = instrument && instrument->open();
           const bool context_wb = workbench && workbench->open();
-          auto caption = context_wb ? workbench->caption()
-                                    : std::string{authored   ? "RETAINED RESULT LAB"
-                                                  : centered ? "COMMAND CENTER"
-                                                             : "COMMAND RESULTS"};
+          const bool hooks_open = hooks_panel && hooks_panel->open();
+          auto caption = context_wb   ? workbench->caption()
+                         : hooks_open ? hooks_panel->caption()
+                                      : std::string{authored   ? "RETAINED RESULT LAB"
+                                                    : centered ? "COMMAND CENTER"
+                                                               : "COMMAND RESULTS"};
           if (!route_notice.empty())
             caption = std::string{route_notice} + " · " + caption;
           visit_inspection([&](auto &view) {
             inspection_layout = unwrap(view.render(grid, {0, 2, main_width, height}));
-            if (!context_wb && !view.notice().empty())
+            if (!context_wb && !hooks_open && !view.notice().empty())
               caption += " · " + std::string{view.notice()};
           });
-          caption += context_wb
-                         ? " · F6 pin · F7 drop/restore · F8 flush · F9 archived · Tab "
+          caption +=
+              context_wb ? " · F6 pin · F7 drop/restore · F8 flush · F9 archived · Tab "
                            "focus · Esc draft"
-                     : authored ? " · F6 A · F7 B · F8 interrupt · Ctrl-] close"
-                     : centered ? " · Ctrl-X close · Tab focus · Esc draft"
-                                : " · Ctrl-O close · Tab focus · Esc draft";
+              : hooks_open
+                  ? " · F6 enable/disable · F9 defs/history · Tab focus · Esc draft"
+              : authored ? " · F6 A · F7 B · F8 interrupt · Ctrl-] close"
+              : centered ? " · Ctrl-X close · Tab focus · Esc draft"
+                         : " · Ctrl-O close · Tab focus · Esc draft";
           grid.line(1, {{std::string(main_width, ' '), Ink::normal}});
           grid.line(1, {{terminal_lines(caption, main_width).front(), Ink::heading}});
         } else if (!route_notice.empty()) {
@@ -3870,6 +3926,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                               std::string{"Instrument action unavailable: "} +
                                   error_name(acted.error().code));
         }
+        auto start_view_command = [&](const std::string &command, RawEventRef actor) {
+          const auto length = command.size();
+          RawUiTrace command_original{
+              raw_capture_,
+              {4071, 4016},
+              std::array{ByteView{actor.lane}, detail::raw_native_field(actor.ordinal),
+                         detail::raw_native_field(length),
+                         detail::raw_string_field(command)},
+              raw_ui_error_bytes,
+              true};
+          command_original.run([&] {
+            const RawUiSource source{command_original.reference(), 0, length};
+            command_original.finish();
+            (void)start(command, source);
+          });
+        };
         if ((result.action == InputAction::instrument_action ||
              result.action == InputAction::workbench_action) &&
             workbench && workbench->open() && workbench->focused()) {
@@ -3886,7 +3958,25 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 transcript.append(ChatKind::notice,
                                   "Turn running — wait for idle to mutate context\n");
               } else {
-                (void)start(action.command, result.source);
+                start_view_command(action.command, result.source.record);
+              }
+            }
+          }
+        }
+        if ((result.action == InputAction::instrument_action ||
+             result.action == InputAction::workbench_action) &&
+            hooks_panel && hooks_panel->open() && hooks_panel->focused()) {
+          if (result.action == InputAction::workbench_action &&
+              result.text == "toggle_archived") {
+            hooks_panel->toggle_history();
+          } else if (result.text == "pin_a") {
+            const auto action = hooks_panel->action_command("toggle_enabled");
+            if (!action.command.empty()) {
+              if (busy) {
+                transcript.append(ChatKind::notice,
+                                  "Turn running — wait for idle to toggle hook\n");
+              } else {
+                start_view_command(action.command, result.source.record);
               }
             }
           }
@@ -3963,6 +4053,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               moved = inspector->act(*navigation);
             else if (workbench && workbench->open())
               moved = workbench->act(*navigation);
+            else if (hooks_panel && hooks_panel->open())
+              moved = hooks_panel->act(*navigation);
             if (!moved.has_value())
               transcript += std::string{"\nInspection navigation refused: "} +
                             error_name(moved.error().code) + "\n";

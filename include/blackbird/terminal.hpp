@@ -4,6 +4,7 @@
 #include "blackbird/command_jobs.hpp"
 #include "blackbird/context_workbench.hpp"
 #include "blackbird/display_text.hpp"
+#include "blackbird/hooks_view.hpp"
 #include "blackbird/raw_ui.hpp"
 #include "blackbird/tasks.hpp"
 #include "blackbird/tui_instrument.hpp"
@@ -209,6 +210,7 @@ public:
   void usage(std::string_view text);
   void telemetry(const TelemetrySnapshot &snapshot);
   void context_workbench(ContextWorkbenchSnapshot snapshot);
+  void hooks_view(HooksViewSnapshot snapshot);
   void operation_started(bool provider);
   void status(std::string_view text);
   // A published context revision (a1v): kind label, e.g. "compacted", and the
@@ -257,7 +259,8 @@ private:
     question,
     context_change,
     telemetry,
-    context_workbench
+    context_workbench,
+    hooks_view
   };
   struct Message {
     Kind kind;
@@ -270,6 +273,7 @@ private:
     std::shared_ptr<const TerminalQuestion> question{};
     std::shared_ptr<const TelemetrySnapshot> telemetry{};
     std::shared_ptr<const ContextWorkbenchSnapshot> workbench_snapshot{};
+    std::shared_ptr<const HooksViewSnapshot> hooks_snapshot{};
   };
   bool raw_capture_ = false;
   RawUiSource initial_source_{};

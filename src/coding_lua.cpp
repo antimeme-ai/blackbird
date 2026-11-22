@@ -745,7 +745,8 @@ struct CodingEngine::Runtime::Impl {
     live_instruction_op,
     now_op,
     pin_op,
-    flush_context_op
+    flush_context_op,
+    hooks_op
   };
   std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
   static int lua_os_time(lua_State *L) {
@@ -850,7 +851,7 @@ struct CodingEngine::Runtime::Impl {
         "set_blocks",    "append",  "decode",           "encode",  "display",
         "array",         "present", "restarting",       "stats",   "decode_packet",
         "encode_packet", "format",  "live_instruction", "now",     "pin",
-        "flush_context"};
+        "flush_context", "hooks"};
     for (std::size_t i = 0; i < std::size(names); ++i) {
       lua_pushlightuserdata(L, self);
       lua_pushinteger(L, static_cast<lua_Integer>(i));
@@ -1478,6 +1479,13 @@ struct CodingEngine::Runtime::Impl {
                {"upstream_epoch", Value{Number{self->engine.upstream_epoch_}}}});
           break;
         }
+        case hooks_op: {
+          const auto args = lua_isnoneornil(L, 1)
+                                ? Value::object({{"op", Value{"list"}}})
+                                : read_value(L, 1, {0, &nodes});
+          frame.value = self->engine.hooks_tool(args);
+          break;
+        }
         case restarting_op:
           frame.value = Value{self->engine.restart_note_.has_value()};
           break;
@@ -1664,6 +1672,24 @@ struct CodingEngine::Runtime::Impl {
       lua_settop(state, base);
       throw;
     }
+  }
+  bool valid_hook_source(std::string_view source) {
+    const int base = lua_gettop(state);
+    const auto wrapped = "return function(event)\n" + std::string{source} + "\nend";
+    try {
+      const bool valid =
+          validation_load(wrapped, "blackbird-hook-definition") == LUA_OK;
+      lua_settop(state, base);
+      return valid;
+    } catch (...) {
+      lua_settop(state, base);
+      throw;
+    }
+  }
+  Value invoke_hook(std::string_view source, const Value &event) {
+    const std::string wrapped = "local fn = function(event)\n" + std::string{source} +
+                                "\nend\nreturn fn(_native_args)";
+    return eval(wrapped, &event, SourceKind::tool);
   }
   Value invoke_tool(ToolInvocation invocation) {
     const auto &source = string_field(invocation.definition, "source");
@@ -1869,8 +1895,14 @@ bool CodingEngine::Runtime::valid_module_source(std::string_view source) {
 bool CodingEngine::Runtime::valid_tool_source(std::string_view source) {
   return impl->valid_tool_source(source);
 }
+bool CodingEngine::Runtime::valid_hook_source(std::string_view source) {
+  return impl->valid_hook_source(source);
+}
 Value CodingEngine::Runtime::invoke_tool(ToolInvocation invocation) {
   return impl->invoke_tool(invocation);
+}
+Value CodingEngine::Runtime::invoke_hook(std::string_view source, const Value &event) {
+  return impl->invoke_hook(source, event);
 }
 Value CodingEngine::Runtime::eval(std::string_view source, const Value *arguments,
                                   SourceKind kind) {

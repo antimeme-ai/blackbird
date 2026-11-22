@@ -984,6 +984,7 @@ void review_palette_and_holder_cuts() {
           std::pair{"view.command-runs", tui::ViewRoute::command_runs},
           std::pair{"view.command-center", tui::ViewRoute::command_center},
           std::pair{"view.context-workbench", tui::ViewRoute::context_workbench},
+          std::pair{"view.hooks-fabric", tui::ViewRoute::hooks_fabric},
           std::pair{"view.result-comparison", tui::ViewRoute::result_comparison}};
       for (const auto &[action, route] : expected_views) {
         views.views();

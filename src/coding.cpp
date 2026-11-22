@@ -171,6 +171,7 @@ CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
     const auto origin = trace.context();
     workflows_ =
         std::make_shared<WorkflowRegistry>(program_config_, program_revision_, &origin);
+    hooks_ = std::make_shared<HookRegistry>(program_config_, program_revision_);
   });
 }
 CodingEngine::~CodingEngine() { command_jobs_->shutdown(); }
@@ -2179,6 +2180,7 @@ void CodingEngine::turn(TurnInput input) {
     pending_program_trace_.finish(2);
     pending_tools_trace_.finish(2);
     pending_workflows_.reset();
+    pending_hooks_.reset();
     clear_value(pending_program_config_);
     pending_program_revision_.clear();
     clear_value(pending_lua_tools_);
@@ -2261,6 +2263,18 @@ void CodingEngine::turn(TurnInput input) {
                             {"content", Value{std::string{input.prompt}}}})},
             "operator", BlockKind::instruction);
 
+      if (!operator_call_ && hooks_ && !hooks_->definitions().empty()) {
+        const HookMatchSample sample{.event = HookEvent::turn_start,
+                                     .tool = {},
+                                     .prompt = std::string{input.prompt}};
+        const auto payload =
+            Value::object({{"event", Value{"turn_start"}},
+                           {"prompt", Value{std::string{input.prompt}}},
+                           {"live_blocks", Value{Number{context_.blocks().size()}}},
+                           {"total_bytes", Value{Number{context_.total_bytes()}}}});
+        (void)run_hooks(sample, payload);
+      }
+
       runtime_ = std::make_unique<Runtime>(*this);
       workflow_result_ = runtime_->eval(
           input.program, operator_arguments_ ? &*operator_arguments_ : nullptr);
@@ -2278,6 +2292,19 @@ void CodingEngine::turn(TurnInput input) {
 
       // Flush any deferred context compactions cleanly at the turn boundary.
       (void)flush_pending_compactions("turn end");
+
+      if (!operator_call_ && hooks_ && !hooks_->definitions().empty()) {
+        const HookMatchSample sample{.event = HookEvent::turn_end,
+                                     .tool = {},
+                                     .prompt = std::string{input.prompt}};
+        const auto payload =
+            Value::object({{"event", Value{"turn_end"}},
+                           {"prompt", Value{std::string{input.prompt}}},
+                           {"live_blocks", Value{Number{context_.blocks().size()}}},
+                           {"total_bytes", Value{Number{context_.total_bytes()}}},
+                           {"upstream_epoch", Value{Number{upstream_epoch_}}}});
+        (void)run_hooks(sample, payload);
+      }
 
       // Activate any pending Lua program config or tool definitions cleanly at turn
       // end.
@@ -2299,6 +2326,7 @@ void CodingEngine::turn(TurnInput input) {
           program_config_.swap(pending_program_config_);
           program_revision_.swap(pending_program_revision_);
           workflows_.swap(pending_workflows_);
+          hooks_.swap(pending_hooks_);
           pending_program_trace_.finish(0);
         }
         if (activate_tools) {
@@ -2307,6 +2335,8 @@ void CodingEngine::turn(TurnInput input) {
           pending_tools_trace_.finish(0);
         }
         clear_pending();
+        if (activate_program && hooks_changed)
+          hooks_changed();
       }
     } catch (const Error &error) {
       rollback(&error);

@@ -1583,6 +1583,41 @@ Value tool_definitions() {
                  {"additionalProperties", Value{false}}})}}),
       Value::object(
           {{"type", Value{"function"}},
+           {"name", Value{"hooks"}},
+           {"description",
+            Value{"Inspect or toggle session hooks and action fabric. op: 'list' "
+                  "(effective & pending hooks + revisions), 'history' (recent bounded "
+                  "hook dispatches, optional limit 1..64), 'explain' (declarative "
+                  "match trace without executing Lua; requires event and optional "
+                  "tool/prompt), 'enable' or 'disable' (toggle a named hook and stage "
+                  "for turn-boundary activation)."}},
+           {"parameters",
+            Value::object(
+                {{"type", Value{"object"}},
+                 {"properties",
+                  Value::object(
+                      {{"op", Value::object(
+                                  {{"type", Value{"string"}},
+                                   {"enum", Value{Value::Array{
+                                                Value{"list"},
+                                                Value{"history"}, Value{"explain"},
+                                                Value{"enable"}, Value{"disable"}}}}})},
+                       {"name", Value::object({{"type", Value{"string"}}})},
+                       {"event",
+                        Value::object(
+                            {{"type", Value{"string"}},
+                             {"enum", Value{Value::Array{
+                                          Value{"turn_start"}, Value{"turn_end"},
+                                          Value{"before_tool"}, Value{"after_tool"},
+                                          Value{"context_compact"}}}}})},
+                       {"tool", Value::object({{"type", Value{"string"}}})},
+                       {"prompt", Value::object({{"type", Value{"string"}}})},
+                       {"limit", Value::object({{"type", Value{"integer"}},
+                                                {"minimum", Value{Number{1}}},
+                                                {"maximum", Value{Number{64}}}})}})},
+                 {"additionalProperties", Value{false}}})}}),
+      Value::object(
+          {{"type", Value{"function"}},
            {"name", Value{"restart"}},
            {"description",
             Value{"Request restart/resume/continue after the current tool batch and "

@@ -3,6 +3,7 @@
 #include "blackbird/colleague.hpp"
 #include "blackbird/command_jobs.hpp"
 #include "blackbird/decision_models.hpp"
+#include "blackbird/hooks.hpp"
 #include "blackbird/host_tools.hpp"
 #include "blackbird/observations.hpp"
 #include "blackbird/openai.hpp"
@@ -14,6 +15,7 @@
 
 #include "blackbird/tasks.hpp"
 #include "blackbird/workflows.hpp"
+#include <deque>
 #include <map>
 #include <memory>
 namespace blackbird {
@@ -148,6 +150,12 @@ public:
   void shutdown_participants();
   bool operator_turn(std::string_view prompt, std::string_view fallback);
   std::shared_ptr<const WorkflowRegistry> workflows() const { return workflows_; }
+  std::shared_ptr<const HookRegistry> hooks() const { return hooks_; }
+  std::shared_ptr<const HookRegistry> pending_hooks() const { return pending_hooks_; }
+  const std::deque<HookDispatchRecord> &hook_history() const noexcept {
+    return hook_history_;
+  }
+  std::function<void()> hooks_changed;
   // One cooperative failure ticket, consumed before creating a recovery audit.
   // A reopened/crashed engine has no such authority.
   Error claim_backstop(const RawAdapterContext *raw_context = nullptr);
@@ -213,13 +221,10 @@ private:
   struct Runtime;
   struct CommandTaskActivity;
   using CommandTaskMap = std::map<std::string, CommandTaskActivity>;
-  bool turn_running_ = false, backstop_claimed_ = false;
-  bool request_group_active_ = false;
   RawOperationTrace *operation_trace_ = nullptr;
   std::optional<Error> failed_turn_;
   Value workflow_result_;
   std::optional<Value> operator_arguments_;
-  bool operator_call_ = false; // Operator inspection stays exact; programs get budgets.
   // What call() (or a drained continuation) hands one operation: the budget keys
   // Blackbird supplied, and the shape applied where the result becomes visible to
   // the model, once its original is retained (T1, design §9). Passed by value, so
@@ -245,7 +250,6 @@ private:
   };
   std::map<std::string, ModelCall, std::less<>> model_calls_;
   std::set<std::string, std::less<>> answered_calls_;
-  bool declared_turn_ = false;
   std::uint64_t response_generation_ = 0, boundary_floor_ = 0, call_sequence_ = 0;
   void note_answered(const Value::Array &items);
   // The texts shaped in this turn and their result_ref: a value that is itself one of
@@ -257,10 +261,6 @@ private:
   std::shared_ptr<CommandJobs> command_jobs_;
   CommandTaskMap command_tasks_;
   std::optional<Error> command_failure_;
-  bool pumping_commands_ = false;
-  bool uncontained_exec_recovery_ = false;
-  bool capacity_stopped_ = false;
-  bool file_effect_unretained_ = false;
   std::size_t operation_depth_ = 0;
   std::size_t unretained_bytes_ = 0;
   AuditLog &log_;
@@ -291,7 +291,17 @@ private:
                                        {"model", Value{""}},
                                        {"effort", Value{""}}})};
   std::shared_ptr<const WorkflowRegistry> workflows_, pending_workflows_;
-  unsigned workflow_depth_ = 0, workflow_invocations_ = 0;
+  std::shared_ptr<const HookRegistry> hooks_, pending_hooks_;
+  std::deque<HookDispatchRecord> hook_history_;
+  std::uint64_t hook_sequence_ = 0;
+  struct HookDenial {
+    std::string hook;
+    std::string reason;
+  };
+  void record_hook_dispatch(HookDispatchRecord record);
+  std::optional<HookDenial> run_hooks(const HookMatchSample &sample,
+                                      const Value &payload);
+  Value hooks_tool(const Value &arguments);
   std::shared_ptr<RawProgramIssuer> program_issuer_;
   RawProgramLifetime pending_program_trace_, pending_tools_trace_;
   struct WorkflowContinuation {
@@ -302,7 +312,6 @@ private:
     std::optional<ResultShape> shape; // The invoking call's; default when absent.
   };
   std::vector<WorkflowContinuation> workflow_continuations_;
-  bool draining_workflows_ = false;
   std::optional<Error> workflow_failure_;
   Value execute_workflow(WorkflowContinuation &invocation, bool continuation = false);
   void drain_workflows();
@@ -352,6 +361,16 @@ private:
   };
   std::size_t process_original_cursor_ = 0;
   std::map<std::string, ProcessOriginalIndex> process_originals_;
+  unsigned workflow_depth_ = 0, workflow_invocations_ = 0, hook_depth_ = 0;
+  bool turn_running_ = false, backstop_claimed_ = false;
+  bool request_group_active_ = false;
+  bool operator_call_ = false; // Operator inspection stays exact; programs get budgets.
+  bool declared_turn_ = false;
+  bool pumping_commands_ = false;
+  bool uncontained_exec_recovery_ = false;
+  bool capacity_stopped_ = false;
+  bool file_effect_unretained_ = false;
+  bool draining_workflows_ = false;
   Value retained_process_output(const Value &arguments);
   Value retained_result_output(const Value &arguments);
   Value operation(std::string_view name, const Value &input,

@@ -1201,6 +1201,27 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       } catch (...) {
       }
     };
+    auto publish_hooks_view = [&] {
+      if (!tui)
+        return;
+      try {
+        HooksViewSnapshot snap;
+        if (const auto active = engine.hooks()) {
+          snap.revision = active->revision();
+          snap.hooks = active->definitions();
+        }
+        if (const auto pending = engine.pending_hooks()) {
+          snap.pending_revision = pending->revision();
+          snap.pending_hooks = pending->definitions();
+        }
+        const auto &hist = engine.hook_history();
+        snap.history.assign(hist.begin(), hist.end());
+        ui.hooks_view(std::move(snap));
+      } catch (...) {
+      }
+    };
+    if (tui)
+      engine.hooks_changed = publish_hooks_view;
     if (tui)
       engine.context().changed = [&](const ContextChange &change) {
         const std::string kind =
@@ -1810,6 +1831,29 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                 unwrap(format_value(field(result, "data")))}}})},
                     "operator.beads");
               emit(unwrap(dump_json(result)) + "\n");
+            } else if (prompt == "/hooks" || prompt.starts_with("/hooks ")) {
+              raw_main_branch(dispatch, 43);
+              const auto rest =
+                  prompt == "/hooks" ? std::string_view{"list"} : prompt.substr(7);
+              Value args;
+              if (rest == "list") {
+                args = Value::object({{"op", Value{"list"}}});
+              } else if (rest == "history") {
+                args = Value::object({{"op", Value{"history"}}});
+              } else if (rest.starts_with("enable ")) {
+                args = Value::object({{"op", Value{"enable"}},
+                                      {"name", Value{std::string{rest.substr(7)}}}});
+              } else if (rest.starts_with("disable ")) {
+                args = Value::object({{"op", Value{"disable"}},
+                                      {"name", Value{std::string{rest.substr(8)}}}});
+              } else if (rest.starts_with("explain ")) {
+                args = unwrap(parse_json(rest.substr(8)));
+                if (!args.find("op"))
+                  args.object().emplace_back("op", Value{"explain"});
+              } else {
+                throw Error{ErrorCode::invalid_range};
+              }
+              emit(unwrap(dump_json(engine.operator_call("hooks", args))) + "\n");
             } else if (prompt.starts_with("/lua ")) {
               raw_main_branch(dispatch, 39);
               engine.turn({"", prompt.substr(5)});
@@ -1838,6 +1882,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             }
             if (tui) {
               publish_context_workbench();
+              publish_hooks_view();
               ui.title(
                   "Blackbird · " +
                   (session_store.settings().name.empty()
@@ -2297,6 +2342,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           {root->environment(), session_identity(log, &session_capture).conversation},
           engine.participant_observer()};
       publish_context_workbench();
+      publish_hooks_view();
       ContextDetailReader context_detail_reader =
           [&](std::uint64_t id, std::size_t offset,
               std::size_t limit) -> std::optional<ContextDetailSlice> {

@@ -236,7 +236,8 @@ Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admi
       for (const auto &[key, value] : proposal->object()) {
         (void)value;
         if (key != "modules" && key != "model" && key != "effort" &&
-            key != "workflows" && key != "workflow_prefix" && key != "prompt_cache")
+            key != "workflows" && key != "workflow_prefix" && key != "prompt_cache" &&
+            key != "hooks")
           throw Error{ErrorCode::invalid_range};
       }
       const auto &model = string_field(*proposal, "model");
@@ -284,6 +285,11 @@ Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admi
               return runtime_->valid_tool_source(string_field(d, "source"));
             }))
           throw Error{ErrorCode::invalid_range};
+      auto candidate_hooks = std::make_shared<HookRegistry>(*proposal, "candidate");
+      for (const auto &hook : candidate_hooks->definitions())
+        if (!program_syntax(trace, 1, hook.source,
+                            [&] { return runtime_->valid_hook_source(hook.source); }))
+          throw Error{ErrorCode::invalid_range};
       // Copy/issue before publication; validation never executes candidate code.
       auto next = *proposal;
       if (trace.enabled() && !program_issuer_)
@@ -302,13 +308,17 @@ Value CodingEngine::program_config(const Value &arguments, DomainAdmission *admi
         trace.stage(6);
         auto registry =
             std::make_shared<WorkflowRegistry>(next, revision, &child_origin);
+        auto next_hooks = std::make_shared<HookRegistry>(next, revision);
         trace.stage(7);
         pending_program_trace_.finish(1);
         pending_workflows_ = std::move(registry);
+        pending_hooks_ = std::move(next_hooks);
         pending_program_config_ = std::move(next);
         pending_program_revision_ = std::move(revision);
         pending.installed(pending_program_revision_);
         pending_program_trace_ = std::move(pending);
+        if (hooks_changed)
+          hooks_changed();
       } catch (const Error &error) {
         pending.finish(3, &error);
         throw;
@@ -640,6 +650,17 @@ Value CodingEngine::context_compact(const Value &arguments) {
     ++upstream_epoch_;
     res.object().emplace_back("applied", Value{"now"});
     res.object().emplace_back("upstream_epoch", Value{Number{upstream_epoch_}});
+    if (hooks_ && !hooks_->definitions().empty()) {
+      const HookMatchSample sample{
+          .event = HookEvent::context_compact, .tool = {}, .prompt = {}};
+      const auto payload =
+          Value::object({{"event", Value{"context_compact"}},
+                         {"op", Value{std::string{compact_op_name(req.op)}}},
+                         {"upstream_epoch", Value{Number{upstream_epoch_}}},
+                         {"live_blocks", Value{Number{context_.blocks().size()}}},
+                         {"total_bytes", Value{Number{context_.total_bytes()}}}});
+      (void)run_hooks(sample, payload);
+    }
   }
   return res;
 }
@@ -675,8 +696,272 @@ std::size_t CodingEngine::flush_pending_compactions(std::string_view reason) {
                                   "; upstream epoch " +
                                   std::to_string(upstream_epoch_) + "]\n");
     }
+    if (hooks_ && !hooks_->definitions().empty()) {
+      const HookMatchSample sample{
+          .event = HookEvent::context_compact, .tool = {}, .prompt = {}};
+      const auto payload =
+          Value::object({{"event", Value{"context_compact"}},
+                         {"op", Value{"flush"}},
+                         {"flushed", Value{Number{applied}}},
+                         {"reason", Value{std::string{reason}}},
+                         {"upstream_epoch", Value{Number{upstream_epoch_}}},
+                         {"live_blocks", Value{Number{context_.blocks().size()}}},
+                         {"total_bytes", Value{Number{context_.total_bytes()}}}});
+      (void)run_hooks(sample, payload);
+    }
   }
   return applied;
+}
+
+void CodingEngine::record_hook_dispatch(HookDispatchRecord record) {
+  record.sequence = ++hook_sequence_;
+  try {
+    (void)log_.record(ApplicationChannel::program,
+                      Value::object({{"label", Value{"hook.dispatch"}},
+                                     {"dispatch", record.to_value()}}));
+  } catch (...) {
+  }
+  if (hook_history_.size() >= 64)
+    hook_history_.pop_front();
+  hook_history_.push_back(std::move(record));
+  if (hooks_changed)
+    hooks_changed();
+}
+
+std::optional<CodingEngine::HookDenial>
+CodingEngine::run_hooks(const HookMatchSample &sample, const Value &payload) {
+  if (!hooks_ || hooks_->definitions().empty())
+    return std::nullopt;
+  const auto active_registry = hooks_;
+  const auto matches = active_registry->matching(sample);
+  if (matches.empty())
+    return std::nullopt;
+  if (hook_depth_ >= 2) {
+    for (const auto *def : matches) {
+      record_hook_dispatch({.sequence = 0,
+                            .hook_name = def->name,
+                            .revision = active_registry->revision(),
+                            .event = def->event,
+                            .kind = def->kind,
+                            .outcome = HookOutcome::skipped,
+                            .detail = "reentrant",
+                            .duration_ms = 0});
+    }
+    return std::nullopt;
+  }
+
+  ++hook_depth_;
+  struct DepthGuard {
+    unsigned &depth;
+    ~DepthGuard() { --depth; }
+  } depth_guard{hook_depth_};
+
+  for (const auto *def : matches) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [&] {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+      return static_cast<std::uint64_t>(ms > 0 ? ms : 0);
+    };
+    try {
+      Runtime child{*this};
+      const Value result = child.invoke_hook(def->source, payload);
+      if (def->kind == HookKind::admission && sample.event == HookEvent::before_tool) {
+        bool allow = true;
+        std::string reason;
+        if (std::holds_alternative<bool>(result.value())) {
+          allow = std::get<bool>(result.value());
+          if (!allow)
+            reason = "denied by hook " + def->name;
+        } else if (std::holds_alternative<Value::Object>(result.value())) {
+          if (const auto *a = result.find("allow");
+              a && std::holds_alternative<bool>(a->value()))
+            allow = std::get<bool>(a->value());
+          if (const auto *r = result.find("reason");
+              r && std::holds_alternative<std::string>(r->value()))
+            reason = r->string();
+          if (!allow && reason.empty())
+            reason = "denied by hook " + def->name;
+        }
+        if (!allow) {
+          record_hook_dispatch({.sequence = 0,
+                                .hook_name = def->name,
+                                .revision = active_registry->revision(),
+                                .event = def->event,
+                                .kind = def->kind,
+                                .outcome = HookOutcome::matched_denied,
+                                .detail = reason,
+                                .duration_ms = elapsed_ms()});
+          return HookDenial{.hook = def->name, .reason = std::move(reason)};
+        }
+      } else if (def->kind == HookKind::context_transform &&
+                 std::holds_alternative<Value::Object>(result.value())) {
+        if (const auto *append = result.find("append");
+            append && std::holds_alternative<Value::Array>(append->value()) &&
+            !append->array().empty()) {
+          (void)context_.append(append->array(), "hook:" + def->name, BlockKind::note);
+        }
+      }
+      std::string detail;
+      if (std::holds_alternative<Value::Object>(result.value())) {
+        if (const auto *note = result.find("note");
+            note && std::holds_alternative<std::string>(note->value()))
+          detail = note->string();
+      } else if (std::holds_alternative<std::string>(result.value())) {
+        detail = result.string();
+      }
+      if (detail.size() > 256)
+        detail.resize(256);
+      record_hook_dispatch({.sequence = 0,
+                            .hook_name = def->name,
+                            .revision = active_registry->revision(),
+                            .event = def->event,
+                            .kind = def->kind,
+                            .outcome = HookOutcome::matched_ok,
+                            .detail = std::move(detail),
+                            .duration_ms = elapsed_ms()});
+    } catch (const Error &err) {
+      const std::string msg = std::string{error_name(err.code)};
+      record_hook_dispatch({.sequence = 0,
+                            .hook_name = def->name,
+                            .revision = active_registry->revision(),
+                            .event = def->event,
+                            .kind = def->kind,
+                            .outcome = HookOutcome::matched_failed,
+                            .detail = msg,
+                            .duration_ms = elapsed_ms()});
+      if (notice)
+        notice("\n[hook " + def->name + " failed: " + msg + "]\n");
+      if (def->kind == HookKind::admission && sample.event == HookEvent::before_tool) {
+        return HookDenial{.hook = def->name, .reason = "admission hook error: " + msg};
+      }
+    } catch (const std::exception &err) {
+      std::string msg = err.what();
+      if (msg.size() > 256)
+        msg.resize(256);
+      record_hook_dispatch({.sequence = 0,
+                            .hook_name = def->name,
+                            .revision = active_registry->revision(),
+                            .event = def->event,
+                            .kind = def->kind,
+                            .outcome = HookOutcome::matched_failed,
+                            .detail = msg,
+                            .duration_ms = elapsed_ms()});
+      if (notice)
+        notice("\n[hook " + def->name + " failed: " + msg + "]\n");
+      if (def->kind == HookKind::admission && sample.event == HookEvent::before_tool) {
+        return HookDenial{.hook = def->name, .reason = "admission hook error: " + msg};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+Value CodingEngine::hooks_tool(const Value &arguments) {
+  if (!std::holds_alternative<Value::Object>(arguments.value()))
+    throw Error{ErrorCode::invalid_range};
+  std::string op = "list";
+  if (const auto *op_val = arguments.find("op")) {
+    if (!std::holds_alternative<std::string>(op_val->value()))
+      throw Error{ErrorCode::invalid_range};
+    op = op_val->string();
+  }
+  if (op == "list") {
+    return Value::object(
+        {{"revision", Value{hooks_ ? hooks_->revision() : program_revision_}},
+         {"pending_revision",
+          pending_hooks_ ? Value{pending_hooks_->revision()} : Value{}},
+         {"hooks", hooks_ ? hooks_->definitions_value() : Value{Value::Array{}}},
+         {"pending_hooks",
+          pending_hooks_ ? pending_hooks_->definitions_value() : Value{}},
+         {"history_count", Value{Number{hook_history_.size()}}}});
+  }
+  if (op == "history") {
+    std::size_t limit = 64;
+    if (arguments.find("limit"))
+      limit = static_cast<std::size_t>(command_number(arguments, "limit", 64));
+    if (limit == 0)
+      throw Error{ErrorCode::invalid_range};
+    Value::Array items;
+    const auto start =
+        hook_history_.size() > limit ? hook_history_.size() - limit : std::size_t{0};
+    for (std::size_t i = start; i < hook_history_.size(); ++i)
+      items.push_back(hook_history_[i].to_value());
+    return Value::object(
+        {{"count", Value{Number{items.size()}}}, {"history", Value{std::move(items)}}});
+  }
+  if (op == "explain") {
+    const auto parsed_event = parse_hook_event(string_field(arguments, "event"));
+    if (!parsed_event)
+      throw Error{ErrorCode::invalid_range};
+    HookMatchSample sample{.event = *parsed_event, .tool = {}, .prompt = {}};
+    if (const auto *tool = arguments.find("tool")) {
+      if (!std::holds_alternative<std::string>(tool->value()))
+        throw Error{ErrorCode::invalid_range};
+      sample.tool = tool->string();
+    }
+    if (const auto *prompt = arguments.find("prompt")) {
+      if (!std::holds_alternative<std::string>(prompt->value()))
+        throw Error{ErrorCode::invalid_range};
+      sample.prompt = prompt->string();
+    }
+    Value::Array results;
+    if (hooks_) {
+      for (const auto &ex : hooks_->explain(sample))
+        results.push_back(ex.to_value());
+    }
+    return Value::object(
+        {{"revision", Value{hooks_ ? hooks_->revision() : program_revision_}},
+         {"event", Value{std::string{hook_event_name(sample.event)}}},
+         {"matches", Value{std::move(results)}}});
+  }
+  if (op == "enable" || op == "disable") {
+    const auto &name = string_field(arguments, "name");
+    const bool target_enabled = op == "enable";
+    const Value &source_config =
+        pending_program_config_ == Value{} ? program_config_ : pending_program_config_;
+    const auto *existing_hooks = source_config.find("hooks");
+    if (!existing_hooks ||
+        !std::holds_alternative<Value::Array>(existing_hooks->value()))
+      throw Error{ErrorCode::invalid_range};
+    Value::Array updated_hooks;
+    bool found = false;
+    for (const auto &entry : existing_hooks->array()) {
+      if (string_field(entry, "name") == name) {
+        found = true;
+        Value::Object copy;
+        bool had_enabled = false;
+        for (const auto &[k, v] : entry.object()) {
+          if (k == "enabled") {
+            copy.emplace_back(k, Value{target_enabled});
+            had_enabled = true;
+          } else {
+            copy.emplace_back(k, v);
+          }
+        }
+        if (!had_enabled)
+          copy.emplace_back("enabled", Value{target_enabled});
+        updated_hooks.push_back(Value::object(std::move(copy)));
+      } else {
+        updated_hooks.push_back(entry);
+      }
+    }
+    if (!found)
+      throw Error{ErrorCode::invalid_range};
+    Value::Object proposal;
+    for (const auto &[k, v] : source_config.object()) {
+      if (k != "hooks")
+        proposal.emplace_back(k, v);
+    }
+    proposal.emplace_back("hooks", Value{std::move(updated_hooks)});
+    auto staged = program_config(
+        Value::object({{"proposal", Value::object(std::move(proposal))}}));
+    staged.object().emplace_back("hook", Value{name});
+    staged.object().emplace_back("enabled", Value{target_enabled});
+    return staged;
+  }
+  throw Error{ErrorCode::invalid_range};
 }
 
 bool CodingEngine::auto_compact_for_overflow() {
@@ -1022,7 +1307,23 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
   DomainAdmission domain_admission;
   FileEffectObservation file_effect;
   const Value &input = stripped ? requested : arguments;
-  return operation(
+  const bool fire_tool_hooks =
+      !exact && name != "hooks" && hooks_ && !hooks_->definitions().empty();
+  if (fire_tool_hooks) {
+    const HookMatchSample sample{
+        .event = HookEvent::before_tool, .tool = name, .prompt = {}};
+    const auto payload = Value::object({{"event", Value{"before_tool"}},
+                                        {"tool", Value{name}},
+                                        {"arguments", input},
+                                        {"model_call", Value{model_call}}});
+    if (const auto denial = run_hooks(sample, payload)) {
+      return Value::object({{"error", Value{"hook_refused"}},
+                            {"hook", Value{denial->hook}},
+                            {"reason", Value{denial->reason}},
+                            {"tool", Value{name}}});
+    }
+  }
+  auto outcome = operation(
       name, input,
       [&](OperationAttemptId attempt, InvocationId invocation,
           DefinitionGenerationId admitted_generation, CommandTaskActivity *activity,
@@ -1273,6 +1574,8 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           return context_compact(arguments);
         if (name == "context_read")
           return context_read(arguments);
+        if (name == "hooks")
+          return hooks_tool(arguments);
         if (name == "rageshake") {
           const RawAdapterContext origin{
               nullptr,
@@ -1663,6 +1966,18 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
       },
       nullptr, name == "exec" ? &command_start : nullptr, &domain_admission,
       &file_effect, {std::move(supplied), shape, call_id, declared_id, refusal});
+  if (fire_tool_hooks) {
+    const HookMatchSample sample{
+        .event = HookEvent::after_tool, .tool = name, .prompt = {}};
+    const auto payload =
+        Value::object({{"event", Value{"after_tool"}},
+                       {"tool", Value{name}},
+                       {"arguments", input},
+                       {"result", outcome},
+                       {"failed", Value{coding_detail::failed_tool_output(outcome)}}});
+    (void)run_hooks(sample, payload);
+  }
+  return outcome;
 }
 
 } // namespace blackbird

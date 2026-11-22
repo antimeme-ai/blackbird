@@ -13638,3 +13638,27 @@ Implemented TUI Unit 3 — interactive Context Workbench built on `tui::SceneHos
   execution authority): `F6` pin/unpin, `F7` drop/restore (protecting `instruction`,
   `open`, and `pinned` blocks with inline notices), `F8` flush pending compactions (added
   `op == "flush"` to `CodingEngine::context_compact`), and `F9` toggle archived filter.
+
+
+## 2026-11-22 — Track 3: Hooks & Action Fabric (`ViewRoute::hooks_fabric`, `/hooks`)
+
+Implemented TUI Unit 4 — Hooks & Action Fabric (`include/blackbird/hooks.hpp`,
+`src/hooks.cpp`, `include/blackbird/hooks_view.hpp`, `src/hooks_view.cpp`,
+`tests/hooks_fabric_test.cpp`):
+- Added immutable validated `HookRegistry` supporting declarative hooks across five
+  lifecycle events (`turn_start`, `turn_end`, `before_tool`, `after_tool`,
+  `context_compact`) and three kinds (`observer`, `context_transform`, `admission`),
+  ordered deterministically by `(order, name)` with optional declarative `match` filters
+  (`tool`, `prompt_prefix`) and side-effect-free `explain(...)`.
+- Extended `program_config` with optional `hooks` array, syntax-checked via Lua without
+  executing candidate code, activated cleanly at turn boundaries, and persisted across
+  reopen in `workflow-config-effective-v1`.
+- Wired real engine dispatch with depth-2 reentrancy guard, failure isolation for
+  observers/transforms, fail-closed refusal for `before_tool` admission gates
+  (`hook_refused`), bounded 64-entry in-memory dispatch ring buffer, and `hook.dispatch`
+  records on `ApplicationChannel::program`.
+- Exposed native `hooks` tool (`list`, `history`, `explain`, `enable`, `disable`),
+  `blackbird.hooks(...)` in Lua, `/hooks` CLI commands, and interactive `HooksView` TUI
+  (`ViewRoute::hooks_fabric`, `/hooks`, `Ctrl-\` picker) with `F6` audited enable/disable
+  and `F9` Definitions <-> Dispatch History toggle (also upgrading Context Workbench and
+  Hooks view command launches in `src/terminal.cpp` to capture exact `4071` raw originals).

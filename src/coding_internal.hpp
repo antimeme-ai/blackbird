@@ -132,7 +132,9 @@ struct CodingEngine::Runtime {
 
   bool valid_module_source(std::string_view source);
   bool valid_tool_source(std::string_view source);
+  bool valid_hook_source(std::string_view source);
   Value invoke_tool(ToolInvocation invocation);
+  Value invoke_hook(std::string_view source, const Value &event);
   Value eval(std::string_view source, const Value *arguments = nullptr,
              SourceKind kind = SourceKind::root);
 };

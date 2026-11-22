@@ -9,7 +9,8 @@ enum class ViewRoute : std::uint8_t {
   command_runs,
   command_center,
   result_comparison,
-  context_workbench
+  context_workbench,
+  hooks_fabric
 };
 struct ViewDescription {
   ViewRoute route;
@@ -28,5 +29,7 @@ inline constexpr std::array view_descriptions{
                     "/instrument", "Ctrl-]"},
     ViewDescription{
         ViewRoute::context_workbench, "view.context-workbench", "Context workbench",
-        "Inspect, pin, drop, restore and flush context blocks", "/workbench", ""}};
+        "Inspect, pin, drop, restore and flush context blocks", "/workbench", ""},
+    ViewDescription{ViewRoute::hooks_fabric, "view.hooks-fabric", "Hooks & fabric",
+                    "Inspect hooks, revisions and dispatch history", "/hooks", ""}};
 } // namespace blackbird::tui
