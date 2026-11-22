@@ -8,7 +8,8 @@ enum class ViewRoute : std::uint8_t {
   conversation,
   command_runs,
   command_center,
-  result_comparison
+  result_comparison,
+  context_workbench
 };
 struct ViewDescription {
   ViewRoute route;
@@ -24,5 +25,8 @@ inline constexpr std::array view_descriptions{
                     "/center", "Ctrl-X"},
     ViewDescription{ViewRoute::result_comparison, "view.result-comparison",
                     "Result comparison", "Compare pinned output from command runs",
-                    "/instrument", "Ctrl-]"}};
+                    "/instrument", "Ctrl-]"},
+    ViewDescription{
+        ViewRoute::context_workbench, "view.context-workbench", "Context workbench",
+        "Inspect, pin, drop, restore and flush context blocks", "/workbench", ""}};
 } // namespace blackbird::tui

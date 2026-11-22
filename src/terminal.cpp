@@ -94,9 +94,8 @@ const std::array builtin_commands{
     ChatCommand{"/compact", "JSON", "Managed context transformation", "Context"},
     ChatCommand{"/inspect", "JSON", "Bounded retained context inspection", "Context"},
     ChatCommand{"/restore", "ENTRY", "Restore an original context entry", "Context"},
-    ChatCommand{"/repair", "[ENTRY...]",
-                "Approve a repair after a context frame that does not apply",
-                "Context"},
+    ChatCommand{"/workbench", "",
+                "Open interactive context block workbench (local TUI)", "Context"},
     ChatCommand{"/lua", "CODE", "Run a Lua workflow", "Programs"},
     ChatCommand{"/workflow", "FILE", "Select the turn workflow", "Programs"},
     ChatCommand{"/restart", "NOTE", "Request native restart; build replacement first",
@@ -1315,6 +1314,10 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       escape_.clear();
       return {InputAction::instrument_action, name};
     }
+    if (inspecting && escape_ == "\x1b[20~") {
+      escape_.clear();
+      return {InputAction::workbench_action, "toggle_archived"};
+    }
     if (inspecting) {
       const auto action =
           escape_ == "\x1b[A" || escape_ == "\x1bOA"   ? InputAction::inspect_previous
@@ -1937,6 +1940,17 @@ void TerminalUI::telemetry(const TelemetrySnapshot &snapshot) {
   post(Kind::telemetry, terminal_usage_summary(snapshot), nullptr, {},
        std::make_shared<const TelemetrySnapshot>(snapshot));
 }
+void TerminalUI::context_workbench(ContextWorkbenchSnapshot snapshot) {
+  const std::lock_guard lock{mutex_};
+  Message message{Kind::context_workbench, "", Ink::muted, {}, {}, {}, {}};
+  message.workbench_snapshot =
+      std::make_shared<const ContextWorkbenchSnapshot>(std::move(snapshot));
+  messages_.push_back(std::move(message));
+  if (notification_ >= 0) {
+    const char byte = 1;
+    (void)::write(notification_, &byte, 1);
+  }
+}
 void TerminalUI::operation_started(bool provider) {
   post(provider ? Kind::provider_start : Kind::tool_start, {});
 }
@@ -2082,7 +2096,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                      const std::function<Result<void>()> &reset_interrupt,
                      RetainedState *raw_root,
                      std::optional<CommandCenterContext> center_context,
-                     std::optional<InstrumentSource> instrument_source) {
+                     std::optional<InstrumentSource> instrument_source,
+                     const ContextDetailReader &context_detail_reader) {
   RawCaptureFailureScope ui_capture{raw_capture_ && raw_enabled()};
   const RawAdapterContext terminal_context{
       nullptr,
@@ -2294,6 +2309,24 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (inspector && inspector->open())
       inspector->toggle();
   };
+  std::optional<ContextWorkbench> workbench;
+  std::optional<ContextWorkbenchSnapshot> latest_workbench_snapshot;
+  auto ensure_workbench = [&] {
+    if (workbench)
+      return true;
+    try {
+      workbench.emplace();
+      if (latest_workbench_snapshot)
+        workbench->update(*latest_workbench_snapshot);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+  auto close_workbench = [&] {
+    if (workbench && workbench->open())
+      workbench->toggle();
+  };
   auto route = tui::ViewRoute::conversation;
   std::string_view route_notice;
   const auto select_view = [&](tui::ViewRoute requested, RawEventRef origin,
@@ -2317,12 +2350,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           "Result comparison unavailable; no composition owner in this session";
       return false;
     }
+    if (next == tui::ViewRoute::context_workbench && !ensure_workbench()) {
+      route_notice = "Context workbench unavailable; native view could not be created";
+      return false;
+    }
     if (next != tui::ViewRoute::command_runs)
       close_inspector();
     if (next != tui::ViewRoute::command_center)
       close_center();
     if (next != tui::ViewRoute::result_comparison)
       close_instrument();
+    if (next != tui::ViewRoute::context_workbench)
+      close_workbench();
     const auto activate = [&](auto &view) {
       if (reset)
         view.first_page(origin);
@@ -2338,6 +2377,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       activate(*center);
     else if (next == tui::ViewRoute::result_comparison)
       activate(*instrument);
+    else if (next == tui::ViewRoute::context_workbench)
+      activate(*workbench);
     route = next;
     route_notice = {};
     return true;
@@ -2346,7 +2387,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   auto inspection_focused = [&] {
     return (instrument && instrument->open() && instrument->focused()) ||
            (center && center->open() && center->focused()) ||
-           (inspector && inspector->open() && inspector->focused());
+           (inspector && inspector->open() && inspector->focused()) ||
+           (workbench && workbench->open() && workbench->focused());
   };
   auto visit_inspection = [&](auto &&action) {
     if (instrument && instrument->open())
@@ -2355,6 +2397,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       action(*center);
     else if (inspector && inspector->open())
       action(*inspector);
+    else if (workbench && workbench->open())
+      action(*workbench);
   };
   auto instrument_refresh = std::chrono::steady_clock::time_point::min();
   auto center_refresh = std::chrono::steady_clock::time_point::min();
@@ -2923,6 +2967,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             observed_usage = message.text;
           if (message.kind == Kind::telemetry && message.telemetry)
             live_telemetry = *message.telemetry;
+          if (message.kind == Kind::context_workbench && message.workbench_snapshot) {
+            latest_workbench_snapshot = *message.workbench_snapshot;
+            if (workbench)
+              workbench->update(*latest_workbench_snapshot);
+          }
           if (message.kind == Kind::provider_start ||
               message.kind == Kind::tool_start) {
             live_provider = message.kind == Kind::provider_start;
@@ -3005,6 +3054,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       inspector_refresh =
           std::chrono::steady_clock::now() + std::chrono::milliseconds{80};
       ui_capture.require();
+    }
+    if (workbench && workbench->open() && workbench->needs_refresh()) {
+      ContextDetailReader guarded_reader;
+      if (!busy && context_detail_reader)
+        guarded_reader = context_detail_reader;
+      redraw = workbench->refresh(guarded_reader) || redraw;
     }
     if (commands) {
       pollfd child_input_ready{STDIN_FILENO, POLLIN, 0};
@@ -3393,17 +3448,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         if (inspecting) {
           const bool centered = center && center->open();
           const bool authored = instrument && instrument->open();
-          auto caption = std::string{authored   ? "RETAINED RESULT LAB"
-                                     : centered ? "COMMAND CENTER"
-                                                : "COMMAND RESULTS"};
+          const bool context_wb = workbench && workbench->open();
+          auto caption = context_wb ? workbench->caption()
+                                    : std::string{authored   ? "RETAINED RESULT LAB"
+                                                  : centered ? "COMMAND CENTER"
+                                                             : "COMMAND RESULTS"};
           if (!route_notice.empty())
             caption = std::string{route_notice} + " · " + caption;
           visit_inspection([&](auto &view) {
             inspection_layout = unwrap(view.render(grid, {0, 2, main_width, height}));
-            if (!view.notice().empty())
+            if (!context_wb && !view.notice().empty())
               caption += " · " + std::string{view.notice()};
           });
-          caption += authored   ? " · F6 A · F7 B · F8 interrupt · Ctrl-] close"
+          caption += context_wb
+                         ? " · F6 pin · F7 drop/restore · F8 flush · F9 archived · Tab "
+                           "focus · Esc draft"
+                     : authored ? " · F6 A · F7 B · F8 interrupt · Ctrl-] close"
                      : centered ? " · Ctrl-X close · Tab focus · Esc draft"
                                 : " · Ctrl-O close · Tab focus · Esc draft";
           grid.line(1, {{std::string(main_width, ' '), Ink::normal}});
@@ -3810,6 +3870,27 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                               std::string{"Instrument action unavailable: "} +
                                   error_name(acted.error().code));
         }
+        if ((result.action == InputAction::instrument_action ||
+             result.action == InputAction::workbench_action) &&
+            workbench && workbench->open() && workbench->focused()) {
+          if (result.action == InputAction::workbench_action &&
+              result.text == "toggle_archived") {
+            workbench->toggle_archived();
+          } else {
+            const std::string_view verb = result.text == "pin_a"   ? "pin"
+                                          : result.text == "pin_b" ? "drop_or_restore"
+                                                                   : "flush";
+            const auto action = workbench->action_command(verb);
+            if (!action.command.empty()) {
+              if (busy) {
+                transcript.append(ChatKind::notice,
+                                  "Turn running — wait for idle to mutate context\n");
+              } else {
+                (void)start(action.command, result.source);
+              }
+            }
+          }
+        }
         if (result.action == InputAction::center_toggle)
           (void)select_view(tui::ViewRoute::command_center, result.source.record, true,
                             false);
@@ -3856,6 +3937,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               center->page(false, result.source.record);
             else if (inspector && inspector->open())
               inspector->page(false);
+            else if (workbench && workbench->open())
+              workbench->page(false);
             break;
           case InputAction::inspect_next_output:
             if (instrument && instrument->open())
@@ -3864,6 +3947,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               center->page(true, result.source.record);
             else if (inspector && inspector->open())
               inspector->page(true);
+            else if (workbench && workbench->open())
+              workbench->page(true);
             break;
           default:
             break;
@@ -3876,6 +3961,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               moved = center->act(*navigation, result.source.record);
             else if (inspector && inspector->open())
               moved = inspector->act(*navigation);
+            else if (workbench && workbench->open())
+              moved = workbench->act(*navigation);
             if (!moved.has_value())
               transcript += std::string{"\nInspection navigation refused: "} +
                             error_name(moved.error().code) + "\n";

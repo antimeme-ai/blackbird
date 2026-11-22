@@ -2,6 +2,7 @@
 #include "blackbird/chat_view.hpp"
 #include "blackbird/command_center.hpp"
 #include "blackbird/command_jobs.hpp"
+#include "blackbird/context_workbench.hpp"
 #include "blackbird/display_text.hpp"
 #include "blackbird/raw_ui.hpp"
 #include "blackbird/tasks.hpp"
@@ -43,6 +44,7 @@ enum class InputAction {
   center_toggle,
   instrument_toggle,
   instrument_action,
+  workbench_action,
   select_view,
   answer_question,
   scroll_up,
@@ -206,6 +208,7 @@ public:
   void restore_message(ChatKind kind, std::string_view text);
   void usage(std::string_view text);
   void telemetry(const TelemetrySnapshot &snapshot);
+  void context_workbench(ContextWorkbenchSnapshot snapshot);
   void operation_started(bool provider);
   void status(std::string_view text);
   // A published context revision (a1v): kind label, e.g. "compacted", and the
@@ -231,7 +234,8 @@ public:
            const std::function<Result<void>()> &reset_interrupt = {},
            RetainedState *raw_root = nullptr,
            std::optional<CommandCenterContext> center_context = {},
-           std::optional<InstrumentSource> instrument_source = {});
+           std::optional<InstrumentSource> instrument_source = {},
+           const ContextDetailReader &context_detail_reader = {});
 
 private:
   enum class Kind {
@@ -252,7 +256,8 @@ private:
     instrument_source,
     question,
     context_change,
-    telemetry
+    telemetry,
+    context_workbench
   };
   struct Message {
     Kind kind;
@@ -264,6 +269,7 @@ private:
     std::optional<InstrumentSource> instrument{};
     std::shared_ptr<const TerminalQuestion> question{};
     std::shared_ptr<const TelemetrySnapshot> telemetry{};
+    std::shared_ptr<const ContextWorkbenchSnapshot> workbench_snapshot{};
   };
   bool raw_capture_ = false;
   RawUiSource initial_source_{};

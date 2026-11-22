@@ -558,7 +558,15 @@ Value CodingEngine::context_list(bool include_archived) const {
 Value CodingEngine::context_compact(const Value &arguments) {
   if (!std::holds_alternative<Value::Object>(arguments.value()))
     throw Error{ErrorCode::invalid_range};
-  const auto op_parsed = parse_compact_op(string_field(arguments, "op"));
+  const auto &op_text = string_field(arguments, "op");
+  if (op_text == "flush") {
+    const auto flushed = flush_pending_compactions("operator");
+    return Value::object({{"ok", Value{true}},
+                          {"op", Value{"flush"}},
+                          {"flushed", Value{Number{flushed}}},
+                          {"upstream_epoch", Value{Number{upstream_epoch_}}}});
+  }
+  const auto op_parsed = parse_compact_op(op_text);
   if (!op_parsed)
     throw Error{ErrorCode::invalid_range};
   CompactRequest req;

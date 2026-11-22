@@ -983,6 +983,7 @@ void review_palette_and_holder_cuts() {
           std::pair{"view.conversation", tui::ViewRoute::conversation},
           std::pair{"view.command-runs", tui::ViewRoute::command_runs},
           std::pair{"view.command-center", tui::ViewRoute::command_center},
+          std::pair{"view.context-workbench", tui::ViewRoute::context_workbench},
           std::pair{"view.result-comparison", tui::ViewRoute::result_comparison}};
       for (const auto &[action, route] : expected_views) {
         views.views();
@@ -1107,7 +1108,7 @@ void review_palette_and_holder_cuts() {
     }
   }
   require(help == 1 && long_command == 1 && retired == 2 && restoration == 1 &&
-              absent_refused && routed == 5,
+              absent_refused && routed == view_actions.size(),
           "exact native palette/view/holder/missing-capture source-to-disk outcomes");
   std::filesystem::remove_all(directory);
 }

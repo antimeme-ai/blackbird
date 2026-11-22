@@ -1148,6 +1148,59 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     };
     // Only the TUI presents changes; headless runs attach no listener, so the
     // store measures no sizes for them.
+    auto publish_context_workbench = [&] {
+      if (!tui)
+        return;
+      try {
+        ContextWorkbenchSnapshot snap;
+        snap.upstream_epoch = engine.upstream_epoch();
+        snap.total_bytes = context.total_bytes();
+        snap.live_blocks = context.blocks().size();
+        snap.archived_blocks = context.archived().size();
+        snap.pending_compactions = engine.pending_compactions_count();
+        snap.context_window_tokens = engine.telemetry().context_window_tokens;
+        const auto listing = context.list(true);
+        const auto &live_blocks = context.blocks();
+        const auto &live_arr = field(listing, "blocks").array();
+        for (std::size_t i = 0; i < live_arr.size(); ++i) {
+          const auto &entry = live_arr[i];
+          ContextWorkbenchBlock b;
+          b.id = std::stoull(field(entry, "id").number().text());
+          b.kind = string_field(entry, "kind");
+          if (i < live_blocks.size() && live_blocks[i].id == b.id)
+            b.label = live_blocks[i].label;
+          b.preview = string_field(entry, "preview");
+          b.bytes = std::stoull(field(entry, "bytes").number().text());
+          b.items = std::stoull(field(entry, "items").number().text());
+          b.pinned = std::get<bool>(field(entry, "pinned").value());
+          b.open = std::get<bool>(field(entry, "open").value());
+          b.archived = false;
+          if (const auto *rep = entry.find("replaces")) {
+            for (const auto &r : rep->array())
+              b.replaces.push_back(std::stoull(r.number().text()));
+          }
+          snap.blocks.push_back(std::move(b));
+        }
+        const auto &arch_blocks = context.archived();
+        if (const auto *arch = listing.find("archived")) {
+          const auto &arch_arr = arch->array();
+          for (std::size_t i = 0; i < arch_arr.size(); ++i) {
+            const auto &entry = arch_arr[i];
+            ContextWorkbenchBlock b;
+            b.id = std::stoull(field(entry, "id").number().text());
+            b.kind = string_field(entry, "kind");
+            if (i < arch_blocks.size() && arch_blocks[i].id == b.id)
+              b.label = arch_blocks[i].label;
+            b.preview = string_field(entry, "preview");
+            b.bytes = std::stoull(field(entry, "bytes").number().text());
+            b.archived = true;
+            snap.blocks.push_back(std::move(b));
+          }
+        }
+        ui.context_workbench(std::move(snap));
+      } catch (...) {
+      }
+    };
     if (tui)
       engine.context().changed = [&](const ContextChange &change) {
         const std::string kind =
@@ -1158,6 +1211,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             : change.mode == "select"                             ? "selected"
                                                                   : change.mode;
         ui.context_changed(kind, change.bytes_before, change.bytes_after);
+        publish_context_workbench();
       };
     engine.task_activity_native = [&, tui](const Value &event,
                                            RawTaskPresentation origin) {
@@ -1782,7 +1836,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               restart_capture = command_context;
               restart_pending.store(true);
             }
-            if (tui)
+            if (tui) {
+              publish_context_workbench();
               ui.title(
                   "Blackbird · " +
                   (session_store.settings().name.empty()
@@ -1791,6 +1846,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   model + " · " + effort +
                   (session_store.settings().effort_pending ? " (choose effort)" : "") +
                   " · " + session.string());
+            }
           });
         } catch (const Error &e) {
           dispatch.require_capture();
@@ -2240,6 +2296,22 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       const CommandCenterContext center_context{
           {root->environment(), session_identity(log, &session_capture).conversation},
           engine.participant_observer()};
+      publish_context_workbench();
+      ContextDetailReader context_detail_reader =
+          [&](std::uint64_t id, std::size_t offset,
+              std::size_t limit) -> std::optional<ContextDetailSlice> {
+        try {
+          const auto res = context.read_block(id, {.offset = offset, .limit = limit});
+          return ContextDetailSlice{
+              .content = string_field(res, "content"),
+              .total_bytes = std::stoull(field(res, "total_bytes").number().text()),
+              .offset = std::stoull(field(res, "offset").number().text()),
+              .truncated = std::get<bool>(field(res, "truncated").value()),
+              .archived = std::get<bool>(field(res, "archived").value())};
+        } catch (...) {
+          return std::nullopt;
+        }
+      };
       RawSessionCall initial_input{
           4200, 4201, &session_capture,
           std::array{detail::raw_native_field(initial_kind),
@@ -2282,7 +2354,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             },
             engine.command_jobs(), interrupt_wake.read_fd(),
             [&] { return interrupt_owner.reset(); }, root.get(), center_context,
-            std::move(instrument_source));
+            std::move(instrument_source), std::move(context_detail_reader));
       });
       return clean_stop.arm(finish_interactive());
     }

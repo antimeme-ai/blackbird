@@ -154,6 +154,9 @@ public:
   const Value &workflow_result() const noexcept { return workflow_result_; }
   ContextStore &context() noexcept { return context_; }
   TaskStore &tasks() noexcept { return tasks_; }
+  std::size_t pending_compactions_count() const noexcept {
+    return pending_compactions_.size();
+  }
   ParticipantObservationReader participant_observer() const;
   void model(std::string name) { model_ = std::move(name); }
   // Pins the session's profiles. Each provider.request resolves its profile from its

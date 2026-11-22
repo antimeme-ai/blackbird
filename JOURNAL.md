@@ -13618,3 +13618,23 @@ behavioral change and `<lua.h>` isolated exclusively to `src/coding_lua.cpp`:
   `context_list`/`context_compact`/`context_read`, retained outputs, and `dispatch()`.
 - `src/coding.cpp` (`2,330` LOC): `CodingEngine` lifecycle, `recover_coding_session`,
   `operation()`, workflows, `stats()`, and `turn()`.
+
+
+## 2026-11-22 — Track 2: Interactive Context Workbench (`ViewRoute::context_workbench`, `/workbench`)
+
+Implemented TUI Unit 3 — interactive Context Workbench built on `tui::SceneHost` and
+`tui::CollectionInspector` (`include/blackbird/context_workbench.hpp`,
+`src/context_workbench.cpp`, `tests/context_workbench_test.cpp`):
+- Registered `ViewRoute::context_workbench` (`view.context-workbench`, `/workbench`,
+  accessible via `/workbench` or `Ctrl-\` View Picker with full draft & cursor
+  preservation).
+- Left pane lists live (and optionally archived via `F9`) context blocks with kind,
+  `[A]`/`[P]`/`[O]` flags, byte size, and UTF-8-safe single-line preview; selection stays
+  anchored by block ID across updates.
+- Right pane inspects block metadata (`status`, `pinned`, `open`, `bytes`, `items`,
+  `replaces`) and pages exact retained originals in 8 KiB windows (`Ctrl-Left`/`Ctrl-Right`)
+  on demand while the session is idle.
+- Mutating actions emit audited slash commands into the worker queue (no direct UI
+  execution authority): `F6` pin/unpin, `F7` drop/restore (protecting `instruction`,
+  `open`, and `pinned` blocks with inline notices), `F8` flush pending compactions (added
+  `op == "flush"` to `CodingEngine::context_compact`), and `F9` toggle archived filter.
