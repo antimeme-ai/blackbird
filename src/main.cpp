@@ -1,6 +1,7 @@
 #include "blackbird/anthropic_provider.hpp"
 #include "blackbird/application.hpp"
 #include "blackbird/backstop.hpp"
+#include "blackbird/chat_provider.hpp"
 #include "blackbird/coding.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
@@ -840,9 +841,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         });
         return levels;
       }
+      if (protocol == "messages" || protocol == "chat")
+        return std::vector<std::string>{"low", "medium", "high"};
       if (protocol != "responses" && protocol != "responses-portable") {
-        warning("Main coding requires a Responses provider or native Anthropic "
-                "Messages.\n");
+        warning("Unsupported provider protocol: " + protocol + ".\n");
         throw Error{ErrorCode::unsupported};
       }
       if (protocol == "responses-portable")
@@ -996,25 +998,43 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       return clean_stop.arm(0);
     std::atomic_bool new_pending{false};
     RawAdapterContext restart_capture;
-    std::unique_ptr<CodingProvider> provider;
-    if (provider_name == "openrouter") {
-      OpenRouterConfig config;
-      if (const auto *curl = std::getenv("BLACKBIRD_OPENROUTER_CURL"); curl && *curl)
-        config.auth.curl_executable = curl;
-      provider = std::make_unique<OpenRouterCodingProvider>(std::move(config));
-    } else if (provider_name == "anthropic") {
-      AnthropicConfig config;
-      if (const auto *curl = std::getenv("BLACKBIRD_ANTHROPIC_CURL"); curl && *curl)
-        config.auth.curl_executable = curl;
-      provider = std::make_unique<AnthropicCodingProvider>(std::move(config));
-    } else if (provider_name != "openai") {
+    auto make_coding_provider =
+        [&](const std::string &target_provider,
+            const RawAdapterContext &capture) -> std::unique_ptr<CodingProvider> {
+      if (target_provider == "openai")
+        return std::make_unique<OpenAiCodingProvider>();
+      if (target_provider == "openrouter") {
+        OpenRouterConfig config;
+        if (const auto *curl = std::getenv("BLACKBIRD_OPENROUTER_CURL"); curl && *curl)
+          config.auth.curl_executable = curl;
+        return std::make_unique<OpenRouterCodingProvider>(std::move(config));
+      }
+      ProviderAuth auth;
+      const RawAuthParent parent{capture.parent.value_or(RawEventRef{})};
+      const auto descriptor = auth.descriptor(target_provider, &parent);
+      const auto &protocol = string_field(descriptor, "protocol");
+      if (protocol == "messages") {
+        AnthropicConfig config;
+        config.provider = target_provider;
+        if (const auto *curl = std::getenv("BLACKBIRD_ANTHROPIC_CURL"); curl && *curl)
+          config.auth.curl_executable = curl;
+        return std::make_unique<AnthropicCodingProvider>(std::move(config));
+      }
+      if (protocol == "chat") {
+        ChatCompletionsConfig config;
+        config.provider = target_provider;
+        if (const auto *curl = std::getenv("BLACKBIRD_CHAT_CURL"); curl && *curl)
+          config.auth.curl_executable = curl;
+        return std::make_unique<ChatCompletionsCodingProvider>(std::move(config));
+      }
       RegisteredResponsesConfig config;
-      config.provider = provider_name;
+      config.provider = target_provider;
       if (const auto *curl = std::getenv("BLACKBIRD_RESPONSES_CURL"); curl && *curl)
         config.auth.curl_executable = curl;
-      provider = std::make_unique<RegisteredResponsesCodingProvider>(std::move(config));
-    } else
-      provider = std::make_unique<OpenAiCodingProvider>();
+      return std::make_unique<RegisteredResponsesCodingProvider>(std::move(config));
+    };
+    std::unique_ptr<CodingProvider> provider =
+        make_coding_provider(provider_name, session_capture);
     CodingEngine engine{log, context, *provider, model};
     if (const auto pinned = engine.profiles(session_profiles); !pinned.has_value()) {
       warning("Provider profile refused for model " + engine.definition_model() + ": " +
@@ -1062,7 +1082,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     engine.cancelled = [&] {
       return interrupted.load(std::memory_order_relaxed) || cancelled.load();
     };
-    TerminalUI ui{"Blackbird · " + model + " · " + effort +
+    TerminalUI ui{"Blackbird · " + provider_name + "/" + model + " · " + effort +
                   (settings.effort_pending ? " (choose effort)" : "") + " · " +
                   session.string()};
     // After a SIGTERM the loops have decided to stop. Rearm the interrupt so the
@@ -1095,6 +1115,82 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       else
         write_plain_formatted(STDOUT_FILENO, PlainOutputKind::emit, text, safe,
                               output_context);
+    };
+    auto is_scalar = [](const Value &val) {
+      return !std::holds_alternative<Value::Array>(val.value()) &&
+             !std::holds_alternative<Value::Object>(val.value());
+    };
+    std::function<void(std::string &, const Value &, std::size_t)> format_tui_value =
+        [&](std::string &out, const Value &val, std::size_t depth) {
+          const std::string pad(depth * 2, ' ');
+          if (std::holds_alternative<std::nullptr_t>(val.value())) {
+            out += "null";
+          } else if (const auto *b = std::get_if<bool>(&val.value())) {
+            out += *b ? "true" : "false";
+          } else if (const auto *n = std::get_if<Number>(&val.value())) {
+            out += n->text();
+          } else if (const auto *s = std::get_if<std::string>(&val.value())) {
+            out += safe(*s);
+          } else if (const auto *arr = std::get_if<Value::Array>(&val.value())) {
+            if (arr->empty()) {
+              out += "[]";
+              return;
+            }
+            bool all_scalar = arr->size() <= 6;
+            for (const auto &e : *arr)
+              all_scalar = all_scalar && is_scalar(e);
+            if (all_scalar) {
+              out += '[';
+              for (std::size_t i = 0; i < arr->size(); ++i) {
+                if (i > 0)
+                  out += ", ";
+                format_tui_value(out, (*arr)[i], depth + 1);
+              }
+              out += ']';
+              return;
+            }
+            for (std::size_t i = 0; i < arr->size(); ++i) {
+              if (i > 0 || depth > 0)
+                out += '\n';
+              out += pad + "- ";
+              format_tui_value(out, (*arr)[i], depth + 1);
+            }
+          } else if (const auto *obj = std::get_if<Value::Object>(&val.value())) {
+            if (obj->empty()) {
+              out += "{}";
+              return;
+            }
+            bool compact = depth > 0 && obj->size() <= 6;
+            for (const auto &[k, v] : *obj)
+              compact = compact && is_scalar(v);
+            if (compact) {
+              for (std::size_t i = 0; i < obj->size(); ++i) {
+                if (i > 0)
+                  out += ", ";
+                out += safe((*obj)[i].first) + "=";
+                format_tui_value(out, (*obj)[i].second, depth + 1);
+              }
+              return;
+            }
+            for (std::size_t i = 0; i < obj->size(); ++i) {
+              if (i > 0 || depth > 0)
+                out += '\n';
+              const auto &[k, v] = (*obj)[i];
+              out += pad + safe(k) + ": ";
+              format_tui_value(out, v, depth + 1);
+            }
+          }
+        };
+    auto emit_structured = [&](const Value &val, bool sanitize = false) {
+      if (!tui) {
+        const auto raw = unwrap(dump_json(val));
+        emit((sanitize ? safe(raw) : raw) + "\n");
+      } else {
+        std::string out = "\n";
+        format_tui_value(out, val, 0);
+        out += '\n';
+        ui.notice(out);
+      }
     };
     auto refresh_info = [&](const RawAdapterContext &capture) {
       RawCaptureFailureScope failure{capture.parent && raw_enabled()};
@@ -1131,6 +1227,143 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           prompt += (index ? ", " : "") + levels[index];
         emit(prompt + ").\n");
       }
+    };
+    const auto suggested_models = [](std::string_view target_provider)
+        -> std::vector<std::pair<std::string, std::string>> {
+      if (target_provider == "openai")
+        return {{"gpt-5.4", "OpenAI flagship coding model"},
+                {"gpt-5.4-mini", "Fast, low-latency GPT-5.4"},
+                {"o3", "OpenAI reasoning model"},
+                {"o4-mini", "Fast OpenAI reasoning model"}};
+      if (target_provider == "anthropic")
+        return {{"claude-opus-4-6", "Anthropic flagship Opus 4.6"},
+                {"claude-sonnet-4-6", "Anthropic Sonnet 4.6"},
+                {"claude-opus-4-5", "Anthropic Opus 4.5"},
+                {"claude-sonnet-4-5", "Anthropic Sonnet 4.5"},
+                {"claude-haiku-4-5", "Fast Anthropic Haiku 4.5"}};
+      if (target_provider == "kimi")
+        return {{"kimi-for-coding", "Kimi Coding flagship (Anthropic Messages)"},
+                {"kimi-k2-thinking", "Kimi K2 reasoning"}};
+      if (target_provider == "gemini")
+        return {{"gemini-2.5-pro", "Google Gemini 2.5 Pro (1M context)"},
+                {"gemini-2.5-flash", "Fast Google Gemini 2.5 Flash"},
+                {"gemini-3-pro-preview", "Google Gemini 3 Pro Preview"},
+                {"gemini-3-flash-preview", "Google Gemini 3 Flash Preview"}};
+      if (target_provider == "grok")
+        return {{"grok-4", "xAI Grok 4 flagship"},
+                {"grok-code-fast-1", "xAI Grok Code Fast"},
+                {"grok-3", "xAI Grok 3"},
+                {"grok-3-mini", "Fast xAI Grok 3 Mini"}};
+      if (target_provider == "moonshot")
+        return {{"kimi-k2-0905-preview", "Moonshot Kimi K2"},
+                {"kimi-k2-thinking", "Moonshot Kimi K2 Thinking"}};
+      if (target_provider == "mimo")
+        return {{"mimo-v2-flash", "Xiaomi MiMo v2 Flash"}};
+      if (target_provider == "openrouter")
+        return {{"anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6 via OpenRouter"},
+                {"google/gemini-2.5-pro", "Gemini 2.5 Pro via OpenRouter"},
+                {"x-ai/grok-4", "Grok 4 via OpenRouter"},
+                {"moonshotai/kimi-k2", "Kimi K2 via OpenRouter"},
+                {"openai/gpt-5.4", "GPT-5.4 via OpenRouter"}};
+      return {};
+    };
+    const auto ask_model_picker = [&](std::string_view active_provider,
+                                      std::string_view active_model) {
+      const auto suggestions = suggested_models(active_provider);
+      if (!tui) {
+        std::string out = "Current route: " + std::string{active_provider} + "/" +
+                          std::string{active_model} + "\nUsage: /model NAME\n";
+        if (!suggestions.empty()) {
+          out += "Suggested models for " + std::string{active_provider} + ":\n";
+          for (const auto &[id, desc] : suggestions)
+            out += "  " + id + "  - " + desc + "\n";
+        }
+        emit(out);
+        return;
+      }
+      TerminalQuestion q{"Select model for " + std::string{active_provider} +
+                             " (or type /model NAME):",
+                         {}};
+      bool listed_current = false;
+      for (const auto &[id, desc] : suggestions) {
+        const bool current = id == active_model;
+        listed_current = listed_current || current;
+        q.choices.push_back({"/model " + id,
+                             "",
+                             desc + (current ? " [active]" : ""),
+                             "Model",
+                             id,
+                             {},
+                             true});
+      }
+      if (!listed_current && !active_model.empty()) {
+        q.choices.insert(q.choices.begin(), {"/model " + std::string{active_model},
+                                             "",
+                                             "Keep current model [active]",
+                                             "Model",
+                                             std::string{active_model},
+                                             {},
+                                             true});
+      }
+      if (q.choices.empty()) {
+        ui.notice("\nCurrent model: " + std::string{active_provider} + "/" +
+                  std::string{active_model} +
+                  ". Pass a model name with /model NAME.\n");
+        return;
+      }
+      ui.question(std::move(q));
+    };
+    struct ProviderBadgeQuery {
+      std::string_view id;
+      std::string_view env_var;
+    };
+    const auto provider_auth_tag = [](const Value &status_doc,
+                                      ProviderBadgeQuery query) -> std::string {
+      for (const auto &acct : field(status_doc, "accounts").array()) {
+        if (string_field(acct, "provider") == query.id &&
+            field(acct, "active") == Value{true}) {
+          const auto &state = string_field(acct, "state");
+          const auto &kind = string_field(acct, "kind");
+          return state == "ready" ? (kind == "oauth" ? "oauth ready" : "key ready")
+                                  : state;
+        }
+      }
+      if (!query.env_var.empty()) {
+        if (const auto *val = std::getenv(std::string{query.env_var}.c_str());
+            val && *val)
+          return "env " + std::string{query.env_var};
+      }
+      return "not signed in";
+    };
+    const auto ask_provider_picker = [&] {
+      ProviderAuth auth;
+      const auto cat = auth.catalog();
+      const auto st = auth.status();
+      if (!tui) {
+        std::string out = "Current provider: " + provider_name + " (model: " + model +
+                          ")\n"
+                          "Usage: /provider ID [MODEL]\nProviders:\n";
+        for (const auto &p : field(cat, "providers").array()) {
+          const auto &pid = string_field(p, "id");
+          const auto &proto = string_field(p, "protocol");
+          const auto &env = string_field(p, "environment");
+          out += (pid == provider_name ? " * " : "   ") + pid + " (" + proto + ", " +
+                 provider_auth_tag(st, {pid, env}) + ")\n";
+        }
+        emit(out);
+        return;
+      }
+      TerminalQuestion q{"Select provider (or type /provider ID [MODEL]):", {}};
+      for (const auto &p : field(cat, "providers").array()) {
+        const auto &pid = string_field(p, "id");
+        const auto &proto = string_field(p, "protocol");
+        const auto &env = string_field(p, "environment");
+        const auto tag = provider_auth_tag(st, {pid, env});
+        const std::string desc =
+            proto + " | " + tag + (pid == provider_name ? " [active]" : "");
+        q.choices.push_back({"/provider " + pid, "", desc, "Provider", pid, {}, true});
+      }
+      ui.question(std::move(q));
     };
     ask_effort(settings, initial_efforts);
     refresh_info(session_capture);
@@ -1331,10 +1564,11 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         output_context = &command_context;
         try {
           dispatch.run([&] {
-            if (session_store.settings().effort_pending &&
-                !prompt.starts_with("/effort ") && !prompt.starts_with("/model ") &&
-                prompt != "/session" && prompt != "/help" && prompt != "/context" &&
-                prompt != "/profile") {
+            if (session_store.settings().effort_pending && prompt != "/effort" &&
+                !prompt.starts_with("/effort ") && prompt != "/model" &&
+                !prompt.starts_with("/model ") && prompt != "/provider" &&
+                !prompt.starts_with("/provider ") && prompt != "/session" &&
+                prompt != "/help" && prompt != "/context" && prompt != "/profile") {
               ask_effort(session_store.settings(),
                          route_efforts(session_store.settings(), command_context));
               return;
@@ -1358,33 +1592,28 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                        prompt.starts_with("/process ")) {
               raw_main_branch(dispatch, 2);
               const bool execute = prompt.starts_with("/exec ");
-              emit(unwrap(dump_json(engine.operator_call(
-                       execute ? "exec" : "process",
-                       unwrap(parse_json(prompt.substr(execute ? 6 : 9)))))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  execute ? "exec" : "process",
+                  unwrap(parse_json(prompt.substr(execute ? 6 : 9)))));
             } else if (prompt.starts_with("/fg ")) {
               raw_main_branch(dispatch, 3);
-              emit(unwrap(dump_json(engine.operator_call(
-                       "process",
-                       Value::object(
-                           {{"op", Value{"foreground"}},
-                            {"job_id", Value{std::string{prompt.substr(4)}}}})))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "process",
+                  Value::object({{"op", Value{"foreground"}},
+                                 {"job_id", Value{std::string{prompt.substr(4)}}}})));
             } else if (prompt == "/jobs") {
               raw_main_branch(dispatch, 4);
-              emit(unwrap(dump_json(engine.command_jobs()->read(Value::object({})))) +
-                   "\n");
+              emit_structured(engine.command_jobs()->read(Value::object({})));
             } else if (prompt == "/bg" || prompt.starts_with("/bg ")) {
               raw_main_branch(dispatch, 5);
               const auto lease = engine.command_jobs()->foreground();
               const auto id = prompt == "/bg" ? string_field(lease, "job_id")
                                               : std::string{prompt.substr(4)};
-              emit(unwrap(dump_json(engine.operator_call(
-                       "process",
-                       Value::object({{"op", Value{"background"}},
-                                      {"job_id", Value{id}},
-                                      {"wait_epoch", field(lease, "wait_epoch")}})))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "process",
+                  Value::object({{"op", Value{"background"}},
+                                 {"job_id", Value{id}},
+                                 {"wait_epoch", field(lease, "wait_epoch")}})));
             } else if (prompt == "continue" && (resume_turn || resume_requested)) {
               raw_main_branch(dispatch, 6);
               if (!resume_turn && !session_store.resume(context, &command_context)) {
@@ -1448,7 +1677,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                             : "") +
                        "\n");
               } else
-                emit(unwrap(dump_json(result)) + "\n");
+                emit_structured(result);
             } else if (prompt.starts_with("/run ") || prompt.starts_with("/send ") ||
                        prompt.starts_with("/join ")) {
               raw_main_branch(dispatch, 9);
@@ -1456,32 +1685,78 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                 : prompt.starts_with("/send ") ? "participant_send"
                                                                : "participant_join";
               const auto offset = prompt.starts_with("/run ") ? 5U : 6U;
-              emit(unwrap(dump_json(engine.operator_call(
-                       name, unwrap(parse_json(prompt.substr(offset)))))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  name, unwrap(parse_json(prompt.substr(offset)))));
             } else if (prompt.starts_with("/await ")) {
               raw_main_branch(dispatch, 10);
-              emit(unwrap(dump_json(engine.operator_call(
-                       "participant_await", unwrap(parse_json(prompt.substr(7)))))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "participant_await", unwrap(parse_json(prompt.substr(7)))));
             } else if (prompt.starts_with("/stop ")) {
               raw_main_branch(dispatch, 11);
-              emit(unwrap(dump_json(engine.operator_call(
-                       "participant_cancel",
-                       Value::object(
-                           {{"run_id", Value{std::string{prompt.substr(6)}}}})))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "participant_cancel",
+                  Value::object({{"run_id", Value{std::string{prompt.substr(6)}}}})));
             } else if (prompt == "/auth" || prompt == "/auth status") {
               raw_main_branch(dispatch, 12);
-              emit(safe(unwrap(dump_json(ProviderAuth{}.status()))) + "\n");
+              const auto st = ProviderAuth{}.status();
+              if (!tui) {
+                emit(safe(unwrap(dump_json(st))) + "\n");
+              } else {
+                const auto &accts = field(st, "accounts").array();
+                std::string out =
+                    "\nAuth accounts (" + std::to_string(accts.size()) + "):\n";
+                if (accts.empty()) {
+                  out += "  No stored accounts yet.\n";
+                } else {
+                  for (const auto &a : accts) {
+                    out += (field(a, "active") == Value{true} ? "  * " : "    ") +
+                           string_field(a, "provider") + " (" +
+                           string_field(a, "account") + ")  " +
+                           string_field(a, "kind") + "  " + string_field(a, "state") +
+                           "\n";
+                  }
+                }
+                out += "Sign in / add keys from your shell:\n"
+                       "  blackbird auth login kimi | grok | openai | anthropic\n"
+                       "  blackbird auth key gemini | kimi | grok | openrouter | "
+                       "moonshot\n";
+                ui.notice(out);
+              }
             } else if (prompt == "/auth providers") {
               raw_main_branch(dispatch, 13);
-              emit(safe(unwrap(dump_json(ProviderAuth{}.catalog()))) + "\n");
+              const auto cat = ProviderAuth{}.catalog();
+              if (!tui) {
+                emit(safe(unwrap(dump_json(cat))) + "\n");
+              } else {
+                const auto st = ProviderAuth{}.status();
+                std::string out = "\nProviders (use /provider to switch):\n";
+                for (const auto &p : field(cat, "providers").array()) {
+                  const auto &pid = string_field(p, "id");
+                  const auto &proto = string_field(p, "protocol");
+                  const auto &env = string_field(p, "environment");
+                  const auto login =
+                      p.find("login") ? string_field(p, "login") : "none";
+                  out += (pid == provider_name ? "  * " : "    ") + pid + "  [" +
+                         proto + "]  " + provider_auth_tag(st, {pid, env});
+                  if (login != "none")
+                    out += "  (oauth: " + login + ")";
+                  out += "  env=" + env + "\n";
+                }
+                out += "Add keys/login in another terminal: blackbird auth login <id> "
+                       "or blackbird auth key <id>\n";
+                ui.notice(out);
+              }
             } else if (prompt.starts_with("/auth ")) {
               raw_main_branch(dispatch, 14);
-              emit("Use ./scripts/blackbird auth outside chat for "
-                   "sign-in/key/use/logout. "
-                   "Secret entry is excluded from session history.\n");
+              const std::string msg =
+                  "Use `blackbird auth` outside chat for login/key/use/logout "
+                  "(e.g. `blackbird auth login kimi`, `blackbird auth login grok`, "
+                  "`blackbird auth key gemini`). Secrets stay out of session "
+                  "history.\n";
+              if (tui)
+                ui.notice("\n" + msg);
+              else
+                emit(msg);
             } else if (prompt == "/variables" || prompt.starts_with("/variables ") ||
                        prompt == "/correlate" || prompt.starts_with("/correlate ")) {
               raw_main_branch(dispatch, 15);
@@ -1537,31 +1812,54 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               }
             } else if (prompt == "/colleagues") {
               raw_main_branch(dispatch, 19);
-              emit(unwrap(dump_json(
-                       engine.operator_call("colleague_catalog", Value::object({})))) +
-                   "\n");
+              emit_structured(
+                  engine.operator_call("colleague_catalog", Value::object({})));
             } else if (prompt.starts_with("/colleague ")) {
               raw_main_branch(dispatch, 20);
-              emit(unwrap(dump_json(engine.operator_call(
-                       "colleague", unwrap(parse_json(prompt.substr(11)))))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "colleague", unwrap(parse_json(prompt.substr(11)))));
             } else if (prompt == "/session") {
               raw_main_branch(dispatch, 21);
               const auto identity = session_identity(log, &command_context);
-              emit(unwrap(dump_json(Value::object(
-                       {{"name", Value{session_store.settings().name}},
-                        {"actor", Value{hex_identity(identity.actor.bytes())}},
-                        {"directory", Value{session.string()}},
-                        {"conversation",
-                         Value{hex_identity(identity.conversation.bytes())}},
-                        {"workflow_id", Value{hex_identity(identity.workflow.bytes())}},
-                        {"model", Value{model}},
-                        {"provider", Value{provider_name}},
-                        {"effort", Value{effort}},
-                        {"effort_pending",
-                         Value{session_store.settings().effort_pending}},
-                        {"workflow", Value{workflow.string()}}}))) +
-                   "\n");
+              if (!tui) {
+                emit(unwrap(dump_json(Value::object(
+                         {{"name", Value{session_store.settings().name}},
+                          {"actor", Value{hex_identity(identity.actor.bytes())}},
+                          {"directory", Value{session.string()}},
+                          {"conversation",
+                           Value{hex_identity(identity.conversation.bytes())}},
+                          {"workflow_id",
+                           Value{hex_identity(identity.workflow.bytes())}},
+                          {"model", Value{model}},
+                          {"provider", Value{provider_name}},
+                          {"effort", Value{effort}},
+                          {"effort_pending",
+                           Value{session_store.settings().effort_pending}},
+                          {"workflow", Value{workflow.string()}}}))) +
+                     "\n");
+              } else {
+                std::string out = "\nSession:\n";
+                if (!session_store.settings().name.empty())
+                  out += "  name:      " + session_store.settings().name + "\n";
+                out += "  provider:  " + provider_name +
+                       "\n"
+                       "  model:     " +
+                       model +
+                       "\n"
+                       "  effort:    " +
+                       effort +
+                       (session_store.settings().effort_pending ? " (pending)" : "") +
+                       "\n"
+                       "  conv:      " +
+                       hex_identity(identity.conversation.bytes()) +
+                       "\n"
+                       "  workflow:  " +
+                       workflow.string() +
+                       "\n"
+                       "  directory: " +
+                       session.string() + "\n";
+                ui.notice(out);
+              }
             } else if (prompt == "/profile") {
               raw_main_branch(dispatch, 42);
               // A refusal is shown, as the next request would show it; the session
@@ -1716,7 +2014,26 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               workflow = candidate.workflow;
             } else if (prompt == "/context") {
               raw_main_branch(dispatch, 27);
-              emit(unwrap(dump_json(context.list(true))) + "\n");
+              const auto listing = context.list(true);
+              if (!tui) {
+                emit(unwrap(dump_json(listing)) + "\n");
+              } else {
+                const auto &live = field(listing, "blocks").array();
+                const auto *arch = listing.find("archived");
+                std::string out =
+                    "\nContext: " + std::to_string(live.size()) + " live block(s), " +
+                    std::to_string(arch ? arch->array().size() : 0U) + " archived, " +
+                    std::to_string(context.total_bytes()) +
+                    " B total (open /workbench for full explorer):\n";
+                for (const auto &b : live) {
+                  out += "  #" + field(b, "id").number().text() + " [" +
+                         string_field(b, "kind") + "]" +
+                         (field(b, "pinned") == Value{true} ? " [P]" : "") + " " +
+                         field(b, "bytes").number().text() + " B  " +
+                         string_field(b, "preview") + "\n";
+                }
+                ui.notice(out);
+              }
             } else if (prompt == "/sessions") {
               raw_main_branch(dispatch, 28);
               RawEventRef listing_source;
@@ -1732,20 +2049,38 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               emit("Session checkpoint saved.\n");
             } else if (prompt == "/stats") {
               raw_main_branch(dispatch, 30);
-              emit(unwrap(dump_json(engine.stats())) + "\n");
+              const auto st = engine.stats();
+              if (!tui) {
+                emit(unwrap(dump_json(st)) + "\n");
+              } else {
+                const auto &t = engine.telemetry();
+                std::string out =
+                    "\nSession stats (" + provider_name + "/" + model +
+                    "):\n"
+                    "  context:  " +
+                    std::to_string(context.blocks().size()) + " live / " +
+                    std::to_string(context.archived().size()) + " archived (" +
+                    std::to_string(context.total_bytes()) + " B) · epoch " +
+                    std::to_string(engine.upstream_epoch()) +
+                    "\n"
+                    "  requests: " +
+                    std::to_string(t.requests) + " · in " +
+                    terminal_format_tokens(t.input_tokens) + " · cached " +
+                    terminal_format_tokens(t.cached_tokens) + " · out " +
+                    terminal_format_tokens(t.output_tokens) + "\n";
+                ui.notice(out);
+              }
             } else if (prompt.starts_with("/compact ")) {
               raw_main_branch(dispatch, 31);
               const auto args = unwrap(parse_json(prompt.substr(9)));
-              emit(unwrap(dump_json(engine.operator_call("context_compact", args))) +
-                   "\n");
+              emit_structured(engine.operator_call("context_compact", args));
             } else if (prompt.starts_with("/inspect ")) {
               raw_main_branch(dispatch, 32);
               const auto args = unwrap(parse_json(prompt.substr(9)));
-              emit(unwrap(dump_json(engine.operator_call("context_read", args))) +
-                   "\n");
+              emit_structured(engine.operator_call("context_read", args));
             } else if (prompt == "/originals") {
               raw_main_branch(dispatch, 33);
-              emit(unwrap(dump_json(context.list(true))) + "\n");
+              emit_structured(context.list(true));
             } else if (prompt.starts_with("/restore ")) {
               raw_main_branch(dispatch, 34);
               const auto arg = prompt.substr(9);
@@ -1758,47 +2093,156 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               CompactRequest req;
               req.ids = {id};
               req.op = CompactOp::restore;
-              emit(unwrap(dump_json(context.compact(req))) + "\n");
-            } else if (prompt.starts_with("/model ")) {
-              raw_main_branch(dispatch, 35);
-              auto candidate = session_store.settings();
-              candidate.model = prompt.substr(7);
-              const auto levels = prepare_route(candidate, command_context);
-              // A model the profiles cannot resolve is refused before it is saved.
-              if (const auto *pinned = engine.session_profiles();
-                  pinned && pinned->binding)
-                if (const auto resolved = resolve_binding(
-                        *pinned->set, *pinned->binding, candidate.model,
-                        pinned->session_override ? &*pinned->session_override
-                                                 : nullptr);
-                    !resolved.has_value()) {
-                  emit("Provider profile refused for model " + candidate.model + ": " +
-                       resolved.error().message() + "\n");
-                  throw Error{ErrorCode::invalid_range};
+              emit_structured(context.compact(req));
+            } else if (prompt == "/provider" || prompt.starts_with("/provider ")) {
+              raw_main_branch(dispatch, 44);
+              auto rest =
+                  prompt == "/provider" ? std::string_view{} : prompt.substr(10);
+              while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+                rest.remove_prefix(1);
+              while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t'))
+                rest.remove_suffix(1);
+              if (rest.empty()) {
+                ask_provider_picker();
+              } else {
+                const auto sp = rest.find_first_of(" \t");
+                const std::string target_provider{
+                    sp == std::string_view::npos ? rest : rest.substr(0, sp)};
+                std::string target_model;
+                if (sp != std::string_view::npos) {
+                  auto m = rest.substr(sp + 1);
+                  while (!m.empty() && (m.front() == ' ' || m.front() == '\t'))
+                    m.remove_prefix(1);
+                  target_model = std::string{m};
                 }
-              session_store.save(candidate, &command_context);
-              engine.model(candidate.model);
-              model = candidate.model;
-              ask_effort(candidate, levels);
-            } else if (prompt.starts_with("/effort ")) {
-              raw_main_branch(dispatch, 36);
-              auto value = std::string{prompt.substr(8)};
-              auto candidate = session_store.settings();
-              candidate.effort = value;
-              candidate.effort_pending = false;
-              const auto levels = prepare_route(candidate, command_context);
-              session_store.save(candidate, &command_context);
-              effort = std::move(value);
-              if (!candidate.effort_pending) {
+                if (tui)
+                  ui.question(std::nullopt);
+                auto next_provider =
+                    make_coding_provider(target_provider, command_context);
+                auto candidate = session_store.settings();
+                candidate.provider = target_provider;
+                if (!target_model.empty()) {
+                  candidate.model = target_model;
+                } else {
+                  const auto suggestions = suggested_models(target_provider);
+                  if (!suggestions.empty())
+                    candidate.model = suggestions.front().first;
+                }
+                candidate.effort_pending = false;
+                const auto levels = prepare_route(candidate, command_context);
+                if (candidate.effort_pending && !levels.empty()) {
+                  candidate.effort = levels.front();
+                  candidate.effort_pending = false;
+                }
+                const RawAuthParent switch_parent{
+                    command_context.parent.value_or(RawEventRef{})};
+                auto next_bound = start_binding(target_provider, &switch_parent);
+                SessionProfiles next_profiles = session_profiles;
+                next_profiles.binding = std::move(next_bound.binding);
+                next_profiles.deferral = std::move(next_bound.deferral);
+                next_profiles.bind =
+                    [p = target_provider](const RawAuthParent *parent) {
+                      return profile_binding(p, parent);
+                    };
+                if (next_profiles.binding) {
+                  if (const auto resolved = resolve_binding(
+                          *next_profiles.set, *next_profiles.binding, candidate.model,
+                          next_profiles.session_override
+                              ? &*next_profiles.session_override
+                              : nullptr);
+                      !resolved.has_value()) {
+                    emit("Provider profile refused for " + target_provider + "/" +
+                         candidate.model + ": " + resolved.error().message() + "\n");
+                    throw Error{ErrorCode::invalid_range};
+                  }
+                }
+                session_store.save(candidate, &command_context);
+                provider = std::move(next_provider);
+                provider_name = candidate.provider;
+                model = candidate.model;
+                effort = candidate.effort;
+                session_profiles = std::move(next_profiles);
+                engine.set_provider(*provider);
+                engine.model(model);
                 engine.effort(effort);
-                emit("Effort set to " + effort + ".\n");
+                (void)engine.profiles(session_profiles);
+                const std::string switched = "Switched provider to " + provider_name +
+                                             "/" + model + " (effort " + effort +
+                                             ").\n";
+                if (tui)
+                  ui.notice("\n" + switched);
+                else
+                  emit(switched);
+                if (target_model.empty() && tui)
+                  ask_model_picker(provider_name, model);
               }
-              ask_effort(candidate, levels);
+            } else if (prompt == "/model" || prompt.starts_with("/model ")) {
+              raw_main_branch(dispatch, 35);
+              auto arg = prompt == "/model" ? std::string_view{} : prompt.substr(7);
+              while (!arg.empty() && (arg.front() == ' ' || arg.front() == '\t'))
+                arg.remove_prefix(1);
+              while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t'))
+                arg.remove_suffix(1);
+              if (arg.empty()) {
+                ask_model_picker(provider_name, model);
+              } else {
+                if (tui)
+                  ui.question(std::nullopt);
+                auto candidate = session_store.settings();
+                candidate.model = std::string{arg};
+                const auto levels = prepare_route(candidate, command_context);
+                // A model the profiles cannot resolve is refused before it is saved.
+                if (const auto *pinned = engine.session_profiles();
+                    pinned && pinned->binding)
+                  if (const auto resolved = resolve_binding(
+                          *pinned->set, *pinned->binding, candidate.model,
+                          pinned->session_override ? &*pinned->session_override
+                                                   : nullptr);
+                      !resolved.has_value()) {
+                    emit("Provider profile refused for model " + candidate.model +
+                         ": " + resolved.error().message() + "\n");
+                    throw Error{ErrorCode::invalid_range};
+                  }
+                session_store.save(candidate, &command_context);
+                engine.model(candidate.model);
+                model = candidate.model;
+                if (tui)
+                  ui.notice("\nModel set to " + provider_name + "/" + model + ".\n");
+                ask_effort(candidate, levels);
+              }
+            } else if (prompt == "/effort" || prompt.starts_with("/effort ")) {
+              raw_main_branch(dispatch, 36);
+              auto arg = prompt == "/effort" ? std::string_view{} : prompt.substr(8);
+              while (!arg.empty() && (arg.front() == ' ' || arg.front() == '\t'))
+                arg.remove_prefix(1);
+              while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t'))
+                arg.remove_suffix(1);
+              if (arg.empty()) {
+                auto candidate = session_store.settings();
+                const auto levels = route_efforts(candidate, command_context);
+                candidate.effort_pending = true;
+                ask_effort(candidate, levels);
+              } else {
+                auto value = std::string{arg};
+                auto candidate = session_store.settings();
+                candidate.effort = value;
+                candidate.effort_pending = false;
+                const auto levels = prepare_route(candidate, command_context);
+                session_store.save(candidate, &command_context);
+                effort = std::move(value);
+                if (!candidate.effort_pending) {
+                  engine.effort(effort);
+                  if (tui)
+                    ui.notice("\nEffort set to " + effort + ".\n");
+                  else
+                    emit("Effort set to " + effort + ".\n");
+                }
+                ask_effort(candidate, levels);
+              }
             } else if (prompt.starts_with("/decision ")) {
               raw_main_branch(dispatch, 37);
-              emit(unwrap(dump_json(engine.operator_call(
-                       "decision_model", unwrap(parse_json(prompt.substr(10)))))) +
-                   "\n");
+              emit_structured(engine.operator_call(
+                  "decision_model", unwrap(parse_json(prompt.substr(10)))));
             } else if (prompt.starts_with("/beads ")) {
               raw_main_branch(dispatch, 38);
               auto rest = prompt.substr(7);
@@ -1830,7 +2274,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                                 "instructions): " +
                                 unwrap(format_value(field(result, "data")))}}})},
                     "operator.beads");
-              emit(unwrap(dump_json(result)) + "\n");
+              emit_structured(result);
             } else if (prompt == "/hooks" || prompt.starts_with("/hooks ")) {
               raw_main_branch(dispatch, 43);
               const auto rest =
@@ -1853,7 +2297,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               } else {
                 throw Error{ErrorCode::invalid_range};
               }
-              emit(unwrap(dump_json(engine.operator_call("hooks", args))) + "\n");
+              emit_structured(engine.operator_call("hooks", args));
             } else if (prompt.starts_with("/lua ")) {
               raw_main_branch(dispatch, 39);
               engine.turn({"", prompt.substr(5)});
@@ -1888,7 +2332,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                   (session_store.settings().name.empty()
                        ? ""
                        : session_store.settings().name + " · ") +
-                  model + " · " + effort +
+                  provider_name + "/" + model + " · " + effort +
                   (session_store.settings().effort_pending ? " (choose effort)" : "") +
                   " · " + session.string());
             }

@@ -415,7 +415,7 @@ while True:
         visible("PTY_READY")
         pty_job = job_id(pty_pid)
         assert pty_job != pipe_job, "different launches share job identity"
-        mouse_on, mouse_off = b"\x1b[?1000h\x1b[?1006h", b"\x1b[?1006l\x1b[?1000l"
+        mouse_on, mouse_off = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", b"\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         command("/mouse on")
         wait(lambda: mouse_on in raw, "composer frames enable SGR wheel reporting")
         mark = len(raw)

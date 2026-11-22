@@ -167,6 +167,7 @@ public:
   }
   ParticipantObservationReader participant_observer() const;
   void model(std::string name) { model_ = std::move(name); }
+  void set_provider(CodingProvider &next);
   // Pins the session's profiles. Each provider.request resolves its profile from its
   // final model (after request options) and its request group's binding, cached per
   // (model, binding digest); the set is never reread. When the start binding was read,
@@ -267,7 +268,7 @@ private:
   ContextStore &context_;
   TaskStore tasks_;
   std::unique_ptr<Participants> participants_;
-  CodingProvider &provider_;
+  CodingProvider *provider_;
   std::string model_;
   std::string effort_ = "medium";
   std::optional<SessionProfiles> profiles_;

@@ -265,6 +265,44 @@ void test_command_inspector_label() {
   jobs.shutdown();
   pump();
 }
+
+void test_chat_bounded_mouse_selection() {
+  ChatView view;
+  view.append(ChatKind::assistant, "First line of answer\nSecond line with café");
+  const auto &rows = view.rows(80);
+  require(rows.size() >= 3, "assistant header + two content lines");
+
+  // Select across rows 1..2 (columns 0..9 on row 1 through col 5 on row 2):
+  // left rail ("  │ ") must be excluded automatically.
+  const auto extracted = terminal_extract_chat_selection(rows, {1, 0, 2, 5});
+  require(extracted == "First line of answer\nSecond",
+          "chat selection extracts exact bounded text without rail or trailing spaces");
+
+  // Reverse drag (bottom-right to top-left) produces identical result.
+  const auto reversed = terminal_extract_chat_selection(rows, {2, 5, 1, 0});
+  require(reversed == extracted, "reverse drag normalizes start/end coordinates");
+
+  // Verify SGR press/drag/release parsing in Composer.
+  Composer c;
+  auto feed_seq = [&](std::string_view seq) {
+    InputResult last{};
+    for (const char ch : seq)
+      last = c.feed(ch);
+    return last;
+  };
+  const auto press = feed_seq("\x1b[<0;10;4M");
+  require(press.action == InputAction::mouse_press && press.mouse_col == 9 &&
+              press.mouse_row == 3,
+          "SGR left press yields 0-based (col, row)");
+  const auto drag = feed_seq("\x1b[<32;20;5M");
+  require(drag.action == InputAction::mouse_drag && drag.mouse_col == 19 &&
+              drag.mouse_row == 4,
+          "SGR left drag yields 0-based (col, row)");
+  const auto rel = feed_seq("\x1b[<0;20;5m");
+  require(rel.action == InputAction::mouse_release && rel.mouse_col == 19 &&
+              rel.mouse_row == 4,
+          "SGR left release yields 0-based (col, row)");
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -278,6 +316,7 @@ int main(int argc, char **argv) {
       {"bare_escape_dispatch", test_bare_escape_dispatch},
       {"file_tool_previews", test_file_tool_previews},
       {"command_inspector_label", test_command_inspector_label},
+      {"chat_bounded_mouse_selection", test_chat_bounded_mouse_selection},
   };
   bool failed = false;
   for (const auto &[name, fn] : cases) {

@@ -13662,3 +13662,36 @@ Implemented TUI Unit 4 — Hooks & Action Fabric (`include/blackbird/hooks.hpp`,
   (`ViewRoute::hooks_fabric`, `/hooks`, `Ctrl-\` picker) with `F6` audited enable/disable
   and `F9` Definitions <-> Dispatch History toggle (also upgrading Context Workbench and
   Hooks view command launches in `src/terminal.cpp` to capture exact `4071` raw originals).
+
+
+## 2026-11-22 — Live Session UX Polish & Multi-Provider Support (`gemini`, `kimi`, `grok`, `/provider`, Trackpad Scroll & Chat-Bounded Selection)
+
+Addressed six operator field notes from live TUI use:
+- **Multi-provider native support:**
+  - Added `gemini` (`https://generativelanguage.googleapis.com/v1beta/openai`, `chat`,
+    `GEMINI_API_KEY`) to built-in `ProviderAuth` catalog alongside `kimi`, `grok`,
+    `openai`, `anthropic`, `mimo`, `moonshot`, and `openrouter`.
+  - Parameterized `AnthropicCodingProvider` (`AnthropicConfig::provider`) so `kimi` (and
+    any `messages`-protocol provider) runs natively without Claude-only `thinking` or
+    Claude Code system-prompt injection.
+  - Added `ChatCompletionsCodingProvider` (`include/blackbird/chat_provider.hpp`,
+    `src/chat_provider.cpp`, `tests/chat_provider_test.cpp`) and live Chat Completions SSE
+    delta extraction in `ResponsePreview::feed` so `gemini`, `grok`, `moonshot`, `mimo`,
+    and custom OpenAI-compatible hosts stream text, execute tool calls, and report
+    normalized token/cache telemetry natively.
+  - Made `CodingEngine::set_provider(...)` hot-swappable between turns (bumping
+    `upstream_epoch_`).
+- **Interactive `/provider`, `/model`, `/effort` & clean TUI formatting:**
+  - Added `/provider [ID [MODEL]]` with interactive `TerminalQuestion` picker showing live
+    auth status (`oauth ready` / `key ready` / `env` / `not signed in`) and live mid-session
+    provider switching.
+  - Bare `/model` (including trailing space from slash completion) and bare `/effort` open
+    interactive pickers instead of dropping errors into chat.
+  - Formatted `/auth status`, `/auth providers`, `/session`, `/stats`, and `/context` as
+    clean human-readable notices in TUI mode (keeping exact JSON in `--plain` mode).
+- **Trackpad scroll + chat-bounded drag selection:**
+  - Enabled SGR mouse wheel + button-drag tracking (`?1000h?1002h?1006h`) by default
+    (`BLACKBIRD_MOUSE=0` or `/mouse off` opts out) so trackpad scrolling works immediately.
+  - Implemented chat-bounded drag selection (`Ink::highlight` confined strictly to the chat
+    content viewport, skipping header, `  │ ` rail, mascot/task pane, and composer) with
+    automatic OSC 52 clipboard copy on release (`terminal_extract_chat_selection`).

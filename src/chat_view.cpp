@@ -28,7 +28,8 @@ std::string_view color(Ink ink) {
                               "\x1b[0;38;2;155;213;172m",
                               "\x1b[1;38;2;242;137;137m",
                               "\x1b[0;1;38;2;114;215;211m",
-                              "\x1b[0;38;2;85;142;151m"};
+                              "\x1b[0;38;2;85;142;151m",
+                              "\x1b[0;38;2;20;24;32;48;2;114;215;211m"};
   return colors[static_cast<std::size_t>(ink)];
 }
 void utf8(std::string &out, char32_t cp) {

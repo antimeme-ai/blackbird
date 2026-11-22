@@ -65,7 +65,7 @@ using coding_detail::validate_protocol;
 CodingEngine::CodingEngine(AuditLog &log, ContextStore &context,
                            CodingProvider &provider, std::string model,
                            DecisionModelConfig decisions)
-    : log_(log), context_(context), tasks_(log), provider_(provider),
+    : log_(log), context_(context), tasks_(log), provider_(&provider),
       model_(std::move(model)), decision_models_(std::move(decisions)),
       identity_(session_identity(log)),
       generation_(unwrap(log.root().issue<DefinitionGenerationId>())) {
@@ -2045,6 +2045,14 @@ void CodingEngine::effort(std::string value) {
       value != "max")
     throw Error{ErrorCode::invalid_range};
   effort_ = std::move(value);
+}
+void CodingEngine::set_provider(CodingProvider &next) {
+  if (turn_running_)
+    throw Error{ErrorCode::busy};
+  provider_ = &next;
+  last_provider_identity_.clear();
+  last_provider_request_at_.reset();
+  ++upstream_epoch_;
 }
 std::string CodingEngine::definition_model() const {
   const auto &configured = string_field(program_config_, "model");

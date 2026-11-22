@@ -48,6 +48,7 @@ bool valid_ink(Ink ink) {
   case Ink::failure:
   case Ink::selected:
   case Ink::border:
+  case Ink::highlight:
     return true;
   }
   return false;

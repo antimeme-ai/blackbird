@@ -67,9 +67,13 @@ const std::array builtin_commands{
                 "Load a recovered draft; explicit Enter sends (TUI only)", "Chat"},
     ChatCommand{"/quit", "", "Stop work and exit; preserve draft", "Chat"},
     ChatCommand{"/exit", "", "Alias for /quit", "Chat"},
-    ChatCommand{"/model", "NAME", "Change model at the next available boundary",
+    ChatCommand{"/provider", "[ID [MODEL]]",
+                "Switch provider (and optional model) or pick interactively",
                 "Session"},
-    ChatCommand{"/effort", "LEVEL", "Set low, medium, high, xhigh or max", "Session"},
+    ChatCommand{"/model", "NAME",
+                "Change model or pick interactively (empty opens list)", "Session"},
+    ChatCommand{"/effort", "LEVEL", "Set low, medium, high, xhigh or max (empty picks)",
+                "Session"},
     ChatCommand{"/session", "", "Current session and settings", "Session"},
     ChatCommand{"/new", "", "Start a fresh saved session; keep current settings",
                 "Session"},
@@ -591,9 +595,10 @@ std::string terminal_key_help() {
          "  PTY input    Keys and Ctrl-C reach selected command; Ctrl-B returns\n"
          "  Ctrl-Q       Stop and exit; preserve unsent draft\n"
          "  PgUp / PgDn  Scroll transcript\n"
-         "  Mouse / Copy Plain drag selects text by default; /copy copies via OSC 52.\n"
-         "               /mouse on or BLACKBIRD_MOUSE=1 enables wheel transcript "
-         "scroll\n"
+         "  Mouse / Copy Trackpad/wheel scrolls chat; drag in chat selects & copies\n"
+         "               via OSC 52 (bounded to chat). /mouse off or "
+         "BLACKBIRD_MOUSE=0\n"
+         "               disables reporting; Shift-drag uses terminal selection.\n"
          "  Paste        Multiline text stays literal; Enter sends explicitly\n";
 }
 std::vector<std::string> terminal_builtin_names() {
@@ -754,6 +759,46 @@ std::string terminal_osc52_copy(std::string_view text) {
     out.push_back('=');
   }
   out.push_back('\x07');
+  return out;
+}
+std::string terminal_extract_chat_selection(const std::vector<ChatRow> &rows,
+                                            ChatSelectionRange range) {
+  if (rows.empty())
+    return {};
+  if (range.start_line > range.end_line ||
+      (range.start_line == range.end_line && range.start_col > range.end_col)) {
+    std::swap(range.start_line, range.end_line);
+    std::swap(range.start_col, range.end_col);
+  }
+  const auto first = std::min(range.start_line, rows.size() - 1);
+  const auto last = std::min(range.end_line, rows.size() - 1);
+  std::string out;
+  for (std::size_t idx = first; idx <= last; ++idx) {
+    if (idx > first)
+      out += '\n';
+    const std::size_t col_lo = idx == first ? range.start_col : std::size_t{0};
+    const std::size_t col_hi =
+        idx == last ? range.end_col : std::numeric_limits<std::size_t>::max();
+    std::string line;
+    DisplayCursor cursor{rows[idx]};
+    DisplayCluster cluster;
+    std::size_t cell_col = 0;
+    while (cursor.next(cluster)) {
+      if (!cluster.cells.value)
+        continue;
+      const auto next_col = cell_col + cluster.cells.value;
+      // Columns 0..3 belong to the left rail ("  │ "); content starts at col 4.
+      if (cell_col >= 4) {
+        const auto content_col = cell_col - 4;
+        if (content_col >= col_lo && content_col <= col_hi)
+          cursor.append(line, cluster);
+      }
+      cell_col = next_col;
+    }
+    while (!line.empty() && line.back() == ' ')
+      line.pop_back();
+    out += line;
+  }
   return out;
 }
 std::size_t terminal_scroll_after_output(const TerminalScrollUpdate &update) {
@@ -1286,25 +1331,55 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       return {};
     if (sgr || escape_.starts_with("\x1b[M")) {
       unsigned button = 0;
+      std::size_t col = 0, row = 0;
       if (sgr) {
-        const auto digits = std::string_view{escape_}.substr(3);
-        (void)std::from_chars(digits.data(), digits.data() + digits.size(), button);
-      } else if (static_cast<unsigned char>(escape_[3]) >= 32U)
+        const auto params = std::string_view{escape_}.substr(3);
+        const auto s1 = params.find(';');
+        const auto s2 = s1 == std::string_view::npos ? std::string_view::npos
+                                                     : params.find(';', s1 + 1);
+        (void)std::from_chars(params.data(),
+                              params.data() +
+                                  (s1 == std::string_view::npos ? params.size() : s1),
+                              button);
+        if (s1 != std::string_view::npos && s2 != std::string_view::npos) {
+          (void)std::from_chars(params.data() + s1 + 1, params.data() + s2, col);
+          (void)std::from_chars(params.data() + s2 + 1,
+                                params.data() + params.size() - 1, row);
+        }
+      } else if (static_cast<unsigned char>(escape_[3]) >= 32U) {
         button = static_cast<unsigned char>(escape_[3]) - 32U;
+        if (static_cast<unsigned char>(escape_[4]) >= 32U)
+          col = static_cast<unsigned char>(escape_[4]) - 32U;
+        if (static_cast<unsigned char>(escape_[5]) >= 32U)
+          row = static_cast<unsigned char>(escape_[5]) - 32U;
+      }
       escape_.clear();
       const bool wheel = !(sgr && byte == 'm') && (button & 0x43U) >= 0x40U &&
                          (button & 0x43U) <= 0x41U;
-      if (!wheel)
-        return {};
-      const bool up = (button & 0x43U) == 0x40U;
-      // Same precedence as the arrows: palette, then inspector, then slash menu.
-      if (palette_open_ || (!inspecting && slash_open_)) {
-        palette_move(up);
-        return {};
+      if (wheel) {
+        const bool up = (button & 0x43U) == 0x40U;
+        // Same precedence as the arrows: palette, then inspector, then slash menu.
+        if (palette_open_ || (!inspecting && slash_open_)) {
+          palette_move(up);
+          return {};
+        }
+        if (inspecting)
+          return {up ? InputAction::inspect_previous : InputAction::inspect_next, {}};
+        return {up ? InputAction::scroll_up : InputAction::scroll_down, {}};
       }
-      if (inspecting)
-        return {up ? InputAction::inspect_previous : InputAction::inspect_next, {}};
-      return {up ? InputAction::scroll_up : InputAction::scroll_down, {}};
+      if (sgr && !inspecting && !palette_open_ && !slash_open_) {
+        const std::size_t col0 = col > 0 ? col - 1 : 0;
+        const std::size_t row0 = row > 0 ? row - 1 : 0;
+        const unsigned base_btn = button & 0x43U;
+        const bool motion = (button & 0x20U) != 0U;
+        if (byte == 'M' && base_btn == 0U && !motion)
+          return {InputAction::mouse_press, {}, {}, {}, col0, row0};
+        if (byte == 'M' && base_btn == 0U && motion)
+          return {InputAction::mouse_drag, {}, {}, {}, col0, row0};
+        if (byte == 'm' && base_btn == 0U)
+          return {InputAction::mouse_release, {}, {}, {}, col0, row0};
+      }
+      return {};
     }
     if (escape_.size() == 2 && (byte == '[' || byte == 'O'))
       return {};
@@ -2593,14 +2668,21 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     return !context_badge.empty() && context_changed_at &&
            at - *context_changed_at < context_blink + std::chrono::milliseconds{250};
   };
-  // SGR wheel reporting rides frame packets; emitted state commits on completion.
-  // Off by default so native terminal drag-select and copy work out of the box.
+  // SGR wheel + button-drag reporting rides frame packets; emitted state commits
+  // on completion. On by default so trackpad scroll and chat-bounded drag-select
+  // with OSC 52 clipboard copy work out of the box (BLACKBIRD_MOUSE=0 disables).
   const auto *mouse_setting = std::getenv("BLACKBIRD_MOUSE");
-  bool mouse_wanted = mouse_setting && std::string_view{mouse_setting} == "1";
+  bool mouse_wanted = !(mouse_setting && std::string_view{mouse_setting} == "0");
   bool mouse_emitted = false, pending_mouse = false;
   std::string pending_osc52;
-  constexpr std::string_view mouse_on = "\x1b[?1000h\x1b[?1006h",
-                             mouse_off = "\x1b[?1006l\x1b[?1000l";
+  constexpr std::string_view mouse_on = "\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+                             mouse_off = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+  struct ChatSelectionState {
+    bool active = false, dragging = false;
+    std::size_t anchor_line = 0, anchor_col = 0;
+    std::size_t focus_line = 0, focus_col = 0;
+  } chat_selection;
+  std::size_t chat_begin_line = 0, chat_end_line = 0, chat_height = 0, chat_width = 0;
   auto service_output = [&] {
     try {
       if (!output.flush())
@@ -3464,10 +3546,44 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             grid.line(welcome_lines.size() + 3,
                       {{"  Enter continues · / commands · Workflow reloads each turn.",
                         Ink::muted}});
-        } else if (!inspecting && (!tasks_expanded || show_task_pane))
-          for (std::size_t row = 0; row < height; ++row)
-            if (begin + row < end)
+        } else if (!inspecting && (!tasks_expanded || show_task_pane)) {
+          chat_begin_line = begin;
+          chat_end_line = end;
+          chat_height = height;
+          chat_width = main_width;
+          ChatSelectionRange sel_norm{};
+          if (chat_selection.active) {
+            sel_norm = {chat_selection.anchor_line, chat_selection.anchor_col,
+                        chat_selection.focus_line, chat_selection.focus_col};
+            if (sel_norm.start_line > sel_norm.end_line ||
+                (sel_norm.start_line == sel_norm.end_line &&
+                 sel_norm.start_col > sel_norm.end_col)) {
+              std::swap(sel_norm.start_line, sel_norm.end_line);
+              std::swap(sel_norm.start_col, sel_norm.end_col);
+            }
+          }
+          for (std::size_t row = 0; row < height; ++row) {
+            if (begin + row < end) {
               grid.line(row + 2, lines[begin + row]);
+              const auto line_idx = begin + row;
+              if (chat_selection.active && line_idx >= sel_norm.start_line &&
+                  line_idx <= sel_norm.end_line && main_width > 4) {
+                const auto content_max = main_width - 5;
+                const auto c_lo = line_idx == sel_norm.start_line ? sel_norm.start_col
+                                                                  : std::size_t{0};
+                const auto c_hi = line_idx == sel_norm.end_line
+                                      ? std::min(sel_norm.end_col, content_max)
+                                      : content_max;
+                if (c_lo <= c_hi) {
+                  for (std::size_t c = 4 + c_lo; c <= 4 + c_hi && c < grid.width; ++c)
+                    grid.cells[(row + 2) * grid.width + c].ink = Ink::highlight;
+                }
+              }
+            }
+          }
+        } else {
+          chat_height = 0;
+        }
         if (graphics_enabled && show_sprite)
           placement = {0, width - blackbird_sprite_width, blackbird_sprite_width,
                        blackbird_sprite_height};
@@ -4136,6 +4252,52 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           scroll += 3;
         if (result.action == InputAction::scroll_down)
           scroll -= std::min(scroll, std::size_t{3});
+        if (result.action == InputAction::mouse_press) {
+          if (!inspection_open() && !welcoming && chat_height > 0 && chat_width > 4 &&
+              chat_end_line > chat_begin_line && result.mouse_row >= 2 &&
+              result.mouse_row < 2 + chat_height && result.mouse_col < chat_width) {
+            const auto line =
+                std::min(chat_begin_line + (result.mouse_row - 2), chat_end_line - 1);
+            const auto col =
+                result.mouse_col >= 4 ? result.mouse_col - 4 : std::size_t{0};
+            chat_selection = {true, true, line, col, line, col};
+          } else {
+            chat_selection = {};
+          }
+        } else if (result.action == InputAction::mouse_drag) {
+          if (chat_selection.dragging && chat_height > 0 && chat_width > 4 &&
+              chat_end_line > chat_begin_line) {
+            const auto clamped_row =
+                std::clamp<std::size_t>(result.mouse_row, 2, 2 + chat_height - 1);
+            const auto clamped_col =
+                std::clamp<std::size_t>(result.mouse_col, 4, chat_width - 1);
+            chat_selection.focus_line =
+                std::min(chat_begin_line + (clamped_row - 2), chat_end_line - 1);
+            chat_selection.focus_col = clamped_col - 4;
+          }
+        } else if (result.action == InputAction::mouse_release) {
+          if (chat_selection.dragging) {
+            chat_selection.dragging = false;
+            const bool moved =
+                chat_selection.anchor_line != chat_selection.focus_line ||
+                chat_selection.anchor_col != chat_selection.focus_col;
+            if (moved && chat_width > 4) {
+              const auto &current_lines = transcript.rows(chat_width);
+              const auto selected = terminal_extract_chat_selection(
+                  current_lines, {chat_selection.anchor_line, chat_selection.anchor_col,
+                                  chat_selection.focus_line, chat_selection.focus_col});
+              if (!selected.empty()) {
+                pending_osc52 = terminal_osc52_copy(selected);
+                activity = "Copied " + std::to_string(selected.size()) + " B";
+              }
+            } else {
+              chat_selection = {};
+            }
+          }
+        } else if (result.action != InputAction::scroll_up &&
+                   result.action != InputAction::scroll_down) {
+          chat_selection = {};
+        }
         if (result.action == InputAction::cancel) {
           action_branch = 5;
           withdraw_ui_prompts(raw_capture_, queued, 2, result.source.record,
@@ -4281,13 +4443,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             if (result.text != "/mouse")
               mouse_wanted = result.text == "/mouse on";
             transcript += mouse_wanted
-                              ? "\nMouse on: the wheel scrolls the transcript; "
-                                "Shift-drag selects text. /mouse off restores "
-                                "plain-drag selection.\n"
-                              : "\nMouse off: plain drag selects text. Terminals "
-                                "with alternate scroll (Ghostty, Alacritty) send the "
-                                "wheel as arrow keys, which recall history. /mouse on "
-                                "scrolls the transcript.\n";
+                              ? "\nMouse on: trackpad/wheel scrolls chat; drag in chat "
+                                "selects and copies (OSC 52). Shift-drag uses terminal "
+                                "selection. /mouse off disables reporting.\n"
+                              : "\nMouse off: native terminal drag-select active. "
+                                "/mouse on restores trackpad scroll and chat-bounded "
+                                "selection.\n";
             scroll = 0;
           } else if (result.text == "/drafts") {
             transcript +=

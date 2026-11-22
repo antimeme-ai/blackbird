@@ -187,11 +187,15 @@ known_context_window_tokens(std::string_view model) noexcept {
       has_icase(model, "claude-3.5"))
     return 200000ULL;
   if (has_icase(model, "gpt-6") || has_icase(model, "gpt-5") ||
-      has_icase(model, "kimi-k2"))
+      has_icase(model, "kimi-k2") || has_icase(model, "kimi-for-coding") ||
+      has_icase(model, "grok-4") || has_icase(model, "grok-code"))
     return 256000ULL;
   if (has_token_icase(model, "o3") || has_token_icase(model, "o4-mini"))
     return 200000ULL;
-  if (has_icase(model, "gpt-4o") || has_icase(model, "deepseek"))
+  if (has_icase(model, "grok-3"))
+    return 131072ULL;
+  if (has_icase(model, "gpt-4o") || has_icase(model, "deepseek") ||
+      has_icase(model, "mimo"))
     return 128000ULL;
   return std::nullopt;
 }
@@ -267,12 +271,12 @@ Value CodingEngine::request_impl(Value options) {
       provider.request_group_owned_ = false;
       active = false;
     }
-  } request_group{provider_, request_group_active_};
+  } request_group{*provider_, request_group_active_};
   RawProviderPhase assembly{2 * provider_scalar_credit + sizeof(IdentityBytes) +
                             sizeof(std::size_t) + 32};
   return assembly.run([&] {
     assembly.start(1);
-    if (request_group_active_ || provider_.request_group_owned_)
+    if (request_group_active_ || provider_->request_group_owned_)
       throw Error{ErrorCode::busy};
     assembly.stage(10);
     RawRegion preparation{raw_regions::provider_prepare};
@@ -337,7 +341,7 @@ Value CodingEngine::request_impl(Value options) {
                  ? model_
                  : string_field(program_config_, "model");
     }();
-    const auto target_identity = provider_.provider_identity();
+    const auto target_identity = provider_->provider_identity();
     if (!pending_compactions_.empty()) {
       const auto now = std::chrono::steady_clock::now();
       const bool cold_cache = last_provider_request_at_.has_value() &&
@@ -435,7 +439,7 @@ Value CodingEngine::request_impl(Value options) {
     validate_protocol(field(request, "input").array(), assembly.reference());
     const auto input_bytes =
         unwrap(encode_packet_string(field(request, "input"))).size();
-    if (state_context && !provider_.retain_request_state()) {
+    if (state_context && !provider_->retain_request_state()) {
       operational_state += "CONTEXT_SIZE input_bytes=" + std::to_string(input_bytes) +
                            " blocks=" + std::to_string(context_.blocks().size()) +
                            " upstream_epoch=" + std::to_string(upstream_epoch_) +
@@ -470,7 +474,7 @@ Value CodingEngine::request_impl(Value options) {
       auto state_item =
           Value::object({{"role", Value{"developer"}},
                          {"content", Value{std::move(operational_state)}}});
-      if (provider_.retain_request_state()) {
+      if (provider_->retain_request_state()) {
         context_.append({state_item}, "provider.request-state");
         origin = context_.head();
         ++reusable_input_items;
@@ -483,21 +487,21 @@ Value CodingEngine::request_impl(Value options) {
     }
     assembly.stage(14);
     request_group_active_ = true;
-    provider_.request_group_owned_ = true;
+    provider_->request_group_owned_ = true;
     request_group.owned = true;
     const RawAdapterContext preparation_context{nullptr, assembly.reference(), nullptr,
                                                 nullptr};
-    provider_.cancelled = [this] {
+    provider_->cancelled = [this] {
       poll_commands();
       return cancelled && cancelled();
     };
     request_group.began = true;
-    provider_.begin_request_group(request, &preparation_context);
+    provider_->begin_request_group(request, &preparation_context);
     // The request's profile: its final model and this group's binding (design §15.4).
     // Nothing reads the behavioural rows yet. Shared storage; fixed for every attempt.
     Value profile_metadata;
     if (profiles_ && start_binding) {
-      const auto *group = provider_.group_binding();
+      const auto *group = provider_->group_binding();
       const auto model = string_field(request, "model");
       const auto resolved =
           resolve_profile_for(*profiles_, model, group ? *group : *start_binding);
@@ -510,12 +514,12 @@ Value CodingEngine::request_impl(Value options) {
       profile_metadata = resolved.value()->record;
     }
     prepare_request_cache(request,
-                          {cache_mode, provider_.supports_prompt_cache_policy(),
-                           provider_.provider_identity(), reusable_input_items});
+                          {cache_mode, provider_->supports_prompt_cache_policy(),
+                           provider_->provider_identity(), reusable_input_items});
     // Cache affinity follows the conversation and current upstream cache epoch,
     // so it survives reopen/restart and rolls cleanly after context cuts.
     // An authored key wins.
-    if (provider_.supports_prompt_cache_key() && !request.find("prompt_cache_key")) {
+    if (provider_->supports_prompt_cache_key() && !request.find("prompt_cache_key")) {
       auto key = hex_identity(identity_.conversation.bytes());
       if (upstream_epoch_ > 0)
         key += ":e" + std::to_string(upstream_epoch_);
@@ -579,7 +583,7 @@ Value CodingEngine::request_impl(Value options) {
           raw_native(base_ms),        raw_native(cap_ms)};
       group.emit(1325, policy_fields);
       const auto retry_group = hex_identity(retry_id.bytes());
-      provider_.cancelled = [this] {
+      provider_->cancelled = [this] {
         poll_commands();
         return cancelled && cancelled();
       };
@@ -671,7 +675,7 @@ Value CodingEngine::request_impl(Value options) {
                         &owner, attempt_phase.reference(), nullptr,
                         &operation_context.receipt};
                     attempt_phase.stage(23);
-                    result = provider_.respond(
+                    result = provider_->respond(
                         request,
                         [&](std::string_view raw) {
                           poll_commands();
@@ -1004,7 +1008,7 @@ Value CodingEngine::request_impl(Value options) {
                         response_generation_, ++call_sequence_});
       last_provider_request_at_ = std::chrono::steady_clock::now();
       last_provider_model_ = string_field(request, "model");
-      last_provider_identity_ = std::string{provider_.provider_identity()};
+      last_provider_identity_ = std::string{provider_->provider_identity()};
       if (const auto *st = response.find("status");
           st && *st == Value{"incomplete"} && (notice || display)) {
         (notice ? notice : display)(

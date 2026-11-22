@@ -49,14 +49,29 @@ enum class InputAction {
   select_view,
   answer_question,
   scroll_up,
-  scroll_down
+  scroll_down,
+  mouse_press,
+  mouse_drag,
+  mouse_release
 };
 struct InputResult {
   InputAction action = InputAction::none;
   std::string text;
   RawUiSource source{};
   std::optional<tui::ViewRoute> view{};
+  std::size_t mouse_col = 0;
+  std::size_t mouse_row = 0;
 };
+struct ChatSelectionRange {
+  std::size_t start_line = 0;
+  std::size_t start_col = 0;
+  std::size_t end_line = 0;
+  std::size_t end_col = 0;
+};
+// Extract exact UTF-8 text from chat transcript rows bounded to the chat pane
+// (automatically stripping the left rail and trailing whitespace).
+std::string terminal_extract_chat_selection(const std::vector<ChatRow> &rows,
+                                            ChatSelectionRange range);
 struct TerminalState {
   std::string draft;
   std::size_t cursor = 0;

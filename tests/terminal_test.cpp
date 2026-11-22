@@ -400,7 +400,19 @@ int main() {
     check(feed(c, "\x1b[<65;10;5M").action == InputAction::scroll_down);
     check(feed(c, "\x1b[<68;1;1M").action == InputAction::scroll_up); // Shift held.
     check(c.text() == "wheel draft" && c.cursor() == 11);
-    check(feed(c, "\x1b[<0;3;4M\x1b[<0;3;4m\x1b[<2;3;4M").action == InputAction::none);
+    // SGR button press/drag/release emit native chat-selection events;
+    // right-click and other non-left buttons are ignored without leaking into the
+    // draft.
+    const auto press = feed(c, "\x1b[<0;3;4M");
+    check(press.action == InputAction::mouse_press && press.mouse_col == 2 &&
+          press.mouse_row == 3);
+    const auto drag = feed(c, "\x1b[<32;7;4M");
+    check(drag.action == InputAction::mouse_drag && drag.mouse_col == 6 &&
+          drag.mouse_row == 3);
+    const auto rel = feed(c, "\x1b[<0;7;4m");
+    check(rel.action == InputAction::mouse_release && rel.mouse_col == 6 &&
+          rel.mouse_row == 3);
+    check(feed(c, "\x1b[<2;3;4M").action == InputAction::none);
     check(c.text() == "wheel draft" && c.cursor() == 11 && !c.escape_pending());
     // X10 reports from terminals that ignore ?1006: raw coordinate bytes,
     // including parameter-range and final-looking ones, never reach the draft.

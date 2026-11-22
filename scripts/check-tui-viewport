@@ -96,7 +96,7 @@ def main():
         expected = {(31, row): {'char': ' ', 'fg': 'default', 'bg': 'default', 'bold': False}
                     for row in range(2, 8)}
         expected.update({
-            (31, 0): {'char': 'u', 'fg': '#72d7d3', 'bg': 'default', 'bold': True},
+            (31, 0): {'char': ' ', 'fg': '#72d7d3', 'bg': 'default', 'bold': True},
             (31, 1): {'char': 't', 'fg': '#e8e3d9', 'bg': 'default', 'bold': True},
             (31, 8): {'char': '╮', 'fg': BORDER, 'bg': 'default', 'bold': False},
             (31, 9): {'char': '│', 'fg': BORDER, 'bg': 'default', 'bold': False},

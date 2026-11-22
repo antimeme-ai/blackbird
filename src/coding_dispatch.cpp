@@ -972,8 +972,8 @@ bool CodingEngine::auto_compact_for_overflow() {
       return true;
   }
   const auto &blocks = context_.blocks();
-  const bool anthropic = provider_.provider_identity() == "anthropic-messages" ||
-                         provider_.provider_identity().starts_with("anthropic");
+  const bool anthropic = provider_->provider_identity() == "anthropic-messages" ||
+                         provider_->provider_identity().starts_with("anthropic");
   std::vector<std::uint64_t> removable;
   for (const auto &b : blocks) {
     if (b.open || b.pinned || b.kind == BlockKind::instruction)

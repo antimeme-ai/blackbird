@@ -3,6 +3,7 @@
 #include "blackbird/provider_auth.hpp"
 namespace blackbird {
 struct AnthropicConfig {
+  std::string provider = "anthropic";
   ProviderAuthConfig auth;
   int timeout_seconds = 180;
   std::uint64_t max_tokens = 16384;
@@ -11,7 +12,9 @@ struct AnthropicConfig {
 class AnthropicCodingProvider final : public CodingProvider {
 public:
   explicit AnthropicCodingProvider(AnthropicConfig config = {});
-  std::string_view provider_identity() const noexcept override { return "anthropic"; }
+  std::string_view provider_identity() const noexcept override {
+    return config_.provider;
+  }
   bool retain_request_state() const noexcept override { return true; }
   void begin_request_group(const Value &, const RawAdapterContext *) override;
   void end_request_group() noexcept override;
@@ -30,7 +33,7 @@ private:
   bool group_ = false, responding_ = false;
 };
 Value export_anthropic_request(const Value &request, std::uint64_t max_tokens = 16384,
-                               bool oauth = false);
+                               bool oauth = false, bool anthropic_native = true);
 void validate_anthropic_route(std::string_view model, std::string_view effort);
 Result<Value> anthropic_completed_response(std::string_view stream,
                                            ValueLimits limits = {},

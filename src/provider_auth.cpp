@@ -307,6 +307,9 @@ Value builtin(std::string_view id) {
                 "https://auth.x.ai/oauth2/device/code",
                 "https://auth.x.ai/oauth2/token",
                 "openid profile email offline_access grok-cli:access api:access");
+  if (id == "gemini")
+    return make("https://generativelanguage.googleapis.com/v1beta/openai", "chat",
+                "GEMINI_API_KEY");
   if (id == "moonshot")
     return make("https://api.moonshot.ai/v1", "chat", "MOONSHOT_API_KEY");
   if (id == "openrouter")
@@ -725,8 +728,8 @@ Value ProviderAuth::catalog() const {
 
     Store s{config_, false};
     Value::Array out;
-    for (const auto id :
-         {"kimi", "mimo", "openai", "anthropic", "grok", "moonshot", "openrouter"})
+    for (const auto id : {"kimi", "gemini", "grok", "openai", "anthropic", "mimo",
+                          "moonshot", "openrouter"})
       out.push_back(builtin(id));
     for (const auto &[k, v] : s.field("providers").object()) {
       (void)k;

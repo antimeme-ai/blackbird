@@ -304,7 +304,7 @@ void validate_anthropic_route(std::string_view model, std::string_view effort) {
     throw Error{ErrorCode::unsupported};
 }
 Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
-                               bool oauth) {
+                               bool oauth, bool anthropic_native) {
   for (const auto &[key, value] : request.object()) {
     (void)value;
     if (key != "model" && key != "instructions" && key != "input" && key != "tools" &&
@@ -325,7 +325,8 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
     throw Error{ErrorCode::invalid_range};
   const auto &model = string_field(request, "model");
   const auto &effort = string_field(field(request, "reasoning"), "effort");
-  validate_anthropic_route(model, effort);
+  if (anthropic_native)
+    validate_anthropic_route(model, effort);
   for (const auto &[key, value] : field(request, "reasoning").object()) {
     (void)value;
     if (key != "effort")
@@ -457,7 +458,7 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
       string_field(messages.front(), "role") != "user")
     throw Error{ErrorCode::conflict};
   std::string instructions = string_field(request, "instructions");
-  if (oauth)
+  if (oauth && anthropic_native)
     instructions =
         "You are Claude Code, Anthropic's official CLI for Claude.\n" + instructions;
   auto result = Value::object(
@@ -489,30 +490,33 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
       if (key == "tool_choice")
         put(value, "type", *choice);
   }
-  // Models before adaptive thinking require an explicit budget. Their old
-  // family names are exact prefixes; unknown/new models use adaptive thinking.
-  const bool manual =
-      model.starts_with("claude-sonnet-4-5") || model.starts_with("claude-haiku-4-5") ||
-      model.starts_with("claude-opus-4-5") ||
-      model.starts_with("claude-sonnet-4-2025") ||
-      model.starts_with("claude-opus-4-2025") || model.starts_with("claude-3-7-sonnet");
-  if (manual) {
-    const std::uint64_t desired = effort == "low"      ? 1024
-                                  : effort == "medium" ? 4096
-                                  : effort == "high"   ? 8192
-                                  : effort == "xhigh"  ? 12288
-                                                       : 16384;
-    if (max_tokens <= 1024)
-      throw Error{ErrorCode::invalid_range};
-    put(result, "thinking",
-        Value::object(
-            {{"type", Value{"enabled"}},
-             {"budget_tokens", Value{Number{std::min(desired, max_tokens - 1)}}}}));
-    if (model.starts_with("claude-opus-4-5"))
+  if (anthropic_native) {
+    // Models before adaptive thinking require an explicit budget. Their old
+    // family names are exact prefixes; unknown/new models use adaptive thinking.
+    const bool manual = model.starts_with("claude-sonnet-4-5") ||
+                        model.starts_with("claude-haiku-4-5") ||
+                        model.starts_with("claude-opus-4-5") ||
+                        model.starts_with("claude-sonnet-4-2025") ||
+                        model.starts_with("claude-opus-4-2025") ||
+                        model.starts_with("claude-3-7-sonnet");
+    if (manual) {
+      const std::uint64_t desired = effort == "low"      ? 1024
+                                    : effort == "medium" ? 4096
+                                    : effort == "high"   ? 8192
+                                    : effort == "xhigh"  ? 12288
+                                                         : 16384;
+      if (max_tokens <= 1024)
+        throw Error{ErrorCode::invalid_range};
+      put(result, "thinking",
+          Value::object(
+              {{"type", Value{"enabled"}},
+               {"budget_tokens", Value{Number{std::min(desired, max_tokens - 1)}}}}));
+      if (model.starts_with("claude-opus-4-5"))
+        put(result, "output_config", Value::object({{"effort", Value{effort}}}));
+    } else {
+      put(result, "thinking", Value::object({{"type", Value{"adaptive"}}}));
       put(result, "output_config", Value::object({{"effort", Value{effort}}}));
-  } else {
-    put(result, "thinking", Value::object({{"type", Value{"adaptive"}}}));
-    put(result, "output_config", Value::object({{"effort", Value{effort}}}));
+    }
   }
   return result;
 }
@@ -586,7 +590,7 @@ void AnthropicCodingProvider::begin_request_group(const Value &request,
     config.cancelled = cancelled;
     ProviderAuth auth{std::move(config)};
     const RawAuthParent parent{phase.reference()};
-    binding_ = auth.binding("anthropic", &parent);
+    binding_ = auth.binding(config_.provider, &parent);
     if (string_field(binding_, "protocol") != "messages")
       throw Error{ErrorCode::unsupported};
     const auto &model = string_field(request, "model");
@@ -637,11 +641,13 @@ Value AnthropicCodingProvider::respond(
     auto config = config_.auth;
     config.cancelled = cancelled;
     ProviderAuth auth{std::move(config)};
+    const bool is_anthropic = config_.provider == "anthropic";
     const auto wire = export_anthropic_request(
-        request, config_.max_tokens, string_field(binding_, "kind") == "oauth");
+        request, config_.max_tokens, string_field(binding_, "kind") == "oauth",
+        is_anthropic);
     const auto response =
-        auth.request("anthropic", "messages", wire, config_.timeout_seconds, capture,
-                     &binding_, owner, context);
+        auth.request(config_.provider, "messages", wire, config_.timeout_seconds,
+                     capture, &binding_, owner, context);
     return unwrap(anthropic_completed_response(response.body, {}, context));
   });
 }

@@ -598,6 +598,22 @@ std::vector<TextPreview> ResponsePreview::feed(std::string_view bytes,
                   output.push_back({anthropic_message_ + ":" + std::to_string(index),
                                     string_field(delta, "text")});
               }
+            } else if (!type) {
+              if (const auto *choices = packet.value().find("choices");
+                  choices && std::holds_alternative<Value::Array>(choices->value()) &&
+                  !choices->array().empty() &&
+                  std::holds_alternative<Value::Object>(
+                      choices->array().front().value())) {
+                if (const auto *delta = choices->array().front().find("delta");
+                    delta && std::holds_alternative<Value::Object>(delta->value())) {
+                  if (const auto *content = delta->find("content");
+                      content &&
+                      std::holds_alternative<std::string>(content->value()) &&
+                      !content->string().empty()) {
+                    output.push_back({"chat_msg_0", content->string()});
+                  }
+                }
+              }
             } else
               event_phase.scalar(63, 0);
             data_.clear();

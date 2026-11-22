@@ -20,7 +20,8 @@ enum class Ink : std::uint8_t {
   success,
   failure,
   selected,
-  border
+  border,
+  highlight
 };
 struct ChatSpan {
   std::string text;

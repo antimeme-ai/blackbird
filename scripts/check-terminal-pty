@@ -26,7 +26,7 @@ spec = importlib.util.spec_from_file_location('screen_oracle', Path(__file__).wi
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
 os.environ['BLACKBIRD_GRAPHICS'] = 'off'  # Text renderer cases are capability-independent.
-mouse_on, mouse_off = b"\x1b[?1000h\x1b[?1006h", b"\x1b[?1006l\x1b[?1000l"
+mouse_on, mouse_off = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", b"\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 
 @contextlib.contextmanager
 def fixture_directory(prefix):
@@ -447,9 +447,7 @@ if arguments.case in ('all', 'input'):
         observed = Observed()
         try:
             wait_for(b"Workflow reloads")
-            # Default startup keeps mouse reporting OFF so plain drag-select works.
-            assert mouse_on not in bytes(observed), "default startup enabled mouse reporting"
-            send(b"/mouse on\r")
+            # Default startup enables SGR mouse reporting (wheel scroll + chat drag-select).
             wait_for(mouse_on)
             send(b'/lua print("INPUT_" .. "HISTORY")\r')
             wait_for(b"INPUT_HISTORY")
@@ -485,21 +483,20 @@ if arguments.case in ('all', 'input'):
             assert tail.rfind(mouse_off) != -1 and tail.rfind(mouse_off) < tail.rfind(b"\x1b[?1049l"), "exit ends reporting before leaving the screen"
             saved = native_packet.read_packet((Path(work) / 'ui-state.bbm'))
             assert bytes.fromhex(saved['draft']) == b"X\nY\nZ", saved
-            # BLACKBIRD_MOUSE=1 enables reporting from startup, including tiny frames.
+            # BLACKBIRD_MOUSE=0 disables mouse reporting from startup.
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
                                      stdout=slave, stderr=slave, start_new_session=True,
-                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
+                                     env=dict(os.environ, BLACKBIRD_MOUSE="0"))
             wait_for(b"Workflow reloads")
-            wait_for(mouse_on)
+            assert mouse_on not in bytes(observed), "BLACKBIRD_MOUSE=0 enabled mouse reporting"
             send(b"\x11")
             assert exit_code() == 0
-            # A launch that starts tiny with BLACKBIRD_MOUSE=1 enables reporting through the small frame.
+            # A launch that starts tiny with default mouse enables reporting through the small frame.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 10, 0, 0))
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
-                                     stdout=slave, stderr=slave, start_new_session=True,
-                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
+                                     stdout=slave, stderr=slave, start_new_session=True)
             wait_for(mouse_on)
             assert b"\x1b[2J" in observed, "first frame was not the small frame"
             send(b"\x11")

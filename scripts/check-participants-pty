@@ -52,17 +52,13 @@ with tempfile.TemporaryDirectory(prefix='blackbird-participants-') as work:
         if paragraph:yield paragraph
     def visible_result(selected=False):
         for paragraph in chat_paragraphs():
-            try:value=json.loads(paragraph)
-            except json.JSONDecodeError:continue
-            if not isinstance(value,dict):continue
-            if selected and 'runs' in value:continue
-            for run in value.get('runs',[value]):
-                if not isinstance(run,dict):continue
-                result=run.get('result',{})
-                if not isinstance(result,dict):continue
-                if (run.get('run_id')==beta and run.get('state')=='completed' and
-                    result.get('text')=='LOCAL_SELECTED_REVIEW' and
-                    result.get('actual_model')=='fake-claude'):return True
+            if (f'run_id: {beta}' in paragraph and
+                'state: completed' in paragraph and
+                'text: LOCAL_SELECTED_REVIEW' in paragraph and
+                'actual_model: fake-claude' in paragraph):
+                if selected and 'runs:' in paragraph:
+                    continue
+                return True
         return False
     def request(who):
         return dict(request_id='initial-'+who,**{'from':'main','to':who},provider='claude',model='fake',task='Review selected code',context=[dict(id='source',text='selected')],profile=dict(name='context-only',provenance='PTY-local-fake',timeout_seconds=5,tools='none',requests=1))
