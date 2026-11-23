@@ -1310,3 +1310,88 @@ add_executable(party_lobby_test tests/party_lobby_test.cpp)
 target_link_libraries(party_lobby_test PRIVATE blackbird_foundation Threads::Threads)
 add_test(NAME party_lobby COMMAND party_lobby_test)
 set_tests_properties(party_lobby PROPERTIES TIMEOUT 60)
+
+if(CMAKE_HOST_APPLE AND NOT DEFINED OPENSSL_ROOT_DIR AND NOT DEFINED ENV{OPENSSL_ROOT_DIR})
+  foreach(_bb_openssl IN ITEMS "/opt/homebrew/opt/openssl@3" "/usr/local/opt/openssl@3")
+    if(EXISTS "${_bb_openssl}/include/openssl/evp.h")
+      set(OPENSSL_ROOT_DIR "${_bb_openssl}")
+      break()
+    endif()
+  endforeach()
+endif()
+set(BLACKBIRD_STATIC_OPENSSL "auto" CACHE STRING "Link static libcrypto.a when available: auto (Release on macOS), on, off")
+set_property(CACHE BLACKBIRD_STATIC_OPENSSL PROPERTY STRINGS auto on off)
+if(BLACKBIRD_STATIC_OPENSSL STREQUAL "on" OR
+   (BLACKBIRD_STATIC_OPENSSL STREQUAL "auto" AND NOT BLACKBIRD_DEBUG AND CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+elseif(NOT BLACKBIRD_STATIC_OPENSSL STREQUAL "off" AND NOT BLACKBIRD_STATIC_OPENSSL STREQUAL "auto")
+  message(FATAL_ERROR "BLACKBIRD_STATIC_OPENSSL must be auto, on, or off")
+endif()
+find_package(OpenSSL 3.0 REQUIRED)
+target_sources(blackbird_foundation PRIVATE src/mp_protocol.cpp)
+target_link_libraries(blackbird_foundation PRIVATE OpenSSL::Crypto)
+add_executable(mp_protocol_test tests/mp_protocol_test.cpp)
+target_link_libraries(mp_protocol_test PRIVATE blackbird_foundation OpenSSL::Crypto Threads::Threads)
+add_test(NAME mp_protocol COMMAND mp_protocol_test)
+set_tests_properties(mp_protocol PROPERTIES TIMEOUT 30)
+
+set(BLACKBIRD_ENABLE_IROH "auto" CACHE STRING "Build iroh v1.5.0 Rust P2P staticlib: auto, on, off")
+set_property(CACHE BLACKBIRD_ENABLE_IROH PROPERTY STRINGS auto on off)
+set(BLACKBIRD_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target" CACHE PATH "Cargo target directory for blackbird-p2p")
+find_program(BLACKBIRD_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin")
+set(BLACKBIRD_USE_IROH OFF)
+if(BLACKBIRD_ENABLE_IROH STREQUAL "on")
+  if(NOT BLACKBIRD_CARGO)
+    message(FATAL_ERROR "BLACKBIRD_ENABLE_IROH=on requires cargo")
+  endif()
+  set(BLACKBIRD_USE_IROH ON)
+elseif(BLACKBIRD_ENABLE_IROH STREQUAL "auto")
+  if(BLACKBIRD_CARGO AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.toml")
+    set(BLACKBIRD_USE_IROH ON)
+  endif()
+elseif(NOT BLACKBIRD_ENABLE_IROH STREQUAL "off")
+  message(FATAL_ERROR "BLACKBIRD_ENABLE_IROH must be auto, on, or off")
+endif()
+
+target_sources(blackbird_foundation PRIVATE src/p2p_transport.cpp)
+if(BLACKBIRD_USE_IROH)
+  set(BLACKBIRD_P2P_STATICLIB "${BLACKBIRD_CARGO_TARGET_DIR}/release/libblackbird_p2p.a")
+  add_custom_command(
+    OUTPUT "${BLACKBIRD_P2P_STATICLIB}"
+    COMMAND "${BLACKBIRD_CARGO}" build --release
+      --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.toml"
+      --target-dir "${BLACKBIRD_CARGO_TARGET_DIR}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.toml"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.lock"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/src/lib.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/include/blackbird_p2p_abi.h"
+    COMMENT "Building blackbird-p2p (iroh v1.5.0) Rust C-ABI staticlib"
+    VERBATIM)
+  add_custom_target(blackbird_p2p_rust DEPENDS "${BLACKBIRD_P2P_STATICLIB}")
+  add_dependencies(blackbird_foundation blackbird_p2p_rust)
+  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=1)
+  target_include_directories(blackbird_foundation PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/include")
+  target_link_libraries(blackbird_foundation PRIVATE "${BLACKBIRD_P2P_STATICLIB}")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_link_libraries(blackbird_foundation PRIVATE
+      "-framework Security"
+      "-framework CoreFoundation"
+      "-framework SystemConfiguration"
+      resolv)
+  else()
+    target_link_libraries(blackbird_foundation PRIVATE ${CMAKE_DL_LIBS} m)
+  endif()
+else()
+  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=0)
+endif()
+
+add_executable(p2p_transport_test tests/p2p_transport_test.cpp)
+target_link_libraries(p2p_transport_test PRIVATE blackbird_foundation Threads::Threads)
+if(BLACKBIRD_USE_IROH)
+  target_compile_definitions(p2p_transport_test PRIVATE BLACKBIRD_HAS_IROH=1)
+else()
+  target_compile_definitions(p2p_transport_test PRIVATE BLACKBIRD_HAS_IROH=0)
+endif()
+add_test(NAME p2p_transport COMMAND p2p_transport_test)
+set_tests_properties(p2p_transport PROPERTIES TIMEOUT 60)

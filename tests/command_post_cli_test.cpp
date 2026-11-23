@@ -3,6 +3,8 @@
 #include "blackbird/capabilities.hpp"
 #include "blackbird/command_post_cli.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/party_lobby.hpp"
+#include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/value.hpp"
 
@@ -191,6 +193,21 @@ int run_sleep_child() {
   for (int i = 0; i < 600; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
   return 0;
+}
+
+int run_party_serve_child(int argc, char **argv) {
+  if (argc < 4)
+    return 96;
+  std::vector<std::string> owned_args = {
+      "party", "serve", "--socket", argv[2], "--peers", argv[3],
+  };
+  std::vector<char *> cargs;
+  cargs.reserve(owned_args.size() + 1);
+  for (auto &a : owned_args)
+    cargs.push_back(a.data());
+  cargs.push_back(nullptr);
+  return command_post_cli(static_cast<int>(owned_args.size()), cargs.data(), std::cin,
+                          std::cout, std::cerr);
 }
 
 struct ScopedCwd {
@@ -1710,6 +1727,276 @@ void test_party_cli_roster_add_leader_and_say(const fs::path &base) {
   }
 }
 
+void test_party_lobby_serve_and_status(const PlatoonTestPaths &paths) {
+  const fs::path &base = paths.base;
+  const fs::path &self_exe = paths.self_exe;
+
+  // Unix domain socket sun_path is limited to 104 bytes on macOS; use a short
+  // `/tmp` directory for socket files while keeping peers/absent dirs in `base`.
+  struct ShortSocketTempDir {
+    fs::path path;
+    ShortSocketTempDir() {
+      std::string pattern = "/tmp/bb-ps-XXXXXX";
+      char *created = ::mkdtemp(pattern.data());
+      check(created != nullptr, "mkdtemp for short socket dir failed");
+      path = fs::path{created};
+    }
+    ~ShortSocketTempDir() {
+      std::error_code ec;
+      fs::remove_all(path, ec);
+    }
+    ShortSocketTempDir(const ShortSocketTempDir &) = delete;
+    ShortSocketTempDir &operator=(const ShortSocketTempDir &) = delete;
+  } sock_tmp;
+
+  // 1. `--help` works cleanly on `party serve` and `party lobby-status`.
+  for (const std::vector<std::string> &help_cmd : std::vector<std::vector<std::string>>{
+           {"party", "serve", "--help"},
+           {"party", "lobby-status", "--help"},
+       }) {
+    const auto help_res = run_cli(help_cmd);
+    check(help_res.exit_code == 0 && help_res.out.empty() && !help_res.err.empty(),
+          "party serve/lobby-status --help must exit 0 with usage on stderr");
+  }
+
+  // 2. `party lobby-status --socket <absent>` returns {"running":false} exit 0
+  //    and creates ZERO files or directories!
+  {
+    const fs::path absent_dir = sock_tmp.path / "absent";
+    const fs::path absent_sock = absent_dir / "party.sock";
+    const Value status = parse_stdout_json(
+        run_cli({"party", "lobby-status", "--socket", absent_sock.string()}),
+        "party lobby-status absent");
+    check(!std::get<bool>(req_field(status, "running").value()),
+          "absent party.sock must report running=false");
+    check(!fs::exists(absent_dir),
+          "party lobby-status on absent socket must NEVER create directories");
+  }
+
+  // 3. Reject `..` traversal in --socket and invalid --idle-timeout-ms (exit 2).
+  {
+    const auto bad_status =
+        run_cli({"party", "lobby-status", "--socket", "/tmp/../etc/party.sock"});
+    check(bad_status.exit_code == 2 && bad_status.out.empty() &&
+              !bad_status.err.empty(),
+          "party lobby-status must reject .. traversal in --socket");
+
+    const auto bad_serve =
+        run_cli({"party", "serve", "--socket", "/tmp/../etc/party.sock"});
+    check(bad_serve.exit_code == 2 && bad_serve.out.empty() && !bad_serve.err.empty(),
+          "party serve must reject .. traversal in --socket");
+
+    const auto bad_idle = run_cli({"party", "serve", "--idle-timeout-ms", "0"});
+    check(bad_idle.exit_code == 2 && bad_idle.out.empty() && !bad_idle.err.empty(),
+          "party serve must reject --idle-timeout-ms 0");
+
+    // Valid non-ASCII UTF-8 socket paths containing continuation bytes in 0x80..0x9F
+    // (e.g. É = C3 89, 日 = E6 97 A5) must be accepted (exit 0 running=false), while
+    // Unicode C1 (U+009B = C2 9B) and BiDi override (U+202E = E2 80 AE) must fail
+    // with exit 2.
+    const fs::path utf8_absent_sock =
+        sock_tmp.path / "caf\xc3\x89-\xe6\x97\xa5" / "p.sock";
+    const Value utf8_status = parse_stdout_json(
+        run_cli({"party", "lobby-status", "--socket", utf8_absent_sock.string()}),
+        "party lobby-status valid utf8 path");
+    check(!std::get<bool>(req_field(utf8_status, "running").value()),
+          "valid UTF-8 absent socket path must return running=false");
+
+    for (const char *bad_ctrl :
+         {"/tmp/bb-\xc2\x9b/party.sock", "/tmp/bb-\xe2\x80\xae/party.sock"}) {
+      const auto rejected_status =
+          run_cli({"party", "lobby-status", "--socket", bad_ctrl});
+      check(rejected_status.exit_code == 2 && rejected_status.out.empty() &&
+                !rejected_status.err.empty(),
+            "party lobby-status must reject C1/BiDi control scalars in --socket");
+      const auto rejected_serve = run_cli({"party", "serve", "--socket", bad_ctrl});
+      check(rejected_serve.exit_code == 2 && rejected_serve.out.empty() &&
+                !rejected_serve.err.empty(),
+            "party serve must reject C1/BiDi control scalars in --socket");
+    }
+
+    // Trailing-slash symlink `--peers` must be rejected (no POSIX lstat bypass).
+    const fs::path real_peers = base / "party-real-peers";
+    const fs::path sym_peers = base / "party-sym-peers";
+    fs::create_directories(real_peers);
+    fs::create_directory_symlink(real_peers, sym_peers);
+    const fs::path sym_sock = sock_tmp.path / "sym" / "party.sock";
+    const auto bad_sym =
+        run_cli({"party", "serve", "--socket", sym_sock.string(), "--peers",
+                 sym_peers.string() + "/", "--idle-timeout-ms", "150"});
+    check(bad_sym.exit_code != 0 && bad_sym.out.empty() && !bad_sym.err.empty(),
+          "party serve must reject trailing-slash symlink --peers");
+  }
+
+  // 4. `party serve --idle-timeout-ms 150` emits ready JSON, serves cleanly,
+  //    exits 0 on idle timeout, unlinks socket, and creates ZERO peers dir or
+  //    party.json!
+  {
+    const fs::path idle_sock = sock_tmp.path / "r1" / "party.sock";
+    const fs::path absent_peers = base / "idle-absent-peers";
+    const auto serve_res =
+        run_cli({"party", "serve", "--socket", idle_sock.string(), "--peers",
+                 absent_peers.string(), "--idle-timeout-ms", "150"});
+    const Value ready = parse_stdout_json(serve_res, "party serve idle-timeout");
+    check(std::get<bool>(req_field(ready, "listening").value()) &&
+              req_str(ready, "socket") == idle_sock.string(),
+          "party serve ready JSON mismatch");
+    check(!fs::exists(idle_sock), "party serve must unlink socket on clean idle exit");
+    check(!fs::exists(absent_peers),
+          "party serve must NEVER create absent --peers directory");
+  }
+
+  // 5. Spawn live `blackbird party serve`, verify ready JSON, ping + live in-RAM
+  //    snapshot via `blackbird party lobby-status`, then SIGTERM for graceful shutdown!
+  {
+    const fs::path live_dir = base / "live-lobby";
+    const fs::path peers_dir = live_dir / "peers";
+    const fs::path wm_dir = live_dir / "id-wintermute";
+    const fs::path sock_path = sock_tmp.path / "r2" / "party.sock";
+
+    auto local_id = PeerIdentityStore::open_or_create(peers_dir);
+    check(local_id.has_value(), "open_or_create local peers identity failed");
+    auto wm_id = PeerIdentityStore::open_or_create(wm_dir);
+    check(wm_id.has_value(), "open_or_create wintermute identity failed");
+    auto known = KnownPeersStore::open(peers_dir);
+    check(known.has_value(), "KnownPeersStore::open failed");
+    check(known.value()
+              .pin_peer(PinPeerRequest{
+                  .alias = "wintermute",
+                  .public_key = wm_id.value().identity().public_key,
+                  .trust_note = "ssh_target=pilot@wintermute",
+              })
+              .has_value(),
+          "pin_peer wintermute failed");
+
+    int pipefd[2]{-1, -1};
+    check(::pipe(pipefd) == 0, "pipe failed for party serve child");
+    const pid_t pid = ::fork();
+    check(pid >= 0, "fork failed for party serve child");
+    if (pid == 0) {
+      (void)::close(pipefd[0]);
+      (void)::dup2(pipefd[1], STDOUT_FILENO);
+      (void)::close(pipefd[1]);
+      std::string exe = self_exe.string();
+      std::string flag = "--party-serve-child";
+      std::string sock_arg = sock_path.string();
+      std::string peers_arg = peers_dir.string();
+      char *child_argv[] = {exe.data(), flag.data(), sock_arg.data(), peers_arg.data(),
+                            nullptr};
+      ::execv(exe.c_str(), child_argv);
+      ::_exit(127);
+    }
+    (void)::close(pipefd[1]);
+
+    struct ChildGuard {
+      pid_t child_pid = -1;
+      int fd = -1;
+      ~ChildGuard() {
+        if (fd >= 0)
+          (void)::close(fd);
+        if (child_pid > 1) {
+          (void)::kill(child_pid, SIGKILL);
+          int st = 0;
+          (void)::waitpid(child_pid, &st, 0);
+        }
+      }
+    } guard{pid, pipefd[0]};
+
+    std::string ready_line;
+    char ch = '\0';
+    while (::read(guard.fd, &ch, 1) == 1) {
+      if (ch == '\n')
+        break;
+      ready_line.push_back(ch);
+    }
+    (void)::close(guard.fd);
+    guard.fd = -1;
+
+    const auto parsed_ready = parse_json(ready_line);
+    check(parsed_ready.has_value() &&
+              std::get<bool>(req_field(parsed_ready.value(), "listening").value()) &&
+              req_str(parsed_ready.value(), "socket") == sock_path.string(),
+          "party serve child must flush ready JSON immediately");
+
+    // Initial live lobby-status: running=true, SOLO (0 rooms, 0 participants).
+    const Value solo_status = parse_stdout_json(
+        run_cli({"party", "lobby-status", "--socket", sock_path.string()}),
+        "party lobby-status live solo");
+    check(std::get<bool>(req_field(solo_status, "running").value()) &&
+              req_int(solo_status, "room_count") == 0 &&
+              req_int(solo_status, "participant_count") == 0 &&
+              req_str(solo_status, "room_scope").empty(),
+          "live lobby-status initial solo payload mismatch");
+
+    // Create a room, invite pinned friend, post a message via PartyLobbyClient.
+    auto client = PartyLobbyClient::connect(sock_path);
+    check(client.has_value(), "PartyLobbyClient::connect to party serve failed");
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    PartyLease draft{};
+    draft.room_id = "ops/cli-live";
+    draft.alias = "pilot";
+    draft.role = PartyMemberRole::operator_human;
+    draft.host = "workstation";
+    draft.issued_ns = now_ns;
+    draft.expires_ns = now_ns + kPartyLobbyDefaultTtlNs;
+    draft.lease_seq = 1;
+    auto signed_lease = sign_party_lease(local_id.value(), std::move(draft));
+    check(signed_lease.has_value(), "sign_party_lease failed");
+    check(client.value().create_room("ops/cli-live", signed_lease.value()).has_value(),
+          "create_room failed");
+    check(client.value().invite_friend("ops/cli-live", "wintermute").has_value(),
+          "invite_friend wintermute failed");
+    check(client.value()
+              .post_message("ops/cli-live", "pilot", "@all", "hello live lobby")
+              .has_value(),
+          "post_message failed");
+    client.value().close();
+
+    // Verify `blackbird party lobby-status` reflects live in-RAM room, members &
+    // message!
+    const Value live_status = parse_stdout_json(
+        run_cli({"party", "lobby-status", "--socket", sock_path.string()}),
+        "party lobby-status populated");
+    check(std::get<bool>(req_field(live_status, "running").value()) &&
+              req_int(live_status, "room_count") == 1 &&
+              req_str(live_status, "active_room_id") == "ops/cli-live" &&
+              req_str(live_status, "room_scope") == "ops/cli-live" &&
+              req_int(live_status, "participant_count") == 2 &&
+              req_int(live_status, "message_count") == 1,
+          "live lobby-status populated payload mismatch");
+
+    // Graceful SIGTERM shutdown -> exit 0 and unlink party.sock!
+    check(::kill(pid, SIGTERM) == 0, "SIGTERM to party serve failed");
+    int wait_status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    pid_t waited = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+      waited = ::waitpid(pid, &wait_status, WNOHANG);
+      if (waited == pid)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    check(waited == pid && WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0,
+          "party serve must exit 0 cleanly on SIGTERM");
+    guard.child_pid = -1;
+    check(!fs::exists(sock_path), "party serve must unlink socket on SIGTERM");
+
+    // Confirm zero `party.json` exists anywhere under live_dir.
+    for (const auto &entry : fs::recursive_directory_iterator(live_dir)) {
+      check(entry.path().filename() != "party.json",
+            "live party.sock lobby must NEVER create party.json on disk");
+    }
+
+    const Value stopped_status = parse_stdout_json(
+        run_cli({"party", "lobby-status", "--socket", sock_path.string()}),
+        "party lobby-status after SIGTERM");
+    check(!std::get<bool>(req_field(stopped_status, "running").value()),
+          "lobby-status must report running=false after SIGTERM");
+  }
+}
+
 void test_flightdeck_cli_once_and_themes(const fs::path &base) {
   const fs::path absent_session = base / "flightdeck-absent-session";
 
@@ -1787,6 +2074,8 @@ int main(int argc, char **argv) {
     return run_fake_peer_child(argc, argv);
   if (argc > 1 && std::string_view{argv[1]} == "--sleep-child")
     return run_sleep_child();
+  if (argc > 1 && std::string_view{argv[1]} == "--party-serve-child")
+    return run_party_serve_child(argc, argv);
 
   try {
     const fs::path self_exe = fs::canonical(argv[0]);
@@ -1803,6 +2092,7 @@ int main(int argc, char **argv) {
     test_bridge_subcommand(temp.path());
     test_bridge_checkpoint_and_join(temp.path());
     test_party_cli_roster_add_leader_and_say(temp.path());
+    test_party_lobby_serve_and_status({temp.path(), self_exe});
     test_flightdeck_cli_once_and_themes(temp.path());
 
     std::cout << "PASS command_post_cli\n";

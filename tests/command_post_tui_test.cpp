@@ -7,6 +7,7 @@
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/party_chat.hpp"
+#include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
@@ -1487,6 +1488,292 @@ void test_wave9b2_flightdeck_detach_and_party_zero_ceremony() {
   }
 }
 
+bool has_any_party_json(const std::filesystem::path &root) {
+  std::error_code ec;
+  if (!std::filesystem::exists(root, ec) || ec)
+    return false;
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(root)) {
+    if (entry.path().filename() == "party.json")
+      return true;
+  }
+  return false;
+}
+
+void test_party_live_lobby_socket_zero_party_json() {
+  TempDir home_dir("bb-cptui-lobby-home");
+  TempDir work_dir("bb-cptui-lobby-work");
+  TempDir work_dir2("bb-cptui-lobby-cwd2");
+  TempDir sock_dir("bb-cptui-lobby-sock");
+  ScopedHomeEnv env_home{home_dir.path};
+
+  const auto peers_dir = home_dir.path / ".local" / "share" / "blackbird" / "peers";
+  auto local_id = unwrap(PeerIdentityStore::open_or_create(peers_dir));
+  auto wm_id = unwrap(PeerIdentityStore::open_or_create(sock_dir.path / "id-wm"));
+  {
+    auto known = unwrap(KnownPeersStore::open(peers_dir));
+    unwrap(known.pin_peer(PinPeerRequest{
+        .alias = "wintermute",
+        .public_key = wm_id.identity().public_key,
+        .trust_note = "ssh_target=pilot@wintermute",
+    }));
+  }
+
+  const auto sock_path = sock_dir.path / "run" / "party.sock";
+  PartyLobbyServerConfig srv_cfg{};
+  srv_cfg.socket_path = sock_path;
+  srv_cfg.local_identity_dir = peers_dir;
+  srv_cfg.known_peers_dir = peers_dir;
+  auto server = unwrap(PartyLobbyServer::start(std::move(srv_cfg)));
+  require(server->running(), "PartyLobbyServer must be running");
+
+  ScopedEnvVar set_sock{"BLACKBIRD_PARTY_SOCKET", sock_path.string()};
+
+  CommandPostTuiContext ctx;
+  ctx.project_root = work_dir.path;
+  ctx.actor = "pilot";
+
+  CommandPostTuiContext ctx_other_window;
+  ctx_other_window.project_root = work_dir2.path;
+  ctx_other_window.actor = "pilot";
+
+  // 1. Initial /party status renders SOLO cleanly without creating any files.
+  const auto initial_status = handle_command_post_slash("/party status", ctx);
+  require(initial_status.has_value() &&
+              initial_status->find("PARTY CHAT") != std::string::npos &&
+              initial_status->find("0 ops") != std::string::npos,
+          "live lobby initial /party status must show SOLO");
+  require(!std::filesystem::exists(work_dir.path / ".blackbird"),
+          "live lobby /party status must NOT create .blackbird");
+
+  // 2. /party create creates live in-RAM room using signed local PartyLease!
+  const auto created = handle_command_post_slash("/party create ops/live", ctx);
+  require(created.has_value() && created->find("ops/live") != std::string::npos &&
+              created->find("live in-RAM lobby") != std::string::npos,
+          "live lobby /party create must confirm in-RAM room");
+
+  auto verify_client = unwrap(PartyLobbyClient::connect(sock_path));
+  {
+    const auto snap = unwrap(verify_client.snapshot());
+    require(snap.room_scope == "ops/live" && snap.participants.size() == 1 &&
+                snap.participants[0].id == "pilot" && snap.participants[0].local_self &&
+                snap.participants[0].fingerprint == local_id.identity().fingerprint,
+            "live lobby snapshot after /party create must include signed local host");
+  }
+
+  // 3. /party add <pinned_friend> invites friend in RAM with zero party.json!
+  const auto added = handle_command_post_slash("/party add wintermute", ctx);
+  require(added.has_value() && added->find("@wintermute") != std::string::npos &&
+              added->find(wm_id.identity().fingerprint) != std::string::npos &&
+              added->find("pilot@wintermute") != std::string::npos &&
+              added->find("live in-RAM lobby") != std::string::npos,
+          "live lobby /party add must invite pinned friend in RAM");
+
+  // Unpinned alias fails cleanly without falling back to party.json.
+  const auto unpinned = handle_command_post_slash("/party add ghost-peer", ctx);
+  require(unpinned.has_value() && unpinned->find("not pinned") != std::string::npos,
+          "live lobby /party add must reject unpinned peer cleanly");
+
+  // 4. /party say posts directly into the live in-RAM room!
+  const auto said = handle_command_post_slash("/party say hello", ctx);
+  require(said.has_value() && said->find("#1") != std::string::npos &&
+              said->find("hello") != std::string::npos,
+          "live lobby /party say hello must post message #1");
+
+  const auto said_target =
+      handle_command_post_slash("/party say @wintermute status check", ctx);
+  require(said_target.has_value() && said_target->find("#2") != std::string::npos &&
+              said_target->find("@wintermute") != std::string::npos &&
+              said_target->find("status check") != std::string::npos,
+          "live lobby /party say @wintermute must route and post message #2");
+
+  // 5. /party status in BOTH windows (different project_roots / /cwd!) shares the
+  //    exact live in-RAM room, members, and messages!
+  for (const CommandPostTuiContext &win : {ctx, ctx_other_window}) {
+    const auto st = handle_command_post_slash("/party status", win);
+    require(st.has_value() && st->find("ops/live") != std::string::npos &&
+                st->find("wintermute") != std::string::npos &&
+                st->find("hello") != std::string::npos &&
+                st->find("status check") != std::string::npos,
+            "live lobby /party status must render shared in-RAM state across windows");
+  }
+
+  // 6. /party remove kicks participant in RAM.
+  const auto removed = handle_command_post_slash("/party remove wintermute", ctx);
+  require(removed.has_value() &&
+              removed->find("Removed party participant @wintermute") !=
+                  std::string::npos,
+          "live lobby /party remove must kick member in RAM");
+  {
+    const auto snap = unwrap(verify_client.snapshot());
+    require(snap.participants.size() == 1 && snap.participants[0].id == "pilot",
+            "live lobby snapshot after /party remove must have only pilot");
+  }
+
+  // 7. /party leave immediately clears live membership across ALL windows back to SOLO!
+  const auto left = handle_command_post_slash("/party leave", ctx);
+  require(left.has_value() && left->find("solo mode") != std::string::npos,
+          "live lobby /party leave must confirm return to solo mode");
+  {
+    const auto snap = unwrap(verify_client.snapshot());
+    require(snap.room_scope.empty() && snap.participants.empty() &&
+                snap.messages.empty(),
+            "live lobby snapshot after /party leave must be SOLO");
+  }
+  const auto other_after_leave =
+      handle_command_post_slash("/party status", ctx_other_window);
+  require(
+      other_after_leave.has_value() &&
+          other_after_leave->find("ops/live") == std::string::npos &&
+          other_after_leave->find("0 ops") != std::string::npos,
+      "other window /party status must immediately reflect SOLO after /party leave");
+
+  // 8. Bare `/party create` in a `.hidden..dir` workspace sanitizes to a valid
+  //    room ID (`hidden.dir`) and succeeds in RAM with zero `party.json`!
+  {
+    const auto weird_root = work_dir.path / ".hidden..dir";
+    std::filesystem::create_directories(weird_root);
+    CommandPostTuiContext weird_ctx;
+    weird_ctx.project_root = weird_root;
+    weird_ctx.actor = "pilot";
+    const auto bare_created = handle_command_post_slash("/party create", weird_ctx);
+    require(bare_created.has_value() &&
+                bare_created->find("hidden.dir") != std::string::npos &&
+                bare_created->find("live in-RAM lobby") != std::string::npos,
+            "bare /party create in .hidden..dir must sanitize to valid room id");
+    const auto snap = unwrap(verify_client.snapshot());
+    require(snap.room_scope == "hidden.dir",
+            "live lobby room scope must be sanitized hidden.dir");
+    const auto left_weird = handle_command_post_slash("/party leave", weird_ctx);
+    require(left_weird.has_value() &&
+                left_weird->find("solo mode") != std::string::npos,
+            "leave sanitized room cleanly");
+  }
+
+  // 9. Live `/party join <room>` (plain) & `/party join <bbjoin1:...> --alias alice`
+  //    both wire through `party.sock` with zero `party.json` written!
+  {
+    // Peer wintermute starts `ops/peer-room` in the live lobby -> local pilot joins it.
+    PartyLease wm_draft{};
+    wm_draft.room_id = "ops/peer-room";
+    wm_draft.alias = "wintermute";
+    wm_draft.role = PartyMemberRole::platoon_leader;
+    wm_draft.host = "wintermute-box";
+    wm_draft.issued_ns = wall_now_ns();
+    wm_draft.expires_ns = wm_draft.issued_ns + kPartyLobbyDefaultTtlNs;
+    wm_draft.lease_seq = 1;
+    auto wm_signed = unwrap(sign_party_lease(wm_id, std::move(wm_draft)));
+    (void)unwrap(verify_client.create_room("ops/peer-room", wm_signed));
+
+    const auto joined_plain =
+        handle_command_post_slash("/party join ops/peer-room", ctx);
+    require(joined_plain.has_value() &&
+                joined_plain->find("ops/peer-room") != std::string::npos &&
+                joined_plain->find("live in-RAM lobby") != std::string::npos,
+            "live /party join <room> must join existing room in RAM");
+    const auto plain_snap = unwrap(verify_client.snapshot("ops/peer-room"));
+    require(plain_snap.participants.size() == 2,
+            "live /party join <room> must add local operator to RAM room");
+    const auto plain_status = handle_command_post_slash("/party status", ctx);
+    require(plain_status.has_value() &&
+                plain_status->find("ops/peer-room") != std::string::npos &&
+                plain_status->find("wintermute") != std::string::npos,
+            "live /party status must display joined room");
+    (void)handle_command_post_slash("/party leave", ctx);
+
+    // Join a `bbjoin1:` invite from a new peer `alice` -> pins alice, refreshes
+    // revocations, materializes `squad-live` in RAM, invites @alice, zero party.json!
+    auto alice_id =
+        unwrap(PeerIdentityStore::open_or_create(sock_dir.path / "id-alice"));
+    RoomInvite alice_inv;
+    alice_inv.room_id = "squad-live";
+    alice_inv.relay_url = "https://relay.example.test/v1";
+    alice_inv.creator_fingerprint = alice_id.identity().fingerprint;
+    alice_inv.creator_public_key = alice_id.identity().public_key;
+    alice_inv.invite_code = "11223344556677889900aabbccddeeff";
+    alice_inv.expires_ns = wall_now_ns() + 3'600'000'000'000LL;
+    const std::string alice_uri = unwrap(encode_room_invite(alice_inv));
+
+    const auto joined_inv =
+        handle_command_post_slash("/party join " + alice_uri + " --alias alice", ctx);
+    require(joined_inv.has_value() &&
+                joined_inv->find("squad-live") != std::string::npos &&
+                joined_inv->find("@alice") != std::string::npos &&
+                joined_inv->find("live in-RAM lobby") != std::string::npos,
+            "live /party join bbjoin1:... must join in RAM and pin creator");
+    const auto inv_snap = unwrap(verify_client.snapshot());
+    require(inv_snap.room_scope == "squad-live" && inv_snap.participants.size() == 2,
+            "live /party join bbjoin1:... must populate squad-live with local + alice");
+    const auto inv_status = handle_command_post_slash("/party status", ctx);
+    require(inv_status.has_value() &&
+                inv_status->find("squad-live") != std::string::npos &&
+                inv_status->find("alice") != std::string::npos,
+            "live /party status must show squad-live and pinned alice");
+    (void)handle_command_post_slash("/party leave", ctx);
+  }
+
+  // 10. ZERO `party.json` file was created anywhere on disk!
+  require(!has_any_party_json(work_dir.path) && !has_any_party_json(work_dir2.path) &&
+              !has_any_party_json(home_dir.path) && !has_any_party_json(sock_dir.path),
+          "live party.sock TUI flow must create ZERO party.json files on disk");
+  require(!std::filesystem::exists(work_dir.path / ".blackbird") &&
+              !std::filesystem::exists(work_dir2.path / ".blackbird"),
+          "live party.sock TUI flow must NOT create .blackbird in workspaces");
+
+  // 11. Invalid BLACKBIRD_PARTY_SOCKET (`..` traversal, C1, BiDi) MUST fail closed
+  //     on BOTH read and mutating `/party` commands without touching disk!
+  {
+    const auto recreated = handle_command_post_slash("/party create ops/guard", ctx);
+    require(recreated.has_value() && recreated->find("ops/guard") != std::string::npos,
+            "recreate room for invalid env check");
+    const std::string traversal_sock =
+        (sock_dir.path / "run" / ".." / "run" / "party.sock").string();
+    const std::array<std::string, 3> bad_envs{
+        traversal_sock,
+        (sock_dir.path / "bad-\xc2\x9b" / "party.sock").string(),
+        (sock_dir.path / "bad-\xe2\x80\xae" / "party.sock").string(),
+    };
+    for (const std::string &bad_env : bad_envs) {
+      ScopedEnvVar bad_sock{"BLACKBIRD_PARTY_SOCKET", bad_env};
+      for (const char *cmd :
+           {"/party status", "/party create disk-leak", "/party add wintermute",
+            "/party say disk-leak", "/party join disk-leak", "/party remove wintermute",
+            "/party leave"}) {
+        const auto res = handle_command_post_slash(cmd, ctx_other_window);
+        require(res.has_value() &&
+                    res->find("invalid BLACKBIRD_PARTY_SOCKET") != std::string::npos &&
+                    res->find("ops/guard") == std::string::npos,
+                "invalid BLACKBIRD_PARTY_SOCKET must fail closed on all /party cmds");
+      }
+    }
+    require(!std::filesystem::exists(work_dir2.path / ".blackbird") &&
+                !has_any_party_json(work_dir2.path),
+            "invalid BLACKBIRD_PARTY_SOCKET must NEVER fall back to writing disk");
+  }
+
+  // 12. Valid non-ASCII UTF-8 BLACKBIRD_PARTY_SOCKET path (containing continuation
+  //     bytes in 0x80..0x9F, e.g. É = C3 89) connects cleanly!
+  {
+    const auto utf8_sock = sock_dir.path / "r-\xc3\x89" / "p.sock";
+    PartyLobbyServerConfig utf8_cfg{};
+    utf8_cfg.socket_path = utf8_sock;
+    utf8_cfg.local_identity_dir = peers_dir;
+    utf8_cfg.known_peers_dir = peers_dir;
+    auto utf8_srv = unwrap(PartyLobbyServer::start(std::move(utf8_cfg)));
+    ScopedEnvVar set_utf8{"BLACKBIRD_PARTY_SOCKET", utf8_sock.string()};
+    const auto utf8_create = handle_command_post_slash("/party create ops/utf8", ctx);
+    require(utf8_create.has_value() &&
+                utf8_create->find("ops/utf8") != std::string::npos &&
+                utf8_create->find("live in-RAM lobby") != std::string::npos,
+            "valid UTF-8 BLACKBIRD_PARTY_SOCKET path must connect cleanly");
+    require(!has_any_party_json(work_dir.path),
+            "UTF-8 live socket path must create ZERO party.json");
+    utf8_srv->stop();
+  }
+
+  verify_client.close();
+  server->stop();
+}
+
 } // namespace
 
 int main() {
@@ -1503,6 +1790,7 @@ int main() {
     test_flightdeck_empty_populated_ticks_and_hostile_labels();
     test_party_passive_say_and_lifecycle();
     test_wave9b2_flightdeck_detach_and_party_zero_ceremony();
+    test_party_live_lobby_socket_zero_party_json();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {

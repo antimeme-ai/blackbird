@@ -9,6 +9,7 @@
 #include "blackbird/mcp_server.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/party_chat.hpp"
+#include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/platoon_runner.hpp"
@@ -5320,18 +5321,362 @@ int run_party_say(std::span<char *> args, CliIo io) {
                        }));
 }
 
+volatile std::sig_atomic_t g_party_serve_stop = 0;
+
+void party_serve_signal_handler(int /*signum*/) noexcept { g_party_serve_stop = 1; }
+
+class PartyServeSignalGuard {
+public:
+  PartyServeSignalGuard() noexcept {
+    g_party_serve_stop = 0;
+    struct sigaction sa{};
+    sa.sa_handler = party_serve_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    if (::sigaction(SIGINT, &sa, &prev_int_) == 0)
+      installed_int_ = true;
+    if (::sigaction(SIGTERM, &sa, &prev_term_) == 0)
+      installed_term_ = true;
+  }
+
+  PartyServeSignalGuard(const PartyServeSignalGuard &) = delete;
+  PartyServeSignalGuard &operator=(const PartyServeSignalGuard &) = delete;
+
+  ~PartyServeSignalGuard() {
+    if (installed_int_)
+      (void)::sigaction(SIGINT, &prev_int_, nullptr);
+    if (installed_term_)
+      (void)::sigaction(SIGTERM, &prev_term_, nullptr);
+  }
+
+private:
+  struct sigaction prev_int_{};
+  struct sigaction prev_term_{};
+  bool installed_int_ = false;
+  bool installed_term_ = false;
+};
+
+char32_t decode_utf8_scalar_cli(std::string_view text, std::size_t &offset) noexcept {
+  const auto b0 = static_cast<unsigned char>(text[offset]);
+  if (b0 < 0x80U) {
+    ++offset;
+    return static_cast<char32_t>(b0);
+  }
+  if ((b0 & 0xe0U) == 0xc0U && offset + 1U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    offset += 2U;
+    return (static_cast<char32_t>(b0 & 0x1fU) << 6U) |
+           static_cast<char32_t>(b1 & 0x3fU);
+  }
+  if ((b0 & 0xf0U) == 0xe0U && offset + 2U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    const auto b2 = static_cast<unsigned char>(text[offset + 2U]);
+    offset += 3U;
+    return (static_cast<char32_t>(b0 & 0x0fU) << 12U) |
+           (static_cast<char32_t>(b1 & 0x3fU) << 6U) |
+           static_cast<char32_t>(b2 & 0x3fU);
+  }
+  if ((b0 & 0xf8U) == 0xf0U && offset + 3U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    const auto b2 = static_cast<unsigned char>(text[offset + 2U]);
+    const auto b3 = static_cast<unsigned char>(text[offset + 3U]);
+    offset += 4U;
+    return (static_cast<char32_t>(b0 & 0x07U) << 18U) |
+           (static_cast<char32_t>(b1 & 0x3fU) << 12U) |
+           (static_cast<char32_t>(b2 & 0x3fU) << 6U) |
+           static_cast<char32_t>(b3 & 0x3fU);
+  }
+  offset = text.size();
+  return 0x110000U;
+}
+
+bool is_forbidden_socket_scalar_cli(char32_t cp) noexcept {
+  if (cp < 0x20U || (cp >= 0x7fU && cp <= 0x9fU) || cp > 0x10ffffU)
+    return true;
+  return (cp >= 0x202aU && cp <= 0x202eU) || (cp >= 0x2066U && cp <= 0x2069U) ||
+         cp == 0x200eU || cp == 0x200fU || cp == 0x061cU || cp == 0xfeffU;
+}
+
+bool valid_party_socket_path_arg(std::string_view raw) noexcept {
+  if (raw.empty() || !valid_utf8(raw))
+    return false;
+  std::size_t i = 0;
+  while (i < raw.size()) {
+    const char32_t cp = decode_utf8_scalar_cli(raw, i);
+    if (is_forbidden_socket_scalar_cli(cp))
+      return false;
+  }
+  const fs::path candidate{raw};
+  if (candidate.filename().empty() || candidate.filename() == ".")
+    return false;
+  for (const auto &comp : candidate) {
+    if (comp == "..")
+      return false;
+  }
+  return true;
+}
+
+fs::path strip_trailing_slashes_party(const fs::path &path) {
+  std::string text = path.string();
+  while (text.size() > 1U && text.back() == '/')
+    text.pop_back();
+  return fs::path{std::move(text)};
+}
+
+bool has_existing_peer_identity_files(const fs::path &peers_dir) {
+  if (peers_dir.empty())
+    return false;
+  const fs::path clean_dir = strip_trailing_slashes_party(peers_dir);
+  std::error_code ec;
+  const fs::file_status dir_st = fs::symlink_status(clean_dir, ec);
+  if (ec || fs::is_symlink(dir_st) || !fs::is_directory(dir_st))
+    return false;
+  const fs::file_status key_st = fs::symlink_status(clean_dir / "id_ed25519", ec);
+  if (ec || fs::is_symlink(key_st) || !fs::is_regular_file(key_st))
+    return false;
+  const fs::file_status pub_st = fs::symlink_status(clean_dir / "id_ed25519.pub", ec);
+  return !ec && !fs::is_symlink(pub_st) && fs::is_regular_file(pub_st);
+}
+
+Value party_message_to_value(const PartyMessage &m) {
+  return Value::object({
+      {"id", Value{m.id}},
+      {"timestamp_ns", Value{Number{m.timestamp_ns}}},
+      {"sender_id", Value{m.sender_id}},
+      {"sender_role", Value{std::string{party_member_role_name(m.sender_role)}}},
+      {"sender_host", Value{m.sender_host}},
+      {"sender_model", Value{m.sender_model}},
+      {"sender_fingerprint", Value{m.sender_fingerprint}},
+      {"verified_peer", Value{m.verified_peer}},
+      {"target", Value{m.target}},
+      {"kind", Value{std::string{party_message_kind_name(m.kind)}}},
+      {"body", Value{m.body}},
+      {"untrusted_remote", Value{m.untrusted_remote}},
+  });
+}
+
+int run_party_serve(std::span<char *> args, CliIo io) {
+  std::optional<fs::path> socket_path;
+  std::optional<fs::path> peers_dir;
+  std::optional<std::uint64_t> idle_timeout_ms;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party serve [--socket PATH] [--peers DIR] "
+                "[--idle-timeout-ms N]\n";
+      return 0;
+    }
+    if (arg == "--socket") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_party_socket_path_arg(*v))
+        return fail_usage(io, "party serve: invalid --socket path");
+      socket_path = fs::path{*v};
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party serve: --peers must not be empty");
+      peers_dir = strip_trailing_slashes_party(fs::path{*v});
+    } else if (arg == "--idle-timeout-ms") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      constexpr std::uint64_t kMaxIdleTimeoutMs = 7ULL * 24ULL * 3600ULL * 1000ULL;
+      const auto parsed = parse_u64(*v);
+      if (!parsed.has_value() || *parsed == 0 || *parsed > kMaxIdleTimeoutMs) {
+        return fail_usage(io, "party serve: --idle-timeout-ms must be between 1 and " +
+                                  std::to_string(kMaxIdleTimeoutMs));
+      }
+      idle_timeout_ms = *parsed;
+    } else {
+      return fail_usage(io, "party serve: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (!socket_path.has_value()) {
+    if (const char *env_sock = std::getenv("BLACKBIRD_PARTY_SOCKET");
+        env_sock != nullptr && env_sock[0] != '\0') {
+      if (!valid_party_socket_path_arg(env_sock))
+        return fail_usage(io, "party serve: invalid BLACKBIRD_PARTY_SOCKET");
+      socket_path = fs::path{env_sock};
+    } else {
+      socket_path = default_party_socket_path();
+    }
+  }
+
+  if (!peers_dir.has_value()) {
+    if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0')
+      peers_dir = fs::path{home} / ".local" / "share" / "blackbird" / "peers";
+  }
+
+  PartyLobbyServerConfig cfg{};
+  cfg.socket_path = *socket_path;
+  if (peers_dir.has_value()) {
+    cfg.known_peers_dir = *peers_dir;
+    if (has_existing_peer_identity_files(*peers_dir))
+      cfg.local_identity_dir = *peers_dir;
+  }
+
+  PartyServeSignalGuard signal_guard{};
+  auto server_res = PartyLobbyServer::start(std::move(cfg));
+  if (!server_res.has_value())
+    return fail_error(io, "party serve", server_res.error());
+  auto server = std::move(server_res).value();
+
+  auto ready_json = dump_json(Value::object({
+      {"listening", Value{true}},
+      {"socket", Value{server->socket_path().string()}},
+  }));
+  if (!ready_json.has_value()) {
+    server->stop();
+    return fail_error(io, "party serve", ready_json.error());
+  }
+  io.out << ready_json.value() << '\n' << std::flush;
+  if (!io.out) {
+    server->stop();
+    return fail_message(io, "party serve: failed to write stdout");
+  }
+
+  using SteadyClock = std::chrono::steady_clock;
+  auto last_activity = SteadyClock::now();
+  PartySnapshot last_snap = server->snapshot();
+
+  while (g_party_serve_stop == 0 && server->running()) {
+    int sleep_ms = 50;
+    if (idle_timeout_ms.has_value()) {
+      const auto now = SteadyClock::now();
+      PartySnapshot cur = server->snapshot();
+      if (cur != last_snap) {
+        last_snap = std::move(cur);
+        last_activity = now;
+      } else {
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_activity)
+                .count();
+        const auto limit_ms = static_cast<std::int64_t>(*idle_timeout_ms);
+        if (elapsed_ms >= limit_ms)
+          break;
+        sleep_ms =
+            static_cast<int>(std::clamp<std::int64_t>(limit_ms - elapsed_ms, 1, 25));
+      }
+    }
+    struct pollfd unused_pfd{};
+    (void)::poll(&unused_pfd, 0, sleep_ms);
+  }
+
+  server->stop();
+  return 0;
+}
+
+int run_party_lobby_status(std::span<char *> args, CliIo io) {
+  std::optional<fs::path> socket_path;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party lobby-status [--socket PATH]\n";
+      return 0;
+    }
+    if (arg == "--socket") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_party_socket_path_arg(*v))
+        return fail_usage(io, "party lobby-status: invalid --socket path");
+      socket_path = fs::path{*v};
+    } else {
+      return fail_usage(io, "party lobby-status: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (!socket_path.has_value()) {
+    if (const char *env_sock = std::getenv("BLACKBIRD_PARTY_SOCKET");
+        env_sock != nullptr && env_sock[0] != '\0') {
+      if (!valid_party_socket_path_arg(env_sock))
+        return fail_usage(io, "party lobby-status: invalid BLACKBIRD_PARTY_SOCKET");
+      socket_path = fs::path{env_sock};
+    } else {
+      socket_path = default_party_socket_path();
+    }
+  }
+
+  auto client_res = PartyLobbyClient::connect(*socket_path);
+  if (!client_res.has_value())
+    return emit_json(io, Value::object({{"running", Value{false}}}));
+
+  auto ping_res = client_res.value().ping();
+  if (!ping_res.has_value() || !ping_res.value().ok)
+    return emit_json(io, Value::object({{"running", Value{false}}}));
+
+  auto snap_res = client_res.value().snapshot();
+  if (!snap_res.has_value())
+    return emit_json(io, Value::object({{"running", Value{false}}}));
+
+  const PartyLobbyPing &pong = ping_res.value();
+  const PartySnapshot &snap = snap_res.value();
+
+  Value::Array participants;
+  participants.reserve(snap.participants.size());
+  for (const auto &p : snap.participants)
+    participants.push_back(party_participant_to_value(p));
+
+  Value::Array messages;
+  messages.reserve(snap.messages.size());
+  for (const auto &m : snap.messages)
+    messages.push_back(party_message_to_value(m));
+
+  Value::Array conflicts;
+  conflicts.reserve(snap.conflicts.size());
+  for (const auto &c : snap.conflicts)
+    conflicts.push_back(conflict_to_value(c));
+
+  return emit_json(
+      io,
+      Value::object({
+          {"running", Value{true}},
+          {"socket", Value{socket_path->string()}},
+          {"protocol_version", Value{Number{pong.protocol_version}}},
+          {"revocation_epoch", Value{Number{pong.revocation_epoch}}},
+          {"server_pid", Value{Number{pong.server_pid}}},
+          {"room_count", Value{Number{static_cast<std::uint64_t>(pong.room_count)}}},
+          {"active_room_id", pong.active_room_id.has_value()
+                                 ? Value{*pong.active_room_id}
+                                 : Value{nullptr}},
+          {"room_scope", Value{snap.room_scope}},
+          {"scope", Value{snap.room_scope}},
+          {"mode", Value{std::string{party_mode_name(snap.mode)}}},
+          {"mode_override",
+           Value{std::string{party_mode_override_name(snap.mode_override)}}},
+          {"participant_count",
+           Value{Number{static_cast<std::uint64_t>(snap.participants.size())}}},
+          {"message_count",
+           Value{Number{static_cast<std::uint64_t>(snap.messages.size())}}},
+          {"participants", Value{std::move(participants)}},
+          {"messages", Value{std::move(messages)}},
+          {"conflicts", Value{std::move(conflicts)}},
+          {"known_peers_present", Value{snap.known_peers_present}},
+      }));
+}
+
 int run_party_cli(std::span<char *> args, CliIo io) {
   if (args.size() < 2) {
-    return fail_usage(
-        io,
-        "party: expected action (roster|create|leave|add-leader|remove-leader|say)");
+    return fail_usage(io, "party: expected action "
+                          "(serve|lobby-status|roster|create|leave|add-leader|"
+                          "remove-leader|say)");
   }
   const std::string_view action{args[1]};
   if (action == "--help" || action == "-h") {
-    io.err << "usage: blackbird party {roster|create|leave|add-leader|remove-leader|"
-              "say} [options]\n";
+    io.err << "usage: blackbird party {serve|lobby-status|roster|create|leave|"
+              "add-leader|remove-leader|say} [options]\n";
     return 0;
   }
+  if (action == "serve")
+    return run_party_serve(args, io);
+  if (action == "lobby-status")
+    return run_party_lobby_status(args, io);
   if (action == "roster")
     return run_party_roster(args, io);
   if (action == "create")

@@ -5,6 +5,7 @@
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/party_chat.hpp"
+#include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
@@ -13,6 +14,7 @@
 #include "blackbird/worktree_lease.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -1744,10 +1746,18 @@ std::string default_party_room_name(const std::filesystem::path &root) {
     const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
                     (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
                     ch == ':';
-    if (ok)
+    if (ok) {
+      if (ch == '.' && !clean.empty() && clean.back() == '.')
+        continue;
       clean.push_back(ch);
+    }
   }
-  if (clean.empty() || is_solo_party_scope(clean))
+  auto is_alnum = [](char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+  };
+  while (!clean.empty() && !is_alnum(clean.front()))
+    clean.erase(clean.begin());
+  if (clean.empty() || is_solo_party_scope(clean) || !valid_party_room_id(clean))
     return std::string{kPartyDefaultScope};
   return clean;
 }
@@ -1919,6 +1929,225 @@ Result<std::string> generate_party_invite_code() {
   return Result<std::string>::success(std::move(out));
 }
 
+char32_t decode_utf8_scalar_tui(std::string_view text, std::size_t &offset) noexcept {
+  const auto b0 = static_cast<unsigned char>(text[offset]);
+  if (b0 < 0x80U) {
+    ++offset;
+    return static_cast<char32_t>(b0);
+  }
+  if ((b0 & 0xe0U) == 0xc0U && offset + 1U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    offset += 2U;
+    return (static_cast<char32_t>(b0 & 0x1fU) << 6U) |
+           static_cast<char32_t>(b1 & 0x3fU);
+  }
+  if ((b0 & 0xf0U) == 0xe0U && offset + 2U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    const auto b2 = static_cast<unsigned char>(text[offset + 2U]);
+    offset += 3U;
+    return (static_cast<char32_t>(b0 & 0x0fU) << 12U) |
+           (static_cast<char32_t>(b1 & 0x3fU) << 6U) |
+           static_cast<char32_t>(b2 & 0x3fU);
+  }
+  if ((b0 & 0xf8U) == 0xf0U && offset + 3U < text.size()) {
+    const auto b1 = static_cast<unsigned char>(text[offset + 1U]);
+    const auto b2 = static_cast<unsigned char>(text[offset + 2U]);
+    const auto b3 = static_cast<unsigned char>(text[offset + 3U]);
+    offset += 4U;
+    return (static_cast<char32_t>(b0 & 0x07U) << 18U) |
+           (static_cast<char32_t>(b1 & 0x3fU) << 12U) |
+           (static_cast<char32_t>(b2 & 0x3fU) << 6U) |
+           static_cast<char32_t>(b3 & 0x3fU);
+  }
+  offset = text.size();
+  return 0x110000U;
+}
+
+bool is_forbidden_socket_scalar_tui(char32_t cp) noexcept {
+  if (cp < 0x20U || (cp >= 0x7fU && cp <= 0x9fU) || cp > 0x10ffffU)
+    return true;
+  return (cp >= 0x202aU && cp <= 0x202eU) || (cp >= 0x2066U && cp <= 0x2069U) ||
+         cp == 0x200eU || cp == 0x200fU || cp == 0x061cU || cp == 0xfeffU;
+}
+
+bool valid_party_lobby_socket_env(std::string_view raw) noexcept {
+  if (raw.empty() || !valid_utf8(raw))
+    return false;
+  std::size_t i = 0;
+  while (i < raw.size()) {
+    const char32_t cp = decode_utf8_scalar_tui(raw, i);
+    if (is_forbidden_socket_scalar_tui(cp))
+      return false;
+  }
+  const std::filesystem::path candidate{raw};
+  if (candidate.filename().empty() || candidate.filename() == ".")
+    return false;
+  for (const auto &comp : candidate) {
+    if (comp == "..")
+      return false;
+  }
+  return true;
+}
+
+enum class PartyLobbyConnectState : std::uint8_t {
+  connected,
+  not_running,
+  invalid_env,
+};
+
+struct PartyLobbyProbe {
+  PartyLobbyConnectState state = PartyLobbyConnectState::not_running;
+  std::optional<PartyLobbyClient> client;
+};
+
+constexpr std::string_view kInvalidPartySocketEnvMsg =
+    "Party command failed: invalid BLACKBIRD_PARTY_SOCKET (traversal or forbidden "
+    "control characters rejected)\n";
+
+PartyLobbyProbe probe_party_lobby() {
+  PartyLobbyProbe out{};
+  if (const char *env_sock = std::getenv("BLACKBIRD_PARTY_SOCKET");
+      env_sock != nullptr && env_sock[0] != '\0') {
+    if (!valid_party_lobby_socket_env(env_sock)) {
+      out.state = PartyLobbyConnectState::invalid_env;
+      return out;
+    }
+    auto client = PartyLobbyClient::connect(std::filesystem::path{env_sock});
+    if (client.has_value()) {
+      out.state = PartyLobbyConnectState::connected;
+      out.client.emplace(std::move(client).value());
+    }
+    return out;
+  }
+  auto client = PartyLobbyClient::connect(default_party_socket_path());
+  if (client.has_value()) {
+    out.state = PartyLobbyConnectState::connected;
+    out.client.emplace(std::move(client).value());
+  }
+  return out;
+}
+
+std::string safe_party_lobby_alias(std::string_view actor) {
+  if (valid_party_alias(actor) && valid_peer_alias(actor))
+    return std::string{actor};
+  return "operator";
+}
+
+struct LocalLobbyLeaseParams {
+  std::string room_id;
+  std::string actor;
+};
+
+struct SignedLocalLeaseOutcome {
+  std::optional<PartyLease> lease;
+  std::string error_reason;
+};
+
+SignedLocalLeaseOutcome sign_local_lobby_lease(PartyLobbyClient &lobby,
+                                               const PeerIdentityStore &identity,
+                                               const LocalLobbyLeaseParams &params) {
+  SignedLocalLeaseOutcome out;
+  std::uint64_t rev_epoch = 0;
+  if (auto refreshed = lobby.refresh_revocations(); refreshed.has_value()) {
+    rev_epoch = refreshed.value();
+  } else if (auto pong = lobby.ping(); pong.has_value()) {
+    rev_epoch = pong.value().revocation_epoch;
+  } else {
+    out.error_reason = std::string{error_name(pong.error().code)};
+    return out;
+  }
+  const std::int64_t now_ns = party_wall_now_ns();
+  if (now_ns > std::numeric_limits<std::int64_t>::max() - kPartyLobbyDefaultTtlNs) {
+    out.error_reason = "clock overflow";
+    return out;
+  }
+  static std::atomic<std::uint64_t> last_lobby_lease_seq{0};
+  const auto now_seq = static_cast<std::uint64_t>(now_ns);
+  std::uint64_t lease_seq = last_lobby_lease_seq.load(std::memory_order_relaxed);
+  for (;;) {
+    const std::uint64_t next = (now_seq > lease_seq) ? now_seq : (lease_seq + 1U);
+    if (last_lobby_lease_seq.compare_exchange_weak(lease_seq, next,
+                                                   std::memory_order_relaxed)) {
+      lease_seq = next;
+      break;
+    }
+  }
+  PartyLease draft{};
+  draft.room_id = params.room_id;
+  draft.alias = safe_party_lobby_alias(params.actor);
+  draft.role = PartyMemberRole::operator_human;
+  draft.host = default_local_hostname();
+  draft.issued_ns = now_ns;
+  draft.expires_ns = now_ns + kPartyLobbyDefaultTtlNs;
+  draft.lease_seq = lease_seq;
+  draft.revocation_epoch = rev_epoch;
+  auto signed_lease = sign_party_lease(identity, std::move(draft));
+  if (!signed_lease.has_value()) {
+    out.error_reason = std::string{error_name(signed_lease.error().code)};
+    return out;
+  }
+  out.lease.emplace(std::move(signed_lease).value());
+  return out;
+}
+
+struct LocalIdentityProbe {
+  std::optional<PeerIdentityStore> store;
+  std::string error_reason;
+};
+
+LocalIdentityProbe try_open_existing_local_identity() {
+  LocalIdentityProbe out;
+  const auto peers_dir = resolve_peers_dir_from_home();
+  if (!peers_dir.has_value()) {
+    out.error_reason = "HOME is not set";
+    return out;
+  }
+  std::error_code pec;
+  const auto st = std::filesystem::symlink_status(*peers_dir, pec);
+  if (pec || std::filesystem::is_symlink(st) || !std::filesystem::is_directory(st)) {
+    out.error_reason =
+        "no peer identity found (run `blackbird peer init` first; never creates keys)";
+    return out;
+  }
+  const auto key_st = std::filesystem::symlink_status(*peers_dir / "id_ed25519", pec);
+  if (pec || std::filesystem::is_symlink(key_st) ||
+      !std::filesystem::is_regular_file(key_st)) {
+    out.error_reason =
+        "no peer identity found (run `blackbird peer init` first; never creates keys)";
+    return out;
+  }
+  const auto pub_st =
+      std::filesystem::symlink_status(*peers_dir / "id_ed25519.pub", pec);
+  if (pec || std::filesystem::is_symlink(pub_st) ||
+      !std::filesystem::is_regular_file(pub_st)) {
+    out.error_reason =
+        "no peer identity found (run `blackbird peer init` first; never creates keys)";
+    return out;
+  }
+  auto identity_res = PeerIdentityStore::open_existing(*peers_dir);
+  if (!identity_res.has_value()) {
+    out.error_reason = "peer identity unavailable (" +
+                       std::string{error_name(identity_res.error().code)} + ")";
+    return out;
+  }
+  out.store.emplace(std::move(identity_res).value());
+  return out;
+}
+
+KnownPeersReadResult read_lobby_friends_if_available(PartyLobbyClient &lobby) {
+  KnownPeersReadResult out;
+  auto friends_res = lobby.list_friends();
+  if (!friends_res.has_value()) {
+    out.error = friends_res.error();
+    return out;
+  }
+  out.peers = std::move(friends_res).value();
+  auto snap_res = lobby.snapshot();
+  out.store_present = !out.peers.empty() ||
+                      (snap_res.has_value() && snap_res.value().known_peers_present);
+  return out;
+}
+
 std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx) {
   const auto root = resolve_project_root(ctx);
   const auto party_config_path = resolve_party_config_path(ctx);
@@ -1936,15 +2165,28 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   if (sub == "peers") {
     if (!rest.empty())
       return "Usage: /party peers\n";
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      return format_pinned_peers_list(read_lobby_friends_if_available(*lobby.client),
+                                      false);
+    }
     return format_pinned_peers_list(read_known_peers_if_present(), false);
   }
 
   // /party add [<alias> [role=leader|operator] [ssh=user@host]]
   if (sub == "add") {
-    if (rest.empty())
+    if (rest.empty()) {
+      auto lobby = probe_party_lobby();
+      if (lobby.state == PartyLobbyConnectState::invalid_env)
+        return std::string{kInvalidPartySocketEnvMsg};
+      if (lobby.client.has_value()) {
+        return format_pinned_peers_list(read_lobby_friends_if_available(*lobby.client),
+                                        true);
+      }
       return format_pinned_peers_list(read_known_peers_if_present(), true);
-    if (party_config_path.empty())
-      return "Party add failed: HOME or BLACKBIRD_HOME is not set\n";
+    }
     const auto [alias_tok, opt_rest] = split_first_token(rest);
     if (!valid_party_alias(alias_tok)) {
       return "Invalid party alias: '" + sanitize_inline(alias_tok, 48) + "'\n";
@@ -1995,6 +2237,44 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       }
       rem = next;
     }
+
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      auto snap_res = lobby.client->snapshot();
+      if (!snap_res.has_value()) {
+        return "Party add failed (live lobby): " +
+               std::string{error_name(snap_res.error().code)} + "\n";
+      }
+      const std::string &room = snap_res.value().room_scope;
+      if (room.empty()) {
+        return "Party add failed (live lobby): no active room (run `/party create "
+               "[room]` first)\n";
+      }
+      auto invited = lobby.client->invite_friend(room, alias_tok);
+      if (!invited.has_value()) {
+        if (invited.error().code == ErrorCode::invalid_identity) {
+          return "Party add failed (live lobby): peer @" +
+                 sanitize_inline(alias_tok, 48) +
+                 " is not pinned or is revoked (run `blackbird peer pin` first)\n";
+        }
+        return "Party add failed (live lobby): " +
+               std::string{error_name(invited.error().code)} + "\n";
+      }
+      const PartyParticipant &p = invited.value();
+      std::string out = "Added party participant @" + sanitize_inline(p.id, 48) + " [" +
+                        std::string{party_member_role_name(p.role)} + "]";
+      if (p.ssh_target.has_value() && !p.ssh_target->empty())
+        out += " ssh=" + sanitize_inline(*p.ssh_target, 64);
+      if (!p.fingerprint.empty())
+        out += " pinned=" + sanitize_inline(p.fingerprint, 48);
+      out += " in room " + sanitize_inline(room, 64) + " (live in-RAM lobby)\n";
+      return out;
+    }
+
+    if (party_config_path.empty())
+      return "Party add failed: HOME or BLACKBIRD_HOME is not set\n";
 
     PartyRosterPeerConfig entry{};
     entry.alias = std::string{alias_tok};
@@ -2065,6 +2345,20 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     else if (sub == "conflicts")
       filter = PartyMessageFilter::conflicts;
 
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      auto snap_res = lobby.client->snapshot();
+      if (!snap_res.has_value()) {
+        return "Party Chat unavailable (live lobby): " +
+               std::string{error_name(snap_res.error().code)} + "\n";
+      }
+      PartyChatPane pane{std::move(snap_res).value()};
+      pane.set_filter(filter);
+      return pane.render(100, 24);
+    }
+
     const PartyConfig cfg = make_passive_party_config(ctx);
     auto snap_res = load_party_snapshot(cfg);
     if (!snap_res.has_value()) {
@@ -2080,6 +2374,86 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   if (sub == "say") {
     if (rest.empty())
       return "Usage: /party say [@all|@alias ...] <message>\n";
+
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      auto snap_res = lobby.client->snapshot();
+      if (!snap_res.has_value()) {
+        return "Party Chat unavailable (live lobby): " +
+               std::string{error_name(snap_res.error().code)} + "\n";
+      }
+      const PartySnapshot &snap = snap_res.value();
+      if (snap.room_scope.empty()) {
+        return "Party say failed (live lobby): no active room (run `/party create "
+               "[room]` first)\n";
+      }
+      auto parsed_res = parse_party_input(rest, snap);
+      if (!parsed_res.has_value())
+        return "Usage: /party say [@all|@alias ...] <message>\n";
+      const ParsedPartyInput &parsed = parsed_res.value();
+
+      std::string sender_alias = safe_party_lobby_alias(ctx.actor);
+      for (const auto &p : snap.participants) {
+        if (p.local_self && valid_party_alias(p.id)) {
+          sender_alias = p.id;
+          break;
+        }
+      }
+      auto seq_res =
+          lobby.client->post_message(snap.room_scope, sender_alias, parsed.target_label,
+                                     parsed.body, PartyMessageKind::chat);
+      if (!seq_res.has_value()) {
+        return "Party say failed (live lobby): " +
+               std::string{error_name(seq_res.error().code)} + "\n";
+      }
+
+      std::string out = "Party posted #" + std::to_string(seq_res.value()) + " [" +
+                        sanitize_inline(sender_alias, 48) + " -> " +
+                        sanitize_inline(parsed.target_label, 64) + "]: " +
+                        quote_untrusted_peer_text(parsed.body, kMaxPreviewBytes) + "\n";
+      if (!parsed.resolved_targets.empty()) {
+        out += "  Routed: ";
+        for (std::size_t i = 0; i < parsed.resolved_targets.size(); ++i) {
+          if (i > 0)
+            out += ", ";
+          out += "@" + sanitize_inline(parsed.resolved_targets[i], 48);
+        }
+        out += '\n';
+      }
+      std::vector<std::string> remote_hints;
+      for (const auto &target_id : parsed.resolved_targets) {
+        for (const auto &p : snap.participants) {
+          if (party_eq_ci(p.id, target_id) && p.ssh_target.has_value() &&
+              !p.ssh_target->empty()) {
+            remote_hints.push_back("@" + sanitize_inline(p.id, 48) + " (" +
+                                   sanitize_inline(*p.ssh_target, 64) + ")");
+            break;
+          }
+        }
+      }
+      if (!remote_hints.empty()) {
+        out += "  Remote peer(s): ";
+        for (std::size_t i = 0; i < remote_hints.size(); ++i) {
+          if (i > 0)
+            out += ", ";
+          out += remote_hints[i];
+        }
+        out += " (use `blackbird party say` or bridge sync for remote delivery)\n";
+      }
+      if (parsed.has_unknown_targets()) {
+        out += "  Unknown target(s): ";
+        for (std::size_t i = 0; i < parsed.unknown_targets.size(); ++i) {
+          if (i > 0)
+            out += ", ";
+          out += "@" + sanitize_inline(parsed.unknown_targets[i], 48);
+        }
+        out += '\n';
+      }
+      return out;
+    }
+
     const PartyConfig cfg = make_passive_party_config(ctx);
     auto snap_res = load_party_snapshot(cfg);
     if (!snap_res.has_value()) {
@@ -2176,12 +2550,36 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     const auto [room_tok, extra] = split_first_token(rest);
     if (!extra.empty())
       return "Usage: /party create [room]\n";
-    if (party_config_path.empty())
-      return "Party create failed: HOME or BLACKBIRD_HOME is not set\n";
     const std::string room =
         room_tok.empty() ? default_party_room_name(root) : std::string{room_tok};
     if (is_solo_party_scope(room))
       return "Invalid party room name: '" + sanitize_inline(room, 64) + "'\n";
+
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      if (!valid_party_room_id(room))
+        return "Invalid party room name: '" + sanitize_inline(room, 64) + "'\n";
+      auto id_probe = try_open_existing_local_identity();
+      if (!id_probe.store.has_value())
+        return "Party create failed (live lobby): " + id_probe.error_reason + "\n";
+      auto signed_lease = sign_local_lobby_lease(
+          *lobby.client, *id_probe.store, LocalLobbyLeaseParams{room, ctx.actor});
+      if (!signed_lease.lease.has_value()) {
+        return "Party create failed (live lobby): " + signed_lease.error_reason + "\n";
+      }
+      auto created = lobby.client->create_room(room, *signed_lease.lease);
+      if (!created.has_value()) {
+        return "Party create failed (live lobby): " +
+               std::string{error_name(created.error().code)} + "\n";
+      }
+      return "Party room active: " + sanitize_inline(created.value().room_scope, 128) +
+             " (live in-RAM lobby; Alt+P opens Party Chat)\n";
+    }
+
+    if (party_config_path.empty())
+      return "Party create failed: HOME or BLACKBIRD_HOME is not set\n";
     auto roster_res = load_or_default_party_roster(party_config_path);
     if (!roster_res.has_value()) {
       return "Party config unreadable: " +
@@ -2220,9 +2618,11 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       }
     }
 
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+
     if (target.starts_with("bbjoin1:")) {
-      if (party_config_path.empty())
-        return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
       const std::int64_t now_ns = party_wall_now_ns();
       auto parsed_res = parse_room_invite(target, now_ns);
       if (!parsed_res.has_value()) {
@@ -2239,6 +2639,12 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
         return "Party join failed: invalid alias '" +
                sanitize_inline(creator_alias, 48) + "'\n";
       }
+      if (lobby.client.has_value() && !valid_party_room_id(invite.room_id)) {
+        return "Party join failed (live lobby): invalid room name '" +
+               sanitize_inline(invite.room_id, 64) + "'\n";
+      }
+      if (!lobby.client.has_value() && party_config_path.empty())
+        return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
       const auto peers_dir = resolve_peers_dir_from_home();
       if (!peers_dir.has_value())
         return "Party join failed: HOME is not set\n";
@@ -2260,6 +2666,32 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
         }
         return "Party join failed: " + std::string{error_name(pin_res.error().code)} +
                "\n";
+      }
+
+      if (lobby.client.has_value()) {
+        auto id_probe = try_open_existing_local_identity();
+        if (!id_probe.store.has_value())
+          return "Party join failed (live lobby): " + id_probe.error_reason + "\n";
+        auto signed_lease =
+            sign_local_lobby_lease(*lobby.client, *id_probe.store,
+                                   LocalLobbyLeaseParams{invite.room_id, ctx.actor});
+        if (!signed_lease.lease.has_value()) {
+          return "Party join failed (live lobby): " + signed_lease.error_reason + "\n";
+        }
+        auto joined = lobby.client->join_room(invite.room_id, *signed_lease.lease);
+        if (!joined.has_value() && joined.error().code == ErrorCode::stale_handle) {
+          joined = lobby.client->create_room(invite.room_id, *signed_lease.lease);
+        }
+        if (!joined.has_value()) {
+          return "Party join failed (live lobby): " +
+                 std::string{error_name(joined.error().code)} + "\n";
+        }
+        if (invite.creator_fingerprint != id_probe.store->identity().fingerprint)
+          (void)lobby.client->invite_friend(invite.room_id, creator_alias);
+        return "Joined party room '" + sanitize_inline(invite.room_id, 128) +
+               "' (pinned creator @" + sanitize_inline(creator_alias, 48) + " [" +
+               sanitize_inline(invite.creator_fingerprint, 64) + "] via " +
+               sanitize_inline(invite.relay_url, 128) + "; live in-RAM lobby)\n";
       }
 
       auto roster_res = load_or_default_party_roster(party_config_path);
@@ -2298,14 +2730,39 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     }
 
     // Plain room join/switch.
-    if (party_config_path.empty())
-      return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
     if (is_solo_party_scope(target))
       return "Invalid party room name: '" + sanitize_inline(target, 64) + "'\n";
     if (explicit_alias.has_value()) {
       return "Usage: /party join <bbjoin1:...> --alias <name> (--alias is only valid "
              "with bbjoin1: invites)\n";
     }
+    if (lobby.client.has_value()) {
+      if (!valid_party_room_id(target))
+        return "Invalid party room name: '" + sanitize_inline(target, 64) + "'\n";
+      auto id_probe = try_open_existing_local_identity();
+      if (!id_probe.store.has_value())
+        return "Party join failed (live lobby): " + id_probe.error_reason + "\n";
+      auto signed_lease =
+          sign_local_lobby_lease(*lobby.client, *id_probe.store,
+                                 LocalLobbyLeaseParams{std::string{target}, ctx.actor});
+      if (!signed_lease.lease.has_value()) {
+        return "Party join failed (live lobby): " + signed_lease.error_reason + "\n";
+      }
+      auto joined = lobby.client->join_room(target, *signed_lease.lease);
+      if (!joined.has_value()) {
+        if (joined.error().code == ErrorCode::stale_handle) {
+          return "Party join failed (live lobby): room '" +
+                 sanitize_inline(target, 128) +
+                 "' not found (run `/party create` first)\n";
+        }
+        return "Party join failed (live lobby): " +
+               std::string{error_name(joined.error().code)} + "\n";
+      }
+      return "Joined party room: " + sanitize_inline(joined.value().room_scope, 128) +
+             " (live in-RAM lobby)\n";
+    }
+    if (party_config_path.empty())
+      return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
     auto roster_res = load_or_default_party_roster(party_config_path);
     if (!roster_res.has_value()) {
       return "Party config unreadable: " +
@@ -2330,7 +2787,18 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       return "Usage: /party invite [relay_url]\n";
 
     std::string room_scope = default_party_room_name(root);
-    {
+    bool got_live_room = false;
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      if (auto snap_res = lobby.client->snapshot();
+          snap_res.has_value() && !snap_res.value().room_scope.empty()) {
+        room_scope = snap_res.value().room_scope;
+        got_live_room = true;
+      }
+    }
+    if (!got_live_room) {
       auto roster_res = load_or_default_party_roster(party_config_path);
       if (!roster_res.has_value()) {
         return "Party config unreadable: " +
@@ -2346,33 +2814,9 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       }
     }
 
-    const auto peers_dir = resolve_peers_dir_from_home();
-    if (!peers_dir.has_value())
-      return "Party invite failed: HOME is not set\n";
-    std::error_code pec;
-    const auto st = std::filesystem::symlink_status(*peers_dir, pec);
-    if (pec || std::filesystem::is_symlink(st) || !std::filesystem::is_directory(st)) {
-      return "Party invite failed: no peer identity found (run `blackbird peer init` "
-             "first; invite never creates keys)\n";
-    }
-    const auto key_st = std::filesystem::symlink_status(*peers_dir / "id_ed25519", pec);
-    if (pec || std::filesystem::is_symlink(key_st) ||
-        !std::filesystem::is_regular_file(key_st)) {
-      return "Party invite failed: no peer identity found (run `blackbird peer init` "
-             "first; invite never creates keys)\n";
-    }
-    const auto pub_st =
-        std::filesystem::symlink_status(*peers_dir / "id_ed25519.pub", pec);
-    if (pec || std::filesystem::is_symlink(pub_st) ||
-        !std::filesystem::is_regular_file(pub_st)) {
-      return "Party invite failed: no peer identity found (run `blackbird peer init` "
-             "first; invite never creates keys)\n";
-    }
-    auto identity_res = PeerIdentityStore::open_existing(*peers_dir);
-    if (!identity_res.has_value()) {
-      return "Party invite failed: peer identity unavailable (" +
-             std::string{error_name(identity_res.error().code)} + ")\n";
-    }
+    auto id_probe = try_open_existing_local_identity();
+    if (!id_probe.store.has_value())
+      return "Party invite failed: " + id_probe.error_reason + "\n";
 
     const std::string local_host = default_local_hostname();
     const std::string ssh_hint = "ssh://" + default_ssh_user() + "@" + local_host;
@@ -2400,8 +2844,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     RoomInvite invite;
     invite.room_id = normalize_invite_room_id(room_scope);
     invite.relay_url = std::move(relay_url);
-    invite.creator_fingerprint = identity_res.value().identity().fingerprint;
-    invite.creator_public_key = identity_res.value().identity().public_key;
+    invite.creator_fingerprint = id_probe.store->identity().fingerprint;
+    invite.creator_public_key = id_probe.store->identity().public_key;
     invite.invite_code = std::move(code_res).value();
     invite.expires_ns = now_ns + kInviteTtlNs;
 
@@ -2428,6 +2872,47 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   if (sub == "leave") {
     if (!rest.empty())
       return "Usage: /party leave\n";
+
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      auto snap_res = lobby.client->snapshot();
+      if (!snap_res.has_value()) {
+        return "Party leave failed (live lobby): " +
+               std::string{error_name(snap_res.error().code)} + "\n";
+      }
+      const PartySnapshot &snap = snap_res.value();
+      if (snap.room_scope.empty()) {
+        return "Left party (already in solo mode; history and pinned peers "
+               "untouched).\n";
+      }
+      std::string local_fp;
+      for (const auto &p : snap.participants) {
+        if (p.local_self && !p.fingerprint.empty()) {
+          local_fp = p.fingerprint;
+          break;
+        }
+      }
+      if (local_fp.empty()) {
+        if (const auto loaded_fp = try_load_local_peer_fingerprint();
+            loaded_fp.has_value()) {
+          local_fp = *loaded_fp;
+        }
+      }
+      if (local_fp.empty()) {
+        return "Party leave failed (live lobby): local peer fingerprint unavailable\n";
+      }
+      auto left = lobby.client->leave_room(snap.room_scope, local_fp);
+      if (!left.has_value()) {
+        return "Party leave failed (live lobby): " +
+               std::string{error_name(left.error().code)} + "\n";
+      }
+      return "Left party room '" + sanitize_inline(snap.room_scope, 64) +
+             "' — returned to solo mode (live in-RAM lobby cleared; history and pinned "
+             "peers preserved).\n";
+    }
+
     if (party_config_path.empty())
       return "Left party (already in solo mode; history and pinned peers untouched).\n";
     std::error_code ec;
@@ -2464,6 +2949,35 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     const auto [alias, extra] = split_first_token(rest);
     if (alias.empty() || !extra.empty())
       return "Usage: /party remove <alias>\n";
+
+    auto lobby = probe_party_lobby();
+    if (lobby.state == PartyLobbyConnectState::invalid_env)
+      return std::string{kInvalidPartySocketEnvMsg};
+    if (lobby.client.has_value()) {
+      auto snap_res = lobby.client->snapshot();
+      if (!snap_res.has_value()) {
+        return "Party remove failed (live lobby): " +
+               std::string{error_name(snap_res.error().code)} + "\n";
+      }
+      if (snap_res.value().room_scope.empty()) {
+        return "Party participant not found: @" + sanitize_inline(alias, 48) +
+               " (solo mode)\n";
+      }
+      auto kicked = lobby.client->kick_member(snap_res.value().room_scope, alias);
+      if (!kicked.has_value()) {
+        if (kicked.error().code == ErrorCode::stale_handle) {
+          return "Party participant not found: @" + sanitize_inline(alias, 48) + "\n";
+        }
+        return "Party remove failed (live lobby): " +
+               std::string{error_name(kicked.error().code)} + "\n";
+      }
+      auto after = lobby.client->snapshot();
+      const std::size_t rem_count =
+          after.has_value() ? after.value().participants.size() : 0U;
+      return "Removed party participant @" + sanitize_inline(alias, 48) +
+             " (remaining participants: " + std::to_string(rem_count) + ")\n";
+    }
+
     if (party_config_path.empty()) {
       return "Party participant not found: @" + sanitize_inline(alias, 48) +
              " (no party config)\n";

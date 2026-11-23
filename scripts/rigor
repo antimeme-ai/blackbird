@@ -89,7 +89,7 @@ def sources(extension):
         if Path(base) == ROOT:
             folders[:] = [name for name in folders if name not in excluded]
         else:
-            folders[:] = [name for name in folders if name != "__pycache__"]
+            folders[:] = [name for name in folders if name not in ("__pycache__", "target")]
         linked = [Path(base) / name for name in folders if (Path(base) / name).is_symlink()]
         if linked:
             raise RuntimeError(f"owned directory symlinks need an explicit source policy: {linked}")
