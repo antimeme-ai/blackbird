@@ -82,6 +82,62 @@ std::vector<std::uint8_t> to_bytes(std::string_view text) {
   return out;
 }
 
+std::vector<std::uint8_t> from_hex(std::string_view hex) {
+  require((hex.size() % 2U) == 0U, "from_hex even length");
+  const auto nibble = [](char ch) -> std::uint8_t {
+    if (ch >= '0' && ch <= '9') {
+      return static_cast<std::uint8_t>(ch - '0');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+      return static_cast<std::uint8_t>(10 + (ch - 'a'));
+    }
+    if (ch >= 'A' && ch <= 'F') {
+      return static_cast<std::uint8_t>(10 + (ch - 'A'));
+    }
+    require(false, "from_hex invalid hex digit");
+    return 0U;
+  };
+  std::vector<std::uint8_t> out;
+  out.reserve(hex.size() / 2U);
+  for (std::size_t i = 0U; i < hex.size(); i += 2U) {
+    const auto hi = nibble(hex[i]);
+    const auto lo = nibble(hex[i + 1U]);
+    out.push_back(static_cast<std::uint8_t>((hi << 4U) | lo));
+  }
+  return out;
+}
+
+std::string encode_base64(std::span<const std::uint8_t> bytes, bool url_safe_nopad) {
+  static constexpr char kStdAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  static constexpr char kUrlAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const char *alphabet = url_safe_nopad ? kUrlAlphabet : kStdAlphabet;
+  std::string out;
+  out.reserve(((bytes.size() + 2U) / 3U) * 4U);
+  for (std::size_t i = 0U; i < bytes.size(); i += 3U) {
+    const std::uint32_t b0 = bytes[i];
+    const bool has_b1 = (i + 1U) < bytes.size();
+    const bool has_b2 = (i + 2U) < bytes.size();
+    const std::uint32_t b1 = has_b1 ? bytes[i + 1U] : 0U;
+    const std::uint32_t b2 = has_b2 ? bytes[i + 2U] : 0U;
+    const std::uint32_t triple = (b0 << 16U) | (b1 << 8U) | b2;
+    out.push_back(alphabet[(triple >> 18U) & 0x3fU]);
+    out.push_back(alphabet[(triple >> 12U) & 0x3fU]);
+    if (has_b1) {
+      out.push_back(alphabet[(triple >> 6U) & 0x3fU]);
+    } else if (!url_safe_nopad) {
+      out.push_back('=');
+    }
+    if (has_b2) {
+      out.push_back(alphabet[triple & 0x3fU]);
+    } else if (!url_safe_nopad) {
+      out.push_back('=');
+    }
+  }
+  return out;
+}
+
 void test_safe_ids_and_handles() {
   g_stage = "safe_ids_and_handles";
 
@@ -1247,6 +1303,385 @@ void test_rust_mp_protocol_bit_exact_parity() {
           "RFC 9421 Ed25519 signature bit-exact Rust parity");
 }
 
+void test_official_multiplayer_site_test_vectors() {
+  g_stage = "official_multiplayer_site_test_vectors";
+
+  // Bit-exact verification of EVERY field in
+  // ../multiplayer_site/docs/TEST_VECTORS.json
+  // (schema: "multiplayer.tech/mp1-interop-vectors/v1").
+
+  // -------------------------------------------------------------------------
+  // 1. keys
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kRootSeedHex =
+      "1111111111111111111111111111111111111111111111111111111111111111";
+  static constexpr std::string_view kRootPubkeyHex =
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+  static constexpr std::string_view kRootPubkeyB64 =
+      "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=";
+  static constexpr std::string_view kRootPubkeySha256Hex =
+      "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d";
+  static constexpr std::string_view kDeviceSeedHex =
+      "2222222222222222222222222222222222222222222222222222222222222222";
+  static constexpr std::string_view kDevicePubkeyHex =
+      "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+  static constexpr std::string_view kDevicePubkeyB64 =
+      "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA=";
+
+  const auto root_seed_vec = from_hex(kRootSeedHex);
+  require(root_seed_vec.size() == 32U, "root_seed_hex 32 bytes");
+  Ed25519Seed root_seed{};
+  std::memcpy(root_seed.data(), root_seed_vec.data(), root_seed.size());
+  const auto root_sk = must(Ed25519SigningKey::from_seed(root_seed), "vector root_sk");
+  const Ed25519PubKey root_pk = root_sk.public_key();
+  require(hex_lower(root_pk) == kRootPubkeyHex, "root_pubkey_hex bit-exact");
+  require(encode_base64(root_pk, false) == kRootPubkeyB64, "root_pubkey_b64 bit-exact");
+  const auto root_pk_sha = must(sha256(root_pk), "root_pubkey sha256");
+  require(hex_lower(root_pk_sha) == kRootPubkeySha256Hex,
+          "root_pubkey_sha256_hex bit-exact");
+
+  const auto dev_seed_vec = from_hex(kDeviceSeedHex);
+  require(dev_seed_vec.size() == 32U, "device_seed_hex 32 bytes");
+  Ed25519Seed dev_seed{};
+  std::memcpy(dev_seed.data(), dev_seed_vec.data(), dev_seed.size());
+  const auto dev_sk = must(Ed25519SigningKey::from_seed(dev_seed), "vector dev_sk");
+  const Ed25519PubKey dev_pk = dev_sk.public_key();
+  require(hex_lower(dev_pk) == kDevicePubkeyHex, "device_pubkey_hex bit-exact");
+  require(encode_base64(dev_pk, false) == kDevicePubkeyB64,
+          "device_pubkey_b64 bit-exact");
+
+  // -------------------------------------------------------------------------
+  // 2. cwt_rfc8392_8747_9052_9864
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kProtectedHeaderHex = "a10132";
+  static constexpr std::int64_t kCwtIat = 1795430000;
+  static constexpr std::int64_t kCwtExp = 1795516400;
+  static constexpr std::string_view kCwtHex =
+      "d28443a10132a0587da4017840313062613638326338616431333531333937316538623536383831"
+      "61616238626437303262623830373739366563613831393332633733356139346436653664041a6b"
+      "0567f0061a6b04167008a101a4010103322006215820a09aa5f47a6759802ff955f8dc2d2a14a5c9"
+      "9d23be97f864127ff9383455a4f05840b20a888785f9231d828f91f597aa97bca878133b3c39940e"
+      "cf5b99ec925c4b39625b5c6387042a957f9d963ca64fa87675a79276e6eeecda917435fbc470130"
+      "a";
+  static constexpr std::string_view kCwtB64 =
+      "0oRDoQEyoFh9pAF4QDEwYmE2ODJjOGFkMTM1MTM5NzFlOGI1Njg4MWFhYjhiZDcwMmJiODA3Nzk2ZWNh"
+      "ODE5MzJjNzM1YTk0ZDZlNmQEGmsFZ/"
+      "AGGmsEFnAIoQGkAQEDMiAGIVggoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/"
+      "5ODRVpPBYQLIKiIeF+SMdgo+R9Zeql7yoeBM7PDmUDs9bmeySXEs5YltcY4cEKpV/"
+      "nZY8pk+odnWnknbm7uzakXQ1+8RwEwo=";
+
+  require(hex_lower(kProtectedHeaderEd25519) == kProtectedHeaderHex,
+          "CWT protected_header_hex bit-exact");
+  const auto cwt =
+      must(encode_device_cwt(root_sk, DeviceCwtMintRequest{dev_pk, kCwtIat, kCwtExp}),
+           "vector encode_device_cwt");
+  require(hex_lower(cwt) == kCwtHex, "cwt_hex bit-exact");
+  require(encode_base64(cwt, false) == kCwtB64, "cwt_b64 bit-exact");
+
+  const auto cwt_from_vector = from_hex(kCwtHex);
+  const auto cwt_claims = must(verify_device_cwt(DeviceCwtVerifyRequest{
+                                   cwt_from_vector, root_pk, dev_pk, kCwtIat + 10}),
+                               "verify_device_cwt succeeds at iat + 10");
+  require(cwt_claims.iss == kRootPubkeySha256Hex, "cwt_claims.iss exact");
+  require(cwt_claims.iat == kCwtIat, "cwt_claims.iat exact");
+  require(cwt_claims.exp == kCwtExp, "cwt_claims.exp exact");
+  require(cwt_claims.device_pubkey == dev_pk, "cwt_claims.device_pubkey exact");
+
+  expect_err(verify_device_cwt(
+                 DeviceCwtVerifyRequest{cwt_from_vector, root_pk, dev_pk, kCwtExp}),
+             MpError::cwt_expired, "verify_device_cwt fails at exact exp");
+
+  // -------------------------------------------------------------------------
+  // 3. rfc9421_post
+  // -------------------------------------------------------------------------
+  const auto acct_1001 = must(AccountId::create(1001U), "acct 1001");
+  const auto dev_2002 = must(DeviceId::create(2002U), "dev 2002");
+  const KeyId vec_keyid = DeviceKeyId{acct_1001, dev_2002};
+  static constexpr std::string_view kVecNonce = "TestVectorNonce_0123456789";
+  static constexpr std::int64_t kSigCreated = 1795430000;
+  static constexpr std::int64_t kSigExpires = 1795430060;
+
+  static constexpr std::string_view kPostBodyUtf8 =
+      R"({"visibility":1,"join_mode":0,"relay_policy":1,"max_members":4})";
+  static constexpr std::string_view kPostContentDigest =
+      "sha-256=:CTtRXZLZ2jZoHv2drxk62oLpXDmmq2jn8kkFuvucCy4=:";
+  static constexpr std::string_view kPostSigInput =
+      R"(mp1=("@method" "@authority" "@path" "@query" "content-type" "content-digest");created=1795430000;expires=1795430060;nonce="TestVectorNonce_0123456789";keyid="1001.2002";alg="ed25519";tag="mp1")";
+  static constexpr std::string_view kPostSigBaseUtf8 =
+      "\"@method\": POST\n"
+      "\"@authority\": api.multiplayer.tech\n"
+      "\"@path\": /v1/parties\n"
+      "\"@query\": ?\n"
+      "\"content-type\": application/json\n"
+      "\"content-digest\": sha-256=:CTtRXZLZ2jZoHv2drxk62oLpXDmmq2jn8kkFuvucCy4=:\n"
+      "\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"@query\" "
+      "\"content-type\" "
+      "\"content-digest\");created=1795430000;expires=1795430060;nonce="
+      "\"TestVectorNonce_0123456789\";keyid=\"1001.2002\";alg=\"ed25519\";tag=\"mp1\"";
+  static constexpr std::string_view kPostSignature =
+      "mp1=:"
+      "obnKgHzwjYrBahN4ajTDHCChV+TrAafRv30dGlAe3yrMBDBclS2yQFA7ZlIkFy1KRjJ2hsBxGGoN3SUs"
+      "ZN6nDw==:";
+
+  const auto post_body = to_bytes(kPostBodyUtf8);
+  const auto signed_post = must(sign_rfc9421_request(dev_sk,
+                                                     Rfc9421SignRequest{
+                                                         HttpMethod::post,
+                                                         "api.multiplayer.tech",
+                                                         "/v1/parties",
+                                                         "?",
+                                                         "application/json",
+                                                         post_body,
+                                                         vec_keyid,
+                                                         kSigCreated,
+                                                         kSigExpires,
+                                                         kVecNonce,
+                                                     }),
+                                "vector sign rfc9421_post");
+  require(must_opt(signed_post.content_digest, "post content_digest") ==
+              kPostContentDigest,
+          "rfc9421_post content_digest bit-exact");
+  require(signed_post.signature_input == kPostSigInput,
+          "rfc9421_post signature_input bit-exact");
+  require(signed_post.signature_base == to_bytes(kPostSigBaseUtf8),
+          "rfc9421_post signature_base_utf8 bit-exact");
+  require(signed_post.signature == kPostSignature, "rfc9421_post signature bit-exact");
+
+  const Rfc9421Request post_req{
+      HttpMethod::post,   "api.multiplayer.tech", "/v1/parties", "?",
+      "application/json", kPostContentDigest,     false,         post_body,
+      kPostSigInput,      kPostSignature,
+  };
+  const auto verified_post =
+      must(verify_rfc9421_request(
+               {post_req, "api.multiplayer.tech", dev_pk, kSigCreated + 10}),
+           "vector verify rfc9421_post");
+  require(verified_post.keyid == vec_keyid, "verified_post keyid");
+  require(verified_post.nonce == kVecNonce, "verified_post nonce");
+  require(verified_post.created == kSigCreated, "verified_post created");
+  require(verified_post.expires == kSigExpires, "verified_post expires");
+
+  // -------------------------------------------------------------------------
+  // 4. rfc9421_get_query
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kGetSigInput =
+      R"(mp1=("@method" "@authority" "@path" "@query");created=1795430000;expires=1795430060;nonce="TestVectorNonce_0123456789";keyid="1001.2002";alg="ed25519";tag="mp1")";
+  static constexpr std::string_view kGetSigBaseUtf8 =
+      "\"@method\": GET\n"
+      "\"@authority\": api.multiplayer.tech\n"
+      "\"@path\": /v1/accounts/resolve\n"
+      "\"@query\": ?handle=patrick\n"
+      "\"@signature-params\": (\"@method\" \"@authority\" \"@path\" "
+      "\"@query\");created=1795430000;expires=1795430060;nonce="
+      "\"TestVectorNonce_0123456789\";keyid=\"1001.2002\";alg=\"ed25519\";tag=\"mp1\"";
+  static constexpr std::string_view kGetSignature =
+      "mp1=:"
+      "ECNkruW957tQidzvYxPzgZra6s5J97WrI+UawuBOiLU4Qj9zlyaf2BPsKdAwk8Kb3+FGesXMd1qLHQbC"
+      "U0ytDA==:";
+
+  const auto signed_get = must(sign_rfc9421_request(dev_sk,
+                                                    Rfc9421SignRequest{
+                                                        HttpMethod::get,
+                                                        "api.multiplayer.tech",
+                                                        "/v1/accounts/resolve",
+                                                        "?handle=patrick",
+                                                        std::nullopt,
+                                                        {},
+                                                        vec_keyid,
+                                                        kSigCreated,
+                                                        kSigExpires,
+                                                        kVecNonce,
+                                                    }),
+                               "vector sign rfc9421_get_query");
+  require(!signed_get.content_digest.has_value(),
+          "rfc9421_get_query has no content_digest");
+  require(signed_get.signature_input == kGetSigInput,
+          "rfc9421_get_query signature_input bit-exact");
+  require(signed_get.signature_base == to_bytes(kGetSigBaseUtf8),
+          "rfc9421_get_query signature_base_utf8 bit-exact");
+  require(signed_get.signature == kGetSignature,
+          "rfc9421_get_query signature bit-exact");
+
+  const Rfc9421Request get_req{
+      HttpMethod::get,
+      "api.multiplayer.tech",
+      "/v1/accounts/resolve",
+      "?handle=patrick",
+      std::nullopt,
+      std::nullopt,
+      false,
+      {},
+      kGetSigInput,
+      kGetSignature,
+  };
+  const auto verified_get =
+      must(verify_rfc9421_request(
+               {get_req, "api.multiplayer.tech", dev_pk, kSigCreated + 10}),
+           "vector verify rfc9421_get_query");
+  require(verified_get.keyid == vec_keyid, "verified_get keyid");
+  require(verified_get.nonce == kVecNonce, "verified_get nonce");
+
+  // -------------------------------------------------------------------------
+  // 5. endpoint_descriptors
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kEpForceRelaysIrohHex =
+      "011e0068747470733a2f2f72656c61792e6d756c7469706c617965722e7465636800";
+  static constexpr std::string_view kEpNoRelaysLanV4Hex = "02000001040a00002a5422";
+
+  const EndpointDescriptor ep_force{
+      TransportKind::iroh_quic,
+      "https://relay.multiplayer.tech",
+      {},
+  };
+  const auto ep_force_enc = must(ep_force.encode(), "encode force_relays_iroh");
+  require(hex_lower(ep_force_enc) == kEpForceRelaysIrohHex,
+          "force_relays_iroh_hex encode bit-exact");
+  const auto ep_force_dec =
+      must(EndpointDescriptor::decode(from_hex(kEpForceRelaysIrohHex)),
+           "decode force_relays_iroh");
+  require(ep_force_dec == ep_force, "force_relays_iroh_hex decode exact");
+  must_void(ep_force_dec.validate_against_policy(RelayPolicy::force_relays,
+                                                 "https://relay.multiplayer.tech"),
+            "force_relays_iroh policy valid");
+
+  const EndpointDescriptor ep_lan{
+      TransportKind::direct_quic,
+      "",
+      {DirectAddrV4{{10U, 0U, 0U, 42U}, 8788U}},
+  };
+  const auto ep_lan_enc = must(ep_lan.encode(), "encode no_relays_lan_v4");
+  require(hex_lower(ep_lan_enc) == kEpNoRelaysLanV4Hex,
+          "no_relays_lan_v4_hex encode bit-exact");
+  const auto ep_lan_dec =
+      must(EndpointDescriptor::decode(from_hex(kEpNoRelaysLanV4Hex)),
+           "decode no_relays_lan_v4");
+  require(ep_lan_dec == ep_lan, "no_relays_lan_v4_hex decode exact");
+  must_void(ep_lan_dec.validate_against_policy(RelayPolicy::no_relays, ""),
+            "no_relays_lan_v4 policy valid");
+
+  // -------------------------------------------------------------------------
+  // 6. mp1_frames
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kHelloAckHex =
+      "010001000000000000000000140000000903000000000000fba5f707a2010000204e0000";
+  static constexpr std::string_view kPresenceSetHex =
+      "010001010000000001000000020000000101";
+  static constexpr std::string_view kPartyEndpointUpdateHex =
+      "01000302000000000200000022000000011e0068747470733a2f2f72656c61792e6d756c7469706c"
+      "617965722e7465636800";
+  static constexpr std::string_view kPartySnapshot1MemberHex =
+      "0100010200000000000000008c01000089130000000000000100000000000000e903000000000000"
+      "d207000000000000010101041e0068747470733a2f2f72656c61792e6d756c7469706c617965722e"
+      "7465636801d207000000000000e903000000000000d04ab232742bb4ab3a1368bd4615e4e6d0224a"
+      "b71a016baf8520a332c9778737a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9"
+      "383455a4f0c800d28443a10132a0587da40178403130626136383263386164313335313339373165"
+      "38623536383831616162386264373032626238303737393665636138313933326337333561393464"
+      "36653664041a6b0567f0061a6b04167008a101a4010103322006215820a09aa5f47a6759802ff955"
+      "f8dc2d2a14a5c99d23be97f864127ff9383455a4f05840b20a888785f9231d828f91f597aa97bca8"
+      "78133b3c39940ecf5b99ec925c4b39625b5c6387042a957f9d963ca64fa87675a79276e6eeecda91"
+      "7435fbc470130a2200011e0068747470733a2f2f72656c61792e6d756c7469706c617965722e7465"
+      "636800010000000000000001";
+
+  // 6a. HELLO_ACK
+  const Mp1Message hello_msg = HelloAckMessage{
+      must(SessionId::create(777U), "sess 777"), 1795430000123ULL, 20000U};
+  const auto hello_enc = must(encode_frame(0U, hello_msg), "encode hello_ack");
+  require(hex_lower(hello_enc) == kHelloAckHex, "hello_ack_hex encode bit-exact");
+  const auto hello_dec = must(decode_frame(from_hex(kHelloAckHex)), "decode hello_ack");
+  require(hello_dec.header.opcode == Opcode::hello_ack && hello_dec.header.seq == 0U &&
+              hello_dec.message == hello_msg,
+          "hello_ack_hex decode exact");
+
+  // 6b. PRESENCE_SET
+  const Mp1Message pres_msg = PresenceSetMessage{PresenceVisibility::online, true};
+  const auto pres_enc = must(encode_frame(1U, pres_msg), "encode presence_set");
+  require(hex_lower(pres_enc) == kPresenceSetHex, "presence_set_hex encode bit-exact");
+  const auto pres_dec =
+      must(decode_frame(from_hex(kPresenceSetHex)), "decode presence_set");
+  require(pres_dec.header.opcode == Opcode::presence_set && pres_dec.header.seq == 1U &&
+              pres_dec.message == pres_msg,
+          "presence_set_hex decode exact");
+
+  // 6c. PARTY_ENDPOINT_UPDATE
+  const Mp1Message ep_upd_msg = PartyEndpointUpdateMessage{ep_force};
+  const auto ep_upd_enc =
+      must(encode_frame(2U, ep_upd_msg), "encode party_endpoint_update");
+  require(hex_lower(ep_upd_enc) == kPartyEndpointUpdateHex,
+          "party_endpoint_update_hex encode bit-exact");
+  const auto ep_upd_dec = must(decode_frame(from_hex(kPartyEndpointUpdateHex)),
+                               "decode party_endpoint_update");
+  require(ep_upd_dec.header.opcode == Opcode::party_endpoint_update &&
+              ep_upd_dec.header.seq == 2U && ep_upd_dec.message == ep_upd_msg,
+          "party_endpoint_update_hex decode exact");
+
+  // 6d. PARTY_SNAPSHOT (1 member)
+  const auto party_5001 = must(PartyId::create(5001U), "party 5001");
+  const PartyMemberRecord vec_member{
+      dev_2002, acct_1001, root_pk, dev_pk, cwt, ep_force, 1U, true,
+  };
+  const Mp1Message snap_msg = PartySnapshotMessage{
+      party_5001,
+      1U,
+      acct_1001,
+      dev_2002,
+      PartyVisibility::friends,
+      PartyJoinMode::approval_required,
+      RelayPolicy::force_relays,
+      4U,
+      "https://relay.multiplayer.tech",
+      {vec_member},
+  };
+  const auto snap_enc =
+      must(encode_frame(0U, snap_msg), "encode party_snapshot_1member");
+  require(hex_lower(snap_enc) == kPartySnapshot1MemberHex,
+          "party_snapshot_1member_hex encode bit-exact");
+  const auto snap_dec = must(decode_frame(from_hex(kPartySnapshot1MemberHex)),
+                             "decode party_snapshot_1member");
+  require(snap_dec.header.opcode == Opcode::party_snapshot &&
+              snap_dec.header.seq == 0U && snap_dec.message == snap_msg,
+          "party_snapshot_1member_hex decode exact");
+  const auto *decoded_snap = std::get_if<PartySnapshotMessage>(&snap_dec.message);
+  require(decoded_snap != nullptr && decoded_snap->members.size() == 1U,
+          "decoded party_snapshot has 1 member");
+  must(verify_party_member_cwt(decoded_snap->members[0], kCwtIat + 10),
+       "decoded snapshot member CWT verifies");
+
+  // -------------------------------------------------------------------------
+  // 7. invite_hashes
+  // -------------------------------------------------------------------------
+  static constexpr std::string_view kRawSecretHex =
+      "3333333333333333333333333333333333333333333333333333333333333333";
+  static constexpr std::string_view kAccountInviteToken =
+      "mpinv1_MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM";
+  static constexpr std::string_view kAccountInviteSha256Hex =
+      "32a3f48e3d5130d7c813b5032809943bd29ac3fa1dd9ac0b02d1e49f8ca4db12";
+  static constexpr std::string_view kPartyInviteLink =
+      "mppi1_5001_MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM";
+  static constexpr std::string_view kPartyInviteSha256Hex =
+      "bf3dff455be4a5ae1a611a037d6e62dcf3d3a83bbb132b430dfa898e511ca34d";
+
+  const auto raw_secret_vec = from_hex(kRawSecretHex);
+  require(raw_secret_vec.size() == 32U, "raw_secret_hex 32 bytes");
+  std::array<std::uint8_t, 32> raw_secret{};
+  std::memcpy(raw_secret.data(), raw_secret_vec.data(), raw_secret.size());
+
+  const std::string raw_secret_b64url = encode_base64(raw_secret, true);
+  require(("mpinv1_" + raw_secret_b64url) == kAccountInviteToken,
+          "account_invite_token bit-exact");
+  require(("mppi1_5001_" + raw_secret_b64url) == kPartyInviteLink,
+          "party_invite_link bit-exact");
+
+  const auto acct_inv_hash =
+      must(hash_account_invite_secret(raw_secret), "vector hash_account_invite_secret");
+  require(hex_lower(acct_inv_hash) == kAccountInviteSha256Hex,
+          "account_invite_sha256_hex bit-exact");
+
+  const auto party_inv_hash = must(hash_party_invite_secret(party_5001, raw_secret),
+                                   "vector hash_party_invite_secret");
+  require(hex_lower(party_inv_hash) == kPartyInviteSha256Hex,
+          "party_invite_sha256_hex bit-exact");
+}
+
 } // namespace
 
 int main() {
@@ -1258,6 +1693,7 @@ int main() {
     test_rfc9421_and_rfc9530();
     test_cbor_cose_sign1_and_device_cwt();
     test_rust_mp_protocol_bit_exact_parity();
+    test_official_multiplayer_site_test_vectors();
     std::cout << "mp_protocol_test: ALL PASSED\n";
     return 0;
   } catch (const std::exception &ex) {
