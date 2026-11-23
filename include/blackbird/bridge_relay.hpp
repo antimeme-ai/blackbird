@@ -10,6 +10,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,6 +40,8 @@ inline constexpr std::size_t kRelayMaxFrameIdBytes = 128;
 inline constexpr std::size_t kRelayMaxNonceB64Bytes = 128;
 inline constexpr std::size_t kRelayMaxEndpointBytes = 256;
 inline constexpr std::size_t kRelayMaxSubscriptions = 256;
+inline constexpr std::size_t kRelayDefaultMaxRoomHistoryBytes =
+    16 * 1024 * 1024; // 16 MiB default byte cap on retained room history
 inline constexpr std::size_t kCheckpointMaxEntries = 4096;
 
 inline constexpr std::uint32_t kDefaultMaxProvenanceHops = 8;
@@ -190,10 +193,25 @@ Result<std::string> canonical_checkpoint_payload(const BridgeCheckpoint &checkpo
 Value checkpoint_to_value(const BridgeCheckpoint &checkpoint);
 Result<BridgeCheckpoint> checkpoint_from_value(const Value &value);
 
+struct CheckpointVerifyOptions {
+  std::optional<std::string> expected_room_id;
+  std::optional<std::uint64_t> min_checkpoint_seq;
+  std::optional<std::int64_t> max_age_ns;
+  std::optional<std::int64_t> now_ns;
+  std::optional<std::int64_t> max_future_skew_ns;
+  // When non-empty, checkpoint.signer_fingerprint must appear in allowed_signers.
+  std::vector<std::string> allowed_signers;
+  bool operator==(const CheckpointVerifyOptions &) const = default;
+};
+
 Result<BridgeCheckpoint> sign_checkpoint(const PeerIdentityStore &identity,
                                          BridgeCheckpointDraft draft);
 Result<void> verify_checkpoint(const KnownPeersStore &known_peers,
                                const BridgeCheckpoint &checkpoint,
+                               const PeerIdentityConfig &config = {});
+Result<void> verify_checkpoint(const KnownPeersStore &known_peers,
+                               const BridgeCheckpoint &checkpoint,
+                               const CheckpointVerifyOptions &options,
                                const PeerIdentityConfig &config = {});
 
 std::map<std::string, std::uint64_t>
@@ -208,6 +226,10 @@ filter_delta_after_checkpoint(const std::vector<CausalEvent> &events,
 // 3. Room Invite URI (bbjoin1:...) & Content-Blind Relay Router (SDR / DERP)
 // ---------------------------------------------------------------------------
 
+// Unsigned room join metadata. `invite_code` IS a room-join bearer credential
+// and MUST be handled as sensitive material over a confidential channel; the
+// URI does not carry private identity keys or E2EE room keys, and `relay_url`
+// forbids embedded userinfo, query parameters, and fragments.
 struct RoomInvite {
   std::string room_id;
   std::string relay_url;
@@ -215,11 +237,19 @@ struct RoomInvite {
   std::string creator_public_key;
   std::string invite_code;
   std::int64_t expires_ns = 0;
+
+  bool is_expired(std::int64_t now_ns) const noexcept {
+    return expires_ns <= 0 || now_ns >= expires_ns;
+  }
+
   bool operator==(const RoomInvite &) const = default;
 };
 
+Result<void> validate_room_invite_freshness(const RoomInvite &invite,
+                                            std::int64_t now_ns) noexcept;
 Result<std::string> encode_room_invite(const RoomInvite &invite);
-Result<RoomInvite> parse_room_invite(std::string_view uri);
+Result<RoomInvite> parse_room_invite(std::string_view uri,
+                                     std::optional<std::int64_t> now_ns = std::nullopt);
 
 struct BlindRelayFrame {
   std::string room_id;
@@ -256,8 +286,14 @@ struct BlindRelayConfig {
   RelayRateLimitPolicy rate_limit{};
   BridgeMuxConfig session_mux{};
   std::size_t max_room_history = 4096;
+  std::size_t max_room_history_bytes = kRelayDefaultMaxRoomHistoryBytes;
   std::size_t max_seen_frame_ids = 8192;
   std::size_t max_sessions_per_room = 512;
+  // Optional TTL for reaping disconnected sessions via evict_stale_sessions() /
+  // publish(). 0 disables automatic clock-based reaping (capacity-triggered eviction of
+  // oldest disconnected sessions and explicit evict_disconnected_before() remain
+  // active).
+  std::int64_t disconnected_session_ttl_ns = 0;
   bool operator==(const BlindRelayConfig &) const = default;
 };
 
@@ -272,11 +308,13 @@ struct RelaySessionSpec {
 struct RelaySessionHandle {
   std::string session_id;
   std::string connection_id;
+  std::string resume_token;
   std::string room_id;
   std::string peer_fingerprint;
   RelayParticipantRole role = RelayParticipantRole::peer;
   std::string remote_endpoint;
   bool connected = false;
+  bool needs_resync = false;
   std::uint64_t roam_count = 0;
   std::uint64_t last_acked_relay_seq = 0;
   bool operator==(const RelaySessionHandle &) const = default;
@@ -287,6 +325,9 @@ struct RelayResumeRequest {
   std::string peer_fingerprint;
   std::string new_remote_endpoint;
   std::uint64_t last_acked_relay_seq = 0;
+  std::string resume_token;
+  std::string
+      room_id; // Optional; if non-empty, must match session's registered room_id.
 };
 
 struct RelayResumeResult {
@@ -300,6 +341,7 @@ struct RelayPublishReport {
   std::uint64_t relay_seq = 0;
   std::size_t delivered_sessions = 0;
   std::size_t coalesced_sessions = 0;
+  std::size_t overflowed_sessions = 0;
   bool duplicate = false;
   bool operator==(const RelayPublishReport &) const = default;
 };
@@ -314,10 +356,14 @@ struct BlindRelayStats {
   std::size_t active_rooms = 0;
   std::size_t registered_sessions = 0;
   std::size_t connected_sessions = 0;
+  std::size_t retained_history_frames = 0;
+  std::size_t retained_history_bytes = 0;
   std::uint64_t published_frames = 0;
   std::uint64_t duplicate_frames = 0;
   std::uint64_t rate_limited_frames = 0;
   std::uint64_t rejected_oversize_frames = 0;
+  std::uint64_t reliable_overflow_events = 0;
+  std::uint64_t evicted_sessions = 0;
   std::uint64_t session_roams = 0;
   bool operator==(const BlindRelayStats &) const = default;
 };
@@ -325,7 +371,16 @@ struct BlindRelayStats {
 // Content-blind in-process room router: routes opaque AEAD ciphertext frames by
 // room_id and routing_scope, enforces per-sender token-bucket rate limits and
 // per-lane size caps, supports read-only spectators, and resumes sessions across
-// IP/network roaming with connection ID rotation and O(delta) reliable replay.
+// IP/network roaming with cryptographic token rotation and atomic O(delta) replay.
+//
+// Reliable delivery invariant (zero silent loss):
+//   Every session tracks `contiguous_enqueued_relay_seq` and `needs_resync`.
+//   If any relevant reliable (control/causal) frame fails to enqueue due to
+//   queue backpressure, `needs_resync` becomes true and NO newer reliable frames
+//   are enqueued for that session until `resume_session` replays contiguously
+//   from `last_acked_relay_seq`. `ack_relay_seq` rejects any sequence above
+//   `contiguous_enqueued_relay_seq` or any sequence that would skip unpolled
+//   reliable frames still queued for that session.
 class BlindRelayRouter {
 public:
   BlindRelayRouter() = default;
@@ -335,9 +390,14 @@ public:
   BlindRelayStats stats() const noexcept;
 
   Result<RelaySessionHandle> register_session(RelaySessionSpec spec);
-  Result<void> disconnect_session(std::string_view session_id);
+  Result<void> disconnect_session(std::string_view session_id, std::int64_t now_ns = 0);
+  std::size_t evict_disconnected_before(std::int64_t cutoff_ns);
+  std::size_t evict_stale_sessions(std::int64_t now_ns);
   Result<RelayResumeResult> resume_session(RelayResumeRequest request);
-  Result<RelayPublishReport> publish(const BlindRelayFrame &frame, std::int64_t now_ns);
+  Result<RelayPublishReport> publish(std::string_view session_id,
+                                     const BlindRelayFrame &frame, std::int64_t now_ns);
+  Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>
+  poll_outbound_shared(std::string_view session_id);
   Result<std::optional<RoutedRelayFrame>> poll_outbound(std::string_view session_id);
   Result<void> ack_relay_seq(std::string_view session_id, std::uint64_t relay_seq);
   Result<RelaySessionHandle> session_info(std::string_view session_id) const;
@@ -354,17 +414,24 @@ private:
     RelaySessionHandle handle;
     std::vector<std::string> subscribed_scopes;
     BridgeMux outbound_mux;
-    std::unordered_map<std::string, RoutedRelayFrame> pending_frames;
+    std::unordered_map<std::string, std::shared_ptr<const RoutedRelayFrame>>
+        pending_frames;
     std::list<std::string> presence_ticket_order;
     std::unordered_map<std::string, std::list<std::string>::iterator>
         presence_ticket_pos;
     std::uint64_t next_ticket = 1;
     std::uint64_t last_enqueued_relay_seq = 0;
+    std::uint64_t contiguous_enqueued_relay_seq = 0;
+    std::uint64_t first_dropped_relay_seq = 0;
+    std::int64_t disconnected_at_ns = 0;
+    std::uint64_t disconnect_order = 0;
   };
 
   struct RoomState {
     std::uint64_t next_relay_seq = 1;
-    std::deque<RoutedRelayFrame> reliable_history;
+    std::uint64_t evicted_through_seq = 0;
+    std::size_t reliable_history_bytes = 0;
+    std::deque<std::shared_ptr<const RoutedRelayFrame>> reliable_history;
     std::unordered_set<std::string> seen_frame_ids;
     std::deque<std::string> seen_frame_order;
     std::vector<std::string> session_ids;
@@ -372,19 +439,24 @@ private:
 
   explicit BlindRelayRouter(BlindRelayConfig config) noexcept : config_(config) {}
 
-  Result<void> enqueue_for_session(SessionState &session,
-                                   const RoutedRelayFrame &routed, bool &coalesced);
+  Result<void>
+  enqueue_for_session(SessionState &session,
+                      const std::shared_ptr<const RoutedRelayFrame> &routed,
+                      bool &coalesced);
+  bool evict_oldest_disconnected_in_room(RoomState &room);
 
   BlindRelayConfig config_{};
   std::unordered_map<std::string, RoomState> rooms_;
   std::unordered_map<std::string, SessionState> sessions_;
   std::unordered_map<std::string, SenderBucket> sender_buckets_;
-  std::uint64_t next_id_counter_ = 1;
+  std::uint64_t disconnect_seq_ = 0;
 
   std::uint64_t published_frames_ = 0;
   std::uint64_t duplicate_frames_ = 0;
   std::uint64_t rate_limited_frames_ = 0;
   std::uint64_t rejected_oversize_frames_ = 0;
+  std::uint64_t reliable_overflow_events_ = 0;
+  std::uint64_t evicted_sessions_ = 0;
   std::uint64_t session_roams_ = 0;
 };
 
@@ -406,12 +478,32 @@ struct TaintTransitionCheck {
   const TaintedProvenance &child;
 };
 
+struct PeerFrameTaintInput {
+  std::string sender_fingerprint;
+  std::string local_actor_id;
+  std::string room_id;
+  std::string frame_id;
+  std::optional<TaintedProvenance> peer_reported_provenance;
+  std::vector<std::string> local_untrusted_sources;
+  std::uint32_t max_hops = kDefaultMaxProvenanceHops;
+};
+
 Result<void> validate_tainted_provenance(const TaintedProvenance &provenance);
 Result<TaintedProvenance>
 propagate_taint(const TaintedProvenance &parent, std::string_view next_actor,
                 const std::vector<std::string> &added_untrusted_sources = {});
 Result<void> verify_taint_monotonicity(const TaintTransitionCheck &transition);
 bool is_provenance_tainted(const TaintedProvenance &provenance) noexcept;
+
+// Receiver-side taint invariant: foreign peer frames are ALWAYS marked tainted
+// with `peer:<sender_fingerprint>` regardless of any self-reported clean
+// provenance sent by a remote peer.
+Result<TaintedProvenance>
+derive_local_taint_for_peer_frame(const PeerFrameTaintInput &input);
+Result<TaintedProvenance> derive_local_taint_for_peer_frame(
+    const BlindRelayFrame &frame, std::string_view local_actor_id,
+    const std::optional<TaintedProvenance> &peer_reported = std::nullopt,
+    const std::vector<std::string> &local_untrusted_sources = {});
 
 Value tainted_provenance_to_value(const TaintedProvenance &provenance);
 Result<TaintedProvenance> tainted_provenance_from_value(const Value &value);

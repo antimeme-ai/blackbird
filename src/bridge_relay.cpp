@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <ranges>
 #include <set>
+#include <sys/random.h>
+#include <unistd.h>
 #include <utility>
 
 namespace blackbird {
@@ -22,6 +25,48 @@ std::int64_t wall_now_ns() noexcept {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
   return ns <= 0 ? 1 : static_cast<std::int64_t>(ns);
+}
+
+Result<std::string> random_token_id(std::string_view prefix) {
+  std::array<unsigned char, 16> bytes{};
+  if (::getentropy(bytes.data(), bytes.size()) != 0)
+    return Result<std::string>::failure({ErrorCode::io, errno});
+  static constexpr std::string_view kHex = "0123456789abcdef";
+  try {
+    std::string out;
+    out.reserve(prefix.size() + bytes.size() * 2U);
+    out.append(prefix);
+    for (const unsigned char b : bytes) {
+      out.push_back(kHex[(b >> 4U) & 0x0fU]);
+      out.push_back(kHex[b & 0x0fU]);
+    }
+    return Result<std::string>::success(std::move(out));
+  } catch (const std::bad_alloc &) {
+    return Result<std::string>::failure({ErrorCode::allocation});
+  }
+}
+
+struct TokenComparePair {
+  std::string_view expected;
+  std::string_view actual;
+};
+
+bool constant_time_equals(TokenComparePair pair) noexcept {
+  if (pair.expected.empty() || pair.expected.size() != pair.actual.size())
+    return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < pair.expected.size(); ++i) {
+    diff |= static_cast<unsigned char>(pair.expected[i]) ^
+            static_cast<unsigned char>(pair.actual[i]);
+  }
+  return diff == 0;
+}
+
+std::size_t routed_frame_bytes(const RoutedRelayFrame &routed) noexcept {
+  const auto &f = routed.frame;
+  return sizeof(RoutedRelayFrame) + f.room_id.size() + f.sender_fingerprint.size() +
+         f.frame_id.size() + f.ciphertext_b64.size() + f.nonce_b64.size() +
+         f.aad_hash.size() + f.routing_scope.size();
 }
 
 bool valid_safe_token(std::string_view value, std::size_t max_len) noexcept {
@@ -358,7 +403,8 @@ Result<void> validate_relay_url(std::string_view url) noexcept {
     const auto u = static_cast<unsigned char>(ch);
     if (u <= 0x20 || u == 0x7f)
       return Result<void>::failure({ErrorCode::invalid_range});
-    // Zero secrets in invite URLs: forbid embedded userinfo, queries, and fragments.
+    // Forbid embedded userinfo, query parameters, and fragments in relay_url
+    // (the room-join bearer credential lives exclusively in `invite_code`).
     if (ch == '@' || ch == '?' || ch == '#')
       return Result<void>::failure({ErrorCode::invalid_range});
   }
@@ -954,9 +1000,58 @@ Result<BridgeCheckpoint> sign_checkpoint(const PeerIdentityStore &identity,
 Result<void> verify_checkpoint(const KnownPeersStore &known_peers,
                                const BridgeCheckpoint &checkpoint,
                                const PeerIdentityConfig &config) {
+  return verify_checkpoint(known_peers, checkpoint, CheckpointVerifyOptions{}, config);
+}
+
+Result<void> verify_checkpoint(const KnownPeersStore &known_peers,
+                               const BridgeCheckpoint &checkpoint,
+                               const CheckpointVerifyOptions &options,
+                               const PeerIdentityConfig &config) {
   auto valid = validate_checkpoint_fields(checkpoint, true);
   if (!valid.has_value())
     return valid;
+
+  if (options.expected_room_id.has_value()) {
+    if (!valid_safe_token(*options.expected_room_id, kMaxRoomIdBytes))
+      return Result<void>::failure({ErrorCode::invalid_range});
+    if (checkpoint.room_id != *options.expected_room_id)
+      return Result<void>::failure({ErrorCode::conflict});
+  }
+
+  if (options.min_checkpoint_seq.has_value() &&
+      checkpoint.checkpoint_seq < *options.min_checkpoint_seq) {
+    return Result<void>::failure({ErrorCode::conflict});
+  }
+
+  if (options.now_ns.has_value() && *options.now_ns <= 0)
+    return Result<void>::failure({ErrorCode::invalid_range});
+
+  if (options.max_age_ns.has_value()) {
+    if (*options.max_age_ns < 0)
+      return Result<void>::failure({ErrorCode::invalid_range});
+    const std::int64_t effective_now =
+        options.now_ns.has_value() ? *options.now_ns : wall_now_ns();
+    if (effective_now > checkpoint.created_ns &&
+        (effective_now - checkpoint.created_ns) > *options.max_age_ns) {
+      return Result<void>::failure({ErrorCode::stale_handle});
+    }
+  }
+
+  if (options.max_future_skew_ns.has_value()) {
+    if (*options.max_future_skew_ns < 0)
+      return Result<void>::failure({ErrorCode::invalid_range});
+    const std::int64_t effective_now =
+        options.now_ns.has_value() ? *options.now_ns : wall_now_ns();
+    if (checkpoint.created_ns > effective_now &&
+        (checkpoint.created_ns - effective_now) > *options.max_future_skew_ns) {
+      return Result<void>::failure({ErrorCode::clock_regressed});
+    }
+  }
+
+  if (!options.allowed_signers.empty()) {
+    if (!std::ranges::contains(options.allowed_signers, checkpoint.signer_fingerprint))
+      return Result<void>::failure({ErrorCode::invalid_identity});
+  }
 
   auto lookup_signer = [&]() -> Result<std::string> {
     auto found = known_peers.find_by_fingerprint(checkpoint.signer_fingerprint);
@@ -1040,13 +1135,24 @@ filter_delta_after_checkpoint(const std::vector<CausalEvent> &events,
 // 3. Room Invite URI (bbjoin1:...) & Content-Blind Relay Router
 // ---------------------------------------------------------------------------
 
+Result<void> validate_room_invite_freshness(const RoomInvite &invite,
+                                            std::int64_t now_ns) noexcept {
+  if (now_ns <= 0 || invite.expires_ns <= 0)
+    return Result<void>::failure({ErrorCode::invalid_range});
+  if (invite.is_expired(now_ns))
+    return Result<void>::failure({ErrorCode::stale_handle});
+  return Result<void>::success();
+}
+
 Result<std::string> encode_room_invite(const RoomInvite &invite) {
   auto validated = validate_and_canonicalize_invite(invite);
   if (!validated.has_value())
     return Result<std::string>::failure(validated.error());
   const RoomInvite &clean = validated.value();
 
-  // Canonical sorted-key JSON with zero embedded secrets.
+  // Canonical sorted-key JSON. Note: `invite_code` IS a room-join bearer
+  // credential (treat the resulting `bbjoin1:` URI as sensitive), though the
+  // invite never carries private identity keys or E2EE room keys.
   const Value doc = Value::object({
       {"creator_fingerprint", Value{clean.creator_fingerprint}},
       {"creator_public_key", Value{clean.creator_public_key}},
@@ -1070,7 +1176,8 @@ Result<std::string> encode_room_invite(const RoomInvite &invite) {
   }
 }
 
-Result<RoomInvite> parse_room_invite(std::string_view uri) {
+Result<RoomInvite> parse_room_invite(std::string_view uri,
+                                     std::optional<std::int64_t> now_ns) {
   if (uri.empty())
     return Result<RoomInvite>::failure({ErrorCode::corrupt});
   if (uri.size() > kRoomInviteMaxUriBytes)
@@ -1110,7 +1217,7 @@ Result<RoomInvite> parse_room_invite(std::string_view uri) {
     return Result<RoomInvite>::failure({ErrorCode::corrupt});
   }
 
-  return validate_and_canonicalize_invite(RoomInvite{
+  auto validated = validate_and_canonicalize_invite(RoomInvite{
       std::move(room_id).value(),
       std::move(relay_url).value(),
       std::move(creator_fp).value(),
@@ -1118,6 +1225,15 @@ Result<RoomInvite> parse_room_invite(std::string_view uri) {
       std::move(invite_code).value(),
       expires_ns.value(),
   });
+  if (!validated.has_value())
+    return validated;
+
+  if (now_ns.has_value()) {
+    auto fresh = validate_room_invite_freshness(validated.value(), *now_ns);
+    if (!fresh.has_value())
+      return Result<RoomInvite>::failure(fresh.error());
+  }
+  return validated;
 }
 
 Value blind_relay_frame_to_value(const BlindRelayFrame &frame) {
@@ -1193,8 +1309,9 @@ Result<BlindRelayRouter> BlindRelayRouter::create(BlindRelayConfig config) {
   auto mux_ok = validate_mux_config(config.session_mux);
   if (!mux_ok.has_value())
     return Result<BlindRelayRouter>::failure(mux_ok.error());
-  if (config.max_room_history == 0 || config.max_seen_frame_ids == 0 ||
-      config.max_sessions_per_room == 0) {
+  if (config.max_room_history == 0 || config.max_room_history_bytes == 0 ||
+      config.max_seen_frame_ids == 0 || config.max_sessions_per_room == 0 ||
+      config.disconnected_session_ttl_ns < 0) {
     return Result<BlindRelayRouter>::failure({ErrorCode::invalid_range});
   }
   return Result<BlindRelayRouter>::success(BlindRelayRouter{config});
@@ -1207,16 +1324,93 @@ BlindRelayStats BlindRelayRouter::stats() const noexcept {
     if (session.handle.connected)
       ++connected;
   }
+  std::size_t history_frames = 0;
+  std::size_t history_bytes = 0;
+  for (const auto &[room_id, room] : rooms_) {
+    (void)room_id;
+    history_frames += room.reliable_history.size();
+    history_bytes += room.reliable_history_bytes;
+  }
   return BlindRelayStats{
       rooms_.size(),
       sessions_.size(),
       connected,
+      history_frames,
+      history_bytes,
       published_frames_,
       duplicate_frames_,
       rate_limited_frames_,
       rejected_oversize_frames_,
+      reliable_overflow_events_,
+      evicted_sessions_,
       session_roams_,
   };
+}
+
+bool BlindRelayRouter::evict_oldest_disconnected_in_room(RoomState &room) {
+  std::size_t best_index = room.session_ids.size();
+  std::int64_t best_ts = std::numeric_limits<std::int64_t>::max();
+  std::uint64_t best_order = std::numeric_limits<std::uint64_t>::max();
+  for (std::size_t i = 0; i < room.session_ids.size(); ++i) {
+    const auto sit = sessions_.find(room.session_ids[i]);
+    if (sit == sessions_.end()) {
+      best_index = i;
+      break;
+    }
+    const SessionState &cand = sit->second;
+    if (cand.handle.connected)
+      continue;
+    if (cand.disconnected_at_ns < best_ts ||
+        (cand.disconnected_at_ns == best_ts && cand.disconnect_order < best_order)) {
+      best_ts = cand.disconnected_at_ns;
+      best_order = cand.disconnect_order;
+      best_index = i;
+    }
+  }
+  if (best_index >= room.session_ids.size())
+    return false;
+  const std::string victim_id = std::move(room.session_ids[best_index]);
+  room.session_ids.erase(room.session_ids.begin() +
+                         static_cast<std::ptrdiff_t>(best_index));
+  if (sessions_.erase(victim_id) > 0)
+    ++evicted_sessions_;
+  return true;
+}
+
+std::size_t BlindRelayRouter::evict_disconnected_before(std::int64_t cutoff_ns) {
+  if (cutoff_ns <= 0)
+    return 0;
+  std::size_t evicted = 0;
+  for (auto room_it = rooms_.begin(); room_it != rooms_.end();) {
+    RoomState &room = room_it->second;
+    std::erase_if(room.session_ids, [&](const std::string &sid) {
+      const auto sit = sessions_.find(sid);
+      if (sit == sessions_.end())
+        return true;
+      if (!sit->second.handle.connected && sit->second.disconnected_at_ns > 0 &&
+          sit->second.disconnected_at_ns < cutoff_ns) {
+        sessions_.erase(sit);
+        ++evicted;
+        ++evicted_sessions_;
+        return true;
+      }
+      return false;
+    });
+    if (room.session_ids.empty()) {
+      room_it = rooms_.erase(room_it);
+    } else {
+      ++room_it;
+    }
+  }
+  return evicted;
+}
+
+std::size_t BlindRelayRouter::evict_stale_sessions(std::int64_t now_ns) {
+  if (config_.disconnected_session_ttl_ns <= 0 ||
+      now_ns <= config_.disconnected_session_ttl_ns) {
+    return 0;
+  }
+  return evict_disconnected_before(now_ns - config_.disconnected_session_ttl_ns);
 }
 
 Result<RelaySessionHandle> BlindRelayRouter::register_session(RelaySessionSpec spec) {
@@ -1241,23 +1435,44 @@ Result<RelaySessionHandle> BlindRelayRouter::register_session(RelaySessionSpec s
   if (!mux.has_value())
     return Result<RelaySessionHandle>::failure(mux.error());
 
-  try {
-    auto &room = rooms_[spec.room_id];
-    if (room.session_ids.size() >= config_.max_sessions_per_room)
-      return Result<RelaySessionHandle>::failure({ErrorCode::capacity});
+  std::string session_id;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    auto cand = random_token_id("sess-");
+    if (!cand.has_value())
+      return Result<RelaySessionHandle>::failure(cand.error());
+    if (!sessions_.contains(cand.value())) {
+      session_id = std::move(cand).value();
+      break;
+    }
+  }
+  if (session_id.empty())
+    return Result<RelaySessionHandle>::failure({ErrorCode::conflict});
 
-    const std::uint64_t seq = next_id_counter_++;
-    std::string session_id = "sess-" + std::to_string(seq);
-    std::string connection_id = "conn-" + std::to_string(seq);
+  auto conn_id = random_token_id("conn-");
+  if (!conn_id.has_value())
+    return Result<RelaySessionHandle>::failure(conn_id.error());
+  auto resume_tok = random_token_id("rtok-");
+  if (!resume_tok.has_value())
+    return Result<RelaySessionHandle>::failure(resume_tok.error());
+
+  try {
+    const auto existing_room = rooms_.find(spec.room_id);
+    if (existing_room != rooms_.end() &&
+        existing_room->second.session_ids.size() >= config_.max_sessions_per_room) {
+      if (!evict_oldest_disconnected_in_room(existing_room->second))
+        return Result<RelaySessionHandle>::failure({ErrorCode::capacity});
+    }
 
     RelaySessionHandle handle{
         session_id,
-        std::move(connection_id),
+        std::move(conn_id).value(),
+        std::move(resume_tok).value(),
         spec.room_id,
         std::move(spec.peer_fingerprint),
         spec.role,
         std::move(spec.remote_endpoint),
         true,
+        false,
         0,
         0,
     };
@@ -1271,7 +1486,13 @@ Result<RelaySessionHandle> BlindRelayRouter::register_session(RelaySessionSpec s
         {},
         1,
         0,
+        0,
+        0,
+        0,
+        0,
     };
+    auto &room = rooms_[handle.room_id];
+    room.session_ids.reserve(room.session_ids.size() + 1U);
     sessions_.emplace(session_id, std::move(state));
     room.session_ids.push_back(std::move(session_id));
     return Result<RelaySessionHandle>::success(std::move(handle));
@@ -1280,46 +1501,62 @@ Result<RelaySessionHandle> BlindRelayRouter::register_session(RelaySessionSpec s
   }
 }
 
-Result<void> BlindRelayRouter::disconnect_session(std::string_view session_id) {
+Result<void> BlindRelayRouter::disconnect_session(std::string_view session_id,
+                                                  std::int64_t now_ns) {
+  if (now_ns < 0)
+    return Result<void>::failure({ErrorCode::invalid_range});
   const auto it = sessions_.find(std::string{session_id});
   if (it == sessions_.end())
     return Result<void>::failure({ErrorCode::stale_handle});
-  it->second.handle.connected = false;
+  SessionState &session = it->second;
+  if (session.handle.connected || session.disconnected_at_ns <= 0) {
+    session.disconnected_at_ns = now_ns > 0 ? now_ns : wall_now_ns();
+    session.disconnect_order = ++disconnect_seq_;
+  }
+  session.handle.connected = false;
   // Drop ephemeral Lane 2 presence on disconnect; never replay stale presence.
-  it->second.outbound_mux.clear_presence();
-  it->second.presence_ticket_order.clear();
-  it->second.presence_ticket_pos.clear();
-  std::erase_if(it->second.pending_frames, [](const auto &entry) {
-    return entry.second.frame.lane == RelayLane::presence;
+  session.outbound_mux.clear_presence();
+  session.presence_ticket_order.clear();
+  session.presence_ticket_pos.clear();
+  std::erase_if(session.pending_frames, [](const auto &entry) {
+    return entry.second && entry.second->frame.lane == RelayLane::presence;
   });
   return Result<void>::success();
 }
 
-Result<void> BlindRelayRouter::enqueue_for_session(SessionState &session,
-                                                   const RoutedRelayFrame &routed,
-                                                   bool &coalesced) {
+Result<void> BlindRelayRouter::enqueue_for_session(
+    SessionState &session, const std::shared_ptr<const RoutedRelayFrame> &routed,
+    bool &coalesced) {
   coalesced = false;
+  if (!routed)
+    return Result<void>::failure({ErrorCode::corrupt});
+  const BlindRelayFrame &frame = routed->frame;
   std::string ticket;
-  if (routed.frame.lane == RelayLane::presence) {
-    ticket = "p:" + routed.frame.sender_fingerprint + ":" + routed.frame.routing_scope;
+  const bool is_presence = (frame.lane == RelayLane::presence);
+  const std::uint64_t ticket_num = session.next_ticket;
+  if (is_presence) {
+    ticket = "p:" + frame.sender_fingerprint + ":" + frame.routing_scope;
   } else {
-    ticket = "r:" + std::to_string(session.next_ticket++);
+    ticket = "r:" + std::to_string(ticket_num);
   }
 
   RelayPacket packet{
-      routed.frame.lane,
+      frame.lane,
       ticket,
-      routed.frame.sender_fingerprint,
-      routed.frame.routing_scope,
-      routed.relay_seq,
-      routed.frame.timestamp_ns,
-      {}, // Content-blind router keeps opaque ciphertext in pending_frames without
-          // duplicating multi-MiB payloads inside the mux queue.
+      frame.sender_fingerprint,
+      frame.routing_scope,
+      routed->relay_seq,
+      frame.timestamp_ns,
+      {}, // Content-blind router shares opaque ciphertext via shared_ptr in
+          // pending_frames without duplicating multi-MiB payloads inside the mux queue.
   };
 
   auto enq = session.outbound_mux.enqueue(std::move(packet));
   if (!enq.has_value())
     return Result<void>::failure(enq.error());
+
+  if (!is_presence)
+    session.next_ticket = ticket_num + 1U;
 
   if (enq.value() == BridgeMuxEnqueueStatus::ignored_stale)
     return Result<void>::success();
@@ -1327,7 +1564,7 @@ Result<void> BlindRelayRouter::enqueue_for_session(SessionState &session,
     coalesced = true;
 
   session.pending_frames.insert_or_assign(ticket, routed);
-  if (routed.frame.lane == RelayLane::presence) {
+  if (is_presence) {
     if (enq.value() == BridgeMuxEnqueueStatus::coalesced) {
       if (const auto pos = session.presence_ticket_pos.find(ticket);
           pos != session.presence_ticket_pos.end()) {
@@ -1348,8 +1585,8 @@ Result<void> BlindRelayRouter::enqueue_for_session(SessionState &session,
           ticket, std::prev(session.presence_ticket_order.end()));
     }
   }
-  if (routed.relay_seq > session.last_enqueued_relay_seq)
-    session.last_enqueued_relay_seq = routed.relay_seq;
+  if (routed->relay_seq > session.last_enqueued_relay_seq)
+    session.last_enqueued_relay_seq = routed->relay_seq;
   return Result<void>::success();
 }
 
@@ -1360,6 +1597,8 @@ Result<RelayResumeResult> BlindRelayRouter::resume_session(RelayResumeRequest re
     return Result<RelayResumeResult>::failure({ErrorCode::invalid_identity});
   if (!valid_utf8_no_ctrl(request.new_remote_endpoint, kRelayMaxEndpointBytes, false))
     return Result<RelayResumeResult>::failure({ErrorCode::invalid_range});
+  if (!request.room_id.empty() && !valid_safe_token(request.room_id, kMaxRoomIdBytes))
+    return Result<RelayResumeResult>::failure({ErrorCode::invalid_range});
 
   const auto it = sessions_.find(request.session_id);
   if (it == sessions_.end())
@@ -1368,62 +1607,96 @@ Result<RelayResumeResult> BlindRelayRouter::resume_session(RelayResumeRequest re
   SessionState &session = it->second;
   if (session.handle.peer_fingerprint != request.peer_fingerprint)
     return Result<RelayResumeResult>::failure({ErrorCode::invalid_identity});
+  if (!request.room_id.empty() && session.handle.room_id != request.room_id)
+    return Result<RelayResumeResult>::failure({ErrorCode::invalid_identity});
+  if (!constant_time_equals({session.handle.resume_token, request.resume_token}))
+    return Result<RelayResumeResult>::failure({ErrorCode::invalid_identity});
 
   const auto room_it = rooms_.find(session.handle.room_id);
   if (room_it == rooms_.end())
     return Result<RelayResumeResult>::failure({ErrorCode::stale_handle});
+  const RoomState &room = room_it->second;
+
+  if (request.last_acked_relay_seq >= room.next_relay_seq)
+    return Result<RelayResumeResult>::failure({ErrorCode::invalid_range});
 
   auto fresh_mux = BridgeMux::create(config_.session_mux);
   if (!fresh_mux.has_value())
     return Result<RelayResumeResult>::failure(fresh_mux.error());
 
+  auto next_conn_id = random_token_id("conn-");
+  if (!next_conn_id.has_value())
+    return Result<RelayResumeResult>::failure(next_conn_id.error());
+  auto next_resume_token = random_token_id("rtok-");
+  if (!next_resume_token.has_value())
+    return Result<RelayResumeResult>::failure(next_resume_token.error());
+
   try {
-    // Rotate connection ID on network/IP roam (RFC 9000 style path migration).
-    session.handle.connection_id = "conn-" + std::to_string(next_id_counter_++);
-    session.handle.remote_endpoint = std::move(request.new_remote_endpoint);
-    session.handle.connected = true;
-    ++session.handle.roam_count;
-    ++session_roams_;
-    session.handle.last_acked_relay_seq = request.last_acked_relay_seq;
+    // Stage the entire resumed session state in a temporary object BEFORE
+    // mutating `session`. If replay exceeds queue capacity or fails, `session`
+    // and `session_roams_` remain completely untouched (atomic rollback).
+    SessionState staged{};
+    staged.handle = session.handle;
+    staged.handle.connection_id = std::move(next_conn_id).value();
+    staged.handle.resume_token = std::move(next_resume_token).value();
+    staged.handle.remote_endpoint = std::move(request.new_remote_endpoint);
+    staged.handle.connected = true;
+    staged.handle.needs_resync = false;
+    ++staged.handle.roam_count;
+    staged.handle.last_acked_relay_seq = request.last_acked_relay_seq;
+    staged.outbound_mux = std::move(fresh_mux).value();
+    staged.next_ticket = session.next_ticket;
+    staged.last_enqueued_relay_seq = request.last_acked_relay_seq;
+    staged.contiguous_enqueued_relay_seq = request.last_acked_relay_seq;
+    staged.first_dropped_relay_seq = 0;
+    staged.disconnected_at_ns = 0;
+    staged.disconnect_order = 0;
 
-    // Reset outbound queue and replay ONLY missed reliable frames (Lane 0 & 1)
-    // strictly newer than last_acked_relay_seq. Never replay stale Lane 2 presence.
-    session.outbound_mux = std::move(fresh_mux).value();
-    session.pending_frames.clear();
-    session.presence_ticket_order.clear();
-    session.presence_ticket_pos.clear();
-    session.last_enqueued_relay_seq = request.last_acked_relay_seq;
-
-    const RoomState &room = room_it->second;
-    bool history_truncated = false;
-    if (!room.reliable_history.empty() &&
-        request.last_acked_relay_seq + 1 < room.reliable_history.front().relay_seq) {
-      history_truncated = true;
-    }
+    const bool history_truncated =
+        room.evicted_through_seq > request.last_acked_relay_seq;
 
     std::size_t replayed = 0;
     for (const auto &entry : room.reliable_history) {
-      if (entry.relay_seq <= request.last_acked_relay_seq)
+      if (!entry || entry->relay_seq <= request.last_acked_relay_seq)
         continue;
-      if (entry.frame.sender_fingerprint == session.handle.peer_fingerprint)
+      if (entry->frame.sender_fingerprint == staged.handle.peer_fingerprint)
         continue;
-      if (!session_interested_in_frame(session.subscribed_scopes, entry.frame))
+      if (!session_interested_in_frame(session.subscribed_scopes, entry->frame))
         continue;
       bool coalesced = false;
-      auto enq = enqueue_for_session(session, entry, coalesced);
+      auto enq = enqueue_for_session(staged, entry, coalesced);
       if (!enq.has_value())
         return Result<RelayResumeResult>::failure(enq.error());
+      if (entry->relay_seq > staged.contiguous_enqueued_relay_seq)
+        staged.contiguous_enqueued_relay_seq = entry->relay_seq;
       ++replayed;
     }
 
-    return Result<RelayResumeResult>::success(
-        RelayResumeResult{session.handle, replayed, history_truncated});
+    // Materialize return value before noexcept commit for strong exception safety.
+    RelayResumeResult result{staged.handle, replayed, history_truncated};
+
+    // Atomic commit (noexcept moves/assignments only).
+    session.handle = std::move(staged.handle);
+    session.outbound_mux = std::move(staged.outbound_mux);
+    session.pending_frames = std::move(staged.pending_frames);
+    session.presence_ticket_order = std::move(staged.presence_ticket_order);
+    session.presence_ticket_pos = std::move(staged.presence_ticket_pos);
+    session.next_ticket = staged.next_ticket;
+    session.last_enqueued_relay_seq = staged.last_enqueued_relay_seq;
+    session.contiguous_enqueued_relay_seq = staged.contiguous_enqueued_relay_seq;
+    session.first_dropped_relay_seq = 0;
+    session.disconnected_at_ns = 0;
+    session.disconnect_order = 0;
+    ++session_roams_;
+
+    return Result<RelayResumeResult>::success(std::move(result));
   } catch (const std::bad_alloc &) {
     return Result<RelayResumeResult>::failure({ErrorCode::allocation});
   }
 }
 
-Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &frame,
+Result<RelayPublishReport> BlindRelayRouter::publish(std::string_view session_id,
+                                                     const BlindRelayFrame &frame,
                                                      std::int64_t now_ns) {
   if (now_ns <= 0)
     return Result<RelayPublishReport>::failure({ErrorCode::invalid_range});
@@ -1435,31 +1708,28 @@ Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &fram
     return Result<RelayPublishReport>::failure(valid.error());
   }
 
+  // Require an authenticated session handle whose registered room and peer
+  // fingerprint match the frame (prevents sender spoofing and room crossover).
+  const auto sender_it = sessions_.find(std::string{session_id});
+  if (sender_it == sessions_.end())
+    return Result<RelayPublishReport>::failure({ErrorCode::invalid_identity});
+  const SessionState &sender_session = sender_it->second;
+  if (sender_session.handle.room_id != frame.room_id ||
+      sender_session.handle.peer_fingerprint != frame.sender_fingerprint) {
+    return Result<RelayPublishReport>::failure({ErrorCode::invalid_identity});
+  }
+  if (sender_session.handle.role != RelayParticipantRole::peer)
+    return Result<RelayPublishReport>::failure({ErrorCode::conflict});
+  if (!sender_session.handle.connected)
+    return Result<RelayPublishReport>::failure({ErrorCode::stale_handle});
+
+  if (config_.disconnected_session_ttl_ns > 0)
+    (void)evict_stale_sessions(now_ns);
+
   const auto room_it = rooms_.find(frame.room_id);
   if (room_it == rooms_.end())
     return Result<RelayPublishReport>::failure({ErrorCode::invalid_identity});
   RoomState &room = room_it->second;
-
-  // Verify sender holds an active peer (non-spectator) session in this room.
-  bool found_sender = false;
-  bool sender_is_peer = false;
-  for (const auto &sid : room.session_ids) {
-    const auto sit = sessions_.find(sid);
-    if (sit == sessions_.end())
-      continue;
-    if (sit->second.handle.peer_fingerprint == frame.sender_fingerprint) {
-      found_sender = true;
-      if (sit->second.handle.role == RelayParticipantRole::peer &&
-          sit->second.handle.connected) {
-        sender_is_peer = true;
-        break;
-      }
-    }
-  }
-  if (!found_sender)
-    return Result<RelayPublishReport>::failure({ErrorCode::invalid_identity});
-  if (!sender_is_peer)
-    return Result<RelayPublishReport>::failure({ErrorCode::conflict});
 
   // Per-sender token bucket (net_chan_limit style): isolates runaway senders
   // without impacting other peers in the room.
@@ -1499,7 +1769,7 @@ Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &fram
   dedupe_key.append(frame.frame_id);
   if (room.seen_frame_ids.contains(dedupe_key)) {
     ++duplicate_frames_;
-    return Result<RelayPublishReport>::success(RelayPublishReport{0, 0, 0, true});
+    return Result<RelayPublishReport>::success(RelayPublishReport{0, 0, 0, 0, true});
   }
 
   try {
@@ -1510,18 +1780,49 @@ Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &fram
       room.seen_frame_order.pop_front();
     }
 
-    std::uint64_t relay_seq = 0;
-    if (frame.lane != RelayLane::presence) {
-      relay_seq = room.next_relay_seq++;
-      room.reliable_history.push_back(RoutedRelayFrame{relay_seq, frame});
-      while (room.reliable_history.size() > config_.max_room_history)
-        room.reliable_history.pop_front();
+    const bool is_reliable = (frame.lane != RelayLane::presence);
+    const std::uint64_t relay_seq = is_reliable ? room.next_relay_seq++ : 0;
+
+    // Single immutable allocation shared across room history and all recipient
+    // pending queues (zero ciphertext duplication across N recipients).
+    auto routed =
+        std::make_shared<const RoutedRelayFrame>(RoutedRelayFrame{relay_seq, frame});
+
+    if (is_reliable) {
+      const std::size_t entry_bytes = routed_frame_bytes(*routed);
+      if (entry_bytes > config_.max_room_history_bytes) {
+        // Single frame exceeds the room history byte cap: evict prior history
+        // and advance evicted_through_seq past this unretainable frame so
+        // late-resuming sessions observe history_truncated = true.
+        room.reliable_history.clear();
+        room.reliable_history_bytes = 0;
+        if (relay_seq > room.evicted_through_seq)
+          room.evicted_through_seq = relay_seq;
+      } else {
+        room.reliable_history.push_back(routed);
+        room.reliable_history_bytes += entry_bytes;
+        while (!room.reliable_history.empty() &&
+               (room.reliable_history.size() > config_.max_room_history ||
+                room.reliable_history_bytes > config_.max_room_history_bytes)) {
+          const auto &evicted = room.reliable_history.front();
+          const std::size_t evicted_bytes = evicted ? routed_frame_bytes(*evicted) : 0;
+          if (evicted && evicted->relay_seq > room.evicted_through_seq)
+            room.evicted_through_seq = evicted->relay_seq;
+          room.reliable_history_bytes =
+              evicted_bytes <= room.reliable_history_bytes
+                  ? (room.reliable_history_bytes - evicted_bytes)
+                  : 0;
+          room.reliable_history.pop_front();
+        }
+      }
     }
 
-    const RoutedRelayFrame routed{relay_seq, frame};
     std::size_t delivered = 0;
     std::size_t coalesced = 0;
+    std::size_t overflowed = 0;
     for (const auto &sid : room.session_ids) {
+      if (sid == session_id)
+        continue;
       const auto sit = sessions_.find(sid);
       if (sit == sessions_.end())
         continue;
@@ -1532,12 +1833,29 @@ Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &fram
         continue;
       if (!session_interested_in_frame(target.subscribed_scopes, frame))
         continue;
+      if (is_reliable && target.handle.needs_resync) {
+        // Do NOT enqueue newer reliable frames past an earlier gap; the session
+        // must drain/ack up to contiguous_enqueued_relay_seq and resume_session().
+        ++overflowed;
+        continue;
+      }
       bool was_coalesced = false;
       auto enq = enqueue_for_session(target, routed, was_coalesced);
       if (!enq.has_value()) {
-        // Backpressure on one slow receiver does not tear down other peers.
+        // Backpressure on one slow receiver does not tear down other peers,
+        // but we NEVER silently skip a reliable frame: latch needs_resync so
+        // neither later reliable frames nor ack_relay_seq can advance past the gap.
+        if (is_reliable) {
+          target.handle.needs_resync = true;
+          if (target.first_dropped_relay_seq == 0)
+            target.first_dropped_relay_seq = relay_seq;
+          ++reliable_overflow_events_;
+        }
+        ++overflowed;
         continue;
       }
+      if (is_reliable && relay_seq > target.contiguous_enqueued_relay_seq)
+        target.contiguous_enqueued_relay_seq = relay_seq;
       if (was_coalesced)
         ++coalesced;
       else
@@ -1546,38 +1864,61 @@ Result<RelayPublishReport> BlindRelayRouter::publish(const BlindRelayFrame &fram
 
     ++published_frames_;
     return Result<RelayPublishReport>::success(
-        RelayPublishReport{relay_seq, delivered, coalesced, false});
+        RelayPublishReport{relay_seq, delivered, coalesced, overflowed, false});
   } catch (const std::bad_alloc &) {
     return Result<RelayPublishReport>::failure({ErrorCode::allocation});
   }
 }
 
-Result<std::optional<RoutedRelayFrame>>
-BlindRelayRouter::poll_outbound(std::string_view session_id) {
+Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>
+BlindRelayRouter::poll_outbound_shared(std::string_view session_id) {
   const auto it = sessions_.find(std::string{session_id});
-  if (it == sessions_.end())
-    return Result<std::optional<RoutedRelayFrame>>::failure({ErrorCode::stale_handle});
+  if (it == sessions_.end()) {
+    return Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>::failure(
+        {ErrorCode::stale_handle});
+  }
   SessionState &session = it->second;
-  if (!session.handle.connected)
-    return Result<std::optional<RoutedRelayFrame>>::failure({ErrorCode::stale_handle});
+  if (!session.handle.connected) {
+    return Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>::failure(
+        {ErrorCode::stale_handle});
+  }
 
   auto next = session.outbound_mux.dequeue_next();
-  if (!next.has_value())
-    return Result<std::optional<RoutedRelayFrame>>::success(std::nullopt);
+  if (!next.has_value()) {
+    return Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>::success(
+        std::nullopt);
+  }
 
   const auto frame_it = session.pending_frames.find(next->packet_id);
-  if (frame_it == session.pending_frames.end())
-    return Result<std::optional<RoutedRelayFrame>>::failure({ErrorCode::corrupt});
-  RoutedRelayFrame out = std::move(frame_it->second);
+  if (frame_it == session.pending_frames.end() || !frame_it->second) {
+    return Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>::failure(
+        {ErrorCode::corrupt});
+  }
+  std::shared_ptr<const RoutedRelayFrame> out = std::move(frame_it->second);
   session.pending_frames.erase(frame_it);
-  if (out.frame.lane == RelayLane::presence) {
+  if (out->frame.lane == RelayLane::presence) {
     if (const auto pos = session.presence_ticket_pos.find(next->packet_id);
         pos != session.presence_ticket_pos.end()) {
       session.presence_ticket_order.erase(pos->second);
       session.presence_ticket_pos.erase(pos);
     }
   }
-  return Result<std::optional<RoutedRelayFrame>>::success(std::move(out));
+  return Result<std::optional<std::shared_ptr<const RoutedRelayFrame>>>::success(
+      std::move(out));
+}
+
+Result<std::optional<RoutedRelayFrame>>
+BlindRelayRouter::poll_outbound(std::string_view session_id) {
+  auto shared = poll_outbound_shared(session_id);
+  if (!shared.has_value())
+    return Result<std::optional<RoutedRelayFrame>>::failure(shared.error());
+  const auto &maybe_frame = shared.value();
+  if (!maybe_frame.has_value())
+    return Result<std::optional<RoutedRelayFrame>>::success(std::nullopt);
+  const std::shared_ptr<const RoutedRelayFrame> &ptr = *maybe_frame;
+  if (!ptr)
+    return Result<std::optional<RoutedRelayFrame>>::failure({ErrorCode::corrupt});
+  return Result<std::optional<RoutedRelayFrame>>::success(*ptr);
 }
 
 Result<void> BlindRelayRouter::ack_relay_seq(std::string_view session_id,
@@ -1585,8 +1926,23 @@ Result<void> BlindRelayRouter::ack_relay_seq(std::string_view session_id,
   const auto it = sessions_.find(std::string{session_id});
   if (it == sessions_.end())
     return Result<void>::failure({ErrorCode::stale_handle});
-  if (relay_seq > it->second.handle.last_acked_relay_seq)
-    it->second.handle.last_acked_relay_seq = relay_seq;
+  SessionState &session = it->second;
+  // Never allow cumulative ACK to advance past a reliable gap or beyond what
+  // has been contiguously enqueued for this session.
+  if (relay_seq > session.contiguous_enqueued_relay_seq)
+    return Result<void>::failure({ErrorCode::conflict});
+  // Never allow cumulative ACK to skip an unpolled reliable frame still queued
+  // in this session (e.g. when a higher-seq Control frame preempted a lower-seq
+  // Causal frame).
+  for (const auto &[ticket, pending] : session.pending_frames) {
+    (void)ticket;
+    if (pending && pending->frame.lane != RelayLane::presence &&
+        pending->relay_seq <= relay_seq) {
+      return Result<void>::failure({ErrorCode::conflict});
+    }
+  }
+  if (relay_seq > session.handle.last_acked_relay_seq)
+    session.handle.last_acked_relay_seq = relay_seq;
   return Result<void>::success();
 }
 
@@ -1717,6 +2073,105 @@ Result<void> verify_taint_monotonicity(const TaintTransitionCheck &transition) {
 
 bool is_provenance_tainted(const TaintedProvenance &provenance) noexcept {
   return !provenance.untrusted_sources.empty();
+}
+
+Result<TaintedProvenance>
+derive_local_taint_for_peer_frame(const PeerFrameTaintInput &input) {
+  if (!valid_peer_fingerprint(input.sender_fingerprint))
+    return Result<TaintedProvenance>::failure({ErrorCode::invalid_identity});
+  if (!valid_utf8_no_ctrl(input.local_actor_id, kMaxActorIdBytes, false))
+    return Result<TaintedProvenance>::failure({ErrorCode::invalid_range});
+  if (input.local_actor_id == input.sender_fingerprint)
+    return Result<TaintedProvenance>::failure({ErrorCode::conflict});
+  if (input.max_hops == 0 || input.max_hops > kHardMaxProvenanceHops)
+    return Result<TaintedProvenance>::failure({ErrorCode::invalid_range});
+  if (!input.room_id.empty() && !valid_safe_token(input.room_id, kMaxRoomIdBytes))
+    return Result<TaintedProvenance>::failure({ErrorCode::invalid_range});
+  if (!input.frame_id.empty() &&
+      !valid_safe_token(input.frame_id, kRelayMaxFrameIdBytes))
+    return Result<TaintedProvenance>::failure({ErrorCode::invalid_range});
+
+  try {
+    std::set<std::string> merged_sources;
+    // Receiver-side invariant: EVERY foreign peer frame is unconditionally
+    // tainted with the authenticated transport sender, regardless of any clean
+    // self-reported provenance supplied by the remote peer.
+    merged_sources.insert("peer:" + input.sender_fingerprint);
+    for (const auto &src : input.local_untrusted_sources) {
+      if (!valid_utf8_no_ctrl(src, kMaxUntrustedSourceBytes, false))
+        return Result<TaintedProvenance>::failure({ErrorCode::invalid_range});
+      merged_sources.insert(src);
+    }
+
+    if (!input.peer_reported_provenance.has_value()) {
+      if (merged_sources.size() > kMaxProvenanceUntrustedSources)
+        return Result<TaintedProvenance>::failure({ErrorCode::capacity});
+      TaintedProvenance derived{
+          input.sender_fingerprint,
+          {input.sender_fingerprint, input.local_actor_id},
+          std::vector<std::string>{merged_sources.begin(), merged_sources.end()},
+          1U,
+          input.max_hops,
+      };
+      return Result<TaintedProvenance>::success(std::move(derived));
+    }
+
+    const TaintedProvenance &reported = *input.peer_reported_provenance;
+    auto reported_ok = validate_tainted_provenance(reported);
+    if (!reported_ok.has_value())
+      return Result<TaintedProvenance>::failure(reported_ok.error());
+
+    for (const auto &src : reported.untrusted_sources)
+      merged_sources.insert(src);
+    if (merged_sources.size() > kMaxProvenanceUntrustedSources)
+      return Result<TaintedProvenance>::failure({ErrorCode::capacity});
+
+    const std::uint32_t effective_max_hops =
+        std::min(input.max_hops, reported.max_hops);
+    std::vector<std::string> chain = effective_hop_chain(reported);
+    const bool sender_is_last =
+        (!chain.empty() && chain.back() == input.sender_fingerprint);
+    const std::uint32_t needed_hops = sender_is_last ? 1U : 2U;
+    if (reported.hop_count > effective_max_hops ||
+        effective_max_hops - reported.hop_count < needed_hops) {
+      return Result<TaintedProvenance>::failure({ErrorCode::capacity});
+    }
+
+    if (!sender_is_last) {
+      if (std::ranges::contains(chain, input.sender_fingerprint))
+        return Result<TaintedProvenance>::failure({ErrorCode::conflict});
+      chain.push_back(input.sender_fingerprint);
+    }
+    if (std::ranges::contains(chain, input.local_actor_id))
+      return Result<TaintedProvenance>::failure({ErrorCode::conflict});
+    chain.push_back(input.local_actor_id);
+
+    TaintedProvenance derived{
+        reported.origin_fingerprint,
+        std::move(chain),
+        std::vector<std::string>{merged_sources.begin(), merged_sources.end()},
+        reported.hop_count + needed_hops,
+        effective_max_hops,
+    };
+    return Result<TaintedProvenance>::success(std::move(derived));
+  } catch (const std::bad_alloc &) {
+    return Result<TaintedProvenance>::failure({ErrorCode::allocation});
+  }
+}
+
+Result<TaintedProvenance> derive_local_taint_for_peer_frame(
+    const BlindRelayFrame &frame, std::string_view local_actor_id,
+    const std::optional<TaintedProvenance> &peer_reported,
+    const std::vector<std::string> &local_untrusted_sources) {
+  return derive_local_taint_for_peer_frame(PeerFrameTaintInput{
+      frame.sender_fingerprint,
+      std::string{local_actor_id},
+      frame.room_id,
+      frame.frame_id,
+      peer_reported,
+      local_untrusted_sources,
+      kDefaultMaxProvenanceHops,
+  });
 }
 
 Value tainted_provenance_to_value(const TaintedProvenance &provenance) {

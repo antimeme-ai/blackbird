@@ -309,8 +309,59 @@ void test_signed_checkpoint_and_delta_filter(const std::filesystem::path &base) 
   check(canonical.find("\"type\":\"blackbird.bridge_checkpoint\"") != std::string::npos,
         "missing blackbird.bridge_checkpoint type tag");
 
-  // Verify valid checkpoint succeeds.
+  // Verify valid checkpoint succeeds (both 2-arg and 3-arg PeerIdentityConfig
+  // overloads).
   must_void(verify_checkpoint(known, checkpoint), "verify valid checkpoint");
+  must_void(verify_checkpoint(known, checkpoint, PeerIdentityConfig{}),
+            "verify valid checkpoint with config");
+
+  // Checkpoint anti-rollback, room binding, freshness, and signer authority checks.
+  {
+    CheckpointVerifyOptions strict_ok{};
+    strict_ok.expected_room_id = "room:falcon";
+    strict_ok.min_checkpoint_seq = 7;
+    strict_ok.max_age_ns = 1000;
+    strict_ok.now_ns = 2000; // age = 500 <= 1000
+    strict_ok.max_future_skew_ns = 100;
+    strict_ok.allowed_signers = {alice_id.identity().fingerprint};
+    must_void(verify_checkpoint(known, checkpoint, strict_ok),
+              "verify valid checkpoint with strict options");
+
+    // Room mismatch rejected.
+    CheckpointVerifyOptions wrong_room = strict_ok;
+    wrong_room.expected_room_id = "room:other";
+    const auto room_res = verify_checkpoint(known, checkpoint, wrong_room);
+    check(!room_res.has_value() && room_res.error().code == ErrorCode::conflict,
+          "wrong-room checkpoint accepted");
+
+    // Sequence rollback rejected.
+    CheckpointVerifyOptions rollback = strict_ok;
+    rollback.min_checkpoint_seq = 8;
+    const auto seq_res = verify_checkpoint(known, checkpoint, rollback);
+    check(!seq_res.has_value() && seq_res.error().code == ErrorCode::conflict,
+          "rolled-back checkpoint_seq accepted");
+
+    // Stale checkpoint rejected.
+    CheckpointVerifyOptions stale = strict_ok;
+    stale.now_ns = 2501; // age = 1001 > 1000
+    const auto stale_res = verify_checkpoint(known, checkpoint, stale);
+    check(!stale_res.has_value() && stale_res.error().code == ErrorCode::stale_handle,
+          "stale checkpoint accepted");
+
+    // Excessively future-dated checkpoint rejected.
+    CheckpointVerifyOptions future_skew = strict_ok;
+    future_skew.now_ns = 1000; // created_ns 1500 is 500ns ahead > 100ns skew
+    const auto skew_res = verify_checkpoint(known, checkpoint, future_skew);
+    check(!skew_res.has_value() && skew_res.error().code == ErrorCode::clock_regressed,
+          "future-skewed checkpoint accepted");
+
+    // Unauthorized signer rejected even when cryptographically valid & pinned.
+    CheckpointVerifyOptions unauth_signer = strict_ok;
+    unauth_signer.allowed_signers = {bob_id.identity().fingerprint};
+    const auto auth_res = verify_checkpoint(known, checkpoint, unauth_signer);
+    check(!auth_res.has_value() && auth_res.error().code == ErrorCode::invalid_identity,
+          "unauthorized checkpoint signer accepted");
+  }
 
   // Round-trip through Value/JSON and re-verify.
   const auto cp_json = must(dump_json(checkpoint_to_value(checkpoint)), "dump cp json");
@@ -430,6 +481,27 @@ void test_room_invite_uri(const std::filesystem::path &base) {
 
   const auto parsed = must(parse_room_invite(uri), "parse room invite");
   check(parsed == invite, "room invite round-trip mismatch");
+
+  // Invite freshness and expiration enforcement.
+  check(!parsed.is_expired(invite.expires_ns - 1), "fresh invite marked expired");
+  check(parsed.is_expired(invite.expires_ns), "boundary-expired invite marked fresh");
+  check(parsed.is_expired(invite.expires_ns + 1), "expired invite marked fresh");
+  must_void(validate_room_invite_freshness(parsed, invite.expires_ns - 1),
+            "validate fresh invite");
+  const auto exp_chk = validate_room_invite_freshness(parsed, invite.expires_ns);
+  check(!exp_chk.has_value() && exp_chk.error().code == ErrorCode::stale_handle,
+        "expired invite passed freshness check");
+  const auto parsed_fresh =
+      must(parse_room_invite(uri, invite.expires_ns - 1), "parse fresh invite");
+  check(parsed_fresh == invite, "fresh parsed invite mismatch");
+  const auto parsed_expired = parse_room_invite(uri, invite.expires_ns);
+  check(!parsed_expired.has_value() &&
+            parsed_expired.error().code == ErrorCode::stale_handle,
+        "parse_room_invite accepted expired invite when now_ns was supplied");
+  const auto parsed_bad_now = parse_room_invite(uri, 0);
+  check(!parsed_bad_now.has_value() &&
+            parsed_bad_now.error().code == ErrorCode::invalid_range,
+        "parse_room_invite accepted non-positive now_ns");
 
   // Mismatched fingerprint vs public key MUST be rejected (MITM pinning defense).
   {
@@ -605,12 +677,14 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       1'000'000'000LL,
       "src/core/mux.cpp",
   };
-  const auto pub1 = must(router.publish(f1, 1'000'000'000LL), "publish f1");
+  const auto pub1 =
+      must(router.publish(s_alice.session_id, f1, 1'000'000'000LL), "publish f1");
   check(pub1.relay_seq == 1 && pub1.delivered_sessions == 2 && !pub1.duplicate,
         "f1 delivery count mismatch");
 
   // Duplicate frame_id is suppressed without re-broadcast.
-  const auto pub1_dup = must(router.publish(f1, 1'000'000'100LL), "publish dup f1");
+  const auto pub1_dup =
+      must(router.publish(s_alice.session_id, f1, 1'000'000'100LL), "publish dup f1");
   check(pub1_dup.duplicate && pub1_dup.delivered_sessions == 0,
         "duplicate frame was not suppressed");
 
@@ -640,7 +714,7 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       1'000'000'200LL,
       "src/core/mux.cpp",
   };
-  const auto spec_pub = router.publish(spec_try, 1'000'000'200LL);
+  const auto spec_pub = router.publish(s_spec.session_id, spec_try, 1'000'000'200LL);
   check(!spec_pub.has_value() && spec_pub.error().code == ErrorCode::conflict,
         "spectator was allowed to publish");
 
@@ -659,7 +733,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       "docs/notes.md",
   };
   const auto pub2 =
-      must(router.publish(f2_out_of_scope, 1'000'000'300LL), "publish f2");
+      must(router.publish(s_alice.session_id, f2_out_of_scope, 1'000'000'300LL),
+           "publish f2");
   check(pub2.relay_seq == 2 && pub2.delivered_sessions == 1,
         "interest filtering did not exclude Bob");
   check(!must(router.poll_outbound(s_bob.session_id), "bob poll filtered").has_value(),
@@ -683,7 +758,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       1'000'000'400LL,
       "src/core/mux.cpp",
   };
-  const auto rl_res = router.publish(f_rate_limited, 1'000'000'400LL);
+  const auto rl_res =
+      router.publish(s_alice.session_id, f_rate_limited, 1'000'000'400LL);
   check(!rl_res.has_value() && rl_res.error().code == ErrorCode::busy,
         "Alice burst was not rate-limited");
   check(router.stats().rate_limited_frames == 1, "rate_limited_frames stat mismatch");
@@ -702,8 +778,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       1'000'000'500LL,
       "src/core/mux.cpp",
   };
-  const auto bob_pub =
-      must(router.publish(f_bob_ok, 1'000'000'500LL), "bob publish ok");
+  const auto bob_pub = must(router.publish(s_bob.session_id, f_bob_ok, 1'000'000'500LL),
+                            "bob publish ok");
   check(bob_pub.relay_seq == 3 && bob_pub.delivered_sessions == 2 && !bob_pub.duplicate,
         "Bob was affected by Alice rate limit or frame_id pre-squatting");
   const auto alice_got_bob =
@@ -725,7 +801,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       3'000'000'000LL,
       {},
   };
-  const auto ctrl_bad = router.publish(oversized_ctrl, 3'000'000'000LL);
+  const auto ctrl_bad =
+      router.publish(s_alice.session_id, oversized_ctrl, 3'000'000'000LL);
   check(!ctrl_bad.has_value() && ctrl_bad.error().code == ErrorCode::capacity,
         "oversized control frame was not rejected");
 
@@ -741,7 +818,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       3'000'000'100LL,
       "src/core/mux.cpp",
   };
-  const auto pres_bad = router.publish(oversized_pres, 3'000'000'100LL);
+  const auto pres_bad =
+      router.publish(s_alice.session_id, oversized_pres, 3'000'000'100LL);
   check(!pres_bad.has_value() && pres_bad.error().code == ErrorCode::capacity,
         "oversized presence frame was not rejected");
   check(router.stats().rejected_oversize_frames == 2, "oversize stat mismatch");
@@ -754,53 +832,53 @@ void test_blind_relay_router(const std::filesystem::path &base) {
   // - causal f-4 in Bob's scope (relay_seq 4)
   // - ephemeral presence heartbeat (NOT replayed on resume!)
   // - control recall f-5 (relay_seq 5, preempts causal on resume!)
-  const auto pub4 = must(router.publish(
-                             BlindRelayFrame{
-                                 "room:ops",
-                                 alice.identity().fingerprint,
-                                 RelayLane::causal,
-                                 "f-4-missed",
-                                 1,
-                                 opaque_ct,
-                                 nonce,
-                                 aad,
-                                 5'000'000'000LL,
-                                 "src/core/net.cpp",
-                             },
-                             5'000'000'000LL),
+  const auto pub4 = must(router.publish(s_alice.session_id,
+                                        BlindRelayFrame{
+                                            "room:ops",
+                                            alice.identity().fingerprint,
+                                            RelayLane::causal,
+                                            "f-4-missed",
+                                            1,
+                                            opaque_ct,
+                                            nonce,
+                                            aad,
+                                            5'000'000'000LL,
+                                            "src/core/net.cpp",
+                                        },
+                                        5'000'000'000LL),
                          "publish missed causal");
   check(pub4.relay_seq == 4, "expected relay_seq 4");
 
-  (void)must(router.publish(
-                 BlindRelayFrame{
-                     "room:ops",
-                     alice.identity().fingerprint,
-                     RelayLane::presence,
-                     "f-pres-offline",
-                     1,
-                     opaque_ct,
-                     nonce,
-                     aad,
-                     5'100'000'000LL,
-                     "src/core/net.cpp",
-                 },
-                 5'100'000'000LL),
+  (void)must(router.publish(s_alice.session_id,
+                            BlindRelayFrame{
+                                "room:ops",
+                                alice.identity().fingerprint,
+                                RelayLane::presence,
+                                "f-pres-offline",
+                                1,
+                                opaque_ct,
+                                nonce,
+                                aad,
+                                5'100'000'000LL,
+                                "src/core/net.cpp",
+                            },
+                            5'100'000'000LL),
              "publish offline presence");
 
-  const auto pub5 = must(router.publish(
-                             BlindRelayFrame{
-                                 "room:ops",
-                                 alice.identity().fingerprint,
-                                 RelayLane::control,
-                                 "f-5-recall",
-                                 2,
-                                 opaque_ct,
-                                 nonce,
-                                 aad,
-                                 5'200'000'000LL,
-                                 {},
-                             },
-                             5'200'000'000LL),
+  const auto pub5 = must(router.publish(s_alice.session_id,
+                                        BlindRelayFrame{
+                                            "room:ops",
+                                            alice.identity().fingerprint,
+                                            RelayLane::control,
+                                            "f-5-recall",
+                                            2,
+                                            opaque_ct,
+                                            nonce,
+                                            aad,
+                                            5'200'000'000LL,
+                                            {},
+                                        },
+                                        5'200'000'000LL),
                          "publish missed control");
   check(pub5.relay_seq == 5, "expected relay_seq 5");
 
@@ -810,6 +888,8 @@ void test_blind_relay_router(const std::filesystem::path &base) {
       outsider.identity().fingerprint,
       "203.0.113.99:4444",
       1,
+      s_bob.resume_token,
+      "room:ops",
   });
   check(!hijack.has_value() && hijack.error().code == ErrorCode::invalid_identity,
         "session resume allowed wrong peer fingerprint");
@@ -820,12 +900,16 @@ void test_blind_relay_router(const std::filesystem::path &base) {
                                 bob.identity().fingerprint,
                                 "100.64.9.42:61234",
                                 1,
+                                s_bob.resume_token,
+                                "room:ops",
                             }),
                             "bob roam resume");
   check(resumed.session.connected, "resumed session not connected");
   check(resumed.session.remote_endpoint == "100.64.9.42:61234", "endpoint not updated");
   check(resumed.session.connection_id != s_bob.connection_id,
         "connection_id did not rotate on roam");
+  check(resumed.session.resume_token != s_bob.resume_token,
+        "resume_token did not rotate on roam");
   check(resumed.session.roam_count == 1, "roam_count != 1");
   // Missed relevant reliable frames after seq 1: f-4-missed (seq 4) and f-5-recall (seq
   // 5). (f-1 was acked, f-2 was out of scope, f-bob-1 was Bob's own, f-pres-offline was
@@ -842,6 +926,668 @@ void test_blind_relay_router(const std::filesystem::path &base) {
   check(r2.has_value() && r2->frame.frame_id == "f-4-missed" && r2->relay_seq == 4,
         "roam drain did not deliver missed causal frame");
   check(!r3.has_value(), "unexpected extra/stale frame replayed on roam");
+}
+
+bool is_random_hex_token(std::string_view token, std::string_view prefix) {
+  if (!token.starts_with(prefix))
+    return false;
+  const std::string_view hex = token.substr(prefix.size());
+  if (hex.size() != 32)
+    return false;
+  for (const char ch : hex) {
+    const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Wave 5 Opus Hardening Regression Tests (Atomic Rollback, Zero Loss,
+//     Auth/Anti-Takeover, Zero-Copy Shared Storage, Byte Cap, Session Reaping)
+// ---------------------------------------------------------------------------
+
+void test_relay_atomic_resume_rollback(const std::filesystem::path &base) {
+  g_stage = "relay_atomic_resume_rollback";
+
+  auto alice = must(PeerIdentityStore::open_or_create(base / "rb-alice"), "rb alice");
+  auto bob = must(PeerIdentityStore::open_or_create(base / "rb-bob"), "rb bob");
+
+  BlindRelayConfig cfg{};
+  cfg.session_mux.max_causal_queue = 2;
+  cfg.session_mux.max_control_queue = 2;
+  cfg.max_room_history = 16;
+  cfg.rate_limit.frames_per_sec = 1000.0;
+  cfg.rate_limit.burst_frames = 100.0;
+
+  auto router = must(BlindRelayRouter::create(cfg), "create rollback router");
+  const auto s_alice = must(router.register_session({
+                                "room:rb",
+                                alice.identity().fingerprint,
+                                RelayParticipantRole::peer,
+                                "10.0.0.1:5000",
+                                {},
+                            }),
+                            "reg rb alice");
+  const auto s_bob = must(router.register_session({
+                              "room:rb",
+                              bob.identity().fingerprint,
+                              RelayParticipantRole::peer,
+                              "10.0.0.2:5000",
+                              {},
+                          }),
+                          "reg rb bob");
+
+  const std::string aad = board_bridge_sha256_hex("room:rb|epoch=1");
+  const std::string ct = "YWJjZGVmZ2g=";
+  const std::string nonce = "QUJDREVGR0hJSktM";
+
+  // Put 1 frame into Bob's queue while connected, then disconnect Bob so Bob
+  // retains his pre-existing pending state before an overflowing resume.
+  (void)must(router.publish(s_alice.session_id,
+                            BlindRelayFrame{
+                                "room:rb",
+                                alice.identity().fingerprint,
+                                RelayLane::causal,
+                                "rb-1",
+                                1,
+                                ct,
+                                nonce,
+                                aad,
+                                1'000'000'000LL,
+                                {},
+                            },
+                            1'000'000'000LL),
+             "publish rb-1");
+  must_void(router.disconnect_session(s_bob.session_id, 1'500'000'000LL),
+            "disconnect rb bob");
+
+  // Alice publishes 3 more frames (total 4 reliable frames > max_causal_queue = 2).
+  for (int i = 2; i <= 4; ++i) {
+    (void)must(
+        router.publish(s_alice.session_id,
+                       BlindRelayFrame{
+                           "room:rb",
+                           alice.identity().fingerprint,
+                           RelayLane::causal,
+                           "rb-" + std::to_string(i),
+                           1,
+                           ct,
+                           nonce,
+                           aad,
+                           static_cast<std::int64_t>(2'000'000'000LL + i * 1000LL),
+                           {},
+                       },
+                       static_cast<std::int64_t>(2'000'000'000LL + i * 1000LL)),
+        "publish rb frame");
+  }
+
+  const auto before_info = must(router.session_info(s_bob.session_id), "before info");
+  check(!before_info.connected, "bob should be disconnected before failed resume");
+
+  // Resume from seq 0 requires replaying 4 causal frames into a 2-slot queue -> MUST
+  // fail with capacity AND leave Bob's session state completely untouched!
+  const auto failed_resume = router.resume_session({
+      s_bob.session_id,
+      bob.identity().fingerprint,
+      "10.9.9.9:9999",
+      0,
+      s_bob.resume_token,
+      "room:rb",
+  });
+  check(!failed_resume.has_value() && failed_resume.error().code == ErrorCode::capacity,
+        "overflowing resume did not fail with capacity");
+
+  const auto after_info = must(router.session_info(s_bob.session_id), "after info");
+  check(after_info == before_info,
+        "failed resume mutated session handle (not atomic rollback)");
+  check(!after_info.connected, "failed resume left session connected");
+  check(after_info.connection_id == s_bob.connection_id,
+        "failed resume rotated connection_id");
+  check(after_info.resume_token == s_bob.resume_token,
+        "failed resume rotated resume_token");
+  check(after_info.remote_endpoint == "10.0.0.2:5000",
+        "failed resume mutated remote_endpoint");
+  check(after_info.roam_count == 0 && router.stats().session_roams == 0,
+        "failed resume incremented roam counters");
+
+  // Also test atomic rollback while connected with an existing queued frame.
+  const auto ok_resume = must(router.resume_session({
+                                  s_bob.session_id,
+                                  bob.identity().fingerprint,
+                                  "10.0.0.20:5000",
+                                  2, // replays frames 3 and 4 (fits in 2-slot queue)
+                                  s_bob.resume_token,
+                                  "room:rb",
+                              }),
+                              "valid resume after rollback");
+  check(ok_resume.replayed_frames == 2, "expected 2 replayed frames");
+  const auto connected_before =
+      must(router.session_info(s_bob.session_id), "connected before");
+  const auto second_fail = router.resume_session({
+      s_bob.session_id,
+      bob.identity().fingerprint,
+      "10.8.8.8:8888",
+      0,
+      ok_resume.session.resume_token,
+      "room:rb",
+  });
+  check(!second_fail.has_value() && second_fail.error().code == ErrorCode::capacity,
+        "second overflowing resume did not fail");
+  check(must(router.session_info(s_bob.session_id), "connected after") ==
+            connected_before,
+        "failed resume while connected mutated session");
+  // Existing queued frames 3 and 4 must still be intact and pollable!
+  const auto p3 = must(router.poll_outbound(s_bob.session_id), "poll intact 3");
+  const auto p4 = must(router.poll_outbound(s_bob.session_id), "poll intact 4");
+  check(p3.has_value() && p3->relay_seq == 3 && p4.has_value() && p4->relay_seq == 4,
+        "failed resume wiped pre-existing pending frames");
+}
+
+void test_relay_zero_silent_frame_loss(const std::filesystem::path &base) {
+  g_stage = "relay_zero_silent_frame_loss";
+
+  auto alice = must(PeerIdentityStore::open_or_create(base / "zfl-alice"), "zfl alice");
+  auto bob = must(PeerIdentityStore::open_or_create(base / "zfl-bob"), "zfl bob");
+  auto charlie =
+      must(PeerIdentityStore::open_or_create(base / "zfl-charlie"), "zfl charlie");
+
+  BlindRelayConfig cfg{};
+  cfg.session_mux.max_causal_queue = 2;
+  cfg.session_mux.max_control_queue = 2;
+  cfg.max_room_history = 32;
+  cfg.rate_limit.frames_per_sec = 1000.0;
+  cfg.rate_limit.burst_frames = 100.0;
+
+  auto router = must(BlindRelayRouter::create(cfg), "create zfl router");
+  const auto s_alice = must(router.register_session({
+                                "room:zfl",
+                                alice.identity().fingerprint,
+                                RelayParticipantRole::peer,
+                                "10.0.1.1:5000",
+                                {},
+                            }),
+                            "reg zfl alice");
+  const auto s_bob = must(router.register_session({
+                              "room:zfl",
+                              bob.identity().fingerprint,
+                              RelayParticipantRole::peer,
+                              "10.0.1.2:5000",
+                              {},
+                          }),
+                          "reg zfl bob");
+  const auto s_charlie = must(router.register_session({
+                                  "room:zfl",
+                                  charlie.identity().fingerprint,
+                                  RelayParticipantRole::peer,
+                                  "10.0.1.3:5000",
+                                  {},
+                              }),
+                              "reg zfl charlie");
+
+  const std::string aad = board_bridge_sha256_hex("room:zfl|epoch=1");
+  const std::string ct = "YWJjZGVmZ2g=";
+  const std::string nonce = "QUJDREVGR0hJSktM";
+
+  auto send_frame = [&](int idx, RelayLane lane) {
+    return must(
+        router.publish(s_alice.session_id,
+                       BlindRelayFrame{
+                           "room:zfl",
+                           alice.identity().fingerprint,
+                           lane,
+                           "zfl-" + std::to_string(idx),
+                           1,
+                           ct,
+                           nonce,
+                           aad,
+                           static_cast<std::int64_t>(1'000'000'000LL + idx * 100LL),
+                           {},
+                       },
+                       static_cast<std::int64_t>(1'000'000'000LL + idx * 100LL)),
+        "publish zfl frame");
+  };
+
+  // Frames 1..4 fill and drain cleanly for Charlie; for Bob, frames 1..2 fill his
+  // 2-slot causal queue, then frame 3 overflows.
+  const auto r1 = send_frame(1, RelayLane::causal);
+  const auto r2 = send_frame(2, RelayLane::causal);
+  check(r1.relay_seq == 1 && r2.relay_seq == 2 && r2.overflowed_sessions == 0,
+        "frames 1-2 should enqueue cleanly");
+
+  // Charlie drains frames 1 and 2 so Charlie never overflows.
+  check(must(router.poll_outbound(s_charlie.session_id), "c poll 1").has_value(),
+        "charlie missed 1");
+  check(must(router.poll_outbound(s_charlie.session_id), "c poll 2").has_value(),
+        "charlie missed 2");
+
+  // Frame 3 overflows Bob's full causal queue (Opus #3: frame 5 scenario).
+  const auto r3 = send_frame(3, RelayLane::causal);
+  check(r3.relay_seq == 3 && r3.delivered_sessions == 1 && r3.overflowed_sessions == 1,
+        "frame 3 should deliver to Charlie and latch overflow on Bob");
+  check(must(router.session_info(s_bob.session_id), "bob overflow info").needs_resync,
+        "bob needs_resync flag not set on reliable overflow");
+  check(router.stats().reliable_overflow_events == 1,
+        "reliable_overflow_events mismatch");
+
+  // Bob polls frame 1, freeing a slot in his causal queue!
+  const auto b1 = must(router.poll_outbound(s_bob.session_id), "bob poll 1");
+  check(b1.has_value() && b1->relay_seq == 1, "bob poll 1 mismatch");
+
+  // Frame 4 (causal) and Frame 5 (control) arrive after Bob freed a slot!
+  // Neither may be enqueued for Bob while needs_resync is latched (prevents skipping
+  // 3).
+  const auto r4 = send_frame(4, RelayLane::causal);
+  const auto r5 = send_frame(5, RelayLane::control);
+  check(r4.overflowed_sessions == 1 && r5.overflowed_sessions == 1,
+        "post-overflow reliable frames were enqueued past gap");
+
+  // Attempting to ack seq 2 BEFORE polling frame 2 must fail (unpolled reliable frame).
+  const auto ack2_early = router.ack_relay_seq(s_bob.session_id, 2);
+  check(!ack2_early.has_value() && ack2_early.error().code == ErrorCode::conflict,
+        "ack_relay_seq allowed skipping unpolled frame 2");
+  must_void(router.ack_relay_seq(s_bob.session_id, 1), "bob ack 1");
+
+  // Bob polls frame 2; queue is now empty (frames 4 & 5 were NOT enqueued past gap 3).
+  const auto b2 = must(router.poll_outbound(s_bob.session_id), "bob poll 2");
+  check(b2.has_value() && b2->relay_seq == 2, "bob poll 2 mismatch");
+  check(!must(router.poll_outbound(s_bob.session_id), "bob poll gap").has_value(),
+        "bob received frame 4 or 5 past dropped frame 3");
+
+  must_void(router.ack_relay_seq(s_bob.session_id, 2), "bob ack 2");
+
+  // Attempting to ack seq 3, 4, or 5 MUST fail (zero silent frame loss).
+  for (std::uint64_t bad_seq : {3ULL, 4ULL, 5ULL}) {
+    const auto bad_ack = router.ack_relay_seq(s_bob.session_id, bad_seq);
+    check(!bad_ack.has_value() && bad_ack.error().code == ErrorCode::conflict,
+          "ack_relay_seq advanced past dropped reliable frame");
+  }
+  check(
+      must(router.session_info(s_bob.session_id), "bob ack seq").last_acked_relay_seq ==
+          2,
+      "bob last_acked_relay_seq advanced past 2");
+
+  // Bob resyncs via resume_session from last_acked_relay_seq = 2 and receives
+  // ALL three missed frames (3, 4, 5) with zero loss!
+  const auto resync = must(router.resume_session({
+                               s_bob.session_id,
+                               bob.identity().fingerprint,
+                               "10.0.1.2:5001",
+                               2,
+                               s_bob.resume_token,
+                               "room:zfl",
+                           }),
+                           "bob resync resume");
+  check(!resync.session.needs_resync && resync.replayed_frames == 3 &&
+            !resync.history_truncated,
+        "bob resync did not cleanly replay frames 3, 4, 5");
+
+  // Control frame 5 preempts causal frames 3 and 4; cumulative ACK 5 MUST fail
+  // until 3 and 4 are also polled!
+  const auto p5 = must(router.poll_outbound(s_bob.session_id), "bob poll resync 5");
+  check(p5.has_value() && p5->relay_seq == 5, "control frame 5 did not preempt");
+  const auto ack5_premature = router.ack_relay_seq(s_bob.session_id, 5);
+  check(!ack5_premature.has_value() &&
+            ack5_premature.error().code == ErrorCode::conflict,
+        "ack_relay_seq(5) succeeded while causal frames 3 & 4 were still unpolled");
+
+  const auto p3 = must(router.poll_outbound(s_bob.session_id), "bob poll resync 3");
+  const auto p4 = must(router.poll_outbound(s_bob.session_id), "bob poll resync 4");
+  check(p3.has_value() && p3->relay_seq == 3 && p4.has_value() && p4->relay_seq == 4,
+        "resync lost frame 3 or 4");
+  must_void(router.ack_relay_seq(s_bob.session_id, 5), "bob ack 5 after full drain");
+}
+
+void test_relay_auth_and_unpredictable_tokens(const std::filesystem::path &base) {
+  g_stage = "relay_auth_and_unpredictable_tokens";
+
+  auto alice =
+      must(PeerIdentityStore::open_or_create(base / "auth-alice"), "auth alice");
+  auto bob = must(PeerIdentityStore::open_or_create(base / "auth-bob"), "auth bob");
+  auto mallory =
+      must(PeerIdentityStore::open_or_create(base / "auth-mallory"), "auth mallory");
+
+  auto router =
+      must(BlindRelayRouter::create(BlindRelayConfig{}), "create auth router");
+  const auto s_alice = must(router.register_session({
+                                "room:auth",
+                                alice.identity().fingerprint,
+                                RelayParticipantRole::peer,
+                                "10.0.2.1:5000",
+                                {},
+                            }),
+                            "reg auth alice");
+  const auto s_bob = must(router.register_session({
+                              "room:auth",
+                              bob.identity().fingerprint,
+                              RelayParticipantRole::peer,
+                              "10.0.2.2:5000",
+                              {},
+                          }),
+                          "reg auth bob");
+  const auto s_mallory = must(router.register_session({
+                                  "room:other",
+                                  mallory.identity().fingerprint,
+                                  RelayParticipantRole::peer,
+                                  "10.0.2.3:5000",
+                                  {},
+                              }),
+                              "reg auth mallory");
+
+  // 128-bit random hex tokens (NEVER predictable sequential sess-1 / conn-1).
+  check(is_random_hex_token(s_alice.session_id, "sess-"),
+        "alice session_id is not 128-bit random hex");
+  check(is_random_hex_token(s_alice.connection_id, "conn-"),
+        "alice connection_id is not 128-bit random hex");
+  check(is_random_hex_token(s_alice.resume_token, "rtok-"),
+        "alice resume_token is not 128-bit random hex");
+  check(is_random_hex_token(s_bob.session_id, "sess-"),
+        "bob session_id is not 128-bit random hex");
+  check(s_alice.session_id != s_bob.session_id &&
+            s_alice.resume_token != s_bob.resume_token &&
+            s_alice.connection_id != s_bob.connection_id,
+        "random session tokens collided");
+
+  const std::string aad = board_bridge_sha256_hex("room:auth|epoch=1");
+  const BlindRelayFrame alice_frame{
+      "room:auth",
+      alice.identity().fingerprint,
+      RelayLane::causal,
+      "auth-f1",
+      1,
+      "YWJjZGVmZ2g=",
+      "QUJDREVGR0hJSktM",
+      aad,
+      1'000'000'000LL,
+      {},
+  };
+
+  // Spoof attempt 1: unknown/guessed sequential session_id.
+  const auto pub_unknown = router.publish("sess-1", alice_frame, 1'000'000'000LL);
+  check(!pub_unknown.has_value() &&
+            pub_unknown.error().code == ErrorCode::invalid_identity,
+        "publish accepted unknown session_id");
+
+  // Spoof attempt 2: Bob uses his own valid session_id to spoof Alice's fingerprint.
+  const auto pub_spoof = router.publish(s_bob.session_id, alice_frame, 1'000'000'000LL);
+  check(!pub_spoof.has_value() && pub_spoof.error().code == ErrorCode::invalid_identity,
+        "publish allowed Bob's session to spoof Alice's sender_fingerprint");
+
+  // Spoof attempt 3: Mallory uses session in room:other to publish into room:auth.
+  BlindRelayFrame cross_room = alice_frame;
+  cross_room.sender_fingerprint = mallory.identity().fingerprint;
+  const auto pub_xroom =
+      router.publish(s_mallory.session_id, cross_room, 1'000'000'000LL);
+  check(!pub_xroom.has_value() && pub_xroom.error().code == ErrorCode::invalid_identity,
+        "publish allowed cross-room session injection");
+
+  // Spoof attempt 4: Disconnected session cannot publish.
+  must_void(router.disconnect_session(s_alice.session_id, 1'000'000'000LL),
+            "disconnect auth alice");
+  const auto pub_disc =
+      router.publish(s_alice.session_id, alice_frame, 1'000'000'100LL);
+  check(!pub_disc.has_value() && pub_disc.error().code == ErrorCode::stale_handle,
+        "disconnected session was allowed to publish");
+
+  // Resume hijack attempt 1: attacker knows session_id + public fingerprint but NOT
+  // resume_token.
+  const auto hijack_no_tok = router.resume_session({
+      s_alice.session_id,
+      alice.identity().fingerprint,
+      "203.0.113.55:4444",
+      0,
+      "",
+      "room:auth",
+  });
+  check(!hijack_no_tok.has_value() &&
+            hijack_no_tok.error().code == ErrorCode::invalid_identity,
+        "resume succeeded without resume_token");
+
+  const auto hijack_wrong_tok = router.resume_session({
+      s_alice.session_id,
+      alice.identity().fingerprint,
+      "203.0.113.55:4444",
+      0,
+      s_bob.resume_token,
+      "room:auth",
+  });
+  check(!hijack_wrong_tok.has_value() &&
+            hijack_wrong_tok.error().code == ErrorCode::invalid_identity,
+        "resume succeeded with wrong resume_token");
+
+  // Resume hijack attempt 2: wrong room_id rejected even with valid token.
+  const auto hijack_wrong_room = router.resume_session({
+      s_alice.session_id,
+      alice.identity().fingerprint,
+      "10.0.2.1:5001",
+      0,
+      s_alice.resume_token,
+      "room:other",
+  });
+  check(!hijack_wrong_room.has_value() &&
+            hijack_wrong_room.error().code == ErrorCode::invalid_identity,
+        "resume succeeded with wrong room_id");
+
+  // Legitimate resume succeeds and rotates resume_token; replaying old token fails!
+  const auto resumed = must(router.resume_session({
+                                s_alice.session_id,
+                                alice.identity().fingerprint,
+                                "10.0.2.1:5001",
+                                0,
+                                s_alice.resume_token,
+                                "room:auth",
+                            }),
+                            "legit auth resume");
+  check(is_random_hex_token(resumed.session.resume_token, "rtok-") &&
+            resumed.session.resume_token != s_alice.resume_token,
+        "resume_token did not rotate to new 128-bit random token");
+
+  const auto replay_old_tok = router.resume_session({
+      s_alice.session_id,
+      alice.identity().fingerprint,
+      "203.0.113.55:4444",
+      0,
+      s_alice.resume_token,
+      "room:auth",
+  });
+  check(!replay_old_tok.has_value() &&
+            replay_old_tok.error().code == ErrorCode::invalid_identity,
+        "replaying rotated-out resume_token succeeded");
+}
+
+void test_relay_memory_and_session_bounds(const std::filesystem::path &base) {
+  g_stage = "relay_memory_and_session_bounds";
+
+  auto alice = must(PeerIdentityStore::open_or_create(base / "mem-alice"), "mem alice");
+  auto bob = must(PeerIdentityStore::open_or_create(base / "mem-bob"), "mem bob");
+  auto charlie =
+      must(PeerIdentityStore::open_or_create(base / "mem-charlie"), "mem charlie");
+
+  // 1) shared_ptr zero-copy + byte-bounded history eviction.
+  {
+    BlindRelayConfig cfg{};
+    cfg.max_room_history = 100;
+    cfg.max_room_history_bytes = 2200; // Fits at most ~2 frames of ~900 bytes each.
+    cfg.rate_limit.frames_per_sec = 1000.0;
+    cfg.rate_limit.burst_frames = 100.0;
+
+    auto router = must(BlindRelayRouter::create(cfg), "create mem router");
+    const auto s_alice = must(router.register_session({
+                                  "room:mem",
+                                  alice.identity().fingerprint,
+                                  RelayParticipantRole::peer,
+                                  "10.0.3.1:5000",
+                                  {},
+                              }),
+                              "reg mem alice");
+    const auto s_bob = must(router.register_session({
+                                "room:mem",
+                                bob.identity().fingerprint,
+                                RelayParticipantRole::peer,
+                                "10.0.3.2:5000",
+                                {},
+                            }),
+                            "reg mem bob");
+    const auto s_charlie = must(router.register_session({
+                                    "room:mem",
+                                    charlie.identity().fingerprint,
+                                    RelayParticipantRole::peer,
+                                    "10.0.3.3:5000",
+                                    {},
+                                }),
+                                "reg mem charlie");
+
+    const std::string aad = board_bridge_sha256_hex("room:mem|epoch=1");
+    const std::string payload_512(512, 'A');
+    const std::string nonce = "QUJDREVGR0hJSktM";
+
+    (void)must(router.publish(s_alice.session_id,
+                              BlindRelayFrame{
+                                  "room:mem",
+                                  alice.identity().fingerprint,
+                                  RelayLane::causal,
+                                  "mem-1",
+                                  1,
+                                  payload_512,
+                                  nonce,
+                                  aad,
+                                  1'000'000'000LL,
+                                  {},
+                              },
+                              1'000'000'000LL),
+               "publish mem-1");
+
+    // Zero-copy verification: Bob and Charlie receive pointers to the EXACT same
+    // immutable RoutedRelayFrame object shared with room history!
+    const auto bob_shared =
+        must(router.poll_outbound_shared(s_bob.session_id), "bob poll shared");
+    const auto charlie_shared =
+        must(router.poll_outbound_shared(s_charlie.session_id), "charlie poll shared");
+    check(bob_shared.has_value() && charlie_shared.has_value(),
+          "missing shared frame for recipients");
+    check(bob_shared.has_value() && charlie_shared.has_value() &&
+              bob_shared->get() == charlie_shared->get(),
+          "ciphertext was duplicated instead of shared via shared_ptr");
+    check(bob_shared.has_value() && bob_shared->use_count() >= 3,
+          "expected shared_ptr shared across bob, charlie, and room history");
+
+    // Publish 4 more 512-byte frames -> byte cap (2200) must evict oldest frames even
+    // though max_room_history frame count is 100!
+    for (int i = 2; i <= 5; ++i) {
+      (void)must(
+          router.publish(s_alice.session_id,
+                         BlindRelayFrame{
+                             "room:mem",
+                             alice.identity().fingerprint,
+                             RelayLane::causal,
+                             "mem-" + std::to_string(i),
+                             1,
+                             payload_512,
+                             nonce,
+                             aad,
+                             static_cast<std::int64_t>(1'000'000'000LL + i * 100LL),
+                             {},
+                         },
+                         static_cast<std::int64_t>(1'000'000'000LL + i * 100LL)),
+          "publish mem frame");
+    }
+    const auto st = router.stats();
+    check(st.retained_history_bytes <= cfg.max_room_history_bytes,
+          "room reliable history exceeded max_room_history_bytes");
+    check(st.retained_history_frames < 5 && st.retained_history_frames >= 1,
+          "byte cap did not evict oldest frames");
+
+    // Resuming from seq 0 must flag history_truncated because seq 1 was byte-evicted.
+    const auto resumed = must(router.resume_session({
+                                  s_bob.session_id,
+                                  bob.identity().fingerprint,
+                                  "10.0.3.2:5001",
+                                  0,
+                                  s_bob.resume_token,
+                                  "room:mem",
+                              }),
+                              "resume after byte eviction");
+    check(resumed.history_truncated,
+          "resume did not report history_truncated after byte-cap eviction");
+    check(resumed.replayed_frames == st.retained_history_frames,
+          "replayed frame count did not match retained byte-bounded history");
+  }
+
+  // 2) Stale disconnected session reaping & automatic eviction under room session cap.
+  {
+    BlindRelayConfig cfg{};
+    cfg.max_sessions_per_room = 2;
+    cfg.disconnected_session_ttl_ns = 1'000'000'000LL; // 1s TTL
+
+    auto router = must(BlindRelayRouter::create(cfg), "create cap router");
+    const auto s1 = must(router.register_session({
+                             "room:cap",
+                             alice.identity().fingerprint,
+                             RelayParticipantRole::peer,
+                             "10.0.4.1:5000",
+                             {},
+                         }),
+                         "reg s1");
+    const auto s2 = must(router.register_session({
+                             "room:cap",
+                             bob.identity().fingerprint,
+                             RelayParticipantRole::peer,
+                             "10.0.4.2:5000",
+                             {},
+                         }),
+                         "reg s2");
+
+    // Both connected -> 3rd session MUST be rejected with capacity.
+    const auto full_rej = router.register_session({
+        "room:cap",
+        charlie.identity().fingerprint,
+        RelayParticipantRole::peer,
+        "10.0.4.3:5000",
+        {},
+    });
+    check(!full_rej.has_value() && full_rej.error().code == ErrorCode::capacity,
+          "room exceeded max_sessions_per_room while all sessions connected");
+
+    // Disconnect s1 (older) then s2 (newer).
+    must_void(router.disconnect_session(s1.session_id, 1'000'000'000LL), "disc s1");
+    must_void(router.disconnect_session(s2.session_id, 2'000'000'000LL), "disc s2");
+
+    // Registering s3 must automatically evict oldest disconnected session (s1),
+    // preventing dead sessions from permanently DoS'ing the room cap!
+    const auto s3 = must(router.register_session({
+                             "room:cap",
+                             charlie.identity().fingerprint,
+                             RelayParticipantRole::peer,
+                             "10.0.4.3:5000",
+                             {},
+                         }),
+                         "reg s3 after evicting s1");
+    check(!router.session_info(s1.session_id).has_value(),
+          "oldest disconnected session s1 was not evicted");
+    check(router.session_info(s2.session_id).has_value(),
+          "newer disconnected session s2 should still exist");
+    check(router.stats().evicted_sessions == 1, "evicted_sessions != 1");
+
+    // Explicit evict_disconnected_before reaps s2 (disconnected at 2s) while keeping
+    // connected s3 alive.
+    check(router.evict_disconnected_before(1'500'000'000LL) == 0,
+          "evicted session disconnected after cutoff");
+    check(router.evict_disconnected_before(2'500'000'000LL) == 1,
+          "failed to evict stale disconnected session s2");
+    check(!router.session_info(s2.session_id).has_value(),
+          "s2 still present after evict_disconnected_before");
+    check(router.session_info(s3.session_id).has_value(),
+          "connected s3 was wrongly evicted");
+
+    // TTL reaping via evict_stale_sessions cleans up disconnected s3 and empty room.
+    must_void(router.disconnect_session(s3.session_id, 3'000'000'000LL), "disc s3");
+    check(router.evict_stale_sessions(3'500'000'000LL) == 0,
+          "evicted s3 before TTL elapsed");
+    check(router.evict_stale_sessions(4'100'000'000LL) == 1,
+          "did not evict s3 after TTL elapsed");
+    check(router.stats().registered_sessions == 0 && router.stats().active_rooms == 0,
+          "empty room/sessions not cleaned up after reaping");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +1674,79 @@ void test_transitive_taint_propagation(const std::filesystem::path &base) {
       must(merge_taint_into_peer_provenance(hop3, base_peer_prov), "merge peer prov");
   check(merged.untrusted_sources.size() == 4,
         "merged PeerProvenance missing transitive untrusted sources");
+
+  // Receiver-side invariant: peer-supplied "clean" provenance MUST NEVER override
+  // local taint!
+  auto forwarder = must(PeerIdentityStore::open_or_create(base / "taint-forwarder"),
+                        "create forwarder");
+  const std::string fp_fwd = forwarder.identity().fingerprint;
+  const BlindRelayFrame foreign_frame{
+      "room:taint",
+      fp_a,
+      RelayLane::causal,
+      "f-clean-claim",
+      1,
+      "YWJjZGVmZ2g=",
+      "QUJDREVGR0hJSktM",
+      board_bridge_sha256_hex("room:taint"),
+      1'000'000'000LL,
+      {},
+  };
+
+  // Case 1: Foreign peer attaches a self-reported "clean" provenance (empty
+  // untrusted_sources).
+  const TaintedProvenance self_reported_clean{
+      fp_a, {fp_a}, {}, 0, kDefaultMaxProvenanceHops,
+  };
+  check(!is_provenance_tainted(self_reported_clean),
+        "self-reported clean fixture should start clean");
+  const auto derived_clean_override =
+      must(derive_local_taint_for_peer_frame(foreign_frame, "local-worker",
+                                             self_reported_clean),
+           "derive local taint overriding clean peer report");
+  check(is_provenance_tainted(derived_clean_override),
+        "receiver trusted peer-supplied clean provenance");
+  check(std::ranges::contains(derived_clean_override.untrusted_sources,
+                              std::string{"peer:" + fp_a}),
+        "receiver missing peer:<sender_fingerprint> taint marker");
+  must_void(verify_taint_monotonicity({self_reported_clean, derived_clean_override}),
+            "derived taint violated monotonicity");
+
+  // Case 2: Foreign peer omits provenance entirely -> still locally tainted.
+  const auto derived_no_prov =
+      must(derive_local_taint_for_peer_frame(foreign_frame, "local-worker"),
+           "derive local taint with omitted peer provenance");
+  check(is_provenance_tainted(derived_no_prov) &&
+            std::ranges::contains(derived_no_prov.untrusted_sources,
+                                  std::string{"peer:" + fp_a}),
+        "omitted peer provenance was not locally tainted");
+
+  // Case 3: Forwarding peer omits itself from hop_chain -> receiver inserts both
+  // forwarder and local actor while preserving upstream untrusted sources.
+  BlindRelayFrame forwarded_frame = foreign_frame;
+  forwarded_frame.sender_fingerprint = fp_fwd;
+  const auto derived_forwarded =
+      must(derive_local_taint_for_peer_frame(forwarded_frame, "local-worker", hop0),
+           "derive local taint for forwarded frame");
+  check(derived_forwarded.hop_count == 2 && derived_forwarded.hop_chain.size() == 3 &&
+            derived_forwarded.hop_chain[0] == fp_a &&
+            derived_forwarded.hop_chain[1] == fp_fwd &&
+            derived_forwarded.hop_chain[2] == "local-worker",
+        "forwarded hop chain missing forwarder or local actor");
+  check(std::ranges::contains(derived_forwarded.untrusted_sources,
+                              std::string{"web:https://untrusted.example/spec"}) &&
+            std::ranges::contains(derived_forwarded.untrusted_sources,
+                                  std::string{"peer:" + fp_fwd}),
+        "forwarded taint missing upstream or forwarder source");
+  must_void(verify_taint_monotonicity({hop0, derived_forwarded}),
+            "forwarded taint violated monotonicity");
+
+  // Case 4: Hop-cap overflow on receive is rejected (fail-closed).
+  const auto derived_overflow =
+      derive_local_taint_for_peer_frame(foreign_frame, "local-worker", hop3);
+  check(!derived_overflow.has_value() &&
+            derived_overflow.error().code == ErrorCode::capacity,
+        "receiver failed to reject hop-cap overflow");
 }
 
 } // namespace
@@ -940,6 +1759,10 @@ int main() {
     test_signed_checkpoint_and_delta_filter(temp_dir);
     test_room_invite_uri(temp_dir);
     test_blind_relay_router(temp_dir);
+    test_relay_atomic_resume_rollback(temp_dir);
+    test_relay_zero_silent_frame_loss(temp_dir);
+    test_relay_auth_and_unpredictable_tokens(temp_dir);
+    test_relay_memory_and_session_bounds(temp_dir);
     test_transitive_taint_propagation(temp_dir);
     std::cout << "bridge_relay_test: all checks passed\n";
   } catch (const std::exception &ex) {

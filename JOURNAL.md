@@ -14047,3 +14047,28 @@ Blackbird must not present itself as another product.
 - **Hygiene & Audit Trail:** added `/.blackbird/` to `.gitignore` so live local Command Post state
   never dirties `git status`; archived `@dentist-2`'s independent Wave 6 verification report in
   `papers/2026-11-23-wave6-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #20: Opus Wave 5 Remediations & Wave 7A Core `PartyChatPane`
+
+- **Opus Wave 5 Remediation A — Command Post Tools (`src/command_post_tools.cpp`, `tests/command_post_tools_test.cpp`):**
+  fixed live OpenAI strict-schema all-fields calls (`""`/`0`/`null`/`[]`/defaults on unused fields)
+  across all 5 tools (`platoon_board`, `bridge_guard`, `project_issues`, `project_memory`,
+  `companion_timing`), added `conflict_count > 0` hard safety floor (`interrupt_room`) in
+  `companion_timing`, switched `bridge_guard` `receipt` to fail-closed `PeerIdentityStore::open_existing()`
+  (zero disk/key creation), and added ESC/C0/DEL/C1/bidi escaping + `untrusted_shared_store` framing
+  on `project_issues` and `project_memory`.
+- **Opus Wave 5 Remediation B — Relay & Checkpoints (`include/blackbird/bridge_relay.hpp`, `src/bridge_relay.cpp`, `tests/bridge_relay_test.cpp`):**
+  made `resume_session()` atomic with full rollback on overflow, eliminated silent reliable frame loss
+  and ack-skip past unqueued/unpolled frames (`needs_resync` latch + contiguous ack enforcement),
+  replaced sequential session/connection IDs with 128-bit CSPRNG tokens (`::getentropy`) and bound
+  `publish()` to authenticated peer sessions, shared immutable `std::shared_ptr<const RoutedRelayFrame>`
+  across room history and recipient queues with a 16 MiB default byte cap + stale-session reaping,
+  added `CheckpointVerifyOptions` (room/seq/freshness/signer-authority), documented `invite_code`
+  honestly as a bearer join credential + freshness checks, and added receiver-side
+  `derive_local_taint_for_peer_frame()`.
+- **Wave 7A — Core Interactive `PartyChatPane` (`include/blackbird/party_chat.hpp`, `src/party_chat.cpp`, `tests/party_chat_test.cpp`, `CMakeLists.txt`):**
+  added unified single-operator (`@all` to all platoon leaders) / multi-operator (operators chat +
+  platoon leader updates) party room model, passive read-only snapshot loader over `.blackbird/platoon`
+  + `.blackbird/bridge` + optional `0600` `.blackbird/party.json`, `@all`/`@alias` target router,
+  responsive split/strip pane renderer, and anti-impersonation/anti-escalation hardening verified by
+  `@dentist-2` (`papers/2026-11-23-opus-wave5-remediation-and-wave7a-dentist-review.md`).
