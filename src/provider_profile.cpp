@@ -1382,9 +1382,12 @@ ProfileResult<std::string> normalize_base_url(std::string_view url) {
   return std::move(*normal);
 }
 
-// Mirrors the main-coding route choice (src/main.cpp:466-545): OpenAI's ChatGPT route
-// and OpenRouter always send Responses (OpenRouter's descriptor says `chat`); native
-// Anthropic sends Messages; a registered route must be a Responses route.
+// Mirrors the main-coding route choice (src/main.cpp:1001-1035): OpenAI's ChatGPT
+// route and OpenRouter always send Responses (OpenRouter's descriptor says `chat`);
+// `messages` routes (Anthropic, Kimi) use Messages; `chat` routes (DeepSeek, Gemini,
+// Grok, Moonshot, MiMo, custom) use Chat Completions; registered Responses routes send
+// `responses` or `responses-portable`. Non-coding protocols (e.g. `decision`) are
+// refused.
 ProfileResult<RouteQuery> route_query(const Value &binding, std::string_view model) {
   const auto field = [&](std::string_view key) -> const std::string * {
     const auto *x = binding.find(key);
@@ -1401,8 +1404,8 @@ ProfileResult<RouteQuery> route_query(const Value &binding, std::string_view mod
   const auto &protocol = *field("protocol");
   if (query.provider == "openai" || query.provider == "openrouter")
     query.protocol = "responses";
-  else if (query.provider == "anthropic" && protocol == "messages")
-    query.protocol = "messages";
+  else if (protocol == "messages" || protocol == "chat")
+    query.protocol = protocol;
   else if (query.provider != "anthropic" &&
            (protocol == "responses" || protocol == "responses-portable"))
     query.protocol = protocol;
@@ -1410,8 +1413,8 @@ ProfileResult<RouteQuery> route_query(const Value &binding, std::string_view mod
     return std::unexpected(
         ProfileError{"binding", 0, 0, "binding.protocol",
                      "`" + protocol +
-                         "` is not a main-coding codec: main coding uses Responses or "
-                         "native Anthropic Messages"});
+                         "` is not a main-coding codec: main coding uses Responses, "
+                         "Messages or Chat Completions"});
   std::string fault;
   auto normal = normal_url(*field("base_url"), fault);
   if (!normal) {

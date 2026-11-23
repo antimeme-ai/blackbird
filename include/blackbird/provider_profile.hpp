@@ -91,9 +91,10 @@ std::string sha256_hex(std::string_view bytes);
 // - provider: the session's provider name, the binding's `provider` (`openai`,
 //   `anthropic`, `openrouter`, or a registered route's id);
 // - protocol: the codec the main-coding route actually sends with, which is not always
-//   the descriptor's protocol: `messages` (native Anthropic), `responses` (OpenAI's
-//   ChatGPT route, OpenRouter, whose descriptor says `chat`, and registered `responses`
-//   routes) or `responses-portable` (src/main.cpp:466-545);
+//   the descriptor's protocol: `messages` (native Anthropic and Kimi), `chat` (Chat
+//   Completions routes such as DeepSeek, Gemini, Grok, Moonshot, MiMo), `responses`
+//   (OpenAI's ChatGPT route, OpenRouter, whose descriptor says `chat`, and registered
+//   `responses` routes) or `responses-portable` (src/main.cpp:1001-1035);
 // - base_url: the binding's `base_url`. Selection normalizes it (lowercase scheme and
 //   host, no default port 443, no trailing `/`) and refuses a non-https or malformed
 //   URL; an empty base_url constrains nothing and matches no profile that names one;

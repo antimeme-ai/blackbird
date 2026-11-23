@@ -17,6 +17,7 @@ with tempfile.TemporaryDirectory(prefix='blackbird install ') as temporary:
         (checkout / name).mkdir()
     (checkout / 'profiles/providers').mkdir(parents=True)
     (checkout / 'profiles/providers/conservative.lua').write_text('fixture profile')
+    (checkout / 'profiles/providers/deepseek-chat.lua').write_text('fixture deepseek profile')
     (checkout / 'CMakeLists.txt').write_text('fixture')
     (checkout / 'CMakePresets.json').write_text('fixture')
     (checkout / 'programs/turn.lua').write_text('fixture workflow')
@@ -85,6 +86,8 @@ exec /bin/mv "$@"
     assert (first / 'share/blackbird/assets/sr71.png').is_file()
     assert (first / 'share/blackbird/profiles/providers/conservative.lua').read_text() == \
         'fixture profile', 'profiles were not shipped beside programs and assets'
+    assert (first / 'share/blackbird/profiles/providers/deepseek-chat.lua').read_text() == \
+        'fixture deepseek profile', 'extra provider profiles were not bundled'
     assert '-DBLACKBIRD_RESOURCE_ROOT=' + str(first / 'share/blackbird') in (root / 'configure').read_text()
     assert str(first / '.build') in (root / 'configure').read_text()
     assert not (first / '.build').exists(), 'intermediate build directory was not pruned'

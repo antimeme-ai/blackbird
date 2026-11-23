@@ -13740,3 +13740,15 @@ Addressed six operator field notes from live TUI use:
   `POSIX_SPAWN_SETPGROUP`, race-free `addchdir`, `F_DUPFD_CLOEXEC` pipe normalization,
   `detail::owned_children` custody, O(N) bounded UTF-8 ring tail capture, SIGTERM->SIGKILL
   process-group escalation, loader/secret env filtering, and clean destructor teardown.
+
+## 2026-11-23 — Rock 2.2: Shipped Provider Profiles (`deepseek`, `gemini`, `grok`, `kimi`, `moonshot`, `mimo`)
+
+- Added 6 grounded Lua provider profiles under `profiles/providers/`:
+  `deepseek-chat.lua` (`must_keep` + `refused_until_probed` + 0.1x cache read),
+  `gemini-chat.lua` (1M window, `user_text`, `retain_current_turn`),
+  `grok-chat.lua` (`context_length_exceeded` overflow),
+  `kimi-messages.lua` (`must_keep`, `anthropic-messages` pairing),
+  `moonshot-chat.lua` (`must_keep`), and `mimo-chat.lua`.
+- Aligned `route_query()` in `src/provider_profile.cpp` to accept `chat` and non-Anthropic
+  `messages` bindings while keeping non-coding `decision` protocols refused; updated
+  shipped profile digests and direct resolution/packaging checks.

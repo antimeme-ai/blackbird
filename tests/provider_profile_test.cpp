@@ -1,6 +1,7 @@
 // Specification oracles for profile schema, layering, selection and digests, plus the
 // repository check over the shipped profile set and today's provider decisions.
 #include "blackbird/anthropic_provider.hpp"
+#include "blackbird/chat_provider.hpp"
 #include "blackbird/openrouter.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/provider_auth.hpp"
@@ -902,11 +903,60 @@ void shipped(const std::filesystem::path &directory) {
   const auto registered =
       resolve({"paper", "responses-portable", "https://paper.example/v1", "api_key",
                "ultramarine"});
+  const auto deepseek = resolve({"deepseek", "chat", "https://api.deepseek.com/v1",
+                                 "api_key", "deepseek-reasoner"});
+  const auto gemini = resolve(
+      {"gemini", "chat", "https://generativelanguage.googleapis.com/v1beta/openai",
+       "api_key", "gemini-2.5-pro"});
+  const auto grok =
+      resolve({"grok", "chat", "https://api.x.ai/v1", "api_key", "grok-4"});
+  const auto kimi = resolve({"kimi", "messages", "https://api.kimi.com/coding/v1",
+                             "oauth", "kimi-for-coding"});
+  const auto moonshot = resolve({"moonshot", "chat", "https://api.moonshot.ai/v1",
+                                 "api_key", "kimi-k2-0905-preview"});
+  const auto mimo = resolve(
+      {"mimo", "chat", "https://api.xiaomimimo.com/v1", "api_key", "mimo-v2-flash"});
   check(anthropic55.id == "anthropic-messages-prefix-checked", "Anthropic 5.5 profile");
   check(anthropic45.id == "anthropic-messages", "Anthropic earlier profile");
   check(openai.id == "openai-chatgpt-responses", "OpenAI ChatGPT profile");
   check(openrouter.id == "openrouter-responses", "OpenRouter profile");
   check(registered.id == "conservative", "registered routes use conservative");
+  check(deepseek.id == "deepseek-chat", "DeepSeek profile");
+  check(gemini.id == "gemini-chat", "Gemini profile");
+  check(grok.id == "grok-chat", "Grok profile");
+  check(kimi.id == "kimi-messages", "Kimi profile");
+  check(moonshot.id == "moonshot-chat", "Moonshot profile");
+  check(mimo.id == "mimo-chat", "MiMo profile");
+  // DeepSeek and Kimi/Moonshot reasoning & archival invariants
+  // (docs/CONTEXT_LIFECYCLE.md §6.2).
+  check(text_at(deepseek.profile, "reasoning.at_cut") == "must_keep",
+        "DeepSeek preserves reasoning_content");
+  check(text_at(deepseek.profile, "archival.mode") == "refused_until_probed",
+        "DeepSeek refuses unsafe removal cuts until probed");
+  check(text_at(deepseek.profile, "cache.capability") == "implicit",
+        "DeepSeek implicit disk cache");
+  check(text_at(gemini.profile, "reasoning.at_cut") == "keep",
+        "Gemini keeps retained reasoning");
+  check(text_at(gemini.profile, "turn.start") == "user_text",
+        "Gemini user_text turn start");
+  check(text_at(gemini.profile, "cache.capability") == "implicit",
+        "Gemini implicit caching");
+  check(text_at(grok.profile, "reasoning.at_cut") == "keep",
+        "Grok keeps retained reasoning");
+  check(text_at(grok.profile, "cache.capability") == "implicit",
+        "Grok implicit caching");
+  check(text_at(kimi.profile, "reasoning.at_cut") == "must_keep",
+        "Kimi must_keep reasoning protection");
+  check(text_at(kimi.profile, "pairing.validator") == "anthropic-messages",
+        "Kimi uses Messages pairing validator");
+  check(text_at(kimi.profile, "note.role") == "developer_as_user_text",
+        "Kimi developer_as_user_text note rendering");
+  check(text_at(moonshot.profile, "reasoning.at_cut") == "must_keep",
+        "Moonshot must_keep reasoning protection");
+  check(text_at(mimo.profile, "reasoning.at_cut") == "keep",
+        "MiMo keeps retained reasoning");
+  check(text_at(mimo.profile, "cache.capability") == "implicit",
+        "MiMo implicit caching");
   // Plan §1.4: these Anthropic rows ship with basis `unobserved`.
   for (const auto &[record, leaf] : std::vector<std::pair<std::string, std::string>>{
            {"turn", "close"},
@@ -923,8 +973,8 @@ void shipped(const std::filesystem::path &directory) {
   check(text_at(anthropic45.profile, "reasoning.at_cut") == "keep",
         "earlier Anthropic models keep reasoning");
   // No row is enabled or probed before its probe (plan §1.4).
-  for (const auto *p :
-       {&anthropic55, &anthropic45, &openai, &openrouter, &registered}) {
+  for (const auto *p : {&anthropic55, &anthropic45, &openai, &openrouter, &registered,
+                        &deepseek, &gemini, &grok, &kimi, &moonshot, &mimo}) {
     check(at(p->profile, "turn.boundary.enabled") == Value{false},
           p->id + ": boundary enabled before its probe");
     check(text_at(p->profile, "tool_restriction.mode") == "palette_only",
@@ -932,9 +982,11 @@ void shipped(const std::filesystem::path &directory) {
   }
   // Today's request-state placement (CodingProvider::retain_request_state) is the row.
   AnthropicCodingProvider anthropic_provider;
+  AnthropicCodingProvider kimi_provider{{"kimi", {}, 180}};
   OpenAiCodingProvider openai_provider;
   OpenRouterCodingProvider openrouter_provider;
   RegisteredResponsesCodingProvider registered_provider{{"paper", {}, 180}};
+  ChatCompletionsCodingProvider chat_provider{{"deepseek", {}, 180}};
   const auto placement = [](const CodingProvider &provider) {
     return provider.retain_request_state() ? "retained_in_place" : "request_local";
   };
@@ -953,6 +1005,11 @@ void shipped(const std::filesystem::path &directory) {
   check(text_at(registered.profile, "request_state.placement") ==
             placement(registered_provider),
         "registered placement differs from today's provider");
+  check(text_at(kimi.profile, "request_state.placement") == placement(kimi_provider),
+        "Kimi placement differs from today's provider");
+  for (const auto *p : {&deepseek, &gemini, &grok, &moonshot, &mimo})
+    check(text_at(p->profile, "request_state.placement") == placement(chat_provider),
+          p->id + " placement differs from ChatCompletionsCodingProvider");
   // Queries come from real bindings (ProviderAuth::binding,
   // src/provider_auth.cpp:790-810; the ChatGPT route's binding,
   // src/openai.cpp:157-163). OpenRouter's descriptor names `chat`, but its main-coding
@@ -1011,17 +1068,33 @@ void shipped(const std::filesystem::path &directory) {
             registered_query.base_url == "https://paper.example/v1" &&
             resolve(registered_query).id == "conservative",
         "a registered Responses binding");
-  auto chat_binding = registered_binding;
-  for (auto &[key, value] : chat_binding.object())
-    if (key == "protocol")
-      value = Value{"chat"};
-  const auto chat = profile_query(chat_binding, "m");
-  check(!chat.has_value() &&
-            chat.error() ==
+  // Real ProviderAuth bindings for all 6 newly supported native providers resolve
+  // directly to their shipped profiles without fallback to conservative or ambiguity.
+  for (const auto &[provider, model, expected_id] :
+       std::vector<std::tuple<std::string, std::string, std::string>>{
+           {"deepseek", "deepseek-reasoner", "deepseek-chat"},
+           {"deepseek", "deepseek-chat", "deepseek-chat"},
+           {"gemini", "gemini-2.5-pro", "gemini-chat"},
+           {"grok", "grok-4", "grok-chat"},
+           {"grok", "grok-3", "grok-chat"},
+           {"kimi", "kimi-for-coding", "kimi-messages"},
+           {"kimi", "kimi-k2-thinking", "kimi-messages"},
+           {"moonshot", "kimi-k2-0905-preview", "moonshot-chat"},
+           {"mimo", "mimo-v2-flash", "mimo-chat"}}) {
+    const auto resolved = resolve_binding(set.value(), auth.binding(provider), model);
+    check(resolved.has_value() && resolved.value().id == expected_id &&
+              resolved.value().id != conservative_profile_id,
+          provider + "/" + model + " binding resolution: " + shown(resolved));
+    check(encode_packet(resolved.value().profile).has_value(),
+          "BBM2 encode " + expected_id);
+  }
+  const auto decision = profile_query(auth.binding("jev"), "jev-1.13.0");
+  check(!decision.has_value() &&
+            decision.error() ==
                 ProfileError{"binding", 0, 0, "binding.protocol",
-                             "`chat` is not a main-coding codec: main coding uses "
-                             "Responses or native Anthropic Messages"},
-        "a chat binding is refused: " + shown(chat));
+                             "`decision` is not a main-coding codec: main coding uses "
+                             "Responses, Messages or Chat Completions"},
+        "a decision binding is refused: " + shown(decision));
   // Design §7.4: OpenAI and Anthropic list `boundary` while it is disabled.
   for (const auto *p : {&anthropic55, &anthropic45, &openai}) {
     const auto &modes = at(p->profile, "turn.open_turn").array();
@@ -1115,9 +1188,10 @@ void records() {
                 std::vector<std::string>{"shipped:conservative/1", "shipped:acme/1",
                                          "operator:acme-local/3"},
         "resolve_binding: " + shown(via_binding));
-  auto chat = binding;
-  chat.object().back().second = Value{"chat"};
-  check(!resolve_binding(s, chat, "m").has_value(), "a chat binding must be refused");
+  auto decision = binding;
+  decision.object().back().second = Value{"decision"};
+  check(!resolve_binding(s, decision, "m").has_value(),
+        "a decision binding must be refused");
   const auto all = effective_profiles(s);
   check(all.has_value() && all.value().size() == 2 &&
             all.value()[0].id == "conservative" && all.value()[1].id == "acme" &&

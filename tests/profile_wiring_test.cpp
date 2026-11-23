@@ -309,9 +309,9 @@ EffectiveProfile oracle(const ProfileSet &set, const ProfileQuery &query) {
 // them with a reviewed profile edit. The binding digests were computed independently
 // (Python: sha256 over the documented canonical encoding of the four route fields).
 constexpr std::string_view shipped_set_digest =
-    "sha256:b30cab78b1a3fed9e6355456030592502e37f020f70b80bfeb3d077776eecb08";
+    "sha256:5e3a5c37524516d4c906b313dc9cd99d876f1a2d799b24cd2646705134257a70";
 constexpr std::string_view shipped_content_digest =
-    "sha256:a90f2e7f8944c4af7c957a4958bb87afd04b4a581c75a7ac12118f88733e09cb";
+    "sha256:d31b19b5ffc1499d9a6af21c2909afca2ea9ba0dc8b5f6203577e6502d0f5034";
 constexpr std::string_view openrouter_effective_digest =
     "sha256:7474e6f725ac4fb722bf3bc54506d7cf4e344b39852cc01471506f73412487de";
 constexpr std::string_view openrouter_binding =
