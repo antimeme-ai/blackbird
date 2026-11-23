@@ -118,11 +118,69 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 6, "all 6 command-post tools must be registered");
+  require(found.size() == 10, "all 10 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
-              found.contains("companion_timing") && found.contains("local_swarm"),
+              found.contains("companion_timing") && found.contains("local_swarm") &&
+              found.contains("sqlite_db") && found.contains("measure_script") &&
+              found.contains("nvim_ast") && found.contains("code_intel"),
           "missing expected command-post tool names");
+}
+
+void test_superpower_tools_smoke(const fs::path &sandbox) {
+  // 1. sqlite_db probe + scratch_query with inline JSONL ingest
+  const Value sql_probe =
+      run_command_post_tool("sqlite_db", Value::object({{"action", Value{"probe"}}}));
+  if (std::get<bool>(field(sql_probe, "available").value())) {
+    const Value sql_res = run_command_post_tool(
+        "sqlite_db",
+        Value::object({
+            {"action", Value{"scratch_query"}},
+            {"table", Value{"items"}},
+            {"data_format", Value{"jsonl"}},
+            {"data", Value{"{\"k\":\"alpha\",\"v\":10}\n{\"k\":\"beta\",\"v\":25}\n"}},
+            {"sql", Value{"SELECT k, v FROM items ORDER BY v DESC;"}},
+        }));
+    require(field(sql_res, "rows").array().size() == 2U,
+            "sqlite_db scratch_query must return 2 ingested rows");
+  }
+  // 2. measure_script real subprocess run
+  const Value meas = run_command_post_tool(
+      "measure_script",
+      Value::object({
+          {"action", Value{"run"}},
+          {"argv", Value{Value::Array{Value{"/bin/sh"}, Value{"-c"},
+                                      Value{"echo BLACKBIRD_METRIC score=42.5"}}}},
+          {"measured_trials", Value{Number{2}}},
+      }));
+  require(std::get<bool>(field(meas, "oracle_passed").value()),
+          "measure_script oracle_passed");
+  require(field(meas, "raw_trials").array().size() == 2U,
+          "measure_script must return 2 raw trials");
+  // 3. nvim_ast probe (+ live scratch_edit when nvim present)
+  const Value nv_probe =
+      run_command_post_tool("nvim_ast", Value::object({{"action", Value{"probe"}}}));
+  if (std::get<bool>(field(nv_probe, "available").value())) {
+    const Value ed = run_command_post_tool(
+        "nvim_ast",
+        Value::object({
+            {"action", Value{"scratch_edit"}},
+            {"source_text", Value{"hello\nworld\n"}},
+            {"script",
+             Value{"vim.api.nvim_buf_set_lines(0, 1, 2, false, {'blackbird'})"}},
+            {"is_lua", Value{true}},
+        }));
+    require(std::get<bool>(field(ed, "changed").value()),
+            "nvim_ast scratch_edit must report changed=true");
+    require(string_field(ed, "proposed_text").find("blackbird") != std::string::npos,
+            "nvim_ast scratch_edit proposed_text mismatch");
+  }
+  // 4. code_intel probe
+  const Value lsp_probe =
+      run_command_post_tool("code_intel", Value::object({{"action", Value{"probe"}}}));
+  require(lsp_probe.find("servers") != nullptr,
+          "code_intel probe must return servers map");
+  (void)sandbox;
 }
 
 void test_readonly_no_dir_creation(const fs::path &sandbox) {
@@ -2272,6 +2330,7 @@ int main(int argc, char **argv) {
 
   try {
     test_tool_definitions();
+    test_superpower_tools_smoke(sandbox);
     test_readonly_no_dir_creation(sandbox);
     test_platoon_board_and_framing(sandbox);
     test_bridge_guard_lifecycle(sandbox);

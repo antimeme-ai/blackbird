@@ -9,10 +9,13 @@
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/lan_party_runtime.hpp"
+#include "blackbird/lsp_client.hpp"
 #include "blackbird/mcp_server.hpp"
+#include "blackbird/measure_harness.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_party_bridge.hpp"
+#include "blackbird/nvim_rpc.hpp"
 #include "blackbird/os_sandbox.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
@@ -21,6 +24,7 @@
 #include "blackbird/platoon_runner.hpp"
 #include "blackbird/project_memory.hpp"
 #include "blackbird/self_upgrade.hpp"
+#include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/value.hpp"
 #include "blackbird/worktree_lease.hpp"
 
@@ -11193,6 +11197,145 @@ int run_brakes_cli(std::span<char *> args, CliIo io) {
   return 0;
 }
 
+std::optional<std::string> find_executable_on_path(std::string_view exe) {
+  const char *raw_path = std::getenv("PATH");
+  if (raw_path == nullptr || raw_path[0] == '\0')
+    return std::nullopt;
+  std::string_view rem{raw_path};
+  while (!rem.empty()) {
+    const std::size_t sep = rem.find(':');
+    const std::string_view dir =
+        sep == std::string_view::npos ? rem : rem.substr(0U, sep);
+    if (!dir.empty()) {
+      std::error_code ec;
+      const fs::path cand = fs::path{dir} / std::string{exe};
+      if (fs::exists(cand, ec) && !fs::is_directory(cand, ec) &&
+          ::access(cand.c_str(), X_OK) == 0) {
+        return cand.string();
+      }
+    }
+    if (sep == std::string_view::npos)
+      break;
+    rem.remove_prefix(sep + 1U);
+  }
+  return std::nullopt;
+}
+
+int run_superpowers_cli(std::span<char *> args, CliIo io) {
+  std::string_view sub = "status";
+  bool json_out = false;
+  std::size_t idx = 1U;
+  if (idx < args.size()) {
+    const std::string_view first{args[idx]};
+    if (!first.starts_with('-')) {
+      sub = first;
+      ++idx;
+    }
+  }
+  for (; idx < args.size(); ++idx) {
+    const std::string_view arg{args[idx]};
+    if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--help" || arg == "-h") {
+      io.out
+          << "Usage:\n"
+             "  blackbird superpowers [status|probe] [--json]\n"
+             "Probe native zero-dependency model superpowers on this host:\n"
+             "  - SQLite Workbench (ephemeral scratch + model-private DB, -safe, FTS5, "
+             "JSON1)\n"
+             "  - Headless Neovim MsgPack-RPC + embedded Tree-sitter AST engine\n"
+             "  - Native C++23 LSP Client (installed language servers on PATH)\n"
+             "  - Script Measurement & Tuning Harness (CLOCK_MONOTONIC_RAW + rusage)\n";
+      return 0;
+    } else {
+      return fail_usage(io, "superpowers: unknown option: " + std::string{arg});
+    }
+  }
+  if (sub != "status" && sub != "probe") {
+    return fail_usage(io, "superpowers: unknown subcommand: " + std::string{sub});
+  }
+
+  const auto sql_res = sqlite::probe_sqlite_capabilities();
+  const sqlite::SqliteCapabilities sql_caps =
+      sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
+  const NvimCapabilities nvim_caps = probe_nvim_capabilities();
+  const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
+
+  constexpr std::array<std::string_view, 4> kLspCandidates = {
+      "clangd", "rust-analyzer", "lua-language-server", "pyright-langserver"};
+  std::vector<std::pair<std::string, std::string>> lsp_found;
+  for (std::string_view name : kLspCandidates) {
+    if (const auto path = find_executable_on_path(name); path.has_value()) {
+      lsp_found.emplace_back(std::string{name}, *path);
+    }
+  }
+
+  if (json_out) {
+    Value::Array ts_parsers;
+    for (const auto &p : nvim_caps.treesitter_parsers)
+      ts_parsers.emplace_back(p);
+    Value::Object lsp_obj;
+    for (const auto &[name, path] : lsp_found)
+      lsp_obj.emplace_back(name, Value{path});
+    return emit_json(
+        io,
+        Value::object({
+            {"sqlite", Value::object({
+                           {"available", Value{sql_caps.available}},
+                           {"binary", Value{sql_caps.binary_path.string()}},
+                           {"version", Value{sql_caps.version}},
+                           {"safe_flag", Value{sql_caps.supports_safe_flag}},
+                           {"fts5", Value{sql_caps.supports_fts5}},
+                           {"json1", Value{sql_caps.supports_json1}},
+                       })},
+            {"nvim_treesitter", Value::object({
+                                    {"available", Value{nvim_caps.available}},
+                                    {"binary", Value{nvim_caps.executable_path}},
+                                    {"version", Value{nvim_caps.version_string}},
+                                    {"has_treesitter", Value{nvim_caps.has_treesitter}},
+                                    {"has_vim_diff", Value{nvim_caps.has_vim_diff}},
+                                    {"parsers", Value{std::move(ts_parsers)}},
+                                })},
+            {"lsp_servers", Value::object(std::move(lsp_obj))},
+            {"measure_harness",
+             Value::object({
+                 {"available", Value{true}},
+                 {"sandbox_backend", Value{sandbox_caps.backend_name}},
+                 {"sandbox_available", Value{sandbox_caps.available}},
+             })},
+        }));
+  }
+
+  io.out << "Blackbird Model Superpowers\n"
+         << "  SQLite Workbench:  "
+         << (sql_caps.available ? ("ready (" + sql_caps.version +
+                                   (sql_caps.supports_safe_flag ? ", -safe" : "") +
+                                   (sql_caps.supports_fts5 ? ", FTS5" : "") +
+                                   (sql_caps.supports_json1 ? ", JSON1" : "") + ")")
+                                : "unavailable (sqlite3 not found)")
+         << '\n'
+         << "  Neovim Tree-sitter:"
+         << (nvim_caps.available
+                 ? (" ready (" + nvim_caps.version_string + ", " +
+                    std::to_string(nvim_caps.treesitter_parsers.size()) + " parsers)")
+                 : " unavailable (nvim not found)")
+         << '\n'
+         << "  Native LSP Client: ready (servers on PATH: ";
+  if (lsp_found.empty()) {
+    io.out << "none detected";
+  } else {
+    for (std::size_t i = 0; i < lsp_found.size(); ++i) {
+      if (i > 0)
+        io.out << ", ";
+      io.out << lsp_found[i].first;
+    }
+  }
+  io.out << ")\n"
+         << "  Measure Harness:   ready (CLOCK_MONOTONIC_RAW + wait4 rusage, sandbox="
+         << sandbox_caps.backend_name << ")\n";
+  return 0;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
@@ -11200,7 +11343,7 @@ bool is_command_post_subcommand(std::string_view arg) noexcept {
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
          arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan" ||
-         arg == "brakes";
+         arg == "brakes" || arg == "superpowers";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -11245,6 +11388,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_lan_cli(args, io);
     if (subcommand == "brakes")
       return run_brakes_cli(args, io);
+    if (subcommand == "superpowers")
+      return run_superpowers_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

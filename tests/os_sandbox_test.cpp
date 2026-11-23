@@ -652,9 +652,14 @@ int main(int argc, char **argv) {
   if (argc == 4 && std::string_view{argv[1]} == "--probe-net") {
     const unsigned long parsed = std::strtoul(argv[2], nullptr, 10);
     if (parsed == 0UL || parsed > 65535UL) {
-      return 2;
+      ::_exit(2);
     }
-    return run_child_net_probe(static_cast<std::uint16_t>(parsed), argv[3]);
+    const int rc = run_child_net_probe(static_cast<std::uint16_t>(parsed), argv[3]);
+    std::cout.flush();
+    std::cerr.flush();
+    // Skip atexit LeakSanitizer ptrace() scan inside the seccomp-jailed child
+    // (seccomp intentionally blocks ptrace); parent process still runs full LSan.
+    ::_exit(rc);
   }
   try {
     const std::filesystem::path self_exe = std::filesystem::canonical(argv[0]);

@@ -2689,6 +2689,11 @@ void test_brakes_slash_status_and_probe() {
               probe_out->find("OS Sandbox Probe:") != std::string::npos &&
               probe_out->find("Backend:") != std::string::npos,
           "/brakes probe must report host OS sandbox backend");
+  const auto sp_out = handle_command_post_slash("/superpowers status", ctx);
+  require(sp_out.has_value() &&
+              sp_out->find("Blackbird Model Superpowers:") != std::string::npos &&
+              sp_out->find("Measure Harness:") != std::string::npos,
+          "/superpowers status must report superpower readiness");
 }
 
 } // namespace

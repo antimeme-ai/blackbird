@@ -3967,6 +3967,26 @@ int main(int argc, char **argv) {
             "brakes probe --json must emit valid JSON");
     }
 
+    // Superpowers subcommand smoke (status --json)
+    {
+      check(is_command_post_subcommand("superpowers"),
+            "superpowers must be registered as a command_post subcommand");
+      const auto sp_help = run_cli({"superpowers", "--help"});
+      check(sp_help.exit_code == 0 &&
+                sp_help.out.find("blackbird superpowers") != std::string::npos,
+            "superpowers --help must exit 0");
+      const auto sp_json = run_cli({"superpowers", "status", "--json"});
+      check(sp_json.exit_code == 0, "superpowers status --json must exit 0");
+      const auto spv = parse_json(sp_json.out);
+      check(spv.has_value() &&
+                std::holds_alternative<Value::Object>(spv.value().value()) &&
+                spv.value().find("sqlite") != nullptr &&
+                spv.value().find("nvim_treesitter") != nullptr &&
+                spv.value().find("lsp_servers") != nullptr &&
+                spv.value().find("measure_harness") != nullptr,
+            "superpowers status --json must include all 4 superpower families");
+    }
+
     std::cout << "PASS command_post_cli\n";
     return 0;
   } catch (const Error &e) {

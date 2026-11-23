@@ -212,6 +212,10 @@ const std::array builtin_commands{
     ChatCommand{"/brakes", "[status|probe|help]",
                 "Inspect unified Brakes containment policy floor & OS kernel sandbox",
                 "Command Post"},
+    ChatCommand{
+        "/superpowers", "[status|probe|help]",
+        "Probe native model superpowers (SQLite, Neovim/Tree-sitter, LSP, Measure)",
+        "Command Post"},
     ChatCommand{"/rail",
                 "[toggle|show|hide|auto|escalations|tokenomics|tasks|anchors|"
                 "multiplayer|next|prev|refresh]",

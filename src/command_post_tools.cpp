@@ -4,9 +4,13 @@
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_swarm.hpp"
+#include "blackbird/lsp_client.hpp"
+#include "blackbird/measure_harness.hpp"
+#include "blackbird/nvim_rpc.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/sqlite_workbench.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <set>
@@ -24,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -2466,12 +2472,629 @@ Value handle_local_swarm(const Value &arguments,
   throw Error{ErrorCode::invalid_range};
 }
 
+// ---------------------------------------------------------------------------
+// Tool 7: sqlite_db (Ephemeral scratch + Permanent model-private SQLite)
+// ---------------------------------------------------------------------------
+
+Value handle_sqlite_db(const Value &arguments) {
+  static constexpr std::array<std::string_view, 14> kAllowedKeys = {
+      "action",     "db_name",     "sql",          "setup_sql",  "table",
+      "data",       "data_format", "project_root", "state_dir",  "max_rows",
+      "timeout_ms", "tainted",     "read_only",    "sqlite_bin",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 64, false});
+
+  std::optional<fs::path> bin_override;
+  if (const auto b =
+          optional_string(arguments, {"sqlite_bin", kMaxPathArgBytes, false});
+      b.has_value()) {
+    bin_override = fs::path{*b};
+  }
+
+  if (action == "probe") {
+    const auto res = sqlite::probe_sqlite_capabilities(bin_override);
+    if (!res.has_value()) {
+      return Value::object({
+          {"available", Value{false}},
+          {"error", Value{std::string{sqlite::sqlite_error_name(
+                        sqlite::sqlite_error_of(res.error()))}}},
+      });
+    }
+    const auto &caps = res.value();
+    return Value::object({
+        {"available", Value{caps.available}},
+        {"binary", Value{caps.binary_path.string()}},
+        {"version", Value{caps.version}},
+        {"safe_flag", Value{caps.supports_safe_flag}},
+        {"nofollow_flag", Value{caps.supports_nofollow_flag}},
+        {"fts5", Value{caps.supports_fts5}},
+        {"json1", Value{caps.supports_json1}},
+    });
+  }
+
+  sqlite::SqliteWorkbenchConfig cfg{};
+  cfg.sqlite_binary_override = bin_override;
+  if (const auto pr =
+          optional_string(arguments, {"project_root", kMaxPathArgBytes, false});
+      pr.has_value()) {
+    cfg.project_root = fs::path{*pr};
+  }
+  if (const auto sd =
+          optional_string(arguments, {"state_dir", kMaxPathArgBytes, false});
+      sd.has_value()) {
+    cfg.model_state_dir = fs::path{*sd};
+  }
+
+  sqlite::SqliteExecLimits limits{};
+  if (const Value *mr = arguments.find("max_rows");
+      mr != nullptr && !is_null_or_false_sentinel(*mr)) {
+    const auto *n = std::get_if<Number>(&mr->value());
+    if (n == nullptr)
+      throw Error{ErrorCode::invalid_range};
+    const std::uint64_t v = std::holds_alternative<std::int64_t>(n->storage())
+                                ? static_cast<std::uint64_t>(std::max<std::int64_t>(
+                                      0, std::get<std::int64_t>(n->storage())))
+                                : (std::holds_alternative<std::uint64_t>(n->storage())
+                                       ? std::get<std::uint64_t>(n->storage())
+                                       : 0U);
+    if (v < 1U || v > 1000U)
+      throw Error{ErrorCode::invalid_range};
+    limits.max_rows = static_cast<std::size_t>(v);
+  }
+  if (const Value *tm = arguments.find("timeout_ms");
+      tm != nullptr && !is_null_or_false_sentinel(*tm)) {
+    const auto *n = std::get_if<Number>(&tm->value());
+    if (n == nullptr)
+      throw Error{ErrorCode::invalid_range};
+    const std::uint64_t v = std::holds_alternative<std::int64_t>(n->storage())
+                                ? static_cast<std::uint64_t>(std::max<std::int64_t>(
+                                      0, std::get<std::int64_t>(n->storage())))
+                                : (std::holds_alternative<std::uint64_t>(n->storage())
+                                       ? std::get<std::uint64_t>(n->storage())
+                                       : 0U);
+    if (v < 100U || v > 30000U)
+      throw Error{ErrorCode::invalid_range};
+    limits.timeout_ms = static_cast<std::uint32_t>(v);
+  }
+  if (const Value *ro = arguments.find("read_only");
+      ro != nullptr && std::holds_alternative<bool>(ro->value())) {
+    limits.read_only = std::get<bool>(ro->value());
+  }
+  bool tainted = false;
+  if (const Value *tv = arguments.find("tainted");
+      tv != nullptr && std::holds_alternative<bool>(tv->value())) {
+    tainted = std::get<bool>(tv->value());
+  }
+
+  sqlite::SqliteWorkbench wb{std::move(cfg)};
+  const bool is_scratch = (action == "scratch_query" || action == "scratch_exec");
+  const bool is_model =
+      (action == "model_query" || action == "model_exec" ||
+       action == "model_ingest_jsonl" || action == "model_ingest_csv" ||
+       action == "model_ingest_lines");
+  if (!is_scratch && !is_model) {
+    throw Error{ErrorCode::invalid_range};
+  }
+
+  const sqlite::SqliteDbHandle db =
+      is_scratch
+          ? unwrap_or_throw(wb.open_scratch(
+                optional_string(arguments, {"db_name", 64, false}).value_or("scratch")))
+          : unwrap_or_throw(wb.open_model_db());
+
+  if (const auto setup = optional_string(arguments, {"setup_sql", 65536, false});
+      setup.has_value()) {
+    (void)unwrap_or_throw(wb.exec(db, *setup, limits));
+  }
+
+  struct IngestInput {
+    std::string_view fmt;
+    std::string_view tbl;
+    std::string_view raw_data;
+  };
+  auto run_ingest = [&](const IngestInput &in) -> sqlite::SqliteIngestResult {
+    if (in.fmt == "jsonl")
+      return unwrap_or_throw(wb.ingest_jsonl(db, in.tbl, in.raw_data, tainted));
+    if (in.fmt == "csv")
+      return unwrap_or_throw(wb.ingest_csv(db, in.tbl, in.raw_data, tainted));
+    if (in.fmt == "lines")
+      return unwrap_or_throw(wb.ingest_lines(db, in.tbl, in.raw_data, tainted));
+    throw Error{ErrorCode::invalid_range};
+  };
+
+  if (action == "model_ingest_jsonl" || action == "model_ingest_csv" ||
+      action == "model_ingest_lines") {
+    const std::string tbl = require_string(arguments, {"table", 64, false});
+    const std::string raw = require_string(arguments, {"data", 512 * 1024, true});
+    const std::string_view fmt = action == "model_ingest_jsonl" ? "jsonl"
+                                 : action == "model_ingest_csv" ? "csv"
+                                                                : "lines";
+    const auto ing = run_ingest({fmt, tbl, raw});
+    Value::Array cols;
+    for (const auto &c : ing.columns)
+      cols.emplace_back(c);
+    return Value::object({
+        {"scope", Value{"model_private"}},
+        {"table", Value{ing.table_name}},
+        {"columns", Value{std::move(cols)}},
+        {"rows_ingested", Value{Number{static_cast<std::uint64_t>(ing.rows_ingested)}}},
+        {"tainted", Value{ing.tainted}},
+    });
+  }
+
+  if (const auto raw = optional_string(arguments, {"data", 512 * 1024, false});
+      raw.has_value()) {
+    const std::string tbl =
+        optional_string(arguments, {"table", 64, false}).value_or("data");
+    const std::string fmt =
+        optional_string(arguments, {"data_format", 16, false}).value_or("jsonl");
+    (void)run_ingest({fmt, tbl, *raw});
+  }
+
+  const std::string sql = require_string(arguments, {"sql", 65536, false});
+  const bool want_rows = (action == "scratch_query" || action == "model_query");
+  const auto res = want_rows ? unwrap_or_throw(wb.query(db, sql, limits))
+                             : unwrap_or_throw(wb.exec(db, sql, limits));
+
+  Value::Array cols;
+  for (const auto &c : res.columns)
+    cols.emplace_back(c);
+  return Value::object({
+      {"scope", Value{is_scratch ? "scratch" : "model_private"}},
+      {"columns", Value{std::move(cols)}},
+      {"rows", Value{res.rows}},
+      {"total_rows_seen",
+       Value{Number{static_cast<std::uint64_t>(res.total_rows_seen)}}},
+      {"truncated_rows", Value{res.truncated_rows}},
+      {"truncated_bytes", Value{res.truncated_bytes}},
+      {"contains_tainted_data", Value{res.contains_tainted_data}},
+      {"duration_ns", Value{Number{res.duration_ns}}},
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tool 8: measure_script (CLOCK_MONOTONIC_RAW + wait4 rusage + oracle gate)
+// ---------------------------------------------------------------------------
+
+std::vector<std::string> require_string_array(const Value &arguments,
+                                              std::string_view key,
+                                              std::size_t max_items, bool allow_empty) {
+  const Value *val = arguments.find(key);
+  if (val == nullptr) {
+    if (allow_empty)
+      return {};
+    throw Error{ErrorCode::invalid_range};
+  }
+  const auto *arr = std::get_if<Value::Array>(&val->value());
+  if (arr == nullptr || arr->size() > max_items || (!allow_empty && arr->empty())) {
+    throw Error{ErrorCode::invalid_range};
+  }
+  std::vector<std::string> out;
+  out.reserve(arr->size());
+  for (const auto &item : *arr) {
+    const auto *s = std::get_if<std::string>(&item.value());
+    if (s == nullptr)
+      throw Error{ErrorCode::invalid_range};
+    validate_utf8_no_nul(*s, kMaxPathArgBytes, true);
+    out.push_back(*s);
+  }
+  return out;
+}
+
+Value handle_measure_script(const Value &arguments) {
+  static constexpr std::array<std::string_view, 7> kAllowedKeys = {
+      "action",          "argv",       "oracle_argv", "cwd", "warmup_trials",
+      "measured_trials", "timeout_ms",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 32, false});
+  if (action != "run")
+    throw Error{ErrorCode::invalid_range};
+
+  measure::MeasurementPlan plan{};
+  plan.command.argv = require_string_array(arguments, "argv", 64U, false);
+  plan.warmup_trials = 0U;
+  plan.measured_trials = 3U;
+  plan.command.timeout_ms = 10000U;
+
+  if (const auto cwd = optional_string(arguments, {"cwd", kMaxPathArgBytes, false});
+      cwd.has_value()) {
+    plan.command.cwd = fs::path{*cwd};
+  }
+  if (const auto *w = arguments.find("warmup_trials");
+      w != nullptr && !is_null_or_false_sentinel(*w)) {
+    const auto *n = std::get_if<Number>(&w->value());
+    if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+      throw Error{ErrorCode::invalid_range};
+    const auto v = std::get<std::int64_t>(n->storage());
+    if (v < 0 || v > 20)
+      throw Error{ErrorCode::invalid_range};
+    plan.warmup_trials = static_cast<std::uint32_t>(v);
+  }
+  if (const auto *m = arguments.find("measured_trials");
+      m != nullptr && !is_null_or_false_sentinel(*m)) {
+    const auto *n = std::get_if<Number>(&m->value());
+    if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+      throw Error{ErrorCode::invalid_range};
+    const auto v = std::get<std::int64_t>(n->storage());
+    if (v < 1 || v > 50)
+      throw Error{ErrorCode::invalid_range};
+    plan.measured_trials = static_cast<std::uint32_t>(v);
+  }
+  if (const auto *t = arguments.find("timeout_ms");
+      t != nullptr && !is_null_or_false_sentinel(*t)) {
+    const auto *n = std::get_if<Number>(&t->value());
+    if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+      throw Error{ErrorCode::invalid_range};
+    const auto v = std::get<std::int64_t>(n->storage());
+    if (v < 100 || v > 60000)
+      throw Error{ErrorCode::invalid_range};
+    plan.command.timeout_ms = static_cast<std::uint64_t>(v);
+  }
+  if (const Value *oa = arguments.find("oracle_argv");
+      oa != nullptr && !is_null_or_false_sentinel(*oa)) {
+    measure::CommandRunSpec oracle{};
+    oracle.argv = require_string_array(arguments, "oracle_argv", 64U, false);
+    oracle.cwd = plan.command.cwd;
+    oracle.timeout_ms = plan.command.timeout_ms;
+    plan.oracle = std::move(oracle);
+  }
+
+  const auto run = unwrap_or_throw(measure::run_measurement_plan(plan));
+  const auto summary = measure::analyze_measurement_trials(run.raw_trials);
+
+  Value::Array raw_arr;
+  raw_arr.reserve(run.raw_trials.size());
+  for (const auto &tr : run.raw_trials) {
+    Value::Object custom_obj;
+    for (const auto &cm : tr.custom_metrics) {
+      custom_obj.emplace_back(cm.key, Value{Number{cm.value}});
+    }
+    raw_arr.push_back(Value::object({
+        {"trial_index", Value{Number{static_cast<std::uint64_t>(tr.trial_index)}}},
+        {"is_warmup", Value{tr.is_warmup}},
+        {"wall_ns", Value{Number{tr.wall_ns}}},
+        {"cpu_us", Value{Number{tr.cpu_us()}}},
+        {"max_rss_bytes", Value{Number{tr.max_rss_bytes}}},
+        {"exit_code", Value{Number{static_cast<std::int64_t>(tr.exit_code)}}},
+        {"timed_out", Value{tr.timed_out}},
+        {"succeeded", Value{tr.succeeded()}},
+        {"custom_metrics", Value::object(std::move(custom_obj))},
+    }));
+  }
+
+  return Value::object({
+      {"oracle_ran", Value{run.oracle_ran}},
+      {"oracle_passed", Value{run.oracle_passed}},
+      {"raw_trials", Value{std::move(raw_arr)}},
+      {"summary", measure::to_value(summary)},
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tool 9: nvim_ast (Headless Neovim Tree-sitter AST + sandboxed scratch edit)
+// ---------------------------------------------------------------------------
+
+Value handle_nvim_ast(const Value &arguments) {
+  static constexpr std::array<std::string_view, 7> kAllowedKeys = {
+      "action", "language", "source_text", "query", "script", "is_lua", "max_captures",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 32, false});
+
+  if (action == "probe") {
+    const NvimCapabilities caps = probe_nvim_capabilities();
+    Value::Array parsers;
+    for (const auto &p : caps.treesitter_parsers)
+      parsers.emplace_back(p);
+    return Value::object({
+        {"available", Value{caps.available}},
+        {"binary", Value{caps.executable_path}},
+        {"version", Value{caps.version_string}},
+        {"has_treesitter", Value{caps.has_treesitter}},
+        {"has_vim_diff", Value{caps.has_vim_diff}},
+        {"parsers", Value{std::move(parsers)}},
+    });
+  }
+
+  auto client = unwrap_or_throw(NvimRpcClient::spawn());
+  if (action == "ast_query") {
+    NvimAstQueryRequest req{};
+    req.language = require_string(arguments, {"language", 64, false});
+    req.source_text = require_string(arguments, {"source_text", 512 * 1024, true});
+    req.treesitter_query = require_string(arguments, {"query", 65536, false});
+    if (const auto *mc = arguments.find("max_captures");
+        mc != nullptr && !is_null_or_false_sentinel(*mc)) {
+      const auto *n = std::get_if<Number>(&mc->value());
+      if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+        throw Error{ErrorCode::invalid_range};
+      const auto v = std::get<std::int64_t>(n->storage());
+      if (v < 1 || v > 4096)
+        throw Error{ErrorCode::invalid_range};
+      req.max_captures = static_cast<std::size_t>(v);
+    }
+    const auto captures = unwrap_or_throw(client.ast_query(req));
+    Value::Array out;
+    out.reserve(captures.size());
+    for (const auto &c : captures) {
+      out.push_back(Value::object({
+          {"capture", Value{c.capture_name}},
+          {"node_type", Value{c.node_type}},
+          {"start_row", Value{Number{static_cast<std::uint64_t>(c.start_row)}}},
+          {"start_col", Value{Number{static_cast<std::uint64_t>(c.start_col)}}},
+          {"end_row", Value{Number{static_cast<std::uint64_t>(c.end_row)}}},
+          {"end_col", Value{Number{static_cast<std::uint64_t>(c.end_col)}}},
+          {"text", Value{c.text}},
+      }));
+    }
+    return Value::object({
+        {"count", Value{Number{static_cast<std::uint64_t>(out.size())}}},
+        {"captures", Value{std::move(out)}},
+    });
+  }
+
+  if (action == "scratch_edit") {
+    NvimScratchEditRequest req{};
+    req.source_text = require_string(arguments, {"source_text", 512 * 1024, true});
+    req.script = require_string(arguments, {"script", 65536, false});
+    req.is_lua = true;
+    if (const auto *il = arguments.find("is_lua");
+        il != nullptr && std::holds_alternative<bool>(il->value())) {
+      req.is_lua = std::get<bool>(il->value());
+    }
+    const auto prop = unwrap_or_throw(client.scratch_edit(req));
+    return Value::object({
+        {"changed", Value{prop.changed}},
+        {"original_lines_count",
+         Value{Number{static_cast<std::uint64_t>(prop.original_lines_count)}}},
+        {"proposed_text", Value{prop.proposed_text}},
+        {"unified_diff", Value{prop.unified_diff}},
+    });
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
+// ---------------------------------------------------------------------------
+// Tool 10: code_intel (Consumer-only Native C++23 LSP Client)
+// ---------------------------------------------------------------------------
+
+std::optional<std::string> locate_lsp_on_path(std::string_view exe) {
+  const char *raw_path = std::getenv("PATH");
+  if (raw_path == nullptr || raw_path[0] == '\0')
+    return std::nullopt;
+  std::string_view rem{raw_path};
+  while (!rem.empty()) {
+    const std::size_t sep = rem.find(':');
+    const std::string_view dir =
+        sep == std::string_view::npos ? rem : rem.substr(0U, sep);
+    if (!dir.empty()) {
+      std::error_code ec;
+      const fs::path cand = fs::path{dir} / std::string{exe};
+      if (fs::exists(cand, ec) && !fs::is_directory(cand, ec) &&
+          ::access(cand.c_str(), X_OK) == 0) {
+        return cand.string();
+      }
+    }
+    if (sep == std::string_view::npos)
+      break;
+    rem.remove_prefix(sep + 1U);
+  }
+  return std::nullopt;
+}
+
+Value handle_code_intel(const Value &arguments) {
+  static constexpr std::array<std::string_view, 12> kAllowedKeys = {
+      "action",    "server",      "server_args", "unix_socket", "tcp_port", "workspace",
+      "file_path", "language_id", "line",        "character",   "new_name", "query",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 32, false});
+
+  if (action == "probe") {
+    constexpr std::array<std::string_view, 4> kServers = {
+        "clangd", "rust-analyzer", "lua-language-server", "pyright-langserver"};
+    Value::Object found;
+    for (std::string_view name : kServers) {
+      if (const auto path = locate_lsp_on_path(name); path.has_value()) {
+        found.emplace_back(std::string{name}, Value{*path});
+      }
+    }
+    return Value::object({
+        {"available", Value{!found.empty()}},
+        {"servers", Value::object(std::move(found))},
+    });
+  }
+
+  std::error_code ec;
+  const fs::path ws = optional_string(arguments, {"workspace", kMaxPathArgBytes, false})
+                          .transform([](const std::string &s) { return fs::path{s}; })
+                          .value_or(fs::current_path(ec));
+  if (ws.empty())
+    throw Error{ErrorCode::invalid_range};
+
+  LspClient client = [&]() -> LspClient {
+    if (const auto sock =
+            optional_string(arguments, {"unix_socket", kMaxPathArgBytes, false});
+        sock.has_value()) {
+      LspUnixSocketConfig cfg{};
+      cfg.workspace_root = ws;
+      cfg.socket_path = fs::path{*sock};
+      return unwrap_or_throw(LspClient::attach_unix_socket(cfg));
+    }
+    if (const auto *tp = arguments.find("tcp_port");
+        tp != nullptr && !is_null_or_false_sentinel(*tp)) {
+      const auto *n = std::get_if<Number>(&tp->value());
+      if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+        throw Error{ErrorCode::invalid_range};
+      const auto p = std::get<std::int64_t>(n->storage());
+      if (p < 1 || p > 65535)
+        throw Error{ErrorCode::invalid_range};
+      LspTcpLoopbackConfig cfg{};
+      cfg.workspace_root = ws;
+      cfg.port = static_cast<std::uint16_t>(p);
+      return unwrap_or_throw(LspClient::attach_tcp_loopback(cfg));
+    }
+    const std::string server =
+        require_string(arguments, {"server", kMaxPathArgBytes, false});
+    fs::path exe{server};
+    if (!exe.is_absolute()) {
+      const auto located = locate_lsp_on_path(server);
+      if (!located.has_value())
+        throw Error{ErrorCode::io};
+      exe = fs::path{*located};
+    }
+    LspStdioSpawnConfig cfg{};
+    cfg.workspace_root = ws;
+    cfg.executable = std::move(exe);
+    cfg.arguments = require_string_array(arguments, "server_args", 32U, true);
+    return unwrap_or_throw(LspClient::spawn_stdio(cfg));
+  }();
+
+  const auto init = unwrap_or_throw(client.initialize());
+
+  auto open_target_file = [&]() -> fs::path {
+    const std::string fp =
+        require_string(arguments, {"file_path", kMaxPathArgBytes, false});
+    const fs::path abs_path = fs::path{fp}.is_absolute() ? fs::path{fp} : (ws / fp);
+    std::error_code file_ec;
+    if (!fs::is_regular_file(abs_path, file_ec) || file_ec)
+      throw Error{ErrorCode::io};
+    const auto fsize = fs::file_size(abs_path, file_ec);
+    if (file_ec || fsize > 4U * 1024U * 1024U)
+      throw Error{ErrorCode::capacity};
+    std::ifstream in{abs_path, std::ios::binary};
+    if (!in.good())
+      throw Error{ErrorCode::io};
+    std::string text(static_cast<std::size_t>(fsize), '\0');
+    if (fsize > 0U &&
+        !in.read(text.data(), static_cast<std::streamsize>(text.size()))) {
+      throw Error{ErrorCode::io};
+    }
+    const std::string lang =
+        optional_string(arguments, {"language_id", 64, false}).value_or("cpp");
+    unwrap_or_throw(client.did_open(LspDidOpenParams{abs_path, lang, 1, text}));
+    return abs_path;
+  };
+
+  auto read_u32_pos = [&](std::string_view key) -> std::uint32_t {
+    const Value *v = arguments.find(key);
+    if (v == nullptr)
+      throw Error{ErrorCode::invalid_range};
+    const auto *n = std::get_if<Number>(&v->value());
+    if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+      throw Error{ErrorCode::invalid_range};
+    const auto iv = std::get<std::int64_t>(n->storage());
+    if (iv < 0 || iv > 10000000)
+      throw Error{ErrorCode::invalid_range};
+    return static_cast<std::uint32_t>(iv);
+  };
+
+  auto loc_to_value = [](const LspLocation &loc) -> Value {
+    return Value::object({
+        {"path", Value{loc.path.string()}},
+        {"start_line", Value{Number{static_cast<std::uint64_t>(loc.range.start.line)}}},
+        {"start_character",
+         Value{Number{static_cast<std::uint64_t>(loc.range.start.character)}}},
+        {"end_line", Value{Number{static_cast<std::uint64_t>(loc.range.end.line)}}},
+        {"end_character",
+         Value{Number{static_cast<std::uint64_t>(loc.range.end.character)}}},
+    });
+  };
+
+  Value response = Value::object({});
+  if (action == "symbols") {
+    if (const auto q = optional_string(arguments, {"query", 512, true});
+        q.has_value() && !arguments.find("file_path")) {
+      const auto syms = unwrap_or_throw(client.workspace_symbols(*q));
+      Value::Array arr;
+      for (const auto &s : syms) {
+        arr.push_back(Value::object({
+            {"name", Value{s.name}},
+            {"kind", Value{Number{static_cast<std::uint64_t>(s.kind)}}},
+            {"container", Value{s.container_name}},
+            {"location", loc_to_value(s.location)},
+        }));
+      }
+      response = Value::object({{"symbols", Value{std::move(arr)}}});
+    } else {
+      const fs::path p = open_target_file();
+      const auto syms = unwrap_or_throw(client.document_symbols(p));
+      Value::Array arr;
+      for (const auto &s : syms) {
+        arr.push_back(Value::object({
+            {"name", Value{s.name}},
+            {"detail", Value{s.detail}},
+            {"kind", Value{Number{static_cast<std::uint64_t>(s.kind)}}},
+            {"start_line",
+             Value{Number{static_cast<std::uint64_t>(s.range.start.line)}}},
+            {"end_line", Value{Number{static_cast<std::uint64_t>(s.range.end.line)}}},
+        }));
+      }
+      response = Value::object({{"symbols", Value{std::move(arr)}}});
+    }
+  } else if (action == "definition" || action == "references") {
+    const fs::path p = open_target_file();
+    const LspPosition pos{read_u32_pos("line"), read_u32_pos("character")};
+    const auto locs =
+        action == "definition"
+            ? unwrap_or_throw(client.definition(LspTextDocumentPosition{p, pos}))
+            : unwrap_or_throw(client.references(LspReferencesParams{p, pos, true}));
+    Value::Array arr;
+    for (const auto &loc : locs)
+      arr.push_back(loc_to_value(loc));
+    response = Value::object({{"locations", Value{std::move(arr)}}});
+  } else if (action == "hover") {
+    const fs::path p = open_target_file();
+    const LspPosition pos{read_u32_pos("line"), read_u32_pos("character")};
+    const auto hov = unwrap_or_throw(client.hover(LspTextDocumentPosition{p, pos}));
+    response = Value::object({
+        {"found", Value{hov.has_value()}},
+        {"kind", Value{hov.has_value() ? hov->kind : std::string{}}},
+        {"value", Value{hov.has_value() ? hov->value : std::string{}}},
+    });
+  } else if (action == "rename_plan") {
+    const fs::path p = open_target_file();
+    const LspPosition pos{read_u32_pos("line"), read_u32_pos("character")};
+    const std::string new_name = require_string(arguments, {"new_name", 256, false});
+    const auto plan = unwrap_or_throw(client.rename(LspRenameParams{p, pos, new_name}));
+    Value::Array files;
+    for (const auto &f : plan.files) {
+      files.push_back(Value::object({
+          {"path", Value{f.path.string()}},
+          {"relative_path", Value{f.relative_path.string()}},
+          {"edit_count", Value{Number{static_cast<std::uint64_t>(f.edits.size())}}},
+          {"unified_diff", Value{f.unified_diff}},
+      }));
+    }
+    response = Value::object({
+        {"total_edits", Value{Number{static_cast<std::uint64_t>(plan.total_edits)}}},
+        {"files", Value{std::move(files)}},
+        {"unified_preview", Value{plan.unified_preview}},
+    });
+  } else {
+    throw Error{ErrorCode::invalid_range};
+  }
+
+  if (client.owns_process()) {
+    (void)client.shutdown();
+  } else {
+    client.disconnect();
+  }
+  return Value::object({
+      {"server_name", Value{init.server_name}},
+      {"result", std::move(response)},
+  });
+}
+
 } // namespace
 
 bool is_command_post_tool(std::string_view name) noexcept {
   return name == "platoon_board" || name == "bridge_guard" ||
          name == "project_issues" || name == "project_memory" ||
-         name == "companion_timing" || name == "local_swarm";
+         name == "companion_timing" || name == "local_swarm" || name == "sqlite_db" ||
+         name == "measure_script" || name == "nvim_ast" || name == "code_intel";
 }
 
 Value command_post_tool_definitions() {
@@ -2756,6 +3379,175 @@ Value command_post_tool_definitions() {
                {"additionalProperties", Value{false}},
            })},
       }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"sqlite_db"}},
+          {"description",
+           Value{
+               "Zero-dependency SQLite workbench providing ephemeral scratch databases "
+               "(auto-destroyed on completion) and a permanent model-private SQLite "
+               "database per project (WAL, FTS5, JSON1, bulk JSONL/CSV/lines ingest, "
+               "SQL lexer guardrails, Brakes taint tracking)."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{
+                                      Value{"probe"}, Value{"scratch_query"},
+                                      Value{"scratch_exec"}, Value{"model_query"},
+                                      Value{"model_exec"}, Value{"model_ingest_jsonl"},
+                                      Value{"model_ingest_csv"},
+                                      Value{"model_ingest_lines"}}}},
+                     })},
+                    {"db_name", Value::object({{"type", Value{"string"}}})},
+                    {"sql", Value::object({{"type", Value{"string"}}})},
+                    {"setup_sql", Value::object({{"type", Value{"string"}}})},
+                    {"table", Value::object({{"type", Value{"string"}}})},
+                    {"data", Value::object({{"type", Value{"string"}}})},
+                    {"data_format",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{Value{"jsonl"}, Value{"csv"},
+                                                     Value{"lines"}}}},
+                     })},
+                    {"project_root", Value::object({{"type", Value{"string"}}})},
+                    {"state_dir", Value::object({{"type", Value{"string"}}})},
+                    {"max_rows", Value::object({{"type", Value{"integer"}},
+                                                {"minimum", Value{Number{1}}},
+                                                {"maximum", Value{Number{1000}}}})},
+                    {"timeout_ms", Value::object({{"type", Value{"integer"}},
+                                                  {"minimum", Value{Number{100}}},
+                                                  {"maximum", Value{Number{30000}}}})},
+                    {"tainted", Value::object({{"type", Value{"boolean"}}})},
+                    {"read_only", Value::object({{"type", Value{"boolean"}}})},
+                    {"sqlite_bin", Value::object({{"type", Value{"string"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"measure_script"}},
+          {"description",
+           Value{
+               "High-precision script measurement and closed-loop tuning harness "
+               "(CLOCK_MONOTONIC_RAW + wait4 rusage with platform-normalized max RSS, "
+               "fail-fast correctness oracle gate, lossless raw trial emission, and "
+               "separate tertiary median/p95/IQR/CV statistics)."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action", Value::object({
+                                   {"type", Value{"string"}},
+                                   {"enum", Value{Value::Array{Value{"run"}}}},
+                               })},
+                    {"argv", Value::object({
+                                 {"type", Value{"array"}},
+                                 {"items", Value::object({{"type", Value{"string"}}})},
+                             })},
+                    {"oracle_argv",
+                     Value::object({
+                         {"type", Value{"array"}},
+                         {"items", Value::object({{"type", Value{"string"}}})},
+                     })},
+                    {"cwd", Value::object({{"type", Value{"string"}}})},
+                    {"warmup_trials", Value::object({{"type", Value{"integer"}},
+                                                     {"minimum", Value{Number{0}}},
+                                                     {"maximum", Value{Number{20}}}})},
+                    {"measured_trials",
+                     Value::object({{"type", Value{"integer"}},
+                                    {"minimum", Value{Number{1}}},
+                                    {"maximum", Value{Number{50}}}})},
+                    {"timeout_ms", Value::object({{"type", Value{"integer"}},
+                                                  {"minimum", Value{Number{100}}},
+                                                  {"maximum", Value{Number{60000}}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}, Value{"argv"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"nvim_ast"}},
+          {"description",
+           Value{"Headless Neovim MsgPack-RPC + embedded Tree-sitter AST query and "
+                 "sandboxed scratch-buffer structural edit engine returning unified "
+                 "diffs without mutating workspace files on disk."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{Value{"probe"}, Value{"ast_query"},
+                                                     Value{"scratch_edit"}}}},
+                     })},
+                    {"language", Value::object({{"type", Value{"string"}}})},
+                    {"source_text", Value::object({{"type", Value{"string"}}})},
+                    {"query", Value::object({{"type", Value{"string"}}})},
+                    {"script", Value::object({{"type", Value{"string"}}})},
+                    {"is_lua", Value::object({{"type", Value{"boolean"}}})},
+                    {"max_captures", Value::object({{"type", Value{"integer"}},
+                                                    {"minimum", Value{Number{1}}},
+                                                    {"maximum", Value{Number{4096}}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"code_intel"}},
+          {"description",
+           Value{"Consumer-only native C++23 JSON-RPC 2.0 LSP client for structural "
+                 "code intelligence (symbols, definition, references, hover, and "
+                 "read-only rename_plan previews with zero direct disk writes)."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum",
+                          Value{Value::Array{Value{"probe"}, Value{"symbols"},
+                                             Value{"definition"}, Value{"references"},
+                                             Value{"hover"}, Value{"rename_plan"}}}},
+                     })},
+                    {"server", Value::object({{"type", Value{"string"}}})},
+                    {"server_args",
+                     Value::object({
+                         {"type", Value{"array"}},
+                         {"items", Value::object({{"type", Value{"string"}}})},
+                     })},
+                    {"unix_socket", Value::object({{"type", Value{"string"}}})},
+                    {"tcp_port", Value::object({{"type", Value{"integer"}},
+                                                {"minimum", Value{Number{1}}},
+                                                {"maximum", Value{Number{65535}}}})},
+                    {"workspace", Value::object({{"type", Value{"string"}}})},
+                    {"file_path", Value::object({{"type", Value{"string"}}})},
+                    {"language_id", Value::object({{"type", Value{"string"}}})},
+                    {"line", Value::object({{"type", Value{"integer"}},
+                                            {"minimum", Value{Number{0}}}})},
+                    {"character", Value::object({{"type", Value{"integer"}},
+                                                 {"minimum", Value{Number{0}}}})},
+                    {"new_name", Value::object({{"type", Value{"string"}}})},
+                    {"query", Value::object({{"type", Value{"string"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
   }};
 }
 
@@ -2773,6 +3565,14 @@ Value run_command_post_tool(std::string_view name, const Value &arguments,
     return handle_companion_timing(arguments, context);
   if (name == "local_swarm")
     return handle_local_swarm(arguments, context);
+  if (name == "sqlite_db")
+    return handle_sqlite_db(arguments);
+  if (name == "measure_script")
+    return handle_measure_script(arguments);
+  if (name == "nvim_ast")
+    return handle_nvim_ast(arguments);
+  if (name == "code_intel")
+    return handle_code_intel(arguments);
   throw Error{ErrorCode::unsupported};
 }
 

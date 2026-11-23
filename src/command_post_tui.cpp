@@ -9,12 +9,14 @@
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
+#include "blackbird/nvim_rpc.hpp"
 #include "blackbird/os_sandbox.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/swarmboard_view.hpp"
 #include "blackbird/token_usage.hpp"
 #include "blackbird/worktree_lease.hpp"
@@ -4237,6 +4239,45 @@ std::string handle_brakes(std::string_view args) {
   return "Usage: /brakes [status|probe|help]\n";
 }
 
+std::string handle_superpowers(std::string_view args) {
+  const auto [sub, rest] = split_first_token(trim_view(args));
+  if (sub == "help") {
+    return "Model Superpowers:\n"
+           "  /superpowers [status|probe]  Show SQLite, Neovim/Tree-sitter, LSP & "
+           "Measure readiness\n";
+  }
+  if (!rest.empty() || (!sub.empty() && sub != "status" && sub != "probe")) {
+    return "Usage: /superpowers [status|probe|help]\n";
+  }
+  const auto sql_res = sqlite::probe_sqlite_capabilities();
+  const sqlite::SqliteCapabilities sql_caps =
+      sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
+  const NvimCapabilities nvim_caps = probe_nvim_capabilities();
+  const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
+
+  std::string out = "Blackbird Model Superpowers:\n";
+  out += "  SQLite Workbench:   ";
+  if (sql_caps.available) {
+    out += "ready (" + sql_caps.version +
+           std::string{sql_caps.supports_safe_flag ? ", -safe" : ""} +
+           std::string{sql_caps.supports_fts5 ? ", FTS5" : ""} +
+           std::string{sql_caps.supports_json1 ? ", JSON1" : ""} + ")\n";
+  } else {
+    out += "unavailable (sqlite3 not found)\n";
+  }
+  out += "  Neovim Tree-sitter: ";
+  if (nvim_caps.available) {
+    out += "ready (" + nvim_caps.version_string + ", " +
+           std::to_string(nvim_caps.treesitter_parsers.size()) + " parsers)\n";
+  } else {
+    out += "unavailable (nvim not found)\n";
+  }
+  out += "  Native LSP Client:  ready (tools: code_intel)\n";
+  out += "  Measure Harness:    ready (CLOCK_MONOTONIC_RAW + rusage, sandbox=" +
+         sandbox_caps.backend_name + ")\n";
+  return out;
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -4272,6 +4313,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_lan(args));
     if (cmd == "/brakes")
       return bound_output(handle_brakes(args));
+    if (cmd == "/superpowers")
+      return bound_output(handle_superpowers(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {
