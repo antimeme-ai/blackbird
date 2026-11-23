@@ -305,11 +305,19 @@ void test_mcp_subcommand(const fs::path &base) {
       R"({"jsonrpc":"2.0","id":"list-2","method":"tools/list","params":{}})"
       "\n";
 
-  const auto res =
-      run_cli({"mcp", "--board", board_dir.string(), "--allow-root", allow_dir.string(),
-               "--max-peers", "2", "--max-line-bytes", "65536"},
-              stdin_rpc);
+  const auto res = run_cli({"mcp", "--board", board_dir.string(), "--allow-root",
+                            allow_dir.string(), "--max-peers", "2",
+                            "--max-total-spawns", "16", "--max-line-bytes", "65536"},
+                           stdin_rpc);
   check(res.exit_code == 0, "mcp subcommand returned non-zero");
+
+  // Verify invalid --max-total-spawns bounds fail with usage exit code 2.
+  for (const char *bad_spawns : {"0", "1025"}) {
+    const auto bad = run_cli(
+        {"mcp", "--allow-root", allow_dir.string(), "--max-total-spawns", bad_spawns});
+    check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+          "out-of-range --max-total-spawns must fail with usage error");
+  }
 
   std::istringstream iss{res.out};
   std::string line1;

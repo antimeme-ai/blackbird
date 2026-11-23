@@ -687,9 +687,10 @@ Result<void> validate_utf8_text(std::string_view value, std::size_t max_bytes,
   return Result<void>::success();
 }
 
-Result<void> validate_config(const PeerIdentityConfig &config) noexcept {
+Result<void> validate_config(const PeerIdentityConfig &config) {
   if (config.ssh_keygen_executable.empty() ||
-      config.ssh_keygen_executable.find('\0') != std::string::npos) {
+      config.ssh_keygen_executable.find('\0') != std::string::npos ||
+      !std::filesystem::path{config.ssh_keygen_executable}.is_absolute()) {
     return Result<void>::failure({ErrorCode::invalid_range});
   }
   if (!valid_safe_token(config.signature_namespace, 64, false))
@@ -767,6 +768,14 @@ Result<ChildOutput> run_child_process(const PeerIdentityConfig &config,
     detail::Child child;
     child.cancelled = config.cancelled;
     child.separate_error = true;
+    child.child_environment.emplace_back("PATH=/usr/bin:/bin");
+    auto copy_env = [&](const char *key) {
+      if (const char *val = std::getenv(key); val != nullptr && val[0] != '\0')
+        child.child_environment.emplace_back(std::string{key} + "=" + val);
+    };
+    copy_env("HOME");
+    copy_env("TMPDIR");
+    copy_env("TZ");
     child.start(std::move(args));
     const auto deadline =
         detail::Clock::now() + std::chrono::seconds{config.process_timeout_seconds};

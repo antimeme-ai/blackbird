@@ -1487,6 +1487,45 @@ void test_kimi3_guard_presence_corruption_and_boundaries(
               cr_eof_rep.incomplete_trailing_frame,
           "EOF immediately after '\\r' not handled cleanly");
   }
+
+  // GLM L5 regression: duplicate outbound (from_fingerprint, envelope_id) reuse
+  // MUST fail with ErrorCode::conflict without writing a duplicate frame to wire.
+  {
+    auto dup_bridge = must(BoardBridge::open(base / "glm-l5-dup"), "glm-l5 bridge");
+    constexpr std::int64_t kT0 = 1700000000000000000LL;
+    const auto first_env = must(alice_id.sign_envelope(PeerEnvelopeDraft{
+                                    "env-dup-01",
+                                    bob_fp,
+                                    "t-dup",
+                                    PeerEnvelopeKind::mail,
+                                    kT0,
+                                    Value::object({{"seq", Value{Number{1}}}}),
+                                }),
+                                "sign first dup env");
+    const auto second_env = must(alice_id.sign_envelope(PeerEnvelopeDraft{
+                                     "env-dup-01",
+                                     bob_fp,
+                                     "t-dup",
+                                     PeerEnvelopeKind::mail,
+                                     kT0 + 1,
+                                     Value::object({{"seq", Value{Number{2}}}}),
+                                 }),
+                                 "sign second dup env");
+
+    std::stringstream out1;
+    must_void(dup_bridge.send_envelope(out1, first_env), "send first env-dup-01");
+    check(!out1.str().empty(), "first send_envelope produced empty output");
+
+    std::stringstream out2;
+    const auto dup_res = dup_bridge.send_envelope(out2, second_env);
+    check(!dup_res.has_value() && dup_res.error().code == ErrorCode::conflict,
+          "duplicate outbound (from_fingerprint, envelope_id) must fail with conflict");
+    check(out2.str().empty(), "refused duplicate send_envelope wrote bytes to stream");
+
+    const auto stored = must(dup_bridge.envelopes(), "envelopes after dup refusal");
+    check(stored.size() == 1 && stored[0] == first_env,
+          "duplicate send_envelope altered stored outbound envelope");
+  }
 }
 
 } // namespace

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <istream>
 #include <limits>
+#include <mutex>
 #include <ostream>
 #include <set>
 #include <span>
@@ -514,6 +515,8 @@ struct McpCommandPostServer::Impl {
 
   McpPlatoonPeerConfig runner_config;
   std::vector<fs::path> normalized_allowed_roots;
+  mutable std::mutex spawn_mutex;
+  std::size_t total_spawns = 0;
 
   std::vector<ToolSchemaEntry> build_tool_schemas() const {
     std::vector<ToolSchemaEntry> tools;
@@ -695,17 +698,17 @@ struct McpCommandPostServer::Impl {
     return tools;
   }
 
-  std::optional<fs::path> resolve_allowed_path(const fs::path &candidate) const {
+  Result<fs::path> resolve_allowed_path(const fs::path &candidate) const {
+    if (normalized_allowed_roots.empty())
+      return Result<fs::path>::failure({ErrorCode::invalid_range});
     const auto resolved = resolve_existing_prefix(candidate);
     if (!resolved.has_value())
-      return std::nullopt;
-    if (normalized_allowed_roots.empty())
-      return resolved.value();
+      return Result<fs::path>::failure({ErrorCode::conflict});
     for (const auto &root : normalized_allowed_roots) {
       if (path_within_root({resolved.value(), root}))
-        return resolved.value();
+        return Result<fs::path>::success(resolved.value());
     }
-    return std::nullopt;
+    return Result<fs::path>::failure({ErrorCode::conflict});
   }
 
   Value call_platoon_board_post(const Value &args) {
@@ -1048,16 +1051,28 @@ struct McpCommandPostServer::Impl {
     }
 
     const auto resolved_working = resolve_allowed_path(spec.working_dir);
-    if (!resolved_working.has_value())
+    if (!resolved_working.has_value()) {
+      if (resolved_working.error().code == ErrorCode::invalid_range) {
+        return make_tool_error(
+            {"invalid_range",
+             "platoon_peer_spawn disabled: no allowed workspace roots configured"});
+      }
       return make_tool_error(
           {"forbidden_path", "working_dir is outside allowed workspace roots"});
-    spec.working_dir = *resolved_working;
+    }
+    spec.working_dir = resolved_working.value();
 
     const auto resolved_session = resolve_allowed_path(spec.session_dir);
-    if (!resolved_session.has_value())
+    if (!resolved_session.has_value()) {
+      if (resolved_session.error().code == ErrorCode::invalid_range) {
+        return make_tool_error(
+            {"invalid_range",
+             "platoon_peer_spawn disabled: no allowed workspace roots configured"});
+      }
       return make_tool_error(
           {"forbidden_path", "session_dir is outside allowed workspace roots"});
-    spec.session_dir = *resolved_session;
+    }
+    spec.session_dir = resolved_session.value();
 
     if (const auto *effort_val = args.find("effort")) {
       if (!is_string(*effort_val))
@@ -1070,10 +1085,16 @@ struct McpCommandPostServer::Impl {
         return make_tool_error(
             {"invalid_arguments", "workflow must be a non-empty string"});
       const auto resolved_wf = resolve_allowed_path(fs::path{wf_val->string()});
-      if (!resolved_wf.has_value())
+      if (!resolved_wf.has_value()) {
+        if (resolved_wf.error().code == ErrorCode::invalid_range) {
+          return make_tool_error(
+              {"invalid_range",
+               "platoon_peer_spawn disabled: no allowed workspace roots configured"});
+        }
         return make_tool_error(
             {"forbidden_path", "workflow is outside allowed workspace roots"});
-      spec.workflow = *resolved_wf;
+      }
+      spec.workflow = resolved_wf.value();
     }
 
     std::uint64_t max_out = spec.max_output_bytes;
@@ -1109,9 +1130,20 @@ struct McpCommandPostServer::Impl {
     spec.extra_env.emplace_back("BLACKBIRD_PLATOON_PEER_ID", spec.peer_id);
     spec.extra_env.emplace_back("BLACKBIRD_PLATOON_ROLE", spec.role);
 
+    {
+      const std::lock_guard<std::mutex> lock{spawn_mutex};
+      if (total_spawns >= runner_config.max_total_spawns)
+        return make_tool_error_from_code({ErrorCode::capacity}, "platoon_peer_spawn");
+      ++total_spawns;
+    }
+
     const auto spawned = runner->spawn(spec);
-    if (!spawned.has_value())
+    if (!spawned.has_value()) {
+      const std::lock_guard<std::mutex> lock{spawn_mutex};
+      if (total_spawns > 0)
+        --total_spawns;
       return make_tool_error_from_code(spawned.error(), "platoon_peer_spawn");
+    }
     return make_tool_result(peer_snapshot_to_value(spawned.value()), false);
   }
 
@@ -1126,6 +1158,12 @@ struct McpCommandPostServer::Impl {
     for (const auto &snap : peers)
       arr.push_back(peer_snapshot_to_value(snap));
 
+    std::size_t current_total_spawns = 0;
+    {
+      const std::lock_guard<std::mutex> lock{spawn_mutex};
+      current_total_spawns = total_spawns;
+    }
+
     return make_tool_result(
         Value::object({
             {"peers", Value{std::move(arr)}},
@@ -1133,6 +1171,10 @@ struct McpCommandPostServer::Impl {
              Value{Number{static_cast<std::uint64_t>(runner->active_count())}}},
             {"max_peers",
              Value{Number{static_cast<std::uint64_t>(runner->max_peers())}}},
+            {"total_spawns",
+             Value{Number{static_cast<std::uint64_t>(current_total_spawns)}}},
+            {"max_total_spawns",
+             Value{Number{static_cast<std::uint64_t>(runner_config.max_total_spawns)}}},
         }),
         false);
   }
@@ -1259,6 +1301,8 @@ Result<McpCommandPostServer> McpCommandPostServer::open(McpCommandPostConfig con
     const auto &rcfg = *config.platoon_runner;
     if (rcfg.max_peers == 0 || rcfg.max_peers > PlatoonRunner::max_peers_limit)
       return Result<McpCommandPostServer>::failure({ErrorCode::invalid_range});
+    if (rcfg.max_total_spawns == 0 || rcfg.max_total_spawns > kMcpMaxTotalSpawnsLimit)
+      return Result<McpCommandPostServer>::failure({ErrorCode::invalid_range});
     if (!rcfg.executable.empty() && !valid_configured_path(rcfg.executable))
       return Result<McpCommandPostServer>::failure({ErrorCode::invalid_range});
     if (!rcfg.working_root.empty() && !valid_configured_path(rcfg.working_root))
@@ -1272,21 +1316,19 @@ Result<McpCommandPostServer> McpCommandPostServer::open(McpCommandPostConfig con
         return Result<McpCommandPostServer>::failure(resolved.error());
       impl->normalized_allowed_roots.push_back(std::move(resolved).value());
     }
-    if (!impl->normalized_allowed_roots.empty()) {
-      auto append_root = [&](const fs::path &p) -> Result<void> {
-        if (p.empty())
-          return Result<void>::success();
-        auto resolved = resolve_existing_prefix(p);
-        if (!resolved.has_value())
-          return Result<void>::failure(resolved.error());
-        impl->normalized_allowed_roots.push_back(std::move(resolved).value());
+    auto append_root = [&](const fs::path &p) -> Result<void> {
+      if (p.empty())
         return Result<void>::success();
-      };
-      if (const auto r = append_root(rcfg.working_root); !r.has_value())
-        return Result<McpCommandPostServer>::failure(r.error());
-      if (const auto r = append_root(rcfg.session_root); !r.has_value())
-        return Result<McpCommandPostServer>::failure(r.error());
-    }
+      auto resolved = resolve_existing_prefix(p);
+      if (!resolved.has_value())
+        return Result<void>::failure(resolved.error());
+      impl->normalized_allowed_roots.push_back(std::move(resolved).value());
+      return Result<void>::success();
+    };
+    if (const auto r = append_root(rcfg.working_root); !r.has_value())
+      return Result<McpCommandPostServer>::failure(r.error());
+    if (const auto r = append_root(rcfg.session_root); !r.has_value())
+      return Result<McpCommandPostServer>::failure(r.error());
 
     impl->runner_config = rcfg;
     try {

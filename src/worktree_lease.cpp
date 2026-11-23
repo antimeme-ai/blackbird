@@ -2,6 +2,7 @@
 #include "blackbird/json.hpp"
 #include "native_process.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -58,7 +59,13 @@ struct PathRelation {
   const fs::path &candidate;
 };
 
+struct GitTarget {
+  const fs::path &git_executable;
+  const fs::path &directory;
+};
+
 struct LeaseRoots {
+  const fs::path &git_executable;
   const fs::path &repo_root;
   const fs::path &lease_root;
 };
@@ -69,6 +76,7 @@ struct RecordParseInput {
 };
 
 struct WorktreeLookup {
+  const fs::path &git_executable;
   const fs::path &repo_root;
   const fs::path &worktree_dir;
 };
@@ -582,24 +590,84 @@ Result<void> write_file_atomic(const fs::path &destination, std::string_view byt
   return sync_directory(parent);
 }
 
-Result<GitOutput> run_git(const fs::path &directory, std::vector<std::string> subargs,
+bool is_valid_executable_file(const fs::path &path) {
+  const std::string native = path.string();
+  if (native.empty() || native.find('\0') != std::string::npos || !path.is_absolute())
+    return false;
+  struct stat st{};
+  if (::stat(path.c_str(), &st) != 0)
+    return false;
+  return S_ISREG(st.st_mode) && ::access(path.c_str(), X_OK) == 0;
+}
+
+Result<fs::path> resolve_git_executable(const fs::path &override_path) {
+  if (!override_path.empty()) {
+    if (!is_valid_executable_file(override_path))
+      return Result<fs::path>::failure({ErrorCode::invalid_range});
+    std::error_code ec;
+    const fs::path canonical_git = fs::canonical(override_path, ec);
+    return Result<fs::path>::success(ec ? override_path : canonical_git);
+  }
+  static constexpr std::array<std::string_view, 3> kStandardGitPaths{
+      "/usr/bin/git",
+      "/opt/homebrew/bin/git",
+      "/usr/local/bin/git",
+  };
+  for (const auto candidate_sv : kStandardGitPaths) {
+    const fs::path candidate{candidate_sv};
+    if (is_valid_executable_file(candidate))
+      return Result<fs::path>::success(candidate);
+  }
+  if (const char *path_env = std::getenv("PATH"); path_env != nullptr) {
+    std::string_view remaining{path_env};
+    while (!remaining.empty()) {
+      const std::size_t colon = remaining.find(':');
+      const std::string_view entry =
+          colon == std::string_view::npos ? remaining : remaining.substr(0, colon);
+      if (!entry.empty()) {
+        const fs::path dir{entry};
+        if (dir.is_absolute()) {
+          const fs::path candidate = dir / "git";
+          if (is_valid_executable_file(candidate)) {
+            std::error_code ec;
+            const fs::path canonical_git = fs::canonical(candidate, ec);
+            return Result<fs::path>::success(ec ? candidate : canonical_git);
+          }
+        }
+      }
+      if (colon == std::string_view::npos)
+        break;
+      remaining.remove_prefix(colon + 1);
+    }
+  }
+  return Result<fs::path>::failure({ErrorCode::io, ENOENT});
+}
+
+Result<GitOutput> run_git(const GitTarget &target, std::vector<std::string> subargs,
                           bool read_only) {
   try {
     std::vector<std::string> argv;
     argv.reserve(subargs.size() + 5);
-    argv.emplace_back("git");
+    argv.emplace_back(target.git_executable.string());
     argv.emplace_back("-C");
-    argv.emplace_back(directory.string());
+    argv.emplace_back(target.directory.string());
     argv.emplace_back("-c");
     argv.emplace_back("core.hooksPath=/dev/null");
     for (auto &arg : subargs)
       argv.emplace_back(std::move(arg));
 
     detail::Child child;
-    for (char **entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
-      if (!std::string_view{*entry}.starts_with("GIT_"))
-        child.child_environment.emplace_back(*entry);
-    }
+    child.child_environment.emplace_back(
+        "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
+    auto copy_env = [&](const char *key) {
+      if (const char *val = std::getenv(key); val != nullptr && val[0] != '\0')
+        child.child_environment.emplace_back(std::string{key} + "=" + val);
+    };
+    copy_env("HOME");
+    copy_env("TMPDIR");
+    copy_env("TZ");
+    copy_env("LC_ALL");
+    copy_env("LANG");
     child.child_environment.emplace_back("GIT_CONFIG_NOSYSTEM=1");
     child.child_environment.emplace_back("GIT_TERMINAL_PROMPT=0");
     if (read_only)
@@ -788,18 +856,18 @@ Result<std::vector<LeaseRecord>> load_all_records(const fs::path &leases_dir,
   return Result<std::vector<LeaseRecord>>::success(std::move(records));
 }
 
-Result<bool> branch_exists(const fs::path &repo_root, std::string_view branch) {
+Result<bool> branch_exists(const GitTarget &target, std::string_view branch) {
   auto output = run_git(
-      repo_root,
-      {"show-ref", "--verify", "--quiet", "refs/heads/" + std::string{branch}}, true);
+      target, {"show-ref", "--verify", "--quiet", "refs/heads/" + std::string{branch}},
+      true);
   if (!output.has_value())
     return Result<bool>::failure(output.error());
   return Result<bool>::success(output.value().exit_code == 0);
 }
 
-Result<bool> branch_checked_out_anywhere(const fs::path &repo_root,
+Result<bool> branch_checked_out_anywhere(const GitTarget &target,
                                          std::string_view branch) {
-  auto output = run_git(repo_root, {"worktree", "list", "--porcelain"}, true);
+  auto output = run_git(target, {"worktree", "list", "--porcelain"}, true);
   if (!output.has_value())
     return Result<bool>::failure(output.error());
   if (output.value().exit_code != 0)
@@ -810,7 +878,8 @@ Result<bool> branch_checked_out_anywhere(const fs::path &repo_root,
 }
 
 Result<bool> is_registered_worktree(const WorktreeLookup &lookup) {
-  auto output = run_git(lookup.repo_root, {"worktree", "list", "--porcelain"}, true);
+  auto output = run_git({lookup.git_executable, lookup.repo_root},
+                        {"worktree", "list", "--porcelain"}, true);
   if (!output.has_value())
     return Result<bool>::failure(output.error());
   if (output.value().exit_code != 0)
@@ -824,8 +893,8 @@ Result<bool> is_registered_worktree(const WorktreeLookup &lookup) {
   return Result<bool>::success(haystack.find(needle) != std::string::npos);
 }
 
-Result<bool> is_own_git_toplevel(const fs::path &canonical_wt) {
-  auto top_res = run_git(canonical_wt, {"rev-parse", "--show-toplevel"}, true);
+Result<bool> is_own_git_toplevel(const GitTarget &target) {
+  auto top_res = run_git(target, {"rev-parse", "--show-toplevel"}, true);
   if (!top_res.has_value())
     return Result<bool>::failure(top_res.error());
   if (top_res.value().exit_code != 0)
@@ -838,7 +907,7 @@ Result<bool> is_own_git_toplevel(const fs::path &canonical_wt) {
   const fs::path canonical_top = fs::canonical(fs::path{toplevel_str}, ec);
   if (ec)
     return Result<bool>::success(false);
-  return Result<bool>::success(canonical_top == canonical_wt);
+  return Result<bool>::success(canonical_top == target.directory);
 }
 
 bool lease_root_conflicts_with_repo(const fs::path &candidate_lease,
@@ -851,9 +920,8 @@ bool lease_root_conflicts_with_repo(const fs::path &candidate_lease,
          is_path_same_or_descendant({candidate_lease, repo_paths.git_common_dir});
 }
 
-Result<fs::path> resolve_git_dir_arg(const fs::path &repo_input,
-                                     std::string_view flag) {
-  auto res = run_git(repo_input, {"rev-parse", std::string{flag}}, true);
+Result<fs::path> resolve_git_dir_arg(const GitTarget &target, std::string_view flag) {
+  auto res = run_git(target, {"rev-parse", std::string{flag}}, true);
   if (!res.has_value())
     return Result<fs::path>::failure(res.error());
   if (res.value().exit_code != 0)
@@ -863,7 +931,7 @@ Result<fs::path> resolve_git_dir_arg(const fs::path &repo_input,
     return Result<fs::path>::failure({ErrorCode::invalid_range});
   fs::path p{raw};
   if (p.is_relative())
-    p = repo_input / p;
+    p = target.directory / p;
   std::error_code ec;
   const fs::path canonical_p = fs::canonical(p, ec);
   if (ec)
@@ -906,10 +974,11 @@ Result<WorktreeLeaseInfo> inspect_lease(const LeaseRecord &record,
   // Verify the directory is actually a registered linked worktree whose git toplevel
   // is itself before querying git status/HEAD; otherwise git would walk up to an
   // enclosing parent repository if .git were missing or corrupt.
-  auto registered = is_registered_worktree({roots.repo_root, canonical_wt});
+  auto registered =
+      is_registered_worktree({roots.git_executable, roots.repo_root, canonical_wt});
   if (!registered.has_value())
     return Result<WorktreeLeaseInfo>::failure(registered.error());
-  auto own_top = is_own_git_toplevel(canonical_wt);
+  auto own_top = is_own_git_toplevel({roots.git_executable, canonical_wt});
   if (!own_top.has_value())
     return Result<WorktreeLeaseInfo>::failure(own_top.error());
   if (!registered.value() || !own_top.value()) {
@@ -917,7 +986,8 @@ Result<WorktreeLeaseInfo> inspect_lease(const LeaseRecord &record,
     return Result<WorktreeLeaseInfo>::success(std::move(info));
   }
 
-  auto head_res = run_git(info.path, {"rev-parse", "--verify", "HEAD"}, true);
+  auto head_res = run_git({roots.git_executable, info.path},
+                          {"rev-parse", "--verify", "HEAD"}, true);
   if (!head_res.has_value())
     return Result<WorktreeLeaseInfo>::failure(head_res.error());
   if (head_res.value().exit_code == 0) {
@@ -927,7 +997,8 @@ Result<WorktreeLeaseInfo> inspect_lease(const LeaseRecord &record,
       info.head_sha = sha;
   }
 
-  auto status_res = run_git(info.path, {"status", "--porcelain"}, true);
+  auto status_res =
+      run_git({roots.git_executable, info.path}, {"status", "--porcelain"}, true);
   if (!status_res.has_value())
     return Result<WorktreeLeaseInfo>::failure(status_res.error());
   if (status_res.value().exit_code != 0) {
@@ -939,8 +1010,8 @@ Result<WorktreeLeaseInfo> inspect_lease(const LeaseRecord &record,
   }
 
   if (!info.head_sha.empty()) {
-    auto ahead_res =
-        run_git(info.path, {"rev-list", "--count", record.base_sha + "..HEAD"}, true);
+    auto ahead_res = run_git({roots.git_executable, info.path},
+                             {"rev-list", "--count", record.base_sha + "..HEAD"}, true);
     if (!ahead_res.has_value())
       return Result<WorktreeLeaseInfo>::failure(ahead_res.error());
     if (ahead_res.value().exit_code == 0) {
@@ -979,19 +1050,21 @@ Result<void> remove_lease_locked(const LeaseRoots &roots, const LeaseRecord &rec
         !is_path_same_or_descendant({roots.lease_root, canonical_wt}))
       return Result<void>::failure({ErrorCode::conflict});
 
-    auto registered = is_registered_worktree({roots.repo_root, canonical_wt});
+    auto registered =
+        is_registered_worktree({roots.git_executable, roots.repo_root, canonical_wt});
     if (!registered.has_value())
       return Result<void>::failure(registered.error());
 
     if (registered.value()) {
       if (!force) {
-        auto own_top = is_own_git_toplevel(canonical_wt);
+        auto own_top = is_own_git_toplevel({roots.git_executable, canonical_wt});
         if (!own_top.has_value())
           return Result<void>::failure(own_top.error());
         if (!own_top.value())
           return Result<void>::failure({ErrorCode::conflict});
 
-        auto status_res = run_git(wt_path, {"status", "--porcelain"}, true);
+        auto status_res =
+            run_git({roots.git_executable, wt_path}, {"status", "--porcelain"}, true);
         if (!status_res.has_value())
           return Result<void>::failure(status_res.error());
         if (status_res.value().exit_code != 0 ||
@@ -1005,7 +1078,8 @@ Result<void> remove_lease_locked(const LeaseRoots &roots, const LeaseRecord &rec
       remove_args.emplace_back("--");
       remove_args.emplace_back(wt_path.string());
 
-      auto rm_res = run_git(roots.repo_root, std::move(remove_args), false);
+      auto rm_res = run_git({roots.git_executable, roots.repo_root},
+                            std::move(remove_args), false);
       if (!rm_res.has_value())
         return Result<void>::failure(rm_res.error());
       if (rm_res.value().exit_code != 0)
@@ -1019,7 +1093,8 @@ Result<void> remove_lease_locked(const LeaseRoots &roots, const LeaseRecord &rec
     }
   }
 
-  auto prune_res = run_git(roots.repo_root, {"worktree", "prune"}, false);
+  auto prune_res =
+      run_git({roots.git_executable, roots.repo_root}, {"worktree", "prune"}, false);
   if (!prune_res.has_value())
     return Result<void>::failure(prune_res.error());
   if (prune_res.value().exit_code != 0)
@@ -1035,7 +1110,8 @@ Result<void> remove_lease_locked(const LeaseRoots &roots, const LeaseRecord &rec
 
 WorktreeLeaseManager::WorktreeLeaseManager(WorktreeLeaseConfig config)
     : repo_root_(std::move(config.repo_root)),
-      lease_root_(std::move(config.lease_root)), max_leases_(config.max_leases) {}
+      lease_root_(std::move(config.lease_root)), max_leases_(config.max_leases),
+      git_executable_(std::move(config.git_executable)) {}
 
 Result<WorktreeLeaseManager>
 WorktreeLeaseManager::open(const WorktreeLeaseConfig &config) {
@@ -1044,13 +1120,19 @@ WorktreeLeaseManager::open(const WorktreeLeaseConfig &config) {
   if (config.repo_root.empty() || config.lease_root.empty())
     return Result<WorktreeLeaseManager>::failure({ErrorCode::invalid_range});
 
+  auto git_exe = resolve_git_executable(config.git_executable);
+  if (!git_exe.has_value())
+    return Result<WorktreeLeaseManager>::failure(git_exe.error());
+  const fs::path resolved_git = std::move(git_exe).value();
+
   std::error_code ec;
   const fs::path canonical_repo_input = fs::canonical(config.repo_root, ec);
   if (ec || !fs::is_directory(canonical_repo_input, ec))
     return Result<WorktreeLeaseManager>::failure(
         {ErrorCode::invalid_range, ec.value()});
 
-  auto top_res = run_git(canonical_repo_input, {"rev-parse", "--show-toplevel"}, true);
+  auto top_res = run_git({resolved_git, canonical_repo_input},
+                         {"rev-parse", "--show-toplevel"}, true);
   if (!top_res.has_value())
     return Result<WorktreeLeaseManager>::failure(top_res.error());
   if (top_res.value().exit_code != 0)
@@ -1065,10 +1147,11 @@ WorktreeLeaseManager::open(const WorktreeLeaseConfig &config) {
   if (ec)
     return Result<WorktreeLeaseManager>::failure({ErrorCode::io, ec.value()});
 
-  auto git_dir = resolve_git_dir_arg(canonical_repo_input, "--git-dir");
+  auto git_dir = resolve_git_dir_arg({resolved_git, canonical_repo_input}, "--git-dir");
   if (!git_dir.has_value())
     return Result<WorktreeLeaseManager>::failure(git_dir.error());
-  auto git_common_dir = resolve_git_dir_arg(canonical_repo_input, "--git-common-dir");
+  auto git_common_dir =
+      resolve_git_dir_arg({resolved_git, canonical_repo_input}, "--git-common-dir");
   if (!git_common_dir.has_value())
     return Result<WorktreeLeaseManager>::failure(git_common_dir.error());
 
@@ -1103,8 +1186,8 @@ WorktreeLeaseManager::open(const WorktreeLeaseConfig &config) {
   if (!dir_ok.has_value())
     return Result<WorktreeLeaseManager>::failure(dir_ok.error());
 
-  return Result<WorktreeLeaseManager>::success(WorktreeLeaseManager{
-      WorktreeLeaseConfig{canonical_repo, canonical_lease, config.max_leases}});
+  return Result<WorktreeLeaseManager>::success(WorktreeLeaseManager{WorktreeLeaseConfig{
+      canonical_repo, canonical_lease, config.max_leases, resolved_git}});
 }
 
 fs::path WorktreeLeaseManager::leases_dir() const { return lease_root_ / ".leases"; }
@@ -1165,8 +1248,9 @@ WorktreeLeaseManager::acquire(const WorktreeLeaseRequest &req) {
   if (ec != std::errc::no_such_file_or_directory)
     return Result<WorktreeLeaseInfo>::failure({ErrorCode::io, ec.value()});
 
-  auto base_res = run_git(
-      repo_root_, {"rev-parse", "--verify", std::string{base_ref} + "^{commit}"}, true);
+  auto base_res =
+      run_git({git_executable_, repo_root_},
+              {"rev-parse", "--verify", std::string{base_ref} + "^{commit}"}, true);
   if (!base_res.has_value())
     return Result<WorktreeLeaseInfo>::failure(base_res.error());
   if (base_res.value().exit_code != 0)
@@ -1177,14 +1261,15 @@ WorktreeLeaseManager::acquire(const WorktreeLeaseRequest &req) {
   if (!is_valid_oid(base_sha))
     return Result<WorktreeLeaseInfo>::failure({ErrorCode::invalid_range});
 
-  auto has_branch = branch_exists(repo_root_, req.branch);
+  auto has_branch = branch_exists({git_executable_, repo_root_}, req.branch);
   if (!has_branch.has_value())
     return Result<WorktreeLeaseInfo>::failure(has_branch.error());
 
   if (req.use_existing_branch) {
     if (!has_branch.value())
       return Result<WorktreeLeaseInfo>::failure({ErrorCode::invalid_range});
-    auto checked_out = branch_checked_out_anywhere(repo_root_, req.branch);
+    auto checked_out =
+        branch_checked_out_anywhere({git_executable_, repo_root_}, req.branch);
     if (!checked_out.has_value())
       return Result<WorktreeLeaseInfo>::failure(checked_out.error());
     if (checked_out.value())
@@ -1201,7 +1286,7 @@ WorktreeLeaseManager::acquire(const WorktreeLeaseRequest &req) {
                 target_path.string(), base_sha};
   }
 
-  auto add_res = run_git(repo_root_, std::move(add_args), false);
+  auto add_res = run_git({git_executable_, repo_root_}, std::move(add_args), false);
   if (!add_res.has_value())
     return Result<WorktreeLeaseInfo>::failure(add_res.error());
   if (add_res.value().exit_code != 0)
@@ -1219,15 +1304,16 @@ WorktreeLeaseManager::acquire(const WorktreeLeaseRequest &req) {
                        : Result<void>::failure(json.error());
   if (!write_res.has_value()) {
     // Roll back the created worktree (and newly created branch) on metadata failure.
-    (void)run_git(repo_root_,
+    (void)run_git({git_executable_, repo_root_},
                   {"worktree", "remove", "--force", "--", target_path.string()}, false);
-    (void)run_git(repo_root_, {"worktree", "prune"}, false);
+    (void)run_git({git_executable_, repo_root_}, {"worktree", "prune"}, false);
     if (!req.use_existing_branch)
-      (void)run_git(repo_root_, {"branch", "-D", "--", req.branch}, false);
+      (void)run_git({git_executable_, repo_root_}, {"branch", "-D", "--", req.branch},
+                    false);
     return Result<WorktreeLeaseInfo>::failure(write_res.error());
   }
 
-  return inspect_lease(record, {repo_root_, lease_root_});
+  return inspect_lease(record, {git_executable_, repo_root_, lease_root_});
 }
 
 Result<std::vector<WorktreeLeaseInfo>> WorktreeLeaseManager::list() const {
@@ -1242,7 +1328,7 @@ Result<std::vector<WorktreeLeaseInfo>> WorktreeLeaseManager::list() const {
   std::vector<WorktreeLeaseInfo> result;
   result.reserve(records.value().size());
   for (const auto &record : records.value()) {
-    auto info = inspect_lease(record, {repo_root_, lease_root_});
+    auto info = inspect_lease(record, {git_executable_, repo_root_, lease_root_});
     if (!info.has_value())
       return Result<std::vector<WorktreeLeaseInfo>>::failure(info.error());
     result.push_back(std::move(info).value());
@@ -1263,7 +1349,7 @@ WorktreeLeaseManager::status(std::string_view lease_id) const {
   if (!record.has_value())
     return Result<WorktreeLeaseInfo>::failure(record.error());
 
-  return inspect_lease(record.value(), {repo_root_, lease_root_});
+  return inspect_lease(record.value(), {git_executable_, repo_root_, lease_root_});
 }
 
 Result<void> WorktreeLeaseManager::release(std::string_view lease_id, bool force) {
@@ -1278,7 +1364,8 @@ Result<void> WorktreeLeaseManager::release(std::string_view lease_id, bool force
   if (!record.has_value())
     return Result<void>::failure(record.error());
 
-  return remove_lease_locked({repo_root_, lease_root_}, record.value(), force);
+  return remove_lease_locked({git_executable_, repo_root_, lease_root_}, record.value(),
+                             force);
 }
 
 Result<WorktreeReclaimReport> WorktreeLeaseManager::reclaim_stale() {
@@ -1296,7 +1383,7 @@ Result<WorktreeReclaimReport> WorktreeLeaseManager::reclaim_stale() {
         ProcessLiveness::dead)
       continue;
 
-    auto info = inspect_lease(record, {repo_root_, lease_root_});
+    auto info = inspect_lease(record, {git_executable_, repo_root_, lease_root_});
     if (!info.has_value())
       return Result<WorktreeReclaimReport>::failure(info.error());
 
@@ -1305,7 +1392,8 @@ Result<WorktreeReclaimReport> WorktreeLeaseManager::reclaim_stale() {
       continue;
     }
 
-    auto removed = remove_lease_locked({repo_root_, lease_root_}, record, false);
+    auto removed =
+        remove_lease_locked({git_executable_, repo_root_, lease_root_}, record, false);
     if (!removed.has_value())
       return Result<WorktreeReclaimReport>::failure(removed.error());
     report.reclaimed.push_back(record.lease_id);

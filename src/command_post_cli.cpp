@@ -453,8 +453,9 @@ int run_mcp_cli(std::span<char *> args, CliIo io) {
     const std::string_view arg{args[i]};
     if (arg == "--help" || arg == "-h") {
       io.err << "usage: blackbird mcp [--board DIR] [--repo DIR] [--leases DIR] "
-                "[--allow-root DIR]... [--max-peers N] [--max-line-bytes N] "
-                "[--working-root DIR] [--session-root DIR] [--executable PATH]\n";
+                "[--allow-root DIR]... [--max-peers N] [--max-total-spawns N] "
+                "[--max-line-bytes N] [--working-root DIR] [--session-root DIR] "
+                "[--executable PATH]\n";
       return 0;
     }
     if (arg == "--board") {
@@ -508,6 +509,16 @@ int run_mcp_cli(std::span<char *> args, CliIo io) {
       }
       enable_runner = true;
       runner_cfg.max_peers = *parsed;
+    } else if (arg == "--max-total-spawns") {
+      auto val = take_flag_value(args, i, arg, io);
+      if (!val.has_value())
+        return 2;
+      const auto parsed = parse_size(*val);
+      if (!parsed.has_value() || *parsed == 0 || *parsed > kMcpMaxTotalSpawnsLimit) {
+        return fail_usage(io, "mcp: --max-total-spawns must be between 1 and 1024");
+      }
+      enable_runner = true;
+      runner_cfg.max_total_spawns = *parsed;
     } else if (arg == "--max-line-bytes") {
       auto val = take_flag_value(args, i, arg, io);
       if (!val.has_value())

@@ -397,6 +397,21 @@ void test_companion_status_and_bounded_ask() {
                   std::string::npos &&
               ask->find("Caution:  p=0.25") != std::string::npos,
           "companion ask runs bounded System One advisory query");
+
+  // GLM L7 regression: raw std::exception::what() from transport MUST be masked.
+  ctx.decision_evaluator = [](const Value &) -> Value {
+    throw std::runtime_error(
+        "curl failed: https://internal.secret.local/v1?token=sk-live-do-not-leak");
+  };
+  const auto masked = handle_command_post_slash(
+      "/companion ask --provider clef Should raw exceptions leak?", ctx);
+  require(
+      masked.has_value() &&
+          masked->find("Companion query failed (clef): unexpected transport error") !=
+              std::string::npos &&
+          masked->find("sk-live-do-not-leak") == std::string::npos &&
+          masked->find("internal.secret.local") == std::string::npos,
+      "companion ask must mask raw std::exception::what() transport strings");
 }
 
 void test_c1_raw_and_utf8_sanitization_regression() {

@@ -1396,9 +1396,11 @@ std::string handle_companion(std::string_view args, const CommandPostTuiContext 
       return "Companion query failed (" + sanitize_inline(provider, 32) +
              "): " + std::string{error_name(err.code)} +
              " (run `/companion status` to check provider configuration)\n";
-    } catch (const std::exception &ex) {
+    } catch (const std::exception &) {
+      // Never leak raw exception strings that could originate from external transport.
       return "Companion query failed (" + sanitize_inline(provider, 32) +
-             "): " + sanitize_inline(ex.what(), 160) + "\n";
+             "): unexpected transport error"
+             " (run `/companion status` to check provider configuration)\n";
     }
   }
 
@@ -1428,9 +1430,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_companion(args, ctx));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
-  } catch (const std::exception &ex) {
-    return bound_output(std::string{cmd} +
-                        " error: " + sanitize_inline(ex.what(), 160));
+  } catch (const std::exception &) {
+    return bound_output(std::string{cmd} + " error: unexpected internal error");
   }
   return std::nullopt;
 }

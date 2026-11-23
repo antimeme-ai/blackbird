@@ -713,6 +713,81 @@ void test_git_hooks_disabled_and_symlink_conflict() {
   check(mgr.release("hook-test", true).has_value(), "cleanup release failed");
 }
 
+void test_absolute_git_and_minimal_secret_free_env() {
+  TempDir tmp{"bb-wt-env"};
+  const fs::path repo = tmp.path() / "repo";
+  const fs::path leases = tmp.path() / "leases";
+  (void)init_temp_repo(repo);
+
+  // Relative git_executable override MUST be rejected.
+  for (const char *bad_git : {"git", "./fake-git", "../git"}) {
+    auto rejected = WorktreeLeaseManager::open({repo, leases, 4, bad_git});
+    check(!rejected.has_value() && rejected.error().code == ErrorCode::invalid_range,
+          "relative git_executable must be rejected with invalid_range");
+  }
+
+  // Default open() must resolve git to an absolute path.
+  auto default_mgr = WorktreeLeaseManager::open({repo, leases, 4});
+  check(default_mgr.has_value(), "default WorktreeLeaseManager::open failed");
+  const fs::path resolved_git = default_mgr.value().git_executable();
+  check(resolved_git.is_absolute(),
+        "WorktreeLeaseManager must resolve git to an absolute path");
+
+  // Set ambient API secrets in parent env and verify ZERO secrets reach git!
+  struct ScopedEnv {
+    const char *key;
+    std::optional<std::string> prev;
+    ScopedEnv(const char *k, const char *val) : key(k) {
+      if (const char *old = std::getenv(k); old != nullptr)
+        prev = old;
+      check(::setenv(k, val, 1) == 0, "setenv failed");
+    }
+    ScopedEnv(const ScopedEnv &) = delete;
+    ScopedEnv &operator=(const ScopedEnv &) = delete;
+    ~ScopedEnv() {
+      if (prev.has_value())
+        (void)::setenv(key, prev->c_str(), 1);
+      else
+        (void)::unsetenv(key);
+    }
+  };
+  const ScopedEnv e1{"OPENAI_API_KEY", "sk-openai-glm-m1-secret"};
+  const ScopedEnv e2{"ANTHROPIC_API_KEY", "sk-ant-glm-m1-secret"};
+  const ScopedEnv e3{"DEEPSEEK_API_KEY", "sk-ds-glm-m1-secret"};
+
+  const fs::path env_dump = tmp.path() / "git-env.txt";
+  const fs::path wrapper = tmp.path() / "wrap-git.sh";
+  write_text_file(wrapper, "#!/bin/sh\n/usr/bin/env > \"" + env_dump.string() +
+                               "\"\nexec \"" + resolved_git.string() + "\" \"$@\"\n");
+  check(::chmod(wrapper.c_str(), 0700) == 0, "chmod git wrapper failed");
+
+  const fs::path leases2 = tmp.path() / "leases2";
+  auto wrapped_mgr = WorktreeLeaseManager::open({repo, leases2, 4, wrapper});
+  check(wrapped_mgr.has_value(), "open with absolute git wrapper failed");
+
+  auto acquired =
+      wrapped_mgr.value().acquire({"env-check", "br-env-check", "HEAD", "owner",
+                                   static_cast<std::int64_t>(::getpid()), false});
+  check(acquired.has_value(), "acquire with ambient secrets set failed");
+  check(wrapped_mgr.value().release("env-check", false).has_value(),
+        "release after env check failed");
+
+  std::ifstream in{env_dump};
+  check(static_cast<bool>(in), "failed to read git env dump");
+  const std::string dumped{std::istreambuf_iterator<char>{in},
+                           std::istreambuf_iterator<char>{}};
+  check(dumped.find("OPENAI_API_KEY") == std::string::npos &&
+            dumped.find("ANTHROPIC_API_KEY") == std::string::npos &&
+            dumped.find("DEEPSEEK_API_KEY") == std::string::npos &&
+            dumped.find("glm-m1-secret") == std::string::npos,
+        "ambient API secrets leaked into git child environment!");
+  check(dumped.find("GIT_CONFIG_NOSYSTEM=1") != std::string::npos &&
+            dumped.find("GIT_TERMINAL_PROMPT=0") != std::string::npos &&
+            dumped.find("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin") !=
+                std::string::npos,
+        "minimal git environment missing required safety controls");
+}
+
 } // namespace
 
 int main() {
@@ -727,6 +802,7 @@ int main() {
     test_rogue_corrupt_lease_quarantine();
     test_owner_pid_one_and_pid_reuse_reclaim();
     test_git_hooks_disabled_and_symlink_conflict();
+    test_absolute_git_and_minimal_secret_free_env();
     std::cout << "PASS worktree_lease\n";
     return 0;
   } catch (const std::exception &ex) {

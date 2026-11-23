@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -812,6 +813,88 @@ void test_kimi_review2_hardening(const std::filesystem::path &base) {
   }
 }
 
+void test_glm53_ssh_keygen_absolute_and_minimal_env(const std::filesystem::path &base) {
+  g_stage = "glm53_ssh_keygen_absolute_and_minimal_env";
+
+  // M2a: Relative or bare ssh_keygen_executable MUST be rejected with invalid_range.
+  for (const char *bad_exe : {"ssh-keygen", "./attacker-helper", "../ssh-keygen"}) {
+    PeerIdentityConfig bad_cfg;
+    bad_cfg.ssh_keygen_executable = bad_exe;
+
+    const auto r1 = PeerIdentityStore::open_or_create(base / "m2-bad-id", bad_cfg);
+    check(!r1.has_value() && r1.error().code == ErrorCode::invalid_range,
+          "PeerIdentityStore::open_or_create accepted relative ssh_keygen_executable");
+
+    const auto r2 = PeerIdentityStore::open_existing(base / "m2-bad-id", bad_cfg);
+    check(!r2.has_value() && r2.error().code == ErrorCode::invalid_range,
+          "PeerIdentityStore::open_existing accepted relative ssh_keygen_executable");
+
+    const auto r3 = KnownPeersStore::open(base / "m2-bad-peers", bad_cfg);
+    check(!r3.has_value() && r3.error().code == ErrorCode::invalid_range,
+          "KnownPeersStore::open accepted relative ssh_keygen_executable");
+
+    const auto r4 = verify_detached_signature({"bb1-00000000000000000000000000000000",
+                                               "ssh-ed25519 invalid", "payload", "sig"},
+                                              bad_cfg);
+    check(!r4.has_value() && r4.error().code == ErrorCode::invalid_range,
+          "verify_detached_signature accepted relative ssh_keygen_executable");
+  }
+
+  // M2b: Ambient ANTHROPIC_API_KEY / OPENAI_API_KEY MUST NOT be visible inside
+  // the ssh-keygen child process.
+  struct ScopedEnv {
+    const char *key;
+    std::optional<std::string> prev;
+    ScopedEnv(const char *k, const char *val) : key(k) {
+      if (const char *old = std::getenv(k); old != nullptr)
+        prev = old;
+      check(::setenv(k, val, 1) == 0, "setenv failed");
+    }
+    ScopedEnv(const ScopedEnv &) = delete;
+    ScopedEnv &operator=(const ScopedEnv &) = delete;
+    ~ScopedEnv() {
+      if (prev.has_value())
+        (void)::setenv(key, prev->c_str(), 1);
+      else
+        (void)::unsetenv(key);
+    }
+  };
+  const ScopedEnv e1{"ANTHROPIC_API_KEY", "sk-ant-glm-m2-secret"};
+  const ScopedEnv e2{"OPENAI_API_KEY", "sk-openai-glm-m2-secret"};
+
+  const auto env_dump = base / "ssh-keygen-env.txt";
+  const auto wrapper = base / "wrap-ssh-keygen.sh";
+  {
+    std::ofstream out{wrapper, std::ios::binary | std::ios::trunc};
+    check(static_cast<bool>(out), "failed to create ssh-keygen wrapper");
+    out << "#!/bin/sh\n/usr/bin/env > \"" << env_dump.string()
+        << "\"\nexec /usr/bin/ssh-keygen \"$@\"\n";
+  }
+  check(::chmod(wrapper.c_str(), mode_t{0700}) == 0, "chmod ssh-keygen wrapper failed");
+
+  PeerIdentityConfig wrap_cfg;
+  wrap_cfg.ssh_keygen_executable = wrapper.string();
+  auto store = must(PeerIdentityStore::open_or_create(base / "m2-wrap-id", wrap_cfg),
+                    "open_or_create with wrapped ssh-keygen");
+  const auto sig = must(store.sign_bytes("m2-secret-isolation"), "sign with wrapper");
+  must_void(verify_detached_signature({store.identity().fingerprint,
+                                       store.identity().public_key,
+                                       "m2-secret-isolation", sig},
+                                      wrap_cfg),
+            "verify with wrapper");
+
+  std::ifstream in{env_dump};
+  check(static_cast<bool>(in), "failed to read ssh-keygen env dump");
+  const std::string dumped{std::istreambuf_iterator<char>{in},
+                           std::istreambuf_iterator<char>{}};
+  check(dumped.find("ANTHROPIC_API_KEY") == std::string::npos &&
+            dumped.find("OPENAI_API_KEY") == std::string::npos &&
+            dumped.find("glm-m2-secret") == std::string::npos,
+        "ambient API secrets leaked into ssh-keygen child process!");
+  check(dumped.find("PATH=/usr/bin:/bin") != std::string::npos,
+        "ssh-keygen child missing sanitized minimal PATH");
+}
+
 } // namespace
 
 int main() {
@@ -837,6 +920,7 @@ int main() {
     test_capability_grants_expiry_and_revocation(base);
     test_concurrent_identity_init(base);
     test_kimi_review2_hardening(base);
+    test_glm53_ssh_keygen_absolute_and_minimal_env(base);
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "peer_identity_test failed at stage [" << g_stage << "]: " << ex.what()

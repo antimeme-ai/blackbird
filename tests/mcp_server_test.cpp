@@ -1000,6 +1000,221 @@ void test_full_stdio_roundtrip(const RoundtripPaths &paths) {
   }
 }
 
+void test_glm53_fail_closed_allowlist_and_spawn_ceiling(const RoundtripPaths &paths) {
+  const fs::path &base = paths.base;
+  const fs::path &self_exe = paths.self_exe;
+  const fs::path work_dir = base / "glm-work";
+  const fs::path sess_dir = base / "glm-sessions";
+  const fs::path outside_dir = base / "glm-outside";
+  const fs::path outside_wf = outside_dir / "evil.lua";
+  fs::create_directories(work_dir);
+  fs::create_directories(sess_dir);
+  fs::create_directories(outside_dir);
+  write_text_file(outside_wf, "return {}\n");
+
+  // H1a: working_root/session_root WITHOUT explicit allowed_workspace_roots MUST
+  // unconditionally populate normalized_allowed_roots and block "/" and outside paths.
+  {
+    McpCommandPostConfig cfg;
+    McpPlatoonPeerConfig peer_cfg;
+    peer_cfg.max_peers = 2;
+    peer_cfg.executable = self_exe;
+    peer_cfg.working_root = work_dir;
+    peer_cfg.session_root = sess_dir;
+    // Deliberately leave allowed_workspace_roots empty.
+    cfg.platoon_runner = std::move(peer_cfg);
+
+    auto opened = McpCommandPostServer::open(std::move(cfg));
+    check(opened.has_value(), "open with working_root/session_root alone failed");
+    auto &server = opened.value();
+
+    const Value slash_reject = require_reply(
+        server.handle_message(rpc_tool_call(301, "platoon_peer_spawn",
+                                            Value::object({
+                                                {"peer_id", Value{"bad-root"}},
+                                                {"role", Value{"worker"}},
+                                                {"provider", Value{"openai"}},
+                                                {"model", Value{"gpt-5"}},
+                                                {"prompt", Value{"hi"}},
+                                                {"working_dir", Value{"/"}},
+                                            }))),
+        "root '/' reject missing reply");
+    check(req_str(parse_tool_payload(slash_reject, true), "error") == "forbidden_path",
+          "working_root alone must block working_dir='/'");
+
+    const Value outside_reject =
+        require_reply(server.handle_message(rpc_tool_call(
+                          302, "platoon_peer_spawn",
+                          Value::object({
+                              {"peer_id", Value{"bad-outside"}},
+                              {"role", Value{"worker"}},
+                              {"provider", Value{"openai"}},
+                              {"model", Value{"gpt-5"}},
+                              {"prompt", Value{"hi"}},
+                              {"working_dir", Value{outside_dir.string()}},
+                          }))),
+                      "outside working_dir reject missing reply");
+    check(req_str(parse_tool_payload(outside_reject, true), "error") ==
+              "forbidden_path",
+          "working_root alone must block outside working_dir");
+
+    const Value wf_reject =
+        require_reply(server.handle_message(
+                          rpc_tool_call(303, "platoon_peer_spawn",
+                                        Value::object({
+                                            {"peer_id", Value{"bad-wf"}},
+                                            {"role", Value{"worker"}},
+                                            {"provider", Value{"openai"}},
+                                            {"model", Value{"gpt-5"}},
+                                            {"prompt", Value{"hi"}},
+                                            {"workflow", Value{outside_wf.string()}},
+                                        }))),
+                      "outside workflow reject missing reply");
+    check(req_str(parse_tool_payload(wf_reject, true), "error") == "forbidden_path",
+          "working_root alone must block outside workflow path");
+
+    // Default working_root/session_root spawn still succeeds cleanly.
+    const Value ok_spawn = require_reply(
+        server.handle_message(rpc_tool_call(304, "platoon_peer_spawn",
+                                            Value::object({
+                                                {"peer_id", Value{"ok-default"}},
+                                                {"role", Value{"worker"}},
+                                                {"provider", Value{"openai"}},
+                                                {"model", Value{"gpt-5"}},
+                                                {"prompt", Value{"ok"}},
+                                            }))),
+        "default working_root spawn missing reply");
+    (void)parse_tool_payload(ok_spawn, false);
+  }
+
+  // H1b: platoon_runner configured with ZERO roots (no working_root, no session_root,
+  // no allowed_workspace_roots) MUST fail closed with invalid_range on spawn!
+  {
+    McpCommandPostConfig cfg;
+    McpPlatoonPeerConfig peer_cfg;
+    peer_cfg.max_peers = 2;
+    peer_cfg.executable = self_exe;
+    cfg.platoon_runner = std::move(peer_cfg);
+
+    auto opened = McpCommandPostServer::open(std::move(cfg));
+    check(opened.has_value(), "open with empty roots should succeed (spawn disabled)");
+    auto &server = opened.value();
+
+    const Value closed_reject = require_reply(
+        server.handle_message(rpc_tool_call(
+            310, "platoon_peer_spawn",
+            Value::object({
+                {"peer_id", Value{"fail-closed"}},
+                {"role", Value{"worker"}},
+                {"provider", Value{"openai"}},
+                {"model", Value{"gpt-5"}},
+                {"prompt", Value{"hi"}},
+                {"working_dir", Value{work_dir.string()}},
+                {"session_dir", Value{(sess_dir / "fail-closed").string()}},
+            }))),
+        "fail-closed spawn missing reply");
+    check(req_str(parse_tool_payload(closed_reject, true), "error") == "invalid_range",
+          "empty allowed roots must fail closed with invalid_range");
+  }
+
+  // H2: Cumulative spawn ceiling validation and enforcement across settled peers.
+  {
+    McpCommandPostConfig zero_cfg;
+    McpPlatoonPeerConfig zero_peer;
+    zero_peer.max_total_spawns = 0;
+    zero_peer.working_root = work_dir;
+    zero_peer.session_root = sess_dir;
+    zero_cfg.platoon_runner = std::move(zero_peer);
+    const auto zero_res = McpCommandPostServer::open(std::move(zero_cfg));
+    check(!zero_res.has_value() && zero_res.error().code == ErrorCode::invalid_range,
+          "max_total_spawns == 0 must be rejected with invalid_range");
+
+    McpCommandPostConfig over_cfg;
+    McpPlatoonPeerConfig over_peer;
+    over_peer.max_total_spawns = kMcpMaxTotalSpawnsLimit + 1U;
+    over_peer.working_root = work_dir;
+    over_peer.session_root = sess_dir;
+    over_cfg.platoon_runner = std::move(over_peer);
+    const auto over_res = McpCommandPostServer::open(std::move(over_cfg));
+    check(!over_res.has_value() && over_res.error().code == ErrorCode::invalid_range,
+          "max_total_spawns > kMcpMaxTotalSpawnsLimit must be rejected");
+
+    McpCommandPostConfig ceil_cfg;
+    McpPlatoonPeerConfig ceil_peer;
+    ceil_peer.max_peers = 2;
+    ceil_peer.max_total_spawns = 2;
+    ceil_peer.executable = self_exe;
+    ceil_peer.working_root = work_dir;
+    ceil_peer.session_root = sess_dir;
+    ceil_cfg.platoon_runner = std::move(ceil_peer);
+
+    auto opened = McpCommandPostServer::open(std::move(ceil_cfg));
+    check(opened.has_value(), "open with max_total_spawns=2 failed");
+    auto &server = opened.value();
+
+    auto wait_until_idle = [&](std::int64_t req_id) {
+      for (int attempt = 0; attempt < 200; ++attempt) {
+        const Value listed = require_reply(
+            server.handle_message(rpc_tool_call(req_id + attempt, "platoon_peer_list",
+                                                Value::object({}))),
+            "peer_list missing reply");
+        const Value p = parse_tool_payload(listed, false);
+        if (req_int(p, "active_count") == 0)
+          return p;
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+      }
+      throw std::runtime_error("timed out waiting for peer to settle");
+    };
+
+    const Value s1 = require_reply(
+        server.handle_message(rpc_tool_call(401, "platoon_peer_spawn",
+                                            Value::object({
+                                                {"peer_id", Value{"ceil-1"}},
+                                                {"role", Value{"worker"}},
+                                                {"provider", Value{"openai"}},
+                                                {"model", Value{"gpt-5"}},
+                                                {"prompt", Value{"one"}},
+                                            }))),
+        "ceil-1 spawn missing reply");
+    (void)parse_tool_payload(s1, false);
+    const Value list1 = wait_until_idle(500);
+    check(req_int(list1, "total_spawns") == 1 &&
+              req_int(list1, "max_total_spawns") == 2,
+          "total_spawns/max_total_spawns mismatch after first spawn");
+
+    const Value s2 = require_reply(
+        server.handle_message(rpc_tool_call(402, "platoon_peer_spawn",
+                                            Value::object({
+                                                {"peer_id", Value{"ceil-2"}},
+                                                {"role", Value{"worker"}},
+                                                {"provider", Value{"openai"}},
+                                                {"model", Value{"gpt-5"}},
+                                                {"prompt", Value{"two"}},
+                                            }))),
+        "ceil-2 spawn missing reply");
+    (void)parse_tool_payload(s2, false);
+    const Value list2 = wait_until_idle(800);
+    check(req_int(list2, "active_count") == 0 && req_int(list2, "total_spawns") == 2,
+          "expected 0 active peers and 2 total_spawns after second settle");
+
+    // 3rd spawn MUST be refused with capacity even though all prior peers settled!
+    const Value s3 = require_reply(
+        server.handle_message(rpc_tool_call(403, "platoon_peer_spawn",
+                                            Value::object({
+                                                {"peer_id", Value{"ceil-3"}},
+                                                {"role", Value{"worker"}},
+                                                {"provider", Value{"openai"}},
+                                                {"model", Value{"gpt-5"}},
+                                                {"prompt", Value{"three"}},
+                                            }))),
+        "ceil-3 spawn missing reply");
+    const Value s3_err = parse_tool_payload(s3, true);
+    check(
+        req_str(s3_err, "error") == "capacity",
+        "spawn max_total_spawns + 1 must fail with capacity after prior peers settle");
+  }
+}
+
 void test_bounded_line_size_framing() {
   McpCommandPostConfig cfg;
   cfg.max_line_bytes = 256;
@@ -1051,6 +1266,7 @@ int main(int argc, char **argv) {
 
     test_selective_exposure_and_config_validation(temp.path());
     test_full_stdio_roundtrip({temp.path(), self_exe});
+    test_glm53_fail_closed_allowlist_and_spawn_ceiling({temp.path(), self_exe});
     test_bounded_line_size_framing();
 
     std::cout << "PASS mcp_server\n";

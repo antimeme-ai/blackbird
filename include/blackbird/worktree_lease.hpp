@@ -20,6 +20,9 @@ struct WorktreeLeaseConfig {
   std::filesystem::path repo_root;
   std::filesystem::path lease_root;
   std::size_t max_leases = kDefaultMaxWorktreeLeases;
+  // Optional absolute git executable override; empty resolves absolute git once at
+  // open().
+  std::filesystem::path git_executable = {};
 };
 
 struct WorktreeLeaseRequest {
@@ -68,6 +71,9 @@ public:
   const std::filesystem::path &repo_root() const noexcept { return repo_root_; }
   const std::filesystem::path &lease_root() const noexcept { return lease_root_; }
   std::size_t max_leases() const noexcept { return max_leases_; }
+  const std::filesystem::path &git_executable() const noexcept {
+    return git_executable_;
+  }
 
 private:
   explicit WorktreeLeaseManager(WorktreeLeaseConfig config);
@@ -80,6 +86,7 @@ private:
   std::filesystem::path repo_root_;
   std::filesystem::path lease_root_;
   std::size_t max_leases_;
+  std::filesystem::path git_executable_;
 };
 
 } // namespace blackbird

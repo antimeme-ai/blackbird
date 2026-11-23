@@ -2192,18 +2192,17 @@ Result<void> BoardBridge::send_envelope(std::ostream &out,
 
       const auto &records = embedded.value();
       const EnvelopeKey key{envelope.from_fingerprint, envelope.envelope_id};
-      if (!state.value().seen_outbound_envelopes.contains(key)) {
-        std::vector<Value> batch;
-        batch.push_back(wrap_envelope_record("outbound", envelope));
-        if (records.causal_event.has_value() &&
-            !state.value().seen_event_hashes.contains(
-                records.causal_event->event_hash)) {
-          batch.push_back(wrap_causal_event_record(*records.causal_event));
-        }
-        auto appended = append_records_locked(dir_fd_, state.value(), batch);
-        if (!appended.has_value())
-          return Result<void>::failure(appended.error());
+      if (state.value().seen_outbound_envelopes.contains(key))
+        return Result<void>::failure({ErrorCode::conflict});
+      std::vector<Value> batch;
+      batch.push_back(wrap_envelope_record("outbound", envelope));
+      if (records.causal_event.has_value() &&
+          !state.value().seen_event_hashes.contains(records.causal_event->event_hash)) {
+        batch.push_back(wrap_causal_event_record(*records.causal_event));
       }
+      auto appended = append_records_locked(dir_fd_, state.value(), batch);
+      if (!appended.has_value())
+        return Result<void>::failure(appended.error());
     }
 
     out.write(wire.value().data(), static_cast<std::streamsize>(wire.value().size()));

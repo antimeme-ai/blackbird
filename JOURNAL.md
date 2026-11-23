@@ -13978,3 +13978,24 @@ Blackbird must not present itself as another product.
   `session-multiplayer`, `Hivemind`, `A2A`, `agent-client-protocol`, `humanlayer`,
   `block/buzz`, `coopagents 0.9.0`) into ignored `quarantine/multiplayer-2026-11-23/` with
   comparative architecture & multiplayer game-netcode analyses.
+
+## 2026-11-23 — Final GLM 5.3 (`opencode-go/glm-5.3`) Security Review & Remediation
+
+- Independent read-only adversarial security review by GLM 5.3 (`opencode-go/glm-5.3`,
+  `--agent plan`, full 18 C++23 files + `src/native_process.hpp`) reported 0 Critical,
+  2 High, 3 Medium, 8 Low, 10 Informational, and independently verified 14 core security
+  properties solid; recorded in `papers/2026-11-23-glm53-security-review.md`.
+- Remediated with direct regression tests:
+  - **H1 (`src/mcp_server.cpp`):** unconditionally add `working_root`/`session_root` to
+    `normalized_allowed_roots` and fail closed (`ErrorCode::invalid_range`) when roots are empty.
+  - **H2 (`include/blackbird/mcp_server.hpp`, `src/mcp_server.cpp`, `src/command_post_cli.cpp`):**
+    enforce cumulative `max_total_spawns` ceiling (`1..1024`, default `64`, `--max-total-spawns`)
+    preventing unlimited spawn-settle-respawn loops on MCP.
+  - **M1 (`include/blackbird/worktree_lease.hpp`, `src/worktree_lease.cpp`):** resolve `git`
+    once at `open()` to a validated absolute executable path and pass minimal secret-free env.
+  - **M2 (`src/peer_identity.cpp`):** require `is_absolute()` on `ssh_keygen_executable` and
+    pass minimal secret-free env (`PATH`, `HOME`, `TMPDIR`, `TZ`) to `ssh-keygen` subprocesses.
+  - **L5 (`src/board_bridge.cpp`):** refuse duplicate outbound `(from_fingerprint, envelope_id)`
+    reuse in `send_envelope()` with `ErrorCode::conflict`.
+  - **L7 (`src/command_post_tui.cpp`):** mask raw `std::exception::what()` in `/companion`
+    and outer Command Post slash-command dispatch.

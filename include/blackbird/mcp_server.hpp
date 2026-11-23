@@ -21,6 +21,8 @@ namespace blackbird {
 inline constexpr std::size_t kMcpDefaultMaxLineBytes = 1024U * 1024U;
 inline constexpr std::size_t kMcpMinLineBytes = 256U;
 inline constexpr std::size_t kMcpMaxLineBytesLimit = 16U * 1024U * 1024U;
+inline constexpr std::size_t kMcpDefaultMaxTotalSpawns = 64U;
+inline constexpr std::size_t kMcpMaxTotalSpawnsLimit = 1024U;
 
 inline constexpr std::string_view kMcpProtocolVersion = "2025-03-26";
 inline constexpr std::string_view kMcpServerName = "blackbird-command-post";
@@ -34,6 +36,8 @@ inline constexpr std::int64_t kJsonRpcInternalError = -32603;
 
 struct McpPlatoonPeerConfig {
   std::size_t max_peers = PlatoonRunner::default_max_peers;
+  // Cumulative lifetime peer spawn ceiling for this MCP server instance.
+  std::size_t max_total_spawns = kMcpDefaultMaxTotalSpawns;
   // Optional binary override (host-configured only; never accepted from tool args).
   std::filesystem::path executable;
   // Optional default working directory when omitted from platoon_peer_spawn args.
