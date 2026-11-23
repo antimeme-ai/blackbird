@@ -1,6 +1,7 @@
 #include "blackbird/integration_vault.hpp"
 
 #include "blackbird/json.hpp"
+#include "blackbird/packet.hpp"
 
 #include <arpa/inet.h>
 #include <array>
@@ -567,6 +568,83 @@ void test_host_pinned_secret_injection() {
     const auto bad = vault.authorize_request({"notion", ""}, bare);
     require_ok(!bad.has_value());
     require_ok(vault_error_of(bad.error()) == VaultError::host_not_pinned);
+  }
+
+  // 6. Reject CRLF / oversized auth_header_prefix on save() and tampered store decode.
+  {
+    CredentialSaveInput bad_prefix{};
+    bad_prefix.service = "evilhdr";
+    bad_prefix.account = "a";
+    bad_prefix.scheme = AuthScheme::header_key;
+    bad_prefix.auth_header_name = "X-Auth";
+    bad_prefix.auth_header_prefix = "Tok \r\nX-Injected: 1";
+    bad_prefix.access_token.assign("secret_val");
+    bad_prefix.allowed_hosts = {"api.linear.app"};
+    const auto res = vault.save(bad_prefix);
+    require_ok(!res.has_value());
+    require_ok(vault_error_of(res.error()) == VaultError::invalid_argument);
+
+    bad_prefix.auth_header_prefix = std::string(65U, 'A');
+    const auto too_long = vault.save(bad_prefix);
+    require_ok(!too_long.has_value());
+    require_ok(vault_error_of(too_long.error()) == VaultError::invalid_argument);
+
+    bad_prefix.auth_header_prefix = "Bearer ";
+    bad_prefix.allowed_hosts = {"..linear.app"};
+    const auto bad_pin = vault.save(bad_prefix);
+    require_ok(!bad_pin.has_value());
+    require_ok(vault_error_of(bad_pin.error()) == VaultError::invalid_argument);
+  }
+  {
+    // Tampered BBM binary packet with CRLF inside auth_header_prefix must fail closed.
+    const TempDir tamper_dir{"tamper_hdr"};
+    const auto auth_dir = tamper_dir.path / "auth";
+    IntegrationVault tvault{{.directory = auth_dir}};
+    CredentialSaveInput seed{};
+    seed.service = "svc";
+    seed.account = "acct";
+    seed.scheme = AuthScheme::bearer_pat;
+    seed.access_token.assign("tok123");
+    seed.allowed_hosts = {"api.example.com"};
+    require_ok(tvault.save(seed).has_value());
+
+    const Value bad_root = Value::object({
+        {"magic", Value{"bb.integrations.v1"}},
+        {"version", Value{Number{1}}},
+        {"next_id", Value{Number{2U}}},
+        {"records",
+         Value{Value::Array{Value::object({
+             {"id", Value{Number{1U}}},
+             {"service", Value{"svc"}},
+             {"account", Value{"acct"}},
+             {"scheme", Value{"bearer_pat"}},
+             {"auth_header_name", Value{"Authorization"}},
+             {"auth_header_prefix", Value{"Bearer \r\nX-Smuggled: 1"}},
+             {"access_token", Value{"tok123"}},
+             {"refresh_token", Value{""}},
+             {"client_secret", Value{""}},
+             {"allowed_hosts", Value{Value::Array{Value{"api.example.com"}}}},
+             {"scopes", Value{Value::Array{}}},
+             {"resource_uri", Value{""}},
+             {"authorization_server", Value{""}},
+             {"token_endpoint", Value{""}},
+             {"client_id", Value{""}},
+             {"expires_at", Value{Number{0}}},
+             {"updated_at", Value{Number{0}}},
+             {"revision", Value{Number{1U}}},
+             {"extra_metadata", Value{Value::Array{}}},
+         })}}},
+        {"active_ids", Value{Value::Array{}}},
+    });
+    const auto pkt = encode_packet_string(bad_root);
+    require_ok(pkt.has_value());
+    {
+      std::ofstream ofs(tvault.store_path(), std::ios::binary | std::ios::trunc);
+      ofs.write(pkt.value().data(), static_cast<std::streamsize>(pkt.value().size()));
+    }
+    const auto tampered = tvault.list();
+    require_ok(!tampered.has_value());
+    require_ok(vault_error_of(tampered.error()) == VaultError::corrupt_store);
   }
 }
 

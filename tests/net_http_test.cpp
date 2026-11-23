@@ -374,13 +374,38 @@ void test_url_and_ssrf_policy() {
   require_ok(net_error_of(loop_only.validate_url(parse_url("https://10.0.0.5/").value())
                               .error()) == NetError::ssrf_blocked);
 
-  // Wildcard host pinning rules.
+  // Wildcard host pinning rules & empty-label hostname rejection.
   require_ok(host_matches_pin({"api.notion.com", "*.notion.com"}));
   require_ok(host_matches_pin({"a.b.notion.com", "*.notion.com"}));
   require_ok(!host_matches_pin({"notion.com", "*.notion.com"}));
   require_ok(!host_matches_pin({"evilnotion.com", "*.notion.com"}));
   require_ok(!host_matches_pin({"api.notion.com", "*"}));
   require_ok(!host_matches_pin({"api.notion.com", "*.com"}));
+  require_ok(!host_matches_pin({"..notion.com", "*.notion.com"}));
+  require_ok(!host_matches_pin({".notion.com", "*.notion.com"}));
+  require_ok(!host_matches_pin({"a..notion.com", "*.notion.com"}));
+  require_ok(!host_matches_pin({"api.notion.com.", "*.notion.com"}));
+
+  require_ok(!parse_url("https://..example.com/").has_value());
+  require_ok(!parse_url("https://.example.com/").has_value());
+  require_ok(!parse_url("https://example.com./").has_value());
+  require_ok(!parse_url("https://a..example.com/").has_value());
+
+  // Relative redirect containing "://" inside query string resolves cleanly.
+  const auto redir_base = parse_url("https://api.example.com/v1/start");
+  require_ok(redir_base.has_value());
+  const auto rel_with_scheme_query =
+      resolve_redirect_url(redir_base.value(), "/login?next=https://other.example/cb");
+  require_ok(rel_with_scheme_query.has_value());
+  require_ok(rel_with_scheme_query.value().host == "api.example.com");
+  require_ok(rel_with_scheme_query.value().path == "/login");
+  require_ok(rel_with_scheme_query.value().query == "next=https://other.example/cb");
+
+  const auto q_only_redir =
+      resolve_redirect_url(redir_base.value(), "?return_to=https://other.example/cb");
+  require_ok(q_only_redir.has_value());
+  require_ok(q_only_redir.value().path == "/v1/start");
+  require_ok(q_only_redir.value().query == "return_to=https://other.example/cb");
 }
 
 void test_sse_parser_unit() {
@@ -636,6 +661,14 @@ void test_real_tls_methods_chunked_sse_redirects_and_caps() {
     const auto resp = client.request(req);
     require_ok(!resp.has_value());
     require_ok(net_error_of(resp.error()) == NetError::redirect_blocked);
+  }
+  {
+    HttpRequest req{};
+    req.url = "https://api.blackbird.test/echo?k=1";
+    req.set_header({"Host", "evil.blackbird.test"});
+    const auto resp = client.request(req);
+    require_ok(!resp.has_value());
+    require_ok(net_error_of(resp.error()) == NetError::invalid_request);
   }
   {
     HttpRequest req{};

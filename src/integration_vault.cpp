@@ -70,6 +70,15 @@ struct CleanseStringGuard {
   }
 };
 
+struct CleanseBytesGuard {
+  std::vector<std::uint8_t> &bytes;
+  ~CleanseBytesGuard() {
+    if (!bytes.empty()) {
+      OPENSSL_cleanse(bytes.data(), bytes.size());
+    }
+  }
+};
+
 bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
   if (a.size() != b.size()) {
     return false;
@@ -144,6 +153,11 @@ bool is_valid_host_pin(std::string_view pin) noexcept {
   } else if (body.find('*') != std::string_view::npos) {
     return false;
   }
+  if (body.find(':') == std::string_view::npos &&
+      (body.empty() || body.front() == '.' || body.back() == '.' ||
+       body.find("..") != std::string_view::npos)) {
+    return false;
+  }
   for (const char c : body) {
     const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                     (c >= '0' && c <= '9') || c == '-' || c == '.' || c == ':';
@@ -162,6 +176,19 @@ bool is_valid_header_name(std::string_view name) noexcept {
     const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                     (c >= '0' && c <= '9') || c == '-' || c == '_';
     if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool is_valid_header_prefix(std::string_view prefix) noexcept {
+  if (prefix.size() > 64U) {
+    return false;
+  }
+  for (const char c : prefix) {
+    const auto b = static_cast<std::uint8_t>(c);
+    if (b < 0x20U || b == 0x7fU) {
       return false;
     }
   }
@@ -674,7 +701,11 @@ Result<VaultState> decode_vault_packet(std::string_view bytes) {
     const auto scheme = parse_auth_scheme(scheme_s.value());
     if (!scheme.has_value() || !is_valid_identifier(service.value()) ||
         !is_valid_identifier(account.value()) ||
-        !is_valid_header_name(hdr_name.value())) {
+        !is_valid_header_name(hdr_name.value()) ||
+        !is_valid_header_prefix(hdr_prefix.value()) ||
+        !is_valid_secret_text(access.value(), false) ||
+        !is_valid_secret_text(refresh.value(), true) ||
+        !is_valid_secret_text(csecret.value(), true)) {
       return fail_v<VaultState>(ErrorCode::corrupt, VaultError::corrupt_store);
     }
     for (const auto &h : hosts.value()) {
@@ -1765,15 +1796,18 @@ register_dynamic_client(const net::HttpClient &http,
   http_req.set_header({"Accept", "application/json"});
   http_req.set_body_string(json_res.value());
 
-  const auto resp = http.request(http_req);
+  auto resp = http.request(http_req);
   if (!resp.has_value()) {
     return Result<OAuthClientRegistration>::failure(resp.error());
   }
+  const CleanseBytesGuard cleanse_raw_resp{resp.value().body};
   if (resp.value().status < 200 || resp.value().status >= 300) {
     return fail_v<OAuthClientRegistration>(ErrorCode::provider_auth,
                                            VaultError::oauth_registration_failed);
   }
-  auto parsed = parse_json(resp.value().body_as_string());
+  std::string resp_body = resp.value().body_as_string();
+  const CleanseStringGuard cleanse_resp_body{resp_body};
+  auto parsed = parse_json(resp_body);
   if (!parsed.has_value() ||
       !std::holds_alternative<Value::Object>(parsed.value().value())) {
     return fail_v<OAuthClientRegistration>(ErrorCode::corrupt,
@@ -1921,13 +1955,14 @@ exchange_oauth_authorization_code(const net::HttpClient &http,
   http_req.set_header({"Accept", "application/json"});
   http_req.set_body_string(body);
 
-  const auto resp = http.request(http_req);
+  auto resp = http.request(http_req);
   if (!http_req.body.empty()) {
     OPENSSL_cleanse(http_req.body.data(), http_req.body.size());
   }
   if (!resp.has_value()) {
     return Result<OAuthTokenResponse>::failure(resp.error());
   }
+  const CleanseBytesGuard cleanse_raw_resp{resp.value().body};
   if (resp.value().status < 200 || resp.value().status >= 300) {
     return fail_v<OAuthTokenResponse>(ErrorCode::provider_auth,
                                       VaultError::oauth_token_exchange_failed);
@@ -1979,13 +2014,14 @@ Result<OAuthTokenResponse> refresh_oauth_token(const net::HttpClient &http,
   http_req.set_header({"Accept", "application/json"});
   http_req.set_body_string(body);
 
-  const auto resp = http.request(http_req);
+  auto resp = http.request(http_req);
   if (!http_req.body.empty()) {
     OPENSSL_cleanse(http_req.body.data(), http_req.body.size());
   }
   if (!resp.has_value()) {
     return Result<OAuthTokenResponse>::failure(resp.error());
   }
+  const CleanseBytesGuard cleanse_raw_resp{resp.value().body};
   if (resp.value().status < 200 || resp.value().status >= 300) {
     return fail_v<OAuthTokenResponse>(ErrorCode::provider_auth,
                                       VaultError::oauth_refresh_failed);
@@ -2198,6 +2234,7 @@ Result<CredentialMetadata>
 IntegrationVault::save(const CredentialSaveInput &input) const {
   if (!is_valid_identifier(input.service) || !is_valid_identifier(input.account) ||
       !is_valid_header_name(input.auth_header_name) ||
+      !is_valid_header_prefix(input.auth_header_prefix) ||
       !is_valid_secret_text(input.access_token.view(), false) ||
       !is_valid_secret_text(input.refresh_token.view(), true) ||
       !is_valid_secret_text(input.client_secret.view(), true) ||

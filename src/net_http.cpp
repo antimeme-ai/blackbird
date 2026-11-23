@@ -134,6 +134,31 @@ bool is_valid_header_value(std::string_view value) noexcept {
   return true;
 }
 
+bool has_empty_hostname_label(std::string_view host) noexcept {
+  return host.empty() || host.front() == '.' || host.back() == '.' ||
+         host.find("..") != std::string_view::npos;
+}
+
+bool has_rfc3986_scheme_prefix(std::string_view text) noexcept {
+  const std::size_t sep = text.find("://");
+  if (sep == std::string_view::npos || sep == 0U) {
+    return false;
+  }
+  const char first = text[0];
+  if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z'))) {
+    return false;
+  }
+  for (std::size_t i = 1U; i < sep; ++i) {
+    const char c = text[i];
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool is_valid_hostname_chars(std::string_view host) noexcept {
   if (host.empty() || host.size() > kMaxHostBytes) {
     return false;
@@ -1259,7 +1284,6 @@ serialize_http_request(const HttpRequest &req, const ParsedUrl &url,
   wire.append(url.request_target());
   wire.append(" HTTP/1.1\r\n");
 
-  bool has_host = false;
   bool has_connection = false;
   bool has_user_agent = false;
   bool has_accept_encoding = false;
@@ -1270,9 +1294,12 @@ serialize_http_request(const HttpRequest &req, const ParsedUrl &url,
       return fail_n<std::vector<std::uint8_t>>(ErrorCode::invalid_range,
                                                NetError::invalid_request);
     }
-    if (ascii_iequals(hdr.name, "host")) {
-      has_host = true;
-    } else if (ascii_iequals(hdr.name, "connection")) {
+    if (ascii_iequals(hdr.name, "host") ||
+        ascii_iequals(hdr.name, "transfer-encoding")) {
+      return fail_n<std::vector<std::uint8_t>>(ErrorCode::invalid_range,
+                                               NetError::invalid_request);
+    }
+    if (ascii_iequals(hdr.name, "connection")) {
       has_connection = true;
     } else if (ascii_iequals(hdr.name, "user-agent")) {
       has_user_agent = true;
@@ -1280,17 +1307,12 @@ serialize_http_request(const HttpRequest &req, const ParsedUrl &url,
       has_accept_encoding = true;
     } else if (ascii_iequals(hdr.name, "content-length")) {
       has_content_length = true;
-    } else if (ascii_iequals(hdr.name, "transfer-encoding")) {
-      return fail_n<std::vector<std::uint8_t>>(ErrorCode::invalid_range,
-                                               NetError::invalid_request);
     }
   }
 
-  if (!has_host) {
-    wire.append("Host: ");
-    wire.append(url.authority());
-    wire.append("\r\n");
-  }
+  wire.append("Host: ");
+  wire.append(url.authority());
+  wire.append("\r\n");
   if (!has_user_agent && !default_user_agent.empty()) {
     wire.append("User-Agent: ");
     wire.append(default_user_agent);
@@ -1662,7 +1684,8 @@ Result<ParsedUrl> parse_url(std::string_view url) {
       port_sv = authority_sv.substr(colon + 1U);
     }
     if (!is_valid_hostname_chars(host_sv) ||
-        host_sv.find(':') != std::string_view::npos) {
+        host_sv.find(':') != std::string_view::npos ||
+        has_empty_hostname_label(host_sv)) {
       return fail_n<ParsedUrl>(ErrorCode::invalid_range, NetError::invalid_url);
     }
   }
@@ -1719,8 +1742,8 @@ Result<ParsedUrl> resolve_redirect_url(const ParsedUrl &base,
   if (const std::size_t hash = location.find('#'); hash != std::string_view::npos) {
     location = location.substr(0U, hash);
   }
-  if (location.find("://") != std::string_view::npos) {
-    return parse_url(location);
+  if (location.empty()) {
+    return fail_n<ParsedUrl>(ErrorCode::invalid_range, NetError::invalid_url);
   }
   if (location.starts_with("//")) {
     return parse_url(base.scheme + ":" + std::string{location});
@@ -1730,6 +1753,9 @@ Result<ParsedUrl> resolve_redirect_url(const ParsedUrl &base,
   }
   if (location.front() == '?') {
     return parse_url(base.canonical_origin() + base.path + std::string{location});
+  }
+  if (has_rfc3986_scheme_prefix(location)) {
+    return parse_url(location);
   }
   // Relative path resolution against base directory.
   const std::size_t last_slash = base.path.rfind('/');
@@ -1819,11 +1845,16 @@ bool host_matches_pin(HostPinCheck check) noexcept {
   if (check.host.empty() || check.pin.empty()) {
     return false;
   }
+  if (check.host.find(':') == std::string_view::npos &&
+      has_empty_hostname_label(check.host)) {
+    return false;
+  }
   if (check.pin.starts_with("*.")) {
     const std::string_view suffix = check.pin.substr(2U);
-    // Reject bare "*" or single-label TLD wildcards like "*.com".
+    // Reject bare "*", single-label TLD wildcards like "*.com", or empty labels.
     if (suffix.empty() || suffix.find('.') == std::string_view::npos ||
-        suffix.find('*') != std::string_view::npos) {
+        suffix.find('*') != std::string_view::npos ||
+        has_empty_hostname_label(suffix)) {
       return false;
     }
     if (check.host.size() <= suffix.size() + 1U) {
@@ -1834,6 +1865,10 @@ bool host_matches_pin(HostPinCheck check) noexcept {
       return false;
     }
     return ascii_iequals(check.host.substr(dot_pos + 1U), suffix);
+  }
+  if (check.pin.find(':') == std::string_view::npos &&
+      has_empty_hostname_label(check.pin)) {
+    return false;
   }
   return ascii_iequals(check.host, check.pin);
 }
