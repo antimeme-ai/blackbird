@@ -13774,3 +13774,13 @@ Addressed six operator field notes from live TUI use:
   `project > user > builtin` precedence with atomic `O_NOFOLLOW | O_CLOEXEC` storage,
   single-pass non-recursive `{{param}}` expansion, strict `executed == false` separation,
   canonical SHA-256 stale-form protection (`ErrorCode::conflict`), and bounded paging.
+
+## 2026-11-23 — Rock 6.1: Zero-Daemon Worktree-Safe `IssueStore`
+
+- Added `include/blackbird/issues.hpp`, `src/issues.cpp`, and `tests/issues_test.cpp`
+  (registered as `issues` in `CMakeLists.txt`), replacing retired `.beads/`/Dolt with a
+  zero-daemon append-only JSONL issue ledger (`events.jsonl` + `flock` + `O_APPEND` +
+  `fsync` + trailing-fragment crash recovery).
+- Supports monotonic `bb-N` IDs, blocker-aware `ready()` ordering, iterative DFS cycle
+  rejection, optimistic CAS `expected_revision` updates/claims/closes, and verified
+  multi-thread + `fork()` multi-process contention.
