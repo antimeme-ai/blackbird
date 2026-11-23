@@ -13818,3 +13818,13 @@ Blackbird must not present itself as another product.
 - The first gated commit attempt failed only on eight TUI/display tests in the fresh
   worktree because the pinned `tui-test` was not installed there; installed with
   `scripts/tui-test --install` and reran the gate.
+
+## 2026-11-23 — Rock 5.2: TUI Unit 6 Tertiary Read-Only `MetricsConsumer`
+
+- Added `include/blackbird/metrics_consumer.hpp`, `src/metrics_consumer.cpp`, and
+  `tests/metrics_consumer_test.cpp` (registered as `metrics_consumer` in `CMakeLists.txt`).
+- Strictly read-only tertiary metrics consumer preserving producer hot-path isolation
+  (`docs/INSTRUMENTATION.md`): explicit tri-state `TriMetric` (`unknown` vs `zero` vs
+  `known_subtotal` vs `complete`), versioned cost estimation separate from observed charges,
+  UTC vs monotonic clock-domain accounting, bounded sparkline projection, source-record
+  drilldown, and stale-retaining refresh on upstream corruption/failure.
