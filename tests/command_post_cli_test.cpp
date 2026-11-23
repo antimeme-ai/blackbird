@@ -3983,8 +3983,9 @@ int main(int argc, char **argv) {
                 spv.value().find("sqlite") != nullptr &&
                 spv.value().find("nvim_treesitter") != nullptr &&
                 spv.value().find("lsp_servers") != nullptr &&
+                spv.value().find("jupyter") != nullptr &&
                 spv.value().find("measure_harness") != nullptr,
-            "superpowers status --json must include all 4 superpower families");
+            "superpowers status --json must include all 5 superpower families");
     }
 
     std::cout << "PASS command_post_cli\n";

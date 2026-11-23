@@ -8,6 +8,7 @@
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/lan_party_runtime.hpp"
 #include "blackbird/lsp_client.hpp"
 #include "blackbird/mcp_server.hpp"
@@ -11259,6 +11260,7 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
   const sqlite::SqliteCapabilities sql_caps =
       sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
   const NvimCapabilities nvim_caps = probe_nvim_capabilities();
+  const JupyterCapabilities jupyter_caps = probe_jupyter_capabilities();
   const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
 
   constexpr std::array<std::string_view, 4> kLspCandidates = {
@@ -11277,6 +11279,9 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
     Value::Object lsp_obj;
     for (const auto &[name, path] : lsp_found)
       lsp_obj.emplace_back(name, Value{path});
+    Value::Array jup_specs;
+    for (const auto &ks : jupyter_caps.kernelspecs)
+      jup_specs.emplace_back(ks.name);
     return emit_json(
         io,
         Value::object({
@@ -11297,6 +11302,11 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
                                     {"parsers", Value{std::move(ts_parsers)}},
                                 })},
             {"lsp_servers", Value::object(std::move(lsp_obj))},
+            {"jupyter", Value::object({
+                            {"available", Value{jupyter_caps.jupyter_available}},
+                            {"binary", Value{jupyter_caps.jupyter_path}},
+                            {"kernelspecs", Value{std::move(jup_specs)}},
+                        })},
             {"measure_harness",
              Value::object({
                  {"available", Value{true}},
@@ -11329,6 +11339,22 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
         io.out << ", ";
       io.out << lsp_found[i].first;
     }
+  }
+  io.out << ")\n"
+         << "  Jupyter / .ipynb:  ready (nbformat v4 + WS v13 consumer";
+  if (jupyter_caps.jupyter_available) {
+    io.out << ", kernels: ";
+    if (jupyter_caps.kernelspecs.empty()) {
+      io.out << "none";
+    } else {
+      for (std::size_t i = 0; i < jupyter_caps.kernelspecs.size(); ++i) {
+        if (i > 0)
+          io.out << ", ";
+        io.out << jupyter_caps.kernelspecs[i].name;
+      }
+    }
+  } else {
+    io.out << ", local jupyter CLI absent";
   }
   io.out << ")\n"
          << "  Measure Harness:   ready (CLOCK_MONOTONIC_RAW + wait4 rusage, sandbox="

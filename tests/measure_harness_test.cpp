@@ -923,7 +923,12 @@ int main(int argc, char **argv) {
       return child_dump_env_keys();
     }
     if (mode == "--child-read" && argc == 3) {
-      return child_read_file(argv[2]);
+      const int rc = child_read_file(argv[2]);
+      std::cout.flush();
+      std::cerr.flush();
+      // Skip atexit LeakSanitizer ptrace() scan inside seccomp-jailed child;
+      // parent process still runs full LSan.
+      ::_exit(rc);
     }
   }
 

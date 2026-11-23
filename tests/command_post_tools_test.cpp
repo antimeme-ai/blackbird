@@ -118,12 +118,13 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 10, "all 10 command-post tools must be registered");
+  require(found.size() == 11, "all 11 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
               found.contains("companion_timing") && found.contains("local_swarm") &&
               found.contains("sqlite_db") && found.contains("measure_script") &&
-              found.contains("nvim_ast") && found.contains("code_intel"),
+              found.contains("nvim_ast") && found.contains("code_intel") &&
+              found.contains("jupyter_nb"),
           "missing expected command-post tool names");
 }
 
@@ -180,6 +181,25 @@ void test_superpower_tools_smoke(const fs::path &sandbox) {
       run_command_post_tool("code_intel", Value::object({{"action", Value{"probe"}}}));
   require(lsp_probe.find("servers") != nullptr,
           "code_intel probe must return servers map");
+  // 5. jupyter_nb probe + outline + replace_cell (zero disk writes)
+  const Value jup_probe =
+      run_command_post_tool("jupyter_nb", Value::object({{"action", Value{"probe"}}}));
+  require(jup_probe.find("kernelspecs") != nullptr,
+          "jupyter_nb probe must return kernelspecs array");
+  const std::string sample_nb =
+      R"({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"id":"c1","cell_type":"code","source":"x = 1\n","metadata":{},"outputs":[],"execution_count":null}]})";
+  const Value jup_out = run_command_post_tool(
+      "jupyter_nb", Value::object({{"action", Value{"outline"}},
+                                   {"notebook_json", Value{sample_nb}}}));
+  require(string_field(jup_out, "outline").find("x = 1") != std::string::npos,
+          "jupyter_nb outline must include cell preview");
+  const Value jup_edit = run_command_post_tool(
+      "jupyter_nb", Value::object({{"action", Value{"replace_cell"}},
+                                   {"notebook_json", Value{sample_nb}},
+                                   {"cell_index", Value{Number{0}}},
+                                   {"new_source", Value{"x = 42\n"}}}));
+  require(string_field(jup_edit, "notebook_json").find("x = 42") != std::string::npos,
+          "jupyter_nb replace_cell must serialize updated source");
   (void)sandbox;
 }
 

@@ -5,6 +5,7 @@
 #include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/lan_party_runtime.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
@@ -4253,6 +4254,7 @@ std::string handle_superpowers(std::string_view args) {
   const sqlite::SqliteCapabilities sql_caps =
       sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
   const NvimCapabilities nvim_caps = probe_nvim_capabilities();
+  const JupyterCapabilities jup_caps = probe_jupyter_capabilities();
   const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
 
   std::string out = "Blackbird Model Superpowers:\n";
@@ -4273,6 +4275,8 @@ std::string handle_superpowers(std::string_view args) {
     out += "unavailable (nvim not found)\n";
   }
   out += "  Native LSP Client:  ready (tools: code_intel)\n";
+  out += "  Jupyter / .ipynb:   ready (" + std::to_string(jup_caps.kernelspecs.size()) +
+         " local kernelspecs, tools: jupyter_nb)\n";
   out += "  Measure Harness:    ready (CLOCK_MONOTONIC_RAW + rusage, sandbox=" +
          sandbox_caps.backend_name + ")\n";
   return out;

@@ -14260,3 +14260,13 @@ Blackbird must not present itself as another product.
 - **Unified Model Tooling, Lua Bindings & Operator Surfaces (`src/command_post_tools.cpp`, `src/coding_lua.cpp`, `src/command_post_cli.cpp`, `src/command_post_tui.cpp`, `src/terminal.cpp`, `scripts/blackbird`, `src/main.cpp`, `CMakeLists.txt`):**
   exposed 4 cohesive model & Lua tools (`sqlite_db`, `measure_script`, `nvim_ast`, `code_intel`), `blackbird superpowers [status|probe] [--json]`, and `/superpowers` TUI command (338 total ctests).
 - **Review Trail:** archived `@dentist-2`'s Wave 19A–19D verification reports in `papers/2026-11-23-wave19-model-superpowers-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #37 (Wave 20 & `v0.4.0` Release): Zero-Dependency `.ipynb` Notebook Engine & Service-Consumer Jupyter Kernel Client + Linux ASan `measure_harness` Fix
+
+- **Wave 20 — `.ipynb` Notebook Engine & Service-Consumer Jupyter Kernel Client (`include/blackbird/jupyter_notebook.hpp`, `src/jupyter_notebook.cpp`, `tests/jupyter_notebook_test.cpp`):**
+  - Pure C++23 nbformat v4.x structural parser/editor/serializer (zero disk writes) with ANSI/control stripping and base64 image/binary MIME byte-size summaries for model context hygiene while preserving raw outputs verbatim.
+  - Zero-dep Service-Consumer Jupyter Server REST + RFC 6455 WebSocket v13 (`Sec-WebSocket-Accept` SHA-1 + `CRYPTO_memcmp`) + Jupyter v5.3 `execute_request` client (loopback-only plain HTTP, `OPENSSL_cleanse` non-reallocating token buffers, destructor never kills shared kernels) + passive `probe_jupyter_capabilities()`.
+  - Exposed as 11th model & Lua tool `jupyter_nb` (`src/command_post_tools.cpp`, `src/coding_lua.cpp`) and integrated into `blackbird superpowers` & `/superpowers` (339 total ctests).
+- **Linux Wave 19 ASan Fix (`tests/measure_harness_test.cpp`):**
+  updated `--child-read` helper exit path to flush and `_exit(rc)` so atexit LeakSanitizer does not invoke `ptrace` inside the seccomp-jailed child while parent LSan stays active.
+- **Review Trail:** archived `@dentist-2`'s Wave 20 verification report in `papers/2026-11-23-wave20-jupyter-notebook-dentist-review.md`.

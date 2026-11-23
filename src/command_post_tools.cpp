@@ -3,6 +3,7 @@
 #include "blackbird/board_bridge.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/local_swarm.hpp"
 #include "blackbird/lsp_client.hpp"
 #include "blackbird/measure_harness.hpp"
@@ -3088,13 +3089,127 @@ Value handle_code_intel(const Value &arguments) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Tool 11: jupyter_nb (.ipynb structural engine & consumer-only kernel client)
+// ---------------------------------------------------------------------------
+
+Value handle_jupyter_nb(const Value &arguments) {
+  static constexpr std::array<std::string_view, 9> kAllowedKeys = {
+      "action",    "notebook_json", "cell_index", "new_source", "base_url",
+      "api_token", "kernel_id",     "code",       "timeout_ms",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 32, false});
+
+  if (action == "probe") {
+    const JupyterCapabilities caps = probe_jupyter_capabilities();
+    Value::Array specs;
+    for (const auto &ks : caps.kernelspecs) {
+      specs.push_back(Value::object({
+          {"name", Value{ks.name}},
+          {"display_name", Value{ks.display_name}},
+          {"language", Value{ks.language}},
+      }));
+    }
+    return Value::object({
+        {"available", Value{caps.jupyter_available}},
+        {"binary", Value{caps.jupyter_path}},
+        {"kernelspecs", Value{std::move(specs)}},
+    });
+  }
+
+  if (action == "outline") {
+    const std::string nb_json =
+        require_string(arguments, {"notebook_json", 4U * 1024U * 1024U, false});
+    const auto doc = unwrap_or_throw(parse_ipynb(nb_json));
+    return Value::object({
+        {"cell_count", Value{Number{static_cast<std::uint64_t>(doc.cells.size())}}},
+        {"nbformat", Value{Number{doc.nbformat}}},
+        {"nbformat_minor", Value{Number{doc.nbformat_minor}}},
+        {"outline", Value{format_notebook_outline(doc)}},
+    });
+  }
+
+  if (action == "replace_cell") {
+    const std::string nb_json =
+        require_string(arguments, {"notebook_json", 4U * 1024U * 1024U, false});
+    const Value *idx_v = arguments.find("cell_index");
+    if (idx_v == nullptr)
+      throw Error{ErrorCode::invalid_range};
+    const auto *n = std::get_if<Number>(&idx_v->value());
+    if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+      throw Error{ErrorCode::invalid_range};
+    const auto idx = std::get<std::int64_t>(n->storage());
+    if (idx < 0)
+      throw Error{ErrorCode::invalid_range};
+    const std::string new_src =
+        require_string(arguments, {"new_source", 512U * 1024U, true});
+    auto doc = unwrap_or_throw(parse_ipynb(nb_json));
+    unwrap_or_throw(replace_cell_source(doc, static_cast<std::size_t>(idx), new_src));
+    const std::string out_json = unwrap_or_throw(serialize_ipynb(doc));
+    return Value::object({
+        {"cell_count", Value{Number{static_cast<std::uint64_t>(doc.cells.size())}}},
+        {"notebook_json", Value{out_json}},
+        {"outline", Value{format_notebook_outline(doc)}},
+    });
+  }
+
+  if (action == "list_kernels" || action == "execute_code") {
+    JupyterClientConfig cfg{};
+    cfg.base_url = require_string(arguments, {"base_url", 512, false});
+    cfg.api_token = optional_string(arguments, {"api_token", 512, true}).value_or("");
+    auto client = unwrap_or_throw(JupyterClient::create(cfg));
+
+    if (action == "list_kernels") {
+      const auto ks = unwrap_or_throw(client.list_kernels());
+      Value::Array arr;
+      for (const auto &k : ks) {
+        arr.push_back(Value::object({
+            {"id", Value{k.id}},
+            {"name", Value{k.name}},
+            {"execution_state", Value{k.execution_state}},
+            {"connections", Value{Number{k.connections}}},
+        }));
+      }
+      return Value::object({{"kernels", Value{std::move(arr)}}});
+    }
+
+    JupyterExecuteRequest req{};
+    req.kernel_id = require_string(arguments, {"kernel_id", 128, false});
+    req.code = require_string(arguments, {"code", 256U * 1024U, false});
+    if (const auto *tm = arguments.find("timeout_ms");
+        tm != nullptr && !is_null_or_false_sentinel(*tm)) {
+      const auto *n = std::get_if<Number>(&tm->value());
+      if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+        throw Error{ErrorCode::invalid_range};
+      const auto v = std::get<std::int64_t>(n->storage());
+      if (v < 100 || v > 60000)
+        throw Error{ErrorCode::invalid_range};
+      req.timeout = std::chrono::milliseconds{v};
+    }
+    const auto res = unwrap_or_throw(client.execute_code(req));
+    Value::Array summaries;
+    for (const auto &out : res.outputs) {
+      summaries.emplace_back(summarize_notebook_output(out));
+    }
+    return Value::object({
+        {"msg_id", Value{res.msg_id}},
+        {"status", Value{res.status}},
+        {"outputs", Value{std::move(summaries)}},
+    });
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
 } // namespace
 
 bool is_command_post_tool(std::string_view name) noexcept {
   return name == "platoon_board" || name == "bridge_guard" ||
          name == "project_issues" || name == "project_memory" ||
          name == "companion_timing" || name == "local_swarm" || name == "sqlite_db" ||
-         name == "measure_script" || name == "nvim_ast" || name == "code_intel";
+         name == "measure_script" || name == "nvim_ast" || name == "code_intel" ||
+         name == "jupyter_nb";
 }
 
 Value command_post_tool_definitions() {
@@ -3548,6 +3663,43 @@ Value command_post_tool_definitions() {
                {"additionalProperties", Value{false}},
            })},
       }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"jupyter_nb"}},
+          {"description",
+           Value{"Zero-dependency .ipynb (nbformat v4.x) structural notebook engine "
+                 "with model-ergonomic ANSI/base64 output hygiene and consumer-only "
+                 "Jupyter Server REST + RFC 6455 WebSocket v13 kernel execution "
+                 "(never mutates files on disk or terminates shared kernels)."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{Value{"probe"}, Value{"outline"},
+                                                     Value{"replace_cell"},
+                                                     Value{"list_kernels"},
+                                                     Value{"execute_code"}}}},
+                     })},
+                    {"notebook_json", Value::object({{"type", Value{"string"}}})},
+                    {"cell_index", Value::object({{"type", Value{"integer"}},
+                                                  {"minimum", Value{Number{0}}}})},
+                    {"new_source", Value::object({{"type", Value{"string"}}})},
+                    {"base_url", Value::object({{"type", Value{"string"}}})},
+                    {"api_token", Value::object({{"type", Value{"string"}}})},
+                    {"kernel_id", Value::object({{"type", Value{"string"}}})},
+                    {"code", Value::object({{"type", Value{"string"}}})},
+                    {"timeout_ms", Value::object({{"type", Value{"integer"}},
+                                                  {"minimum", Value{Number{100}}},
+                                                  {"maximum", Value{Number{60000}}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
   }};
 }
 
@@ -3573,6 +3725,8 @@ Value run_command_post_tool(std::string_view name, const Value &arguments,
     return handle_nvim_ast(arguments);
   if (name == "code_intel")
     return handle_code_intel(arguments);
+  if (name == "jupyter_nb")
+    return handle_jupyter_nb(arguments);
   throw Error{ErrorCode::unsupported};
 }
 
