@@ -1194,3 +1194,21 @@ add_test(NAME native_module COMMAND native_module_test
   $<TARGET_FILE:native_module_fixture_v2>
   $<TARGET_FILE:native_module_fixture_bad>)
 set_tests_properties(native_module PROPERTIES TIMEOUT 30)
+
+target_sources(blackbird_foundation PRIVATE src/mcp_server.cpp)
+add_executable(mcp_server_test tests/mcp_server_test.cpp)
+target_link_libraries(mcp_server_test PRIVATE blackbird_foundation Threads::Threads)
+add_test(NAME mcp_server COMMAND mcp_server_test)
+set_tests_properties(mcp_server PROPERTIES TIMEOUT 60)
+
+target_sources(blackbird_foundation PRIVATE src/peer_identity.cpp)
+add_executable(peer_identity_test tests/peer_identity_test.cpp)
+target_link_libraries(peer_identity_test PRIVATE blackbird_foundation Threads::Threads)
+add_test(NAME peer_identity COMMAND peer_identity_test)
+set_tests_properties(peer_identity PROPERTIES TIMEOUT 60)
+
+target_sources(blackbird_foundation PRIVATE src/project_memory.cpp)
+add_executable(project_memory_test tests/project_memory_test.cpp)
+target_link_libraries(project_memory_test PRIVATE blackbird_foundation Threads::Threads)
+add_test(NAME project_memory COMMAND project_memory_test)
+set_tests_properties(project_memory PROPERTIES TIMEOUT 30)

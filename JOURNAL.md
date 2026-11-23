@@ -13850,3 +13850,32 @@ Blackbird must not present itself as another product.
 - Hardened peer environment construction to strip ambient secret/provider/loader variables
   from the parent environment for external harness peers (remediating Opus's §5
   ambient-secret leakage finding before exposure).
+
+## 2026-11-23 — Rock 3.1: Zero-Dependency Stdio `McpCommandPostServer`
+
+- Added `include/blackbird/mcp_server.hpp`, `src/mcp_server.cpp`, and
+  `tests/mcp_server_test.cpp` (registered as `mcp_server` in `CMakeLists.txt`).
+- Exposes 13 Command Post tools over newline-delimited JSON-RPC 2.0 MCP (`2025-03-26`)
+  covering `PlatoonBoard`, `WorktreeLeaseManager`, `PlatoonRunner`, and `DecisionModels`
+  with explicit `allowed_workspace_roots` symlink/dangling-symlink containment, bounded
+  line framing, and caller `extra_env` hijack rejection.
+
+## 2026-11-23 — Rock 3.2: Multiplayer Stage 0 Gate (`PeerIdentityStore` & `KnownPeersStore`)
+
+- Added `include/blackbird/peer_identity.hpp`, `src/peer_identity.cpp`, and
+  `tests/peer_identity_test.cpp` (registered as `peer_identity` in `CMakeLists.txt`).
+- Provides zero-fortress Stage 0 Ed25519 identity custody (`0700` dir / `0600` OpenSSH
+  keypair), deterministic self-certifying `bb1-...` fingerprints, `ssh-keygen -Y` detached
+  signing/verification of canonical JSON `PeerEnvelope` and `CapabilityGrant` objects,
+  duplicate-key smuggling rejection, silent key-swap refusal (`ErrorCode::conflict`), and
+  local peer + grant kill-switch revocation.
+
+## 2026-11-23 — Rock 4.1: Cross-Session `ProjectMemoryStore` with Live SHA-256 Staleness
+
+- Added `include/blackbird/project_memory.hpp`, `src/project_memory.cpp`, and
+  `tests/project_memory_test.cpp` (registered as `project_memory` in `CMakeLists.txt`).
+- Zero-daemon multi-process-safe append-only JSONL project memory store (`0700` dirfd +
+  `flock` + `fsync`) supporting typed entries (`decision`, `invariant`, `handoff`,
+  `finding`, `friction`, `preference`), superseding lineage, and live component-wise
+  `O_NOFOLLOW | O_CLOEXEC` SHA-256 source-file freshness verification (`fresh` / `stale` /
+  `missing_source` / `unpinned`).
