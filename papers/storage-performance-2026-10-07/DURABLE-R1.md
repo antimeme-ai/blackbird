@@ -21,11 +21,11 @@ Fault model: one writer under existing file lock, append-only journal, correctly
 ## Source-grounded decisions
 
 Pinned absolute paths are from references.json, read only, never executed:
-- /Users/patrickbeam/projects/blackbird/quarantine/storage-lmdb-700e10f91a65/libraries/liblmdb/mdb.c:4868: alternate root publication; borrow lifetime would require stable owner-backed views, not transient decode buffers.
-- /Users/patrickbeam/projects/blackbird/quarantine/storage-sqlite-5af1b822f5da/src/wal.c:1422 and :3740: suffix recovery and selected-offset reads are separate from historical replay.
-- /Users/patrickbeam/projects/blackbird/quarantine/storage-aeron-ad4baf8dcd5a/aeron-cluster/src/main/java/io/aeron/cluster/RecordingLog.java:1694: bind snapshot selection to a replay boundary.
-- /Users/patrickbeam/projects/blackbird/quarantine/storage-bitcask-d84c8d913713/src/bitcask_fileops.erl:405: checked hints fall back to data scanning. A resident all-history keydir is not the complete target.
-- /Users/patrickbeam/projects/blackbird/quarantine/storage-tigerbeetle-c95d7a53a3d0/src/vsr/superblock.zig and src/vsr/grid.zig: bind locations to contents and make cache lifetime explicit. This partial adds no persistent payload cache; metadata lives for the journal owner's lifetime as required by existing APIs. Future compact-state integration must replace that history-sized interface.
+- ./quarantine/storage-lmdb-700e10f91a65/libraries/liblmdb/mdb.c:4868: alternate root publication; borrow lifetime would require stable owner-backed views, not transient decode buffers.
+- ./quarantine/storage-sqlite-5af1b822f5da/src/wal.c:1422 and :3740: suffix recovery and selected-offset reads are separate from historical replay.
+- ./quarantine/storage-aeron-ad4baf8dcd5a/aeron-cluster/src/main/java/io/aeron/cluster/RecordingLog.java:1694: bind snapshot selection to a replay boundary.
+- ./quarantine/storage-bitcask-d84c8d913713/src/bitcask_fileops.erl:405: checked hints fall back to data scanning. A resident all-history keydir is not the complete target.
+- ./quarantine/storage-tigerbeetle-c95d7a53a3d0/src/vsr/superblock.zig and src/vsr/grid.zig: bind locations to contents and make cache lifetime explicit. This partial adds no persistent payload cache; metadata lives for the journal owner's lifetime as required by existing APIs. Future compact-state integration must replace that history-sized interface.
 
 ## Measurement procedure
 

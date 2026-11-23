@@ -161,11 +161,11 @@ the useful parameterization without accidentally replaying an effect.
 
 ```text
 EXECUTE release.lookup@r12             project:blackbird / local host
-owner          [ patrickbeam                  ]
+owner          [ antimemeai                   ]
 repository     [ blackbird                    ]
 tag            [ latest                       ]
 account        [ public                       ]
-Resolved request: GET /repos/patrickbeam/blackbird/releases/latest
+Resolved request: GET /repos/antimemeai/blackbird/releases/latest
 Defaults from project r12; tag overridden in this draft
 Run / Save values / Save as skill / Show source
 

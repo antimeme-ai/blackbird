@@ -58,7 +58,7 @@ All runs were built from `fd19b5d8d30b98995b0ae50dc0e0d2f43bd74fa3` (every
 that commit with `git show fd19b5d:...`.
 
 Restored into
-`/private/tmp/claude-501/-Users-patrickbeam-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/`:
+`/private/tmp/claude-501/-<home>-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/`:
 the full sessions of `a-t08-luna`, `r-t03-luna` and `r2-t07-paper`, and the raw run
 `bb9fbf15fe9e6592d159ba4aab` of `r2-t05-paper`. The restore command was
 `tar -xf RUN/session.tar.zst --use-compress-program=unzstd -C DEST`. Nothing under
@@ -102,7 +102,7 @@ reap and 1409 release. For example, for request 92004 these are child ord 92013
 through 92575. Re-running the analyzer with only line 51 changed to
 `reqs.setdefault(key, {}).update(...)` turns all 23 a-t08-luna requests into
 `(200, 1, 0, 0, 0, True)`. That scratch copy is
-`/private/tmp/claude-501/-Users-patrickbeam-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/tools/timing_patched.py`.
+`/private/tmp/claude-501/-<home>-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/tools/timing_patched.py`.
 
 Timing relative to process exit is irrelevant here, because nothing is missing. For
 the record, none of these requests ended its run. 14 are in the middle of their
@@ -189,7 +189,7 @@ Control case: the same records with items 6-9 written first must give the same r
 This passes before and after the fix, which shows the test isolates stream order.
 
 This test was run. The generator is
-`/private/tmp/claude-501/-Users-patrickbeam-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/tools/redtest.py`,
+`/private/tmp/claude-501/-<home>-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/e8n/tools/redtest.py`,
 called with `control-first` or `data-first`. With control-first order, the current
 `timing.py` gives `http: None, term_branch: None, term_code: None, term_detail: None`,
 while `curl_exit: 0, eof: true, reads: 1` and `url` are set. That reproduces the

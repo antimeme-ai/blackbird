@@ -20,7 +20,7 @@ release archive checksum and installed phux/phux-mcp in ~/.local/bin.
 From your project working directory:
 
 ```sh
-/Users/patrickbeam/projects/blackbird/scripts/blackbird-phux arco --session context/my-blackbird
+./scripts/blackbird-phux arco --session context/my-blackbird
 ```
 
 The first argument names the phux session. Remaining arguments go to scripts/blackbird

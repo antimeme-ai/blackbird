@@ -170,7 +170,7 @@ Operator steering on 2026-10-01: postpone mutation campaigns until a useful work
 Arconaut and a mature test suite exist. Mutation is not a prerequisite on the current
 U0–U9 path. Retain direct behavioral, fault, conformance and sanitizer checks plus
 independent code/oracle review. Future mutants use Runpod only; general Linux checks
-use Neuroses over Tailscale. The operator handles Runpod node termination. This
+use `<linux-host>` (`$BLACKBIRD_LINUX_HOST`) over SSH. The operator handles Runpod node termination. This
 explicit steering supersedes the earlier campaign timing below.
 
 Run the owning unit's direct tests and relevant sanitizer/conformance profile during

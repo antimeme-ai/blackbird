@@ -1,7 +1,7 @@
 # Usable tool observations — 2026-10-19
 
 Two conceptual units, q4n then 47k. No activation, push, beads, or ageing.
-BLACKBIRD.md is absent here; read the shared /Users/patrickbeam/projects/BLACKBIRD.md.
+BLACKBIRD.md is absent here; read the shared ~/projects/BLACKBIRD.md.
 
 ## Representation
 

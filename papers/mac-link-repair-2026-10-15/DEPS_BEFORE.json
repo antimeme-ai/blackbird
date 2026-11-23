@@ -1,6 +1,6 @@
 [
   {
-    "path": "/Users/patrickbeam/projects/blackbird/build/debug/.ninja_deps",
+    "path": "./build/debug/.ninja_deps",
     "bytes": 2922348,
     "sha256": "33f03f88031100e30f5a2cbb8d393e8f1fcd1ba6db46af41b66bbc87c9798412",
     "endian": "little",

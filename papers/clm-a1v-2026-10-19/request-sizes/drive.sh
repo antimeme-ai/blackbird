@@ -1,6 +1,6 @@
 #!/bin/sh
 # drive.sh: extract each run's session one at a time into scratch, measure every raw run, delete the copy.
-S=/private/tmp/claude-501/-Users-patrickbeam-projects-blackbird/7a9f433b-5f15-4206-8722-548bda7b4ce9/scratchpad/request-sizes
+S="${SCRATCH_DIR:-/tmp/blackbird-request-sizes}"
 A=$HOME/projects/blackbird_runs/2026-10-17-cpp26
 RR=$HOME/projects/blackbird/context/cpp26-toolchain/build/release/blackbird-raw-reader
 mkdir -p "$S/out" "$S/extract"

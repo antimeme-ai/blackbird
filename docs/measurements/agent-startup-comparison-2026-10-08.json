@@ -17,7 +17,7 @@
     "tools": {
       "blackbird": {
         "command": [
-          "/Users/patrickbeam/projects/blackbird/scripts/blackbird",
+          "./scripts/blackbird",
           "--session",
           "{run}/session"
         ],
@@ -30,7 +30,7 @@
       },
       "codex": {
         "command": [
-          "/Users/patrickbeam/.local/bin/codex",
+          "~/.local/bin/codex",
           "--no-daemon"
         ],
         "ready_text": [
@@ -43,7 +43,7 @@
       },
       "claude": {
         "command": [
-          "/Users/patrickbeam/.local/bin/claude"
+          "~/.local/bin/claude"
         ],
         "ready_text": [
           "Claude",
@@ -57,7 +57,7 @@
       },
       "hermes": {
         "command": [
-          "/Users/patrickbeam/projects/blackbird/context/agent-startup-comparison-2026-10-08/hermes-source/venv/bin/hermes",
+          "./context/agent-startup-comparison-2026-10-08/hermes-source/venv/bin/hermes",
           "chat"
         ],
         "ready_text": [
@@ -70,7 +70,7 @@
       },
       "opencode": {
         "command": [
-          "/Users/patrickbeam/.opencode/bin/opencode",
+          "~/.opencode/bin/opencode",
           "--model",
           "openrouter/anthropic/claude-sonnet-4.6"
         ],

@@ -1,7 +1,7 @@
 {
   "status": "partial-not-complete",
   "owner": "slot-0",
-  "checkout": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0",
+  "checkout": "./context/performance-armada/pool/slot-0",
   "branch": "candidate/saved-state-delivery-2026-10-08",
   "code_checkpoint": "8d377dacab8f5c74ba0ec56ee96a1d9e4c5b79f9",
   "deadline_epoch": 1791431497.25,

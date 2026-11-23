@@ -42,31 +42,31 @@
   "host": "macOS-26.6-arm64-arm-64bit",
   "evidence": [
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-final-measure/range.jsonl",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-final-measure/range.jsonl",
       "sha256": "098998bd437a28a898a103b0815711e0c1128b14a6e247bd8812e97aa8e2f816"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-final-measure/single.jsonl",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-final-measure/single.jsonl",
       "sha256": "060b894984f885124eb880589ffc2d5a503a23dfe9e06a3583d5110649ccb186"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-final-measure/range-resources.log",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-final-measure/range-resources.log",
       "sha256": "6391b53969f781b3372022215ffa25f343633bd2289b6d6f28fb4527567e1c84"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-final-measure/single-resources.log",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-final-measure/single-resources.log",
       "sha256": "a8cdddda06eae35d7ab5f3f2c53c73c3e2dc49f52716d7f77e935c26ec3bb419"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-final-measure/single-stack.txt",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-final-measure/single-stack.txt",
       "sha256": "d9652846620435892641125b39f815384bc711d7fb1a7f46c53ec61e821667e8"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-layer2-checks.log",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-layer2-checks.log",
       "sha256": "dd0d4263cf7efaf4afb565ff77474c4994015e65ba2025a1c7b99b7b025e7198"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0/build/issuer-review/result.txt",
+      "path": "./context/performance-armada/pool/slot-0/build/issuer-review/result.txt",
       "sha256": "249faa8eb6e2d2509d8b2173b7bb44d702e0da54229383475de20188e6473406"
     }
   ],

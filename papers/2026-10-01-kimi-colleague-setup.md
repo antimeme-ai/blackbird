@@ -5,7 +5,7 @@ their Kimi subscription for independent code review and potentially test work.
 
 ## Available runtime and subscription route
 
-The existing executable is `/Users/patrickbeam/.kimi-code/bin/kimi`, version
+The existing executable is `~/.kimi-code/bin/kimi`, version
 2.1.1. No CLI installation, upgrade, interactive login or new subscription was
 needed. `kimi doctor` validated its existing `config.toml` and `tui.toml`.
 `kimi provider list` reports `managed:kimi-code`, type `kimi`, source `oauth`,
@@ -48,10 +48,10 @@ entry points, installed **kimi-delegate** v0.5.0 (MIT), from
 [amElnagdy/delegate-skills](https://github.com/amElnagdy/delegate-skills/tree/6826b363085dcc80875372315fe7d208c4bf733f/skills/kimi-delegate),
 path `skills/kimi-delegate`, revision
 `6826b363085dcc80875372315fe7d208c4bf733f`, into
-`/Users/patrickbeam/.codex/skills/kimi-delegate`:
+`~/.codex/skills/kimi-delegate`:
 
 ```sh
-python3 /Users/patrickbeam/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py --repo amElnagdy/delegate-skills --ref 6826b363085dcc80875372315fe7d208c4bf733f --path skills/kimi-delegate
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py --repo amElnagdy/delegate-skills --ref 6826b363085dcc80875372315fe7d208c4bf733f --path skills/kimi-delegate
 ```
 
 The skill is aimed at bounded implementation/test delegation, with exact briefs,

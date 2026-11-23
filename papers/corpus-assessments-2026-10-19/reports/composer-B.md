@@ -1,6 +1,6 @@
 # Prompt composers in terminal coding agents: source study B
 
-This is a read-only study of the snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/`, taken around 2026-09-30. Hermes is the 2026-10-07 snapshot. Nothing was run or built.
+This is a read-only study of the snapshots under `./quarantine/`, taken around 2026-09-30. Hermes is the 2026-10-07 snapshot. Nothing was run or built.
 
 - Every claim cites file:line in the snapshot.
 - "Library" means the behaviour lives in a dependency that is not vendored (prompt_toolkit, bubbles textarea, rustyline, Textual), so it is stated from the call site only.
@@ -390,7 +390,7 @@ Composer: `aider/aider/io.py` (`get_input` at `io.py:523-734`), `commands.py`, `
 
 ## Composer study, part: hermes-agent, mistral-vibe, vtcode
 
-Read-only source study of snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/`.
+Read-only source study of snapshots under `./quarantine/`.
 Path prefixes used below:
 
 - `H/` = `hermes-agent-2026-10-07/` (classic prompt_toolkit CLI in `hermes_cli/`; the separate Ink TUI is in `ui-tui/`)
@@ -708,7 +708,7 @@ Trap:
 
 ## Composer study: letta-code and goose CLI
 
-Source snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/`. Paths below are relative to `letta-code/` or `goose/crates/goose-cli/src/`. Read-only study; nothing was run.
+Source snapshots under `./quarantine/`. Paths below are relative to `letta-code/` or `goose/crates/goose-cli/src/`. Read-only study; nothing was run.
 
 ---
 

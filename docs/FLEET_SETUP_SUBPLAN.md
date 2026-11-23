@@ -3,15 +3,15 @@
 Status after operator steering on 2026-10-01: Runpod provisioning and mutation are
 deferred from the current path to working Arconaut. No Runpod pod was created.
 The operator accepts responsibility for node termination; the automatic lifecycle
-machinery proposed below is retired discussion, not required work. Neuroses access
+machinery proposed below is retired discussion, not required work. `<linux-host>` access
 and minimal Linux development-tool installation succeeded and remain useful for
 general Linux checks. Do not resurrect cloud plumbing as a prerequisite to U0–U9.
 
-2026-10-01. Operator selects Neuroses over Tailscale for general Linux checks and
+2026-10-01. Operator selects `<linux-host>` (`$BLACKBIRD_LINUX_HOST`) over SSH for general Linux checks and
 Runpod's existing credit account for mutation. This finishes the previously open
 resource selection for the rigor setup; production units retain their own oracles.
 
-Neuroses is reachable through the existing SSH alias and key. Ubuntu 24.04 x86_64
+`<linux-host>` is reachable through the existing SSH alias and key. Ubuntu 24.04 x86_64
 has GCC but no Clang/CMake/Ninja. Install only the necessary development packages
 without upgrading unrelated software, then qualify a deliberately declared Linux
 compiler/profile. Jobs use isolated temporary workspaces and bounded build/test
@@ -47,6 +47,6 @@ fixture for characterized product oracles.
 
 Meaningful red cases: missing configuration fails before remote mutation; conflicting
 job identity/rate rejects; cleanup remains explicit after a failed remote test.
-General Linux tests run independently on Neuroses. Independent Kimi review examines
+General Linux tests run independently on `<linux-host>`. Independent Kimi review examines
 launcher job custody, billing cleanup, source scope and actual evidence before the
 setup is called complete. Journals/beads retain resource choices and achieved scope.

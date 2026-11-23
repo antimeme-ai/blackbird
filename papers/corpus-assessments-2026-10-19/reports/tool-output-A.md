@@ -1,6 +1,6 @@
 # Large tool output in coding agents: truncation, spill and recovery (read-only source study)
 
-Date: 2026-10-19. Snapshots under /Users/patrickbeam/projects/blackbird/quarantine/ (taken ~2026-09-30; hermes 2026-10-07).
+Date: 2026-10-19. Snapshots under ./quarantine/ (taken ~2026-09-30; hermes 2026-10-07).
 Claude Code: bundle 2.1.286 (claude-code-official-distribution/distributions/2.1.286/), CHANGELOG, and live docs (labelled [source]/[changelog]/[doc]).
 Nothing was built, run or installed. Citations are file:line (or bundle byte offset). Detailed per-reference sections follow the synthesis.
 Spot-verified by grep in the parent pass: Codex markers (utils/string/src/truncate.rs:139-141, core/src/tools/context.rs:520, tui/src/exec_cell/render.rs:778),
@@ -44,7 +44,7 @@ MAX_MCP_OUTPUT_TOKENS, "characters truncated] ...", clear_tool_uses_20250919, "O
 ---
 # Codex (quarantine snapshot ~2026-09-30): large tool output handling
 
-Read-only source study of `/Users/patrickbeam/projects/blackbird/quarantine/codex/codex-rs/`. All paths below are relative to `codex-rs/`. Nothing was built or run.
+Read-only source study of `./quarantine/codex/codex-rs/`. All paths below are relative to `codex-rs/`. Nothing was built or run.
 
 ## 0. The tool surface in this snapshot
 
@@ -573,7 +573,7 @@ Background: `Command was manually backgrounded by user with ID: X. Output is bei
 
 # Large tool output handling: goose and crush (source study, snapshots ~2026-09-30)
 
-Read-only study. Paths are relative to `/Users/patrickbeam/projects/blackbird/quarantine/`.
+Read-only study. Paths are relative to `./quarantine/`.
 Nothing was built or run.
 
 Snapshot caveat (goose): the old `goose-mcp` "developer" extension (text_editor view
@@ -1001,8 +1001,8 @@ shortest paths (`glob.go:131-134, 185-187`).
 # Large tool output handling: kimi-cli vs hermes-agent (read-only source study)
 
 Roots:
-- K = /Users/patrickbeam/projects/blackbird/quarantine/kimi-cli/
-- H = /Users/patrickbeam/projects/blackbird/quarantine/hermes-agent-2026-10-07/
+- K = ./quarantine/kimi-cli/
+- H = ./quarantine/hermes-agent-2026-10-07/
 
 Nothing was run. All claims are from source reading. One trap (K shell readline limit) depends on
 CPython asyncio StreamReader semantics, which are not in the snapshot; it is marked as inferred.

@@ -1,6 +1,6 @@
 {
   "identity": {
-    "executable": "/Users/patrickbeam/projects/blackbird/build/debug/blackbird",
+    "executable": "./build/debug/blackbird",
     "sha256": "38738cbb3c1c467272e6af521039ac84f4749014a5d1d51830de93ecacfaba33",
     "declared_source_checkpoint": "659f62bc9435ae0931da578574ddb805fac77e94+working-instrument-independent-binding",
     "backend": "alacritty",

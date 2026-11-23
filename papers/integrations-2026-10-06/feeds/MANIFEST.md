@@ -1,6 +1,6 @@
 # Feed/package research acquisition manifest
 
-2026-10-06. Repository cwd `/Users/patrickbeam/projects/arconaut`. No reference execution, installations, credentials or external messages. Source ZIP archives remain intact. Extracted source omits archive root plus nested `.git`, `.DS_Store`, `__MACOSX` and `Thumbs.db`. [acquisition.json](acquisition.json) contains hashes and exact repo-cwd restoration commands, including Python ZIP extraction that never executes acquired source. Restore extracted trees into absent/empty destinations.
+2026-10-06. Repository cwd `~/projects/arconaut`. No reference execution, installations, credentials or external messages. Source ZIP archives remain intact. Extracted source omits archive root plus nested `.git`, `.DS_Store`, `__MACOSX` and `Thumbs.db`. [acquisition.json](acquisition.json) contains hashes and exact repo-cwd restoration commands, including Python ZIP extraction that never executes acquired source. Restore extracted trees into absent/empty destinations.
 
 ## Pinned sources
 

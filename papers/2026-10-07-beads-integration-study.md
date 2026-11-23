@@ -100,7 +100,7 @@ existing ID can overwrite intervening changes. Reconcile before retrying.
 ## Project and worktree binding
 
 This project's installed identity resolves to
-`/Users/patrickbeam/projects/blackbird/.beads`, prefix `arconaut`, Dolt server
+`./.beads`, prefix `arconaut`, Dolt server
 mode, database `arconaut`, configured port **13308**. The legacy prefix/database
 name is valid; renaming the harness does not authorize database migration.
 

@@ -1,4 +1,4 @@
-Test project /Users/patrickbeam/projects/blackbird/build/debug
+Test project ./build/debug
     Start 87: raw_runtime
 1/1 Test #87: raw_runtime ......................   Passed    1.98 sec
 

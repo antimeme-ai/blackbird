@@ -260,7 +260,7 @@
         "tools": {
           "blackbird": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/scripts/blackbird",
+              "./scripts/blackbird",
               "--session",
               "{run}/session"
             ],
@@ -273,7 +273,7 @@
           },
           "codex": {
             "command": [
-              "/Users/patrickbeam/.local/bin/codex",
+              "~/.local/bin/codex",
               "--no-daemon"
             ],
             "ready_text": [
@@ -286,7 +286,7 @@
           },
           "claude": {
             "command": [
-              "/Users/patrickbeam/.local/bin/claude"
+              "~/.local/bin/claude"
             ],
             "ready_text": [
               "Claude",
@@ -300,7 +300,7 @@
           },
           "hermes": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/context/agent-startup-comparison-2026-10-08/hermes-source/venv/bin/hermes",
+              "./context/agent-startup-comparison-2026-10-08/hermes-source/venv/bin/hermes",
               "chat"
             ],
             "ready_text": [
@@ -313,7 +313,7 @@
           },
           "opencode": {
             "command": [
-              "/Users/patrickbeam/.opencode/bin/opencode",
+              "~/.opencode/bin/opencode",
               "--model",
               "openrouter/anthropic/claude-sonnet-4.6"
             ],
@@ -360,7 +360,7 @@
         "tools": {
           "pi": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
+              "./context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
               "--provider",
               "openrouter",
               "--model",
@@ -383,7 +383,7 @@
           },
           "kimi": {
             "command": [
-              "/Users/patrickbeam/.kimi-code/bin/kimi",
+              "~/.kimi-code/bin/kimi",
               "--skills-dir",
               "{run}/session"
             ],
@@ -400,7 +400,7 @@
           },
           "omp": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
+              "./context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
               "--model",
               "openrouter/anthropic/claude-sonnet-4.6",
               "--no-extensions",
@@ -9723,7 +9723,7 @@
           "tools": {
             "pi": {
               "command": [
-                "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
+                "./context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
                 "--provider",
                 "openrouter",
                 "--model",
@@ -9746,7 +9746,7 @@
             },
             "kimi": {
               "command": [
-                "/Users/patrickbeam/.kimi-code/bin/kimi",
+                "~/.kimi-code/bin/kimi",
                 "--skills-dir",
                 "{run}/session"
               ],
@@ -9869,7 +9869,7 @@
           "tools": {
             "omp": {
               "command": [
-                "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
+                "./context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
                 "--model",
                 "openrouter/anthropic/claude-sonnet-4.6",
                 "--no-extensions",

@@ -8,7 +8,7 @@ no recovery launcher, provider, command replay, AFL output or artwork was used.
 ## What the model actually inspected
 
 The original session is
-`/Users/patrickbeam/.local/state/blackbird/session-nIWneY`. Its audit was read
+`~/.local/state/blackbird/session-nIWneY`. Its audit was read
 using the native ARJ1 frame layout from `src/journal.cpp`, retained event layout
 from `src/retained_events.cpp`, and the existing development BBM2 decoder in
 `scripts/native-packet.py`. Source bytes and metadata below come from that

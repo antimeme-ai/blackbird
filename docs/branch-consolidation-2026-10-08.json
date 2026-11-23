@@ -270,27 +270,27 @@
   ],
   "parked_worktrees": [
     {
-      "path": "/Users/patrickbeam/projects/arconaut/context/giga-parallel/pool/slot-0",
+      "path": "~/projects/arconaut/context/giga-parallel/pool/slot-0",
       "tip": "f23368914f46f9edd2db935fb499d669c690b009",
       "disposition": "detach in place; retain ignored build/evidence files"
     },
     {
-      "path": "/Users/patrickbeam/projects/arconaut/context/useful-work/pilot-pool/slot-0",
+      "path": "~/projects/arconaut/context/useful-work/pilot-pool/slot-0",
       "tip": "5e58d51d1df87df92016d69f4d3f7e1af001bae5",
       "disposition": "detach in place; retain ignored build/evidence files"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-0",
+      "path": "./context/performance-armada/pool/slot-0",
       "tip": "91da60e00b9ae54fc096ffc2ca256061b685d0d7",
       "disposition": "detach in place; retain ignored build/evidence files"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/performance-armada/pool/slot-1",
+      "path": "./context/performance-armada/pool/slot-1",
       "tip": "ccc26087328d882c3e2dd0ced2af38063f6d183b",
       "disposition": "detach in place; retain ignored build/evidence files"
     },
     {
-      "path": "/Users/patrickbeam/projects/blackbird/context/workflows-campaign/pool/slot-0",
+      "path": "./context/workflows-campaign/pool/slot-0",
       "tip": "47bb9be83b771f8bbc11b3e164b06584af4a9c65",
       "disposition": "detach in place; retain ignored build/evidence files"
     }

@@ -43,7 +43,7 @@ json.dump(req, open(P + '/request.json', 'w'), indent=1)
 results = []
 for run in (1, 2):
     t0 = time.time()
-    p = subprocess.run(['python3', '-I', '/Users/patrickbeam/projects/codex-tools/jev.py', '-'], input=json.dumps(req), capture_output=True, text=True, timeout=120)
+    p = subprocess.run(['python3', '-I', os.path.expanduser('~/projects/codex-tools/jev.py'), '-'], input=json.dumps(req), capture_output=True, text=True, timeout=120)
     el = time.time() - t0
     if p.returncode != 0:
         print('jev failed', p.returncode, p.stderr[:300]); sys.exit(1)

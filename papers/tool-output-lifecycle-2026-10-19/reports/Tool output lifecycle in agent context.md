@@ -31,15 +31,15 @@ Reading this branch's source (`f7a79b1`) turns up defaults that matter more than
 
 Every harness studied bounds a tool output when it is created. Nearly all of them keep the overflow somewhere the model can reach.
 
-The reconstruction of Claude Code (a third-party "leaked source" tree, `codeaashu/claude-code`, provenance unverified) swaps any result over **50,000 characters** for a `<persisted-output>` block. The block holds a 2 KB head preview and the path of a session file. Its replacement decisions are **frozen**: a result left unreplaced the first time is "never replaced later (would break prompt cache)", and each decision is recorded so that a resume reproduces byte-identical previews ([toolResultStorage.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/claude-code-unofficial/src/utils/toolResultStorage.ts)). That is operator decision 1, implemented for cache reasons alone.
+The reconstruction of Claude Code (a third-party "leaked source" tree, `codeaashu/claude-code`, provenance unverified) swaps any result over **50,000 characters** for a `<persisted-output>` block. The block holds a 2 KB head preview and the path of a session file. Its replacement decisions are **frozen**: a result left unreplaced the first time is "never replaced later (would break prompt cache)", and each decision is recorded so that a resume reproduces byte-identical previews ([toolResultStorage.ts](quarantine/claude-code-unofficial/src/utils/toolResultStorage.ts)). That is operator decision 1, implemented for cache reasons alone.
 
 The other harnesses:
-- **opencode** keeps at most 2000 lines or 50 KB. It spills the rest to a directory kept for 7 days, and tells the model to Grep/Read the spill or delegate ([truncate.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/opencode/packages/opencode/src/tool/truncate.ts)).
-- **codex** keeps a head and tail within 10,000 tokens. It gives the model **no path** to the dropped middle ([truncate.rs](file:///Users/patrickbeam/projects/blackbird/quarantine/codex/codex-rs/utils/string/src/truncate.rs)).
-- **pi, oh-my-pi, gemini-cli and qwen-code** spill to files and name the path. qwen-code adds a SHA-256 and a warning that the spill may be cleaned up after 24 hours ([qwen truncation.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/qwen-code/packages/core/src/tools/truncation.ts)).
+- **opencode** keeps at most 2000 lines or 50 KB. It spills the rest to a directory kept for 7 days, and tells the model to Grep/Read the spill or delegate ([truncate.ts](quarantine/opencode/packages/opencode/src/tool/truncate.ts)).
+- **codex** keeps a head and tail within 10,000 tokens. It gives the model **no path** to the dropped middle ([truncate.rs](quarantine/codex/codex-rs/utils/string/src/truncate.rs)).
+- **pi, oh-my-pi, gemini-cli and qwen-code** spill to files and name the path. qwen-code adds a SHA-256 and a warning that the spill may be cleaned up after 24 hours ([qwen truncation.ts](quarantine/qwen-code/packages/core/src/tools/truncation.ts)).
 - **OpenHands V1** middle-truncates terminal output above 30,000 characters and names a hash-deduplicated full-output file ([truncate.py](https://github.com/OpenHands/software-agent-sdk/blob/33d8aa29c3078d074799e2fbf5e847aeb2d71360/openhands-sdk/openhands/sdk/utils/truncate.py#L11-L117)).
 
-The shape matters because logs put errors at the end. pi's bash, qwen-code's split and gemini-cli's split all weight the tail. kimi-cli keeps only the head and silently drops later writes ([kimi utils.py](file:///Users/patrickbeam/projects/blackbird/quarantine/kimi-cli/src/kimi_cli/tools/utils.py)).
+The shape matters because logs put errors at the end. pi's bash, qwen-code's split and gemini-cli's split all weight the tail. kimi-cli keeps only the head and silently drops later writes ([kimi utils.py](quarantine/kimi-cli/src/kimi_cli/tools/utils.py)).
 
 | Harness | Creation cap and shape | Full output | Locator in model text |
 |---|---|---|---|
@@ -56,15 +56,15 @@ The shape matters because logs put errors at the end. pi's bash, qwen-code's spl
 | OpenHands V1 | terminal 30k, middle cut | conversation `observations/` | yes, path |
 
 Later in a session, the defaults reveal what the projects trust:
-- **opencode's `prune`** ships **off** ([config.mdx](file:///Users/patrickbeam/projects/blackbird/quarantine/opencode/packages/web/src/content/docs/config.mdx)).
-- **Claude Code's time-based microcompact** (in the reconstruction) clears all but the last 5 compactable results after a 60-minute idle gap, because "the server's 1h cache TTL is guaranteed expired". It is flag-gated off ([timeBasedMCConfig.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/claude-code-unofficial/src/services/compact/timeBasedMCConfig.ts)).
+- **opencode's `prune`** ships **off** ([config.mdx](quarantine/opencode/packages/web/src/content/docs/config.mdx)).
+- **Claude Code's time-based microcompact** (in the reconstruction) clears all but the last 5 compactable results after a 60-minute idle gap, because "the server's 1h cache TTL is guaranteed expired". It is flag-gated off ([timeBasedMCConfig.ts](quarantine/claude-code-unofficial/src/services/compact/timeBasedMCConfig.ts)).
 - **SWE-agent's** `LastNObservations` left the default config. Its docstring says it "will break prompt caching" and "is not always needed anymore" ([history_processors.py](https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/sweagent/agent/history_processors.py#L106-L111)).
 - **OpenHands V1** keeps one LLM-summarizing condenser. That condenser cuts only at "manipulation indices" that never split a call from its result, a parallel batch, or a thinking tool loop ([tool_loop_atomicity.py](https://github.com/OpenHands/software-agent-sdk/blob/33d8aa29c3078d074799e2fbf5e847aeb2d71360/openhands-sdk/openhands/sdk/context/view/properties/tool_loop_atomicity.py#L14-L126)). That is the round atomicity Blackbird already enforces.
 
 Three harnesses do rewrite old results by default:
-- **gemini-cli** masks every turn behind a 50k-token protected window, with a placeholder that carries the path ([toolOutputMaskingService.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/gemini-cli/packages/core/src/context/toolOutputMaskingService.ts)).
-- **qwen-code** microcompacts to `[Old tool result content cleared]`. It overwrites the whole response, **destroying any spill path inside it**, but never clears errors ([microcompact.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/qwen-code/packages/core/src/services/microcompaction/microcompact.ts)).
-- **oh-my-pi** blanks superseded reads and results its tools flag as uneventful. Its "shake" placeholders carry `recover: artifact://<id>` ([pruning.ts](file:///Users/patrickbeam/projects/blackbird/quarantine/oh-my-pi/packages/agent/src/compaction/pruning.ts)).
+- **gemini-cli** masks every turn behind a 50k-token protected window, with a placeholder that carries the path ([toolOutputMaskingService.ts](quarantine/gemini-cli/packages/core/src/context/toolOutputMaskingService.ts)).
+- **qwen-code** microcompacts to `[Old tool result content cleared]`. It overwrites the whole response, **destroying any spill path inside it**, but never clears errors ([microcompact.ts](quarantine/qwen-code/packages/core/src/services/microcompaction/microcompact.ts)).
+- **oh-my-pi** blanks superseded reads and results its tools flag as uneventful. Its "shake" placeholders carry `recover: artifact://<id>` ([pruning.ts](quarantine/oh-my-pi/packages/agent/src/compaction/pruning.ts)).
 
 The common gaps are more telling than the features.
 - **No lifecycles by kind.** No harness declares lifecycles by output kind; exemptions are hand-kept name lists.
@@ -74,8 +74,8 @@ The common gaps are more telling than the features.
 - **Repair at send time.** Every harness repairs call/result pairing when it builds the request, keeping `tool_use_id`/`call_id` stable.
 
 Blackbird already has stronger pieces than most of these harnesses, but its defaults undercut them. `exec` returns an `output_ref`, and `read_process_output` fetches byte slices "without rerunning effects". `read_file` returns a `snapshot` ID for later range fetches. Yet in this branch:
-- `exec`'s visible budget defaults to **16 MiB** ([command_jobs.hpp:16](file:///Users/patrickbeam/projects/blackbird/context/clm-a1v/include/blackbird/command_jobs.hpp)).
-- `read_process_output` treats a missing end as EOF ([tools.cpp](file:///Users/patrickbeam/projects/blackbird/context/clm-a1v/src/tools.cpp)).
+- `exec`'s visible budget defaults to **16 MiB** ([command_jobs.hpp:16](context/clm-a1v/include/blackbird/command_jobs.hpp)).
+- `read_process_output` treats a missing end as EOF ([tools.cpp](context/clm-a1v/src/tools.cpp)).
 - `context_view` and `context_originals` take no parameters and return bodies.
 - `context_inspect` is bounded (limit 1..65,536 bytes, default 4,096) but returns `hex-bbm2-stream` or `hex-json-utf8`, doubling every byte the model reads.
 
@@ -299,7 +299,7 @@ Both are honorable because Blackbird owns creation and cuts. Two strains follow.
 
 Fetched slices should be shaped like any other output, so a fetch cannot recreate the C5 failure. The benefit: aggressive shaping and archival become safe, and Blackbird already owns the originals (decisions 2 and 3). The cost: re-retrieval appends bytes and turns, which roughly tripled under 5x compression in 2608.16370. Fetch counts per archived round should be a first-class metric in the next live check.
 
-**Jev-scored relevance.** The pilot measured **7,796 input tokens (~$0.0003)** per triage, 0.35–0.44 s, and stability within 0.08 across repeats. It kept every cited source read and rated the 646 KB of dumps at "summary suffices" ([JEV_PILOT.md](file:///Users/patrickbeam/projects/blackbird/context/clm-a1v/papers/clm-a1v-2026-10-19/JEV_PILOT.md)). That is one task at one decision point, not a calibration. The best fit is a score column in the archival-step index that pre-sorts candidates for the model, never a decider. Decision 5 keeps authorship with the model, and the near-oracle performance of random selection in 2608.16370 suggests recoverability matters more than ranking. Running Jev at creation is the wrong fit: it adds latency to every call and nondeterminism to bytes that must stay cache-stable. Trained, task-conditioned verbatim extractors such as Squeez and SWE-Pruner are the creation-time technique the literature supports, and they would be a separately qualified later unit ([Squeez](https://arxiv.org/abs/2604.04979)).
+**Jev-scored relevance.** The pilot measured **7,796 input tokens (~$0.0003)** per triage, 0.35–0.44 s, and stability within 0.08 across repeats. It kept every cited source read and rated the 646 KB of dumps at "summary suffices" ([JEV_PILOT.md](context/clm-a1v/papers/clm-a1v-2026-10-19/JEV_PILOT.md)). That is one task at one decision point, not a calibration. The best fit is a score column in the archival-step index that pre-sorts candidates for the model, never a decider. Decision 5 keeps authorship with the model, and the near-oracle performance of random selection in 2608.16370 suggests recoverability matters more than ranking. Running Jev at creation is the wrong fit: it adds latency to every call and nondeterminism to bytes that must stay cache-stable. Trained, task-conditioned verbatim extractors such as Squeez and SWE-Pruner are the creation-time technique the literature supports, and they would be a separately qualified later unit ([Squeez](https://arxiv.org/abs/2604.04979)).
 
 **Provider profiles as shipped data.** Hosts disagree on the same model. Each host exposes its own reasoning-history knob. Meta, DeepSeek and Mistral each impose a different structural rule. So all of this should live in profile data keyed by host, endpoint and model, extending the unmerged `5st` settings table:
 

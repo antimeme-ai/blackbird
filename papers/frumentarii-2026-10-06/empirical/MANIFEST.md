@@ -1,6 +1,6 @@
 # Empirical lane acquisition manifest
 
-2026-10-06, repository cwd `/Users/patrickbeam/projects/arconaut`. Archives intact; extracted trees skip top archive directory and omit nested `.git`, `.DS_Store`, `__MACOSX`, `Thumbs.db`. No reference code executed. Each precise replay command, acquisition hash, source URL and path is in [acquisition.json](acquisition.json). Replay into absent/empty extracted targets; do not erase working files to restore a reference.
+2026-10-06, repository cwd `~/projects/arconaut`. Archives intact; extracted trees skip top archive directory and omit nested `.git`, `.DS_Store`, `__MACOSX`, `Thumbs.db`. No reference code executed. Each precise replay command, acquisition hash, source URL and path is in [acquisition.json](acquisition.json). Replay into absent/empty extracted targets; do not erase working files to restore a reference.
 
 ## Source snapshots
 

@@ -131,7 +131,7 @@ an independent behavioral oracle or authorize execution.
 ## Remaining qualifications
 
 `scripts/rigor fleet` fails explicitly because no fleet host/launcher is configured.
-The operator selected Wintermute (replacing the former Neuroses host) over Tailscale for ordinary Linux checks, available
+Ordinary Linux checks run on the configured Linux host (`$BLACKBIRD_LINUX_HOST`, replacing the former Linux check host) over SSH, available
 through `scripts/check-linux`. It archives the current native source scope into
 a temporary remote directory, runs debug/release/ASan+UBSan cases and retains logs
 under `context/linux/`.
@@ -141,7 +141,7 @@ have a 60-second watchdog for host scheduling/storage delays; their oracles asse
 bytes, signals and effects, not a production latency guarantee. CTest owns each
 test's watchdog; a complete three-profile build/test run has no fixed overall
 deadline.
-Compilation uses at most 24 parallel jobs on Wintermute (48 cores).
+Compilation uses at most 24 parallel jobs on `<linux-host>` (48 cores).
 
 Its explicit profile is Arch/Omarchy Linux x86_64, Clang 23.1.3, libc++/libc++abi 23.1.3,
 Lua 5.5.1, CMake 4.4.4 and Ninja 1.13.2. The Linux ASan+UBSan profile keeps debug
@@ -169,7 +169,7 @@ listed in QUARANTINE.md inside each disposable remote workspace. Ordinary checks
 change no server system package. The operator-authorized C++23 upgrade installed versioned
 LLVM 23 packages from the signed official LLVM APT release repository; see
 [the upgrade record](../papers/2026-10-17-cpp23-toolchain.md). Historical
-session/RRC/coding/recovery/terminal checks passed in the former Neuroses
+session/RRC/coding/recovery/terminal checks passed in the former `<linux-host>`
 Clang18/libstdc++13 debug/release/ASan+UBSan profiles on 2026-10-03.
 
 ## Native performance

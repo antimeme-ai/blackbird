@@ -1,6 +1,6 @@
 # Platform reference restoration
 
-Run from `/Users/patrickbeam/projects/blackbird` or the corresponding cloned
+Run from `<repo>` or the corresponding cloned
 project root. Study only: no imported source is a dependency or current instruction.
 
 The manifest [platform-references.json](platform-references.json) gives the tmux

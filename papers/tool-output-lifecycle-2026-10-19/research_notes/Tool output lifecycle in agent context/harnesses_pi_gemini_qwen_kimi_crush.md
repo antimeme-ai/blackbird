@@ -9,14 +9,14 @@ Method: read-only source reading of the quarantined upstream source ZIPs (nothin
 - crush `76cc5c574e15` (no CHANGELOG)
 
 **Citation roots.** Sources are local files, cited as `ROOT/path:line`, where ROOT is one of:
-- PI = `/Users/patrickbeam/projects/blackbird/quarantine/pi/packages`
-- OMP = `/Users/patrickbeam/projects/blackbird/quarantine/oh-my-pi/packages`
-- GC = `/Users/patrickbeam/projects/blackbird/quarantine/gemini-cli/packages/core/src`
-- GU = `/Users/patrickbeam/projects/blackbird/quarantine/gemini-cli/packages/cli/src`
-- QC = `/Users/patrickbeam/projects/blackbird/quarantine/qwen-code/packages/core/src`
-- QU = `/Users/patrickbeam/projects/blackbird/quarantine/qwen-code/packages/cli/src`
-- K = `/Users/patrickbeam/projects/blackbird/quarantine/kimi-cli`
-- CR = `/Users/patrickbeam/projects/blackbird/quarantine/crush/internal`
+- PI = `./quarantine/pi/packages`
+- OMP = `./quarantine/oh-my-pi/packages`
+- GC = `./quarantine/gemini-cli/packages/core/src`
+- GU = `./quarantine/gemini-cli/packages/cli/src`
+- QC = `./quarantine/qwen-code/packages/core/src`
+- QU = `./quarantine/qwen-code/packages/cli/src`
+- K = `./quarantine/kimi-cli`
+- CR = `./quarantine/crush/internal`
 
 **Verification.** I re-read the load-bearing constants and placeholder strings myself:
 - pi summariser truncation, cut-point rule, orphan repair, branch-summary skip and bash notices
@@ -173,7 +173,7 @@ Three harnesses rewrite individual old tool results in place before compaction: 
   - auto mode protects the last 16 K tokens, needs 4 K minimum savings and targets fenced/XML blocks of at least 400 tokens; manual `/shake` protects 4 K (OMP/agent/src/compaction/shake.ts:48-76)
   - placeholder `[shaken ~N tokens — recover: artifact://<id> (region k)]` (session-maintenance.ts:1029-1043)
 - Compaction:
-  - default method order `["remote","snapcompact","handoff","shake","soft"]` (/Users/patrickbeam/projects/blackbird/quarantine/oh-my-pi/docs/compaction.md:512)
+  - default method order `["remote","snapcompact","handoff","shake","soft"]` (./quarantine/oh-my-pi/docs/compaction.md:512)
   - threshold `contextWindow - max(floor(0.15*window), 16384)`, `keepRecentTokens = 20000` (OMP/agent/src/compaction/compaction.ts:213, 233, 334-410)
   - the summariser cuts tool results to 2000 chars and drops useless call/result pairs (OMP/agent/src/compaction/utils.ts:200-262)
 - "Windowed" is confirmed and means a fold over summariser input. When the serialised span exceeds `max(minWindow, 0.8*window - maxTokens - 16384)`, messages are packed into windows on message boundaries and each window updates the summary carried from the previous one. A provider overflow halves the window and re-plans it (compaction.ts:781-929). `MAX_SUMMARY_TOKENS = 16384` (compaction.ts:225); CHANGELOG OMP/agent/CHANGELOG.md:276.

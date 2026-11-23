@@ -49,7 +49,7 @@ would establish who committed text, not who originated or accepted a requirement
 ## Corpus and provenance
 
 The read-only legacy reference root is
-`/Users/patrickbeam/projects_old/miscellaneous/arconaut/quarantine/`.
+`~/projects_old/miscellaneous/arconaut/quarantine/`.
 It contains **53 immediate directories**, of which **52 retain root `.git`
 metadata**, and a root `shell_execution_survey.md`. No root restoration manifest
 was present. Existing metadata is useful for recovering revisions before clean

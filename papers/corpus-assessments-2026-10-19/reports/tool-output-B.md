@@ -1,6 +1,6 @@
 # How coding agents bound large tool output, and how the model gets it back
 
-Read-only source study of snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/` (taken around 2026-09-30). Nothing was run, built or installed. Line numbers refer to those snapshots. A sample of the key constants and markers was re-checked by direct reading; those carry a check mark (✔).
+Read-only source study of snapshots under `./quarantine/` (taken around 2026-09-30). Nothing was run, built or installed. Line numbers refer to those snapshots. A sample of the key constants and markers was re-checked by direct reading; those carry a check mark (✔).
 
 **OpenHands caveat:** `quarantine/openhands/` contains only the Agent Canvas web frontend (`package.json`, v1.24.0). The Python backend is absent: no `CmdOutputObservation`, `truncate_content`, `max_message_chars`, bash-session limits, editor view limits or condenser implementations. A grep of the whole quarantine for `max_message_chars|ObservationMaskingCondenser|truncate_content` found matches only in smolagents and mistral-vibe. The OpenHands section below therefore covers only the wire contract and UI that the frontend exposes.
 

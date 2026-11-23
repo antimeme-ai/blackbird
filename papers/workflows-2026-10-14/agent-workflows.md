@@ -10,7 +10,7 @@ The opportunity is to unite these mechanisms with **separate effect uncertainty,
 
 The October 7 [ecosystem](../workflows-2026-10-07/ecosystem.md) and [Hermes](../workflows-2026-10-07/hermes-study.md) reports remain useful. They distinguish expressibility, operational semantics and interoperability correctly. Existing capability dossiers provide prior source findings for Codex, OpenCode, Oh My Pi, Pi, Gas Town/Gas City and Dagger; their pinned revisions remain historical.
 
-Fresh immutable source archives, revision dates, SHA-256 hashes, extract paths and restoration commands are recorded in [agent-acquisition.json](agent-acquisition.json). Archives remain intact on `/Users/patrickbeam/projects/quarantine_proj/archives/workflows-2026-10-14/`; cleaned extracts are under `quarantine/workflows-2026-10-14/agent-*`. Extraction omits Git metadata, filesystem detritus and symlink/hardlink entries; those remain available in the intact archives. This report owns only its report and acquisition manifest; it does not change shared quarantine manifests.
+Fresh immutable source archives, revision dates, SHA-256 hashes, extract paths and restoration commands are recorded in [agent-acquisition.json](agent-acquisition.json). Archives remain intact on `~/projects/quarantine_proj/archives/workflows-2026-10-14/`; cleaned extracts are under `quarantine/workflows-2026-10-14/agent-*`. Extraction omits Git metadata, filesystem detritus and symlink/hardlink entries; those remain available in the intact archives. This report owns only its report and acquisition manifest; it does not change shared quarantine manifests.
 
 | System | Fresh source revision | Evidence actually inspected |
 | --- | --- | --- |

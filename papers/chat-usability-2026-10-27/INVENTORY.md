@@ -2,14 +2,14 @@
 
 ## Studied source versus installed and running code
 
-Study checkout: `/Users/patrickbeam/projects/blackbird/context/autodev-2026-10-26/continuity`, branch `work/autodev-chat-study-2026-10-27`, initial HEAD **b7c082eb2522e7dbca0c4f3d320705673edee13b**. Source citations in this study name that base unless explicitly qualified. Only papers and this checkout's JOURNAL change. No other checkout or worktree was created, no product/test/configuration code changed, and no build ran.
+Study checkout: `./context/autodev-2026-10-26/continuity`, branch `work/autodev-chat-study-2026-10-27`, initial HEAD **b7c082eb2522e7dbca0c4f3d320705673edee13b**. Source citations in this study name that base unless explicitly qualified. Only papers and this checkout's JOURNAL change. No other checkout or worktree was created, no product/test/configuration code changed, and no build ran.
 
 Observed 2026-10-27 around 04:13 UTC:
 
 | Object | Exact observation | What it does not prove |
 | --- | --- | --- |
-| PATH launcher | `/Users/patrickbeam/.local/bin/blackbird`, managed-launcher v1 shell file | A shell launcher is not the loaded executable or Lua identity. |
-| Managed current | `~/.local/lib/blackbird/current` → `/Users/patrickbeam/.local/lib/blackbird/releases/generation-6QI9PQx9` | Current selection does not replace an existing process. |
+| PATH launcher | `~/.local/bin/blackbird`, managed-launcher v1 shell file | A shell launcher is not the loaded executable or Lua identity. |
+| Managed current | `~/.local/lib/blackbird/current` → `~/.local/lib/blackbird/releases/generation-6QI9PQx9` | Current selection does not replace an existing process. |
 | Pinned executable | `generation-6QI9PQx9/build/release/blackbird`, 5,133,798 bytes; SHA256 `145be9185bcdaa509aaf3f2c2c2a958fb9e21fcdfa05c1c0f663ed642d61e1f1` | Hash identifies bytes, not source parity or qualification. |
 | Packaged launcher | 3,403 bytes; SHA256 `8a07f5b795c3d96d52f8c8d8c9fc0a2b0141a536a810846e695e96abcf77c9ed` | Explicit executable overrides still win. |
 | Packaged default Lua | SHA256 `856042aed9aed2e16feb37446523b4b6d477f2cd74b700edfff0e2ba97f91fe2` | A saved session can select a different absolute workflow. |
@@ -40,7 +40,7 @@ Anchors are navigational ranges, not an assertion every line of these large sour
 
 ## Governing material and historical reading
 
-Read workspace `/Users/patrickbeam/projects/BLACKBIRD.md`, own AGENTS and README, ROOT/OVERSIGHT, campaign and exact governing brief. ROOT has no papers directory; “primary papers” resolve to `/Users/patrickbeam/projects/blackbird/papers/`, not a fabricated ROOT/papers path. Read local campaign/brief plus primary corpus assessments read-only. Read INTERACTION_THEORY, TUI_DOCTRINE, TUI_COMPONENTS, TUI_VIEWS and TUI_IMPLEMENTATION_PLAN. These deliberately distinguish design intent, qualified source slices and activation; old plan status is not current runtime evidence.
+Read workspace `~/projects/BLACKBIRD.md`, own AGENTS and README, ROOT/OVERSIGHT, campaign and exact governing brief. ROOT has no papers directory; “primary papers” resolve to `./papers/`, not a fabricated ROOT/papers path. Read local campaign/brief plus primary corpus assessments read-only. Read INTERACTION_THEORY, TUI_DOCTRINE, TUI_COMPONENTS, TUI_VIEWS and TUI_IMPLEMENTATION_PLAN. These deliberately distinguish design intent, qualified source slices and activation; old plan status is not current runtime evidence.
 
 Existing research studied before any new acquisition: October7 terminal study/chat review disposition; October15 TUI synthesis and manifests; interaction-theory HCI/systems reports and source manifests; coordination reference report; TUI bug queue, testing/performance procedures; October19 corpus tool-output/slash synthesis, gaps, and selected composer report sections; October26 repository orientation. Corpus assessments are retained on `work/corpus-assessments-2026-10-19` / `9fa7e2a` and in the primary papers, not silently copied over this base. Their composer synthesis link is unfinished, not evidence of a completed design. Source claims here were checked directly for the selected references, rather than inheriting rankings such as “strongest retention” as universal facts.
 

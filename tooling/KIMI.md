@@ -82,7 +82,7 @@ For simple turns, the CLI itself suffices:
 ```sh
 kimi -m kimi-code/k3 -p 'Review the specified files' --output-format stream-json
 kimi -S SESSION_ID -p 'Here is the follow-up' --output-format stream-json
-kimi session list --cwd /Users/patrickbeam/projects/arconaut --json
+kimi session list --cwd <repo> --json
 ```
 
 Prompt mode already runs automatically; it cannot be combined with `--auto`,

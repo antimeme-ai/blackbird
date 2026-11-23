@@ -12,6 +12,6 @@
   "timing_finished_utc": "2026-10-16T06:53:48Z",
   "recorded_processes": 120,
   "recorded_endpoints": 960,
-  "terminal_output_directory": "/Users/patrickbeam/projects/blackbird/context/tui-command-inspector-2026-10-16/performance/perf-round/terminal-output",
+  "terminal_output_directory": "./context/tui-command-inspector-2026-10-16/performance/perf-round/terminal-output",
   "remote_campaign": "/home/patrick/.local/share/blackbird-campaigns/tui-command-inspector-20261016-wcm_b0zz"
 }

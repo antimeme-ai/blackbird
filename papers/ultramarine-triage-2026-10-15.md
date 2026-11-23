@@ -5,11 +5,11 @@ model explanation of interruption during a running build is unsupported.
 
 ## Retained session
 
-`/Users/patrickbeam/.local/state/blackbird/session-nIWneY` contains the original
+`~/.local/state/blackbird/session-nIWneY` contains the original
 14,497,203-byte audit, diagnostic captures, UI state and raw run
 `bb569e1e7cce6a0c95e34064ef`. Session metadata selects provider `paper`, model
 `ultramarine-1-flash`, effort `max`, and workflow
-`/Users/patrickbeam/projects/blackbird-paper-provider/programs/turn.lua`.
+`~/projects/blackbird-paper-provider/programs/turn.lua`.
 That checkout is absent now. Raw descriptions embed build identifier
 `13a19f1daa95dd31c99697a1f7fc037aabaadeb803eec9c138bd42deed5f42ea`.
 Do not identify it as current source676120c from the screenshot.

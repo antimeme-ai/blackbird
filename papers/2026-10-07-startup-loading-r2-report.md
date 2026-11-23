@@ -100,7 +100,7 @@ No external real provider/network readiness measurement, no operator-megasession
 claim, no cold-disk comparison or copied-byte/allocation census. Candidate inactive
 pending Root integration. Scoped binaries built under build/release and
 build/startup-profile; primary harness untouched. Build/review/raw measurement logs
-persist at `/Users/patrickbeam/projects/blackbird/context/startup-loading-r2-2026-10-07/evidence`.
+persist at `./context/startup-loading-r2-2026-10-07/evidence`.
 
 Binary/source identities (full per-sample metrics in valid-measurements.json):
 

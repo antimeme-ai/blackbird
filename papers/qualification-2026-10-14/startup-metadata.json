@@ -16,7 +16,7 @@
   "tools": {
     "previous-segment": {
       "command": [
-        "/Users/patrickbeam/projects/blackbird/scripts/blackbird",
+        "./scripts/blackbird",
         "--session",
         "{run}/session"
       ],
@@ -29,7 +29,7 @@
     },
     "current-segment": {
       "command": [
-        "/Users/patrickbeam/projects/blackbird/scripts/blackbird",
+        "./scripts/blackbird",
         "--session",
         "{run}/session"
       ],

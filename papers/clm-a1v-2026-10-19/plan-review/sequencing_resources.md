@@ -33,7 +33,7 @@ Severities: 6 high, 9 medium, 7 low.
     red failure in the journal. The a1v master merge already conflicted on `JOURNAL.md` and `coding_test.cpp`
     (JOURNAL, "merge master into the a1v branch").
 - **Ungated merges.** The repository has only `.githooks/pre-commit`. `core.hooksPath` is
-  `/Users/patrickbeam/projects/blackbird/.githooks`, and there is no `pre-merge-commit` hook. A clean `git merge`
+  `./.githooks`, and there is no `pre-merge-commit` hook. A clean `git merge`
   therefore runs no gate. Conflict resolutions in `coding.cpp` reach the program branch unchecked. The next unit
   branches from that unchecked tree, and its first gate then blames the wrong change.
 - **Consequence.**

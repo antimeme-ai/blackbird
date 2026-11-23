@@ -30,5 +30,5 @@ workflow. Composition's already-active turn retained older source and was not
 claimed hot-updated. Repository-default source repair remains separate delivery.
 
 The returned review transcript is retained locally at
-/Users/patrickbeam/.hermes/cache/delegation/live/deleg_116d2ef9/task-0.log.
+~/.hermes/cache/delegation/live/deleg_116d2ef9/task-0.log.
 No additional review layer is requested by this result.

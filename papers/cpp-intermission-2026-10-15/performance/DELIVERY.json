@@ -2,7 +2,7 @@
   "delivered_source_commit": "abaee8ac20d0675ab15fa8fb778fa281c18f6d5d",
   "timed_native_tree_sha256": "48027f980f11cfd5ce6913db9d56fe9f4f94b0d7bea23e64d14605e2e0f097d0",
   "native_inputs_match_delivered_commit": true,
-  "terminal_output_directory": "/Users/patrickbeam/projects/blackbird/context/cpp-intermission-2026-10-15/performance/perf-round/terminal-output",
+  "terminal_output_directory": "./context/cpp-intermission-2026-10-15/performance/perf-round/terminal-output",
   "remote_campaign_root": "/home/patrick/.local/share/blackbird-campaigns/cpp-intermission-20261015-rDlHIhMM",
   "terminal_outputs": [
     {

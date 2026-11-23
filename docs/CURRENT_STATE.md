@@ -5,7 +5,7 @@
 Read this before the older sections below, which describe stock from October 2026.
 
 - **master** unifies the qualified worktrees and branches onto one working checkout
-  (`/Users/patrickbeam/projects/blackbird`):
+  (`<repo>`):
   - **Oxcart native host tools, pinned Lua 5.5.1, and portable runtime paths**
     (`work/oxcart-host-tools-2026-10-23`, `work/oxcart-lua-2026-10-29`,
     `work/oxcart-portable-resources-2026-11-01`). `load_profiles()` also resolves

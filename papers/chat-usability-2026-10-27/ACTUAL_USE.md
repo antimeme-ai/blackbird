@@ -4,7 +4,7 @@
 
 Two new private sessions use the pinned generation described in [inventory](INVENTORY.md). The research driver opens a real OS PTY, sets physical rows/columns, launches the native executable with explicit provider/model/effort, sends recorded bytes, captures terminal output verbatim and decodes it with the existing independent emitted-VT-subset parser. The supplied fixtures deliberately use local `/lua` dispatch and no `blackbird.request`; the studied dispatch source predicts no inference. Provider-attempt records and network traffic were not independently enumerated, so “no model request” is a source-path inference, not a direct absence measurement. `BLACKBIRD_AUTH_HOME` points to a new directory per observation, isolating selected account configuration; this does not independently exclude every fallback credential route. Commands print synthetic diagnostic labels, loop in interruptible Lua, run harmless shell/Python children and write only an owned child-input ledger. These are actual execution fixtures, not invented screen mockups or source-test results.
 
-Local evidence root: `/Users/patrickbeam/projects/blackbird/context/autodev-2026-10-26/chat-study-01/` (ROOT/chat-study-01 below). Preserve originals:
+Local evidence root: `./context/autodev-2026-10-26/chat-study-01/` (ROOT/chat-study-01 below). Preserve originals:
 
 | Evidence | Exact retained location |
 | --- | --- |

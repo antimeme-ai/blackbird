@@ -12,7 +12,7 @@
       "workflow_id": "03000000000000000304000000000000",
       "model": "gpt-6.1-sol",
       "effort": "medium",
-      "workflow": "/Users/patrickbeam/projects/blackbird/programs/turn.lua"
+      "workflow": "./programs/turn.lua"
     }
   },
   "diagnostics_ttl_cli": {

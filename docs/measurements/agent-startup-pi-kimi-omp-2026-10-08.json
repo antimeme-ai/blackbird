@@ -17,7 +17,7 @@
     "tools": {
       "pi": {
         "command": [
-          "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
+          "./context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
           "--provider",
           "openrouter",
           "--model",
@@ -40,7 +40,7 @@
       },
       "kimi": {
         "command": [
-          "/Users/patrickbeam/.kimi-code/bin/kimi",
+          "~/.kimi-code/bin/kimi",
           "--skills-dir",
           "{run}/session"
         ],
@@ -57,7 +57,7 @@
       },
       "omp": {
         "command": [
-          "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
+          "./context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
           "--model",
           "openrouter/anthropic/claude-sonnet-4.6",
           "--no-extensions",
@@ -3182,7 +3182,7 @@
       "context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/package-lock.json": "337c6317ac81b7f8e8f40999f80af317615ad22ac900a6d793f9e43f0f6a09ef",
       "context/agent-startup-pi-kimi-omp-2026-10-08/bun.lock": "dda21ac91b3f29ac87e9121cfbddc21bc94386fd0ff088518a3491bcc55b3c1f",
       "context/agent-startup-pi-kimi-omp-2026-10-08/package.json": "f01c6f81db1addf998187b0471f5b1d24dccca7270add454efa059a0adcf705d",
-      "/Users/patrickbeam/.bun/bin/bun": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
+      "~/.bun/bin/bun": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
       "/opt/homebrew/bin/node": "fe1c0128a4c0163b034ec06b8b290494830ccb49922b5ce9ca4edf497a083e5f"
     }
   },
@@ -3206,7 +3206,7 @@
         "tools": {
           "pi": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
+              "./context/agent-startup-pi-kimi-omp-2026-10-08/pi-install/node_modules/.bin/pi",
               "--provider",
               "openrouter",
               "--model",
@@ -3229,7 +3229,7 @@
           },
           "kimi": {
             "command": [
-              "/Users/patrickbeam/.kimi-code/bin/kimi",
+              "~/.kimi-code/bin/kimi",
               "--skills-dir",
               "{run}/session"
             ],
@@ -3352,7 +3352,7 @@
         "tools": {
           "omp": {
             "command": [
-              "/Users/patrickbeam/projects/blackbird/context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
+              "./context/agent-startup-pi-kimi-omp-2026-10-08/node_modules/.bin/omp",
               "--model",
               "openrouter/anthropic/claude-sonnet-4.6",
               "--no-extensions",

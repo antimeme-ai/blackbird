@@ -1,6 +1,6 @@
 # Paper Instruments qualification
 
-Worktree: `/Users/patrickbeam/projects/blackbird-paper-provider`.
+Worktree: `~/projects/blackbird-paper-provider`.
 Branch: `work/paper-provider-2026-10-15`, based on `d987f6f`.
 No merge into master or executable activation in another checkout.
 

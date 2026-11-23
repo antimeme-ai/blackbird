@@ -1071,3 +1071,96 @@ To restore from the kept archives instead of fetching, extract each archive with
 the owned `scripts/ingest_zip.py ARCHIVE DEST --root ROOT --skip-symlinks`, where
 ROOT is the archive's top directory: `SWE-agent-<commit>`, `OpenHands-<commit>` (both
 OpenHands trees) or `software-agent-sdk-<commit>`.
+
+## Public-repository hygiene quarantine removals — 2026-11-23
+
+Verbatim third-party HTML articles, documentation snapshots, converted arXiv paper
+texts, and Apple Xcode SDK manual pages previously tracked under `papers/` were
+removed from Git so the public repository publishes only Blackbird's own research
+notes, manifests, syntheses, mockups, and capability surveys. Original provenance,
+URLs, byte counts, and SHA-256 digests are preserved below and in the corresponding
+tracked acquisition manifests under `papers/`. Live pages may change upstream;
+hashes identify the originally studied capture.
+
+### Orchestration articles (`papers/frumentarii-2026-10-06/orchestration/manifest.json`)
+
+Removed from tracked `papers/frumentarii-2026-10-06/orchestration/`; restore into
+ignored `quarantine/frumentarii-2026-10-06/orchestration/` with `curl -fL`:
+
+| File | Source URL | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `compiler-teams.html` | https://www.anthropic.com/engineering/building-c-compiler | 149,871 | `aebddd9da9124f565470c0b0a26aa063890290a4fcf06d1e30ebd02d859219af` |
+| `infrastructure-noise.html` | https://www.anthropic.com/engineering/infrastructure-noise | 128,646 | `02a22102950c1c3581724f081bf9d5d68e23ee98b5931da0a4a2dc44af62935e` |
+| `metr-update.html` | https://metr.org/blog/2026-02-24-uplift-update/ | 61,349 | `dcdb724b147eb060c38631b914977d1a6b40541f2cf01ddbe5a2933c15517a40` |
+
+### Native-reload documentation (`papers/2026-10-01-native-reload-literature-acquisition.json`)
+
+Removed from tracked `papers/native-reload/`; restore into ignored
+`quarantine/native-reload-docs-2026-10-01/` with `curl -fL`:
+
+| File | Source URL | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `godot-gdextension-manager.html` | https://docs.godotengine.org/en/stable/classes/class_gdextensionmanager.html | 1,304,147 | `1729440be443a8a091c649112f67eb696ae66707eebb0d965d3dd67d12436d9d` |
+| `jenova-getting-started.html` | https://jenova-framework.github.io/docs/pages/Getting-Started/ | 57,250 | `7a7f004385b348a7df576882ec1ceedfe33eb0cd919671e711257551bd02fb9e` |
+| `jenova-hot-reload.html` | https://jenova-framework.github.io/docs/pages/Advanced/Hot-Reload/ | 62,849 | `cee6a78a4ae828874c674d48641a020324ff972597944053ebd2517a702962fe` |
+| `jenova-readme.md` | https://raw.githubusercontent.com/Jenova-Framework/Jenova-Runtime/084e02830d07e6d3dfdb309dc9df9d3a165b9056/ReadMe.md | 5,176 | `42560cfb238d6aeb1021e73ee80e621ff94907f2e825278d4e894cfcdee6d541` |
+
+### Refit-custody POSIX and Darwin manuals (`papers/2026-10-01-refit-custody-platform-acquisition.json`)
+
+Removed from tracked `papers/platform/refit-custody-2026-10-01/`; restore into
+ignored `quarantine/refit-custody-platform-2026-10-01/`. Open Group POSIX.1-2024
+Issue 8 HTML pages refetch via `curl -fL`; Darwin manuals originate from Apple
+Xcode `macosx26.2` SDK (`/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/share/man/man2/<name>.2`):
+
+| File | Source | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `posix-exec.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html | 57,832 | `48155c576661c580a239e2291190244a8e3145b0493cdcae62dc7a58b2d6b938` |
+| `posix-kill.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/kill.html | 15,293 | `779bf66b859e9d5f10c5adc4ccac0afb2b1088daa3eaaa81a22e40751f1a0cc2` |
+| `posix-pipe.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/pipe.html | 12,561 | `d8425cee340fdacb4f8b3db37a7ed1bced59e9b8227aed4a0cff387ced8d81f4` |
+| `posix-recvmsg.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/recvmsg.html | 13,840 | `f7281e904b0aad16c0b054cf56499faf314a85b85835530fd33b03d23f5ca456` |
+| `posix-sendmsg.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/sendmsg.html | 13,732 | `f670e8542ae647d4597cc51a4792806bc3a38a4e749db88a962ec7eef2ae7595` |
+| `posix-wait.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/wait.html | 36,271 | `8c9d5d9bf54b098e460832d466503567376fdd61d24cbef0d461389d113a36e5` |
+| `posix-write.html` | https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html | 31,921 | `1b45e6a71f8bc9bff702da5633d42c88fd927c1d0efc5bafe7a939d23eb66e6a` |
+| `darwin-execve.2` | Apple Xcode `macosx26.2` SDK `man2/execve.2` | 9,141 | `551d9ae27d03112b9db14479fe283e16f9bcd722868ce43e8861adcc6fe2d770` |
+| `darwin-fcntl.2` | Apple Xcode `macosx26.2` SDK `man2/fcntl.2` | 28,079 | `cbb0c4e1e2778eb1c7be8ccca7bbdb7c4e5e73c41b5823118992441d540fd205` |
+| `darwin-fsync.2` | Apple Xcode `macosx26.2` SDK `man2/fsync.2` | 4,187 | `2399c28e11ea3a1e71b85d0002ac96b540372d405926657a101025f70ae10006` |
+| `darwin-kill.2` | Apple Xcode `macosx26.2` SDK `man2/kill.2` | 4,811 | `6c16952e8d776338a5d57b182734b72e1ef4772fc8e5e58ce720841776ba8a3e` |
+| `darwin-kqueue.2` | Apple Xcode `macosx26.2` SDK `man2/kqueue.2` | 23,602 | `48302f5a7c664d9323dca51593253a30e7263161a6ea514fcb89cdcedd03d2a4` |
+| `darwin-pipe.2` | Apple Xcode `macosx26.2` SDK `man2/pipe.2` | 3,842 | `e1b9d9e1a50a8dbaf504d7e691680672054bd9e491b80173ef39644952b8940b` |
+| `darwin-recv.2` | Apple Xcode `macosx26.2` SDK `man2/recv.2` | 9,980 | `03cfc49cde9a7378497501af3d914e1b9ebe4feaa7bf7ba3c682307092467040` |
+| `darwin-wait.2` | Apple Xcode `macosx26.2` SDK `man2/wait.2` | 8,764 | `2178648ce5091cba439ca601216ec3f368ed64487f91385f68b65e7b5e5e5409` |
+| `darwin-write.2` | Apple Xcode `macosx26.2` SDK `man2/write.2` | 9,233 | `c901c9512813ba2542a4ab3cf59414a73a992e6865c07fbea7ca251cd2bd5bad` |
+
+### Harness evolution arXiv text extractions (`papers/frumentarii-2026-10-06/harness/paper-acquisition.json`)
+
+Removed from tracked `papers/frumentarii-2026-10-06/harness/`; restore by
+downloading each PDF from its recorded arXiv URL into ignored
+`quarantine/frumentarii-2026-10-06/harness/` and converting with `pdftotext -layout`:
+
+| File | Source PDF URL | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `dgm.txt` | https://arxiv.org/pdf/2505.22954v1 | 231,256 | `24952259b5916364f928956901d31b2c6f1e6356b2956325b1dfa1a059540835` |
+| `helix.txt` | https://arxiv.org/pdf/2608.13951v1 | 96,622 | `89b6d616e90e5553ee5a173b059d3720b211dd935aae5f90447a2781e37aa89b` |
+| `modularrsi.txt` | https://arxiv.org/pdf/2609.14857v1 | 94,651 | `82efdfe0516c93f8d9ee381dd2e698d85f7b4f6937b7703428317f3c6899deac` |
+| `ouroboros.txt` | https://arxiv.org/pdf/2608.08311v1 | 75,527 | `823e3823ffb4dd015a93d75864835779400b9cbc7a6af57be061b8b65a40555d` |
+| `seal.txt` | https://arxiv.org/pdf/2506.10943v1 | 93,390 | `601f0285254a7c7abf505c796d4de3abb64249651695298f865792413033e953` |
+| `self-evolving-multitask.txt` | https://arxiv.org/pdf/2609.38372v1 | 85,308 | `74a4ad56bd793c2f53ec9a0e49b0227dad92e47f4f2493e95bdf955f51233b63` |
+| `self-harness.txt` | https://arxiv.org/pdf/2606.09498v1 | 71,116 | `f5b0c3ecc7a4fa6d134275231660f307379b0982a878944a452dfe813888f579` |
+| `sica.txt` | https://arxiv.org/pdf/2504.15228v2 | 73,323 | `5eccce85a97a0788e0c6bc16ed401d166d862148b3ae07edf92fa2a00567ad18` |
+| `stop.txt` | https://arxiv.org/pdf/2310.02304v3 | 161,990 | `fa0ff0ff048f1496c20705b87fe24e70f3e93c686c714c2f87866adc77145c79` |
+| `trusting-trust.txt` | https://arxiv.org/pdf/2609.17817v1 | 156,072 | `637965a6e5510347b6aa4051ff14ff67d19b152b7a2ab06dbb48ed070f958bb2` |
+
+### Claude Code documentation captures (`papers/integrations-2026-10-06/{teams/manifest.json,mods/docs-manifest.json}`)
+
+Removed from tracked `papers/integrations-2026-10-06/teams/` and
+`papers/integrations-2026-10-06/mods/`; restore into ignored
+`quarantine/integrations-2026-10-06/` from the official documentation URLs:
+
+| File | Source URL | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `teams/agent-teams.md` | https://code.claude.com/docs/en/agent-teams.md | 40,197 | `a2ed185b716d2550240752d988bfd1875cb2cad3f803be3a795f14054f3c0549` |
+| `teams/cross-session-messaging.md` | https://code.claude.com/docs/en/cross-session-messaging.md | 34,715 | `acb3fe186690f15df260d149e1caf0c6c459061de3740db5f9b2c6fe89fbc4c6` |
+| `teams/remote-control.md` | https://code.claude.com/docs/en/remote-control.md | 55,132 | `1a75c97f8e18af0e49b9a77a438e01ac2b838267bedc7ecbd9c467ce7a574eca` |
+| `teams/sub-agents.md` | https://code.claude.com/docs/en/sub-agents.md | 107,435 | `2a447df088c10f4edef2c565da63bdbb850d889423dd90322977ab4c8a6a4b75` |
+| `mods/lifecycle-browser-capture.txt` | https://code.claude.com/docs/en/plugins/mods/{overview,events,interface,api,reference,test,create} | 30,540 | `bd313b205d5115cc89d306abc01c74e4fe538cd5b47befaa3927a9b8e330de76` |
+| `mods/official-docs-browser-capture.json` | https://code.claude.com/docs/en/plugins/mods/{overview,events,interface,api,reference,test,create} | 31,633 | `d927c918c7913bb73849416e43032d872e754e98084560477f880998c8c0eecd` |

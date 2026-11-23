@@ -1,6 +1,6 @@
 # Built-in slash commands across coding agents: survey
 
-Date: 2026-10-19. Sources are snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/` (around 2026-09-30, plus `hermes-agent-2026-10-07`). This was a read-only grep/read survey. Nothing was run, built or installed.
+Date: 2026-10-19. Sources are snapshots under `./quarantine/` (around 2026-09-30, plus `hermes-agent-2026-10-07`). This was a read-only grep/read survey. Nothing was run, built or installed.
 
 Layout:
 - Sections 1-4: synthesis (coverage, per-agent mechanics, union table, common and distinctive commands).
@@ -252,7 +252,7 @@ Note: no codex-lineage agent (CX, OI) has undo or rewind.
 Read-only survey. Nothing in the reference trees was run, built or installed. For the
 Claude Code binary, printable strings were pulled from the Mach-O with `strings` into the
 scratchpad, then searched with regular expressions.
-Paths are relative to `/Users/patrickbeam/projects/blackbird/quarantine/`.
+Paths are relative to `./quarantine/`.
 
 ---
 
@@ -658,7 +658,7 @@ are inserted after `/model` when `service_tier_commands_enabled` is set
 
 ### Part B: built-in slash commands (opencode, pi, oh-my-pi, crush, mimo-code)
 
-All paths are relative to `/Users/patrickbeam/projects/blackbird/quarantine/`. This was a read-only grep/read survey: nothing was run or built.
+All paths are relative to `./quarantine/`. This was a read-only grep/read survey: nothing was run or built.
 
 ---
 
@@ -1074,7 +1074,7 @@ Every item marked conditional above is shown only when its condition holds. Ther
 
 ### Part C: built-in slash commands, gemini-cli / qwen-code / kimi-cli / goose / continue
 
-Read-only survey of source snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/`. Paths below are relative to each agent's tree. "?" marks uncertainty.
+Read-only survey of source snapshots under `./quarantine/`. Paths below are relative to each agent's tree. "?" marks uncertainty.
 
 ---
 
@@ -1499,7 +1499,7 @@ Read-only survey of source snapshots under `/Users/patrickbeam/projects/blackbir
 
 ### D. Built-in slash commands: aider, hermes-agent, mistral-vibe, gptme, open-interpreter (codex fork + classic), plandex
 
-Source snapshots under `/Users/patrickbeam/projects/blackbird/quarantine/` (paths below are relative to that). This is a read-only survey: nothing was run.
+Source snapshots under `./quarantine/` (paths below are relative to that). This is a read-only survey: nothing was run.
 
 ---
 
@@ -1911,7 +1911,7 @@ CLI-mirrored commands (`Repl: true`; alias in parentheses):
 
 ### Part E: built-in slash commands (letta-code, forgecode, vtcode, cline, roo-code)
 
-Source root: `/Users/patrickbeam/projects/blackbird/quarantine/`. Read-only grep/read survey. Paths below are relative to each agent's directory.
+Source root: `./quarantine/`. Read-only grep/read survey. Paths below are relative to each agent's directory.
 
 ---
 

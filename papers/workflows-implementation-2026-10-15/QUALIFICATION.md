@@ -2,7 +2,7 @@
 
 2026-10-15. First delivered slice of arconaut-45a, owned by arconaut-45a.1.
 Source branch: `work/concurrent-durable-workflows-2026-10-15`, isolated checkout
-`/Users/patrickbeam/projects/blackbird-workflows`. No main integration or running
+`~/projects/blackbird-workflows`. No main integration or running
 launcher replacement. [Usage and limits](../../docs/NATIVE_WORKFLOW_HOST.md),
 [remaining sequence](../../docs/WORKFLOW_DELIVERY.md),
 [implementation/review record](PLAN.md).

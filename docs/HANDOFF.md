@@ -3,7 +3,7 @@
 Historical as of 2026-10-19: this describes the 2026-10-14 watch. Current
 state is at the top of [CURRENT_STATE.md](CURRENT_STATE.md).
 
-2026-10-17 update: the operator authorized C++23 and Neuroses LLVM23.1.4/libc++23.1.4.
+2026-10-17 update: the operator authorized C++23 and `<linux-host>` LLVM23.1.4/libc++23.1.4.
 Mac retains LLVM23.1.2. The earlier toolchain declarations below describe their
 original snapshot; current profiles and qualification are in the
 [C++23 upgrade record](../papers/2026-10-17-cpp23-toolchain.md).
@@ -41,7 +41,7 @@ reference study does not adopt a library.
 
 ## Source and publication state
 
-Repo: /Users/patrickbeam/projects/blackbird. Current work branch:
+Repo: <repo>. Current work branch:
 **work/nls2-qualification-state**, pushed to origin. Remote is
 https://github.com/antimemeai/blackbird.git. This handoff is a documentation-only
 checkpoint after f250552; use git log/status for its final commit ID.
@@ -194,7 +194,7 @@ Station empty-steering separator. Earlier successes were not repeated for later
 oracle changes. No successful sample or slow outlier was discarded.
 
 macOS qualified tools: LLVM 23.1.2/libc++, Lua 5.4.8, C++20; presets use explicit
-Homebrew paths and actual SDK. Linux: Neuroses over Tailscale SSH, Clang 18.1.3/
+Homebrew paths and actual SDK. Linux: `<linux-host>` (`$BLACKBIRD_LINUX_HOST`) over SSH, Clang 18.1.3/
 libstdc++ 13, existing digest-pinned Lua 5.4.8 source archive. Use at most six total
 compiler/static workers and one Ninja writer per buildtree. Serialize native
 performance work per host. No mutants on the laptop. No new libraries selected.

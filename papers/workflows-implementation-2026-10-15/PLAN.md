@@ -1,7 +1,7 @@
 # Native concurrent workflow implementation
 
 2026-10-15. Operator authorizes implementation with “now send it”. Work only in
-`/Users/patrickbeam/projects/blackbird-workflows`, branch
+`~/projects/blackbird-workflows`, branch
 `work/concurrent-durable-workflows-2026-10-15`; the main checkout belongs to a
 colleague. The reviewed [design](../../docs/CONCURRENT_DURABLE_WORKFLOWS.md) and
 [delivery sequence](../../docs/WORKFLOW_DELIVERY.md) remain the destination.

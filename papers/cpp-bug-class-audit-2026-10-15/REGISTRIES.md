@@ -152,7 +152,7 @@ using capacity guards, container removal, threads, condition variables, waiters,
 receipt/history counts, and all explicit native `.join()` occurrences. This is a
 bounded class survey, not a claim of exhaustive correctness. The requested
 Rhizome rigor-watch paths `../rhizome/papers` and
-`/Users/patrickbeam/projects_old/rhizome/papers` were unavailable in this checkout;
+`~/projects_old/rhizome/papers` were unavailable in this checkout;
 no findings are attributed to an unread corpus.
 
 ## Prevention mechanisms grounded in source

@@ -9234,7 +9234,7 @@ run, certification campaign, test suppression or running-executable activation.
 
 Operator says send it, then requests a dedicated worktree because a colleague
 is actively changing the main checkout. Create sibling checkout
-/Users/patrickbeam/projects/blackbird-workflows on
+~/projects/blackbird-workflows on
 work/concurrent-durable-workflows-2026-10-15 from committed master fa347eb.
 That base already includes the workflow design and subsequent integrated work.
 Do not switch, stage, stash or modify the colleague's main-tree files/index.
@@ -10346,7 +10346,7 @@ command-helper and archive-helper paths now refer to this stable runtime.
 This builds identical merged source and does not repeat settled source checks.
 
 Reopened the normal Oxcart session
-`/Users/patrickbeam/projects_old/inactive-2026-10-07/bow_shock/context/runtime/live/blackbird`
+`~/projects_old/inactive-2026-10-07/bow_shock/context/runtime/live/blackbird`
 through the normal CLI with `--workflow` selecting the exported
 `source/programs/turn.lua`, `--plain` and stdin EOF. It exited zero, preserving
 conversation history/provider/auth and making no model request. Probe histories
@@ -11308,9 +11308,9 @@ RUN_SERIAL; unchanged deadlines/assertions and remaining deterministic-entry
 work are recorded in `arconaut-9h5`. No third review/assurance campaign is added.
 
 Actual `scripts/install-blackbird` builds production Release at final generation
-`/Users/patrickbeam/.local/lib/blackbird/releases/generation-z8hyFGNP`. Native
+`~/.local/lib/blackbird/releases/generation-z8hyFGNP`. Native
 help, isolated auth catalog and Lua exec with real PTY helper pass before atomic
-activation. `blackbird` resolves to `/Users/patrickbeam/.local/bin/blackbird`;
+activation. `blackbird` resolves to `~/.local/bin/blackbird`;
 help and auth providers pass through that wrapper from `/tmp`. Close installer
 `arconaut-5c4`. One actual host generation was built; update/rollback are covered
 by the direct filesystem fixture rather than a redundant production rebuild.
@@ -13281,7 +13281,7 @@ checkout and removing the repository's `.beads/` tracker and Dolt workspace
    - Removed all four auxiliary worktrees (`context/autodev-2026-10-26/composition`,
      `context/autodev-2026-10-26/continuity`, `context/oxcart-upgrade-2026-10-29`,
      and `../oxcart/context/blackbird-portable-source-2026-11-01/worktree`),
-     leaving `/Users/patrickbeam/projects/blackbird` as the sole checkout.
+     leaving `<repo>` as the sole checkout.
    - Archived untracked primary-checkout clutter (`blackbird-art/`,
      `blackbird-art.zip`, superseded `OXCART-HANDOFF-2026-10-23.md`, and the
      `.beads/backup/` snapshot) under `~/archives/blackbird-unification-2026-11-21/`.
@@ -13582,14 +13582,14 @@ in `CodingEngine::turn()`) with a single unified Block model and clean turn exec
      across turns while background command jobs remain active.
 
 
-## 2026-11-22 — Migrate Linux Checks to Wintermute (Clang 23.1.3 / libc++ 23.1.3 / Lua 5.5.1)
+## 2026-11-22 — Migrate Linux Checks to `<linux-host>` (Clang 23.1.3 / libc++ 23.1.3 / Lua 5.5.1)
 
-Replaced the retired Neuroses host with `patrick@wintermute` (`Arch/Omarchy Linux x86_64`,
+Replaced the retired Linux check host with `$BLACKBIRD_LINUX_HOST` (`Arch/Omarchy Linux x86_64`,
 48 cores) for ordinary Linux verification:
 - Provisioned `llvm`/`clang` `23.1.3`, `libc++`/`libc++abi` `23.1.3`, `compiler-rt`,
-  `lld`, `cmake` `4.4.4`, and `ninja` `1.13.2` on Wintermute alongside system `lua 5.5.1`.
-- Updated `CMakeLists.txt` (`linux-llvm23` -> `23.1.3`), `scripts/check-linux` (default
-  host `patrick@wintermute` with `BLACKBIRD_LINUX_HOST` override, system Lua 5.5.1,
+  `lld`, `cmake` `4.4.4`, and `ninja` `1.13.2` on `<linux-host>` alongside system `lua 5.5.1`.
+- Updated `CMakeLists.txt` (`linux-llvm23` -> `23.1.3`), `scripts/check-linux` (configured
+  via `BLACKBIRD_LINUX_HOST`, system Lua 5.5.1,
   `mise` shim `PATH` for `tui-test`, bundled `scripts/check-portable-runtime`, removed
   retired `lua-5.4.8` archive and deleted `context_cut_fuzz`/`saved_payload_fuzz`), and
   docs (`AGENTS.md`, `README.md`, `tooling/README.md`).
@@ -13601,7 +13601,7 @@ Replaced the retired Neuroses host with `patrick@wintermute` (`Arch/Omarchy Linu
   2. `scripts/check-terminal-pty` (`terminal_pty_comfort`): narrowed scroll-lock check
      so echoed `NEW_TAIL` in the `/lua` command line and in-place tail sliding inside
      collapsed tool cards do not trip false positives.
-- Qualified full `./scripts/check-linux --profiles debug release asan` on Wintermute:
+- Qualified full `./scripts/check-linux --profiles debug release asan` on `<linux-host>`:
   **292/292 Debug, 292/292 Release, and 292/292 ASan+UBSan** passed (`context/linux/run-tg3yf6tc`).
 
 
