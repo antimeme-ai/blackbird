@@ -2165,6 +2165,13 @@ void test_online_cli_subcommand(const fs::path &base) {
            {"online", "devices", "--help"},
            {"online", "devices", "init", "--help"},
            {"online", "devices", "install-cwt", "--help"},
+           {"online", "devices", "link", "--help"},
+           {"online", "devices", "link", "create", "--help"},
+           {"online", "devices", "link", "join", "--help"},
+           {"online", "devices", "link", "approve", "--help"},
+           {"online", "recovery-key", "--help"},
+           {"online", "export-mpkey", "--help"},
+           {"online", "recover", "--help"},
            {"online", "web-approve", "--help"},
            {"online", "friends", "--help"},
            {"online", "friends", "add", "--help"},
@@ -2185,8 +2192,16 @@ void test_online_cli_subcommand(const fs::path &base) {
     const auto top_help = run_cli({"online", "--help"});
     check(top_help.err.find("web-approve") != std::string::npos &&
               top_help.err.find("init") != std::string::npos &&
-              top_help.err.find("install-cwt") != std::string::npos,
-          "online --help must list web-approve and devices init|install-cwt");
+              top_help.err.find("install-cwt") != std::string::npos &&
+              top_help.err.find("link") != std::string::npos &&
+              top_help.err.find("recovery-key") != std::string::npos &&
+              top_help.err.find("export-mpkey") != std::string::npos &&
+              top_help.err.find("recover") != std::string::npos,
+          "online --help must list web-approve, devices init|install-cwt|link, "
+          "recovery-key, export-mpkey, recover");
+    const auto dev_help = run_cli({"online", "devices", "--help"});
+    check(dev_help.err.find("link") != std::string::npos,
+          "online devices --help must list link");
     const auto friends_help = run_cli({"online", "friends", "--help"});
     check(friends_help.err.find("accept") != std::string::npos &&
               friends_help.err.find("deny") != std::string::npos &&
@@ -2358,6 +2373,12 @@ state = {
     "devices": [],
     "friends": {},
     "parties": {},
+    "device_links": {},
+    "link_codes": ["W4K9-M2P7", "A2B3-C4D5", "H6J7-K8M9"],
+    "link_code_idx": 0,
+    "poll_nonces": set(),
+    "inject_429_inspect": {"A2B3-C4D5": True},
+    "inject_429_poll": {"A2B3-C4D5": True},
     "next_device_id": 2002,
     "next_party_id": 5001,
     "next_invite_id": 7001,
@@ -2393,8 +2414,9 @@ def read_http_request(conn):
 
 def send_json(conn, status, payload):
     body = json.dumps(payload).encode("utf-8")
-    reason = {200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized",
-              404: "Not Found", 409: "Conflict", 410: "Gone"}.get(status, "Error")
+    reason = {200: "OK", 201: "Created", 202: "Accepted", 400: "Bad Request",
+              401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+              409: "Conflict", 410: "Gone", 429: "Too Many Requests"}.get(status, "Error")
     resp = (
         f"HTTP/1.1 {status} {reason}\r\n"
         "Content-Type: application/json\r\n"
@@ -2497,6 +2519,153 @@ def handle_request(method, target, headers, body_bytes):
             if d["device_id"] == did:
                 d["revoked_at_ms"] = now_ms
         return 200, {"revoked": True, "evicted_parties": [], "pending_retries": 0}
+
+    if method == "POST" and path == "/v1/accounts/recover-lookup":
+        if 'keyid="rec.' not in headers.get("signature-input", ""):
+            return 401, {"error": "invalid_keyid"}
+        if body.get("root_pubkey_b64") != state["root_pubkey_b64"]:
+            return 404, {"error": "account_not_found"}
+        return 200, {
+            "account_id": state["account_id"],
+            "handle": state["handle"],
+            "root_pubkey_b64": state["root_pubkey_b64"],
+            "safety_number": "SPOOF-IGNORED-BY-CLIENT",
+            "devices": state["devices"],
+        }
+
+    if method == "POST" and path == "/v1/device-links/create":
+        if '.root"' not in headers.get("signature-input", ""):
+            return 403, {"error": "root_key_required"}
+        idx = state["link_code_idx"]
+        code = state["link_codes"][idx % len(state["link_codes"])]
+        state["link_code_idx"] = idx + 1
+        state["device_links"][code] = {
+            "status": 0,
+            "suggested_label": body.get("device_label"),
+            "device_pubkey_b64": None,
+            "device_label": None,
+            "poll_token": f"mpdl1_tok_{idx}_ABCDEFGHIJKLMNOPQRSTUVWXYZ01234",
+            "device_id": None,
+            "device_cwt_b64": None,
+            "cwt_expires_ms": None,
+            "created_at_ms": now_ms,
+            "expires_at_ms": now_ms + 300000,
+        }
+        return 201, {"link_code": code, "expires_at_ms": now_ms + 300000}
+
+    if method == "POST" and path == "/v1/device-links/claim":
+        if 'keyid="link.' not in headers.get("signature-input", ""):
+            return 401, {"error": "invalid_keyid"}
+        code = body.get("link_code", "")
+        rec = state["device_links"].get(code)
+        if rec is None or rec["status"] != 0:
+            return 404, {"error": "invalid_or_expired_link"}
+        rec["status"] = 1
+        rec["device_pubkey_b64"] = body["device_pubkey_b64"]
+        rec["device_label"] = body["device_label"]
+        return 200, {
+            "poll_token": rec["poll_token"],
+            "device_fingerprint": "00000000-00000000-00000000-00000000",
+            "expires_at_ms": rec["expires_at_ms"],
+        }
+
+    if method == "POST" and path == "/v1/device-links/inspect":
+        if '.root"' not in headers.get("signature-input", ""):
+            return 403, {"error": "root_key_required"}
+        code = body.get("link_code", "")
+        if state["inject_429_inspect"].pop(code, False):
+            with open(req_log_path, "a", encoding="utf-8") as logf:
+                logf.write("429 /v1/device-links/inspect\n")
+            return 429, {"error": "rate_limited"}
+        rec = state["device_links"].get(code)
+        if rec is None:
+            return 404, {"error": "invalid_or_expired_link"}
+        if rec["status"] == 0:
+            return 200, {
+                "state": "waiting_for_device",
+                "suggested_label": rec["suggested_label"],
+                "created_at_ms": rec["created_at_ms"],
+                "expires_at_ms": rec["expires_at_ms"],
+            }
+        return 200, {
+            "state": "pending_approval",
+            "device_pubkey_b64": rec["device_pubkey_b64"],
+            "device_fingerprint": "ffffffff-ffffffff-ffffffff-ffffffff",
+            "device_label": rec["device_label"],
+            "requester_country": "US",
+            "created_at_ms": rec["created_at_ms"],
+            "expires_at_ms": rec["expires_at_ms"],
+        }
+
+    if method == "POST" and path == "/v1/device-links/approve":
+        if '.root"' not in headers.get("signature-input", ""):
+            return 403, {"error": "root_key_required"}
+        code = body.get("link_code", "")
+        rec = state["device_links"].get(code)
+        if rec is None or rec["status"] != 1:
+            return 404, {"error": "invalid_or_expired_link"}
+        if body.get("device_pubkey_b64") != rec["device_pubkey_b64"]:
+            return 409, {"error": "device_pubkey_mismatch"}
+        did = state["next_device_id"]
+        state["next_device_id"] += 1
+        exp_ms = now_ms + 30 * 86400 * 1000
+        rec["status"] = 2
+        rec["device_id"] = did
+        rec["device_label"] = body["device_label"]
+        rec["device_cwt_b64"] = body["device_cwt_b64"]
+        rec["cwt_expires_ms"] = exp_ms
+        state["devices"].append({
+            "device_id": did,
+            "pubkey_b64": rec["device_pubkey_b64"],
+            "label": rec["device_label"],
+            "cwt_expires_ms": exp_ms,
+            "generation": 1,
+            "pop_verified": True,
+            "created_at_ms": now_ms,
+            "revoked_at_ms": None,
+        })
+        return 200, {
+            "approved": True,
+            "account_id": state["account_id"],
+            "device_id": did,
+            "device_label": rec["device_label"],
+            "device_fingerprint": "server-fp-ignored",
+            "cwt_expires_ms": exp_ms,
+        }
+
+    if method == "POST" and path == "/v1/device-links/poll":
+        si = headers.get("signature-input", "")
+        if 'keyid="link.' not in si:
+            return 401, {"error": "invalid_keyid"}
+        nonce_marker = 'nonce="'
+        n_pos = si.find(nonce_marker)
+        if n_pos != -1:
+            n_end = si.find('"', n_pos + len(nonce_marker))
+            nonce = si[n_pos + len(nonce_marker):n_end]
+            if nonce in state["poll_nonces"]:
+                return 401, {"error": "replay"}
+            state["poll_nonces"].add(nonce)
+        code = body.get("link_code", "")
+        if state["inject_429_poll"].pop(code, False):
+            with open(req_log_path, "a", encoding="utf-8") as logf:
+                logf.write("429 /v1/device-links/poll\n")
+            return 429, {"error": "rate_limited"}
+        rec = state["device_links"].get(code)
+        if (rec is None or body.get("poll_token") != rec["poll_token"]
+                or body.get("device_pubkey_b64") != rec["device_pubkey_b64"]):
+            return 404, {"error": "invalid_or_expired_link"}
+        if rec["status"] < 2:
+            return 202, {"status": "pending", "expires_at_ms": rec["expires_at_ms"]}
+        return 200, {
+            "status": "approved",
+            "account_id": state["account_id"],
+            "handle": state["handle"],
+            "device_id": rec["device_id"],
+            "root_pubkey_b64": state["root_pubkey_b64"],
+            "device_cwt_b64": rec["device_cwt_b64"],
+            "cwt_expires_ms": rec["cwt_expires_ms"],
+            "safety_number": "SPOOF-IGNORED-BY-CLIENT",
+        }
 
     if method == "POST" and path == "/v1/web-sessions/approve":
         uc = body.get("user_code", "")
@@ -2713,6 +2882,17 @@ finally:
     const auto dev_seed_bytes = read_binary_file(state_dir / "device.seed");
     check(root_seed_bytes.size() == 32U && dev_seed_bytes.size() == 32U,
           "expected 32-byte raw seeds in keystore");
+    // Verify `online register` prints canonical mprk1_... Recovery Key on stderr (Spec
+    // §2) while keeping stdout JSON backward-compatible and NEVER leaking raw/hex/b64
+    // seeds!
+    mp::Ed25519Seed reg_root_seed{};
+    std::memcpy(reg_root_seed.data(), root_seed_bytes.data(), 32U);
+    const auto expected_mprk1 = mp::encode_recovery_key(reg_root_seed);
+    check(expected_mprk1.has_value(), "encode_recovery_key failed");
+    check(reg_res.err.find(expected_mprk1.value()) != std::string::npos,
+          "online register must display canonical mprk1_ recovery key on stderr");
+    check(reg_res.out.find("mprk1_") == std::string::npos,
+          "online register must keep stdout JSON clean of recovery key");
     const std::string combined = reg_res.out + "\n" + reg_res.err;
     for (const std::string &forbidden : std::vector<std::string>{
              reg_secret,
@@ -3331,6 +3511,319 @@ finally:
                 .find("--label 'Work'\\''s $(id) Laptop' --pubkey-b64 " + quoted_pk) !=
             std::string::npos,
         "devices init next_step must POSIX shell-quote --label with spaces/quotes/$()");
+
+    // 15. Identity Portability v1 E2E:
+    //     (a) `online recovery-key` (primary succeeds, secondary fails closed)
+    //     (b) 2-step `devices link create --no-wait` <-> `devices link join` <->
+    //     `approve` (c) 1-command concurrent `devices link create` <-> `devices link
+    //     join` (d) `export-mpkey --passphrase-stdin` -> `recover --mpkey
+    //     --passphrase-stdin` (e) `mprk1_...` stdin `recover` roundtrip (f) ZERO
+    //     secrets accepted on argv (exit 2, zero echo!)
+    {
+      const auto orig_root_bytes = read_binary_file(state_dir / "root.seed");
+      check(orig_root_bytes.size() == 32U, "expected 32-byte primary root.seed");
+      mp::Ed25519Seed orig_root_seed{};
+      std::memcpy(orig_root_seed.data(), orig_root_bytes.data(), 32U);
+      const std::string expected_mprk = mp::encode_recovery_key(orig_root_seed).value();
+      const auto orig_root_key =
+          mp::Ed25519SigningKey::from_seed(orig_root_seed).value();
+      const std::string expected_sn =
+          mp::compute_safety_number(mp::AccountId::create(1001U).value(),
+                                    orig_root_key.public_key())
+              .value();
+
+      // (a) `online recovery-key` displays exact mprk1_ on primary, refuses secondary!
+      const auto rk_primary =
+          run_cli({"online", "recovery-key", "--state-dir", state_dir.string()});
+      check(rk_primary.exit_code == 0 && rk_primary.out == expected_mprk + "\n",
+            "online recovery-key on primary must output exact mprk1_");
+      const auto rk_secondary =
+          run_cli({"online", "recovery-key", "--state-dir", state_dir_b.string()});
+      check(rk_secondary.exit_code != 0 && rk_secondary.out.empty() &&
+                rk_secondary.err.find("missing_root_key") != std::string::npos,
+            "online recovery-key on secondary device must fail with missing_root_key");
+
+      // (b) 2-step Device Linking: create --no-wait -> join (thread) -> approve --yes!
+      const fs::path state_dir_c = base / "online-machine-c";
+      const auto create_nw_res =
+          run_cli({"online", "devices", "link", "create", "--label", "lap-c",
+                   "--no-wait", "--state-dir", state_dir.string(), "--connect-host",
+                   "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()});
+      const Value create_nw =
+          parse_stdout_json(create_nw_res, "devices link create --no-wait");
+      const std::string code1 = req_str(create_nw, "link_code");
+      check(code1 == "W4K9-M2P7" &&
+                req_str(create_nw, "join_command")
+                        .find("blackbird online devices link join W4K9-M2P7 --label "
+                              "lap-c") != std::string::npos &&
+                create_nw_res.err.find(code1) != std::string::npos,
+            "devices link create --no-wait output mismatch");
+
+      // Start `devices link join` in a background thread so it claims + polls 202->200!
+      CliResult join_c_res{};
+      std::thread join_c_thread([&]() {
+        join_c_res = run_cli({"online",
+                              "devices",
+                              "link",
+                              "join",
+                              "w4k9m2p7",
+                              "--label",
+                              "lap-c",
+                              "--poll-ms",
+                              "50",
+                              "--timeout-s",
+                              "15",
+                              "--state-dir",
+                              state_dir_c.string(),
+                              "--authority",
+                              "api.test.local",
+                              "--connect-host",
+                              "127.0.0.1",
+                              "--port",
+                              port_str,
+                              "--ca-bundle",
+                              crt_path.string()});
+      });
+
+      // Wait briefly until the new machine has claimed, then run `devices link
+      // approve`!
+      CliResult approve_c_res{};
+      for (int attempt = 0; attempt < 40; ++attempt) {
+        approve_c_res =
+            run_cli({"online", "devices", "link", "approve", code1, "--yes",
+                     "--state-dir", state_dir.string(), "--connect-host", "127.0.0.1",
+                     "--port", port_str, "--ca-bundle", crt_path.string()});
+        if (approve_c_res.exit_code == 0)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+      }
+      join_c_thread.join();
+
+      const Value approved_c =
+          parse_stdout_json(approve_c_res, "devices link approve --yes");
+      const Value joined_c = parse_stdout_json(join_c_res, "devices link join");
+      const std::string fp_c_approve = req_str(approved_c, "device_fingerprint");
+      const std::string fp_c_join = req_str(joined_c, "device_fingerprint");
+      check(std::get<bool>(req_field(approved_c, "approved").value()) &&
+                std::get<bool>(req_field(joined_c, "linked").value()) &&
+                fp_c_approve.size() == mp::kDeviceFingerprintFormattedLength &&
+                fp_c_approve == fp_c_join &&
+                fp_c_join != "00000000-00000000-00000000-00000000" &&
+                fp_c_approve != "ffffffff-ffffffff-ffffffff-ffffffff" &&
+                req_str(joined_c, "handle") == "pilot_one" &&
+                req_str(joined_c, "safety_number") == expected_sn &&
+                join_c_res.err.find("@pilot_one") != std::string::npos &&
+                join_c_res.err.find(expected_sn) != std::string::npos &&
+                approve_c_res.err.find(fp_c_approve) != std::string::npos &&
+                approve_c_res.err.find("US") != std::string::npos,
+            "2-step device link create/join/approve verification mismatch");
+      check(!fs::exists(state_dir_c / "root.seed"),
+            "linked machine C must NEVER receive root.seed");
+
+      // Machine C can immediately call live `whoami` with its installed CWT!
+      const Value whoami_c = parse_stdout_json(
+          run_cli({"online", "whoami", "--state-dir", state_dir_c.string(),
+                   "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                   crt_path.string()}),
+          "machine C live whoami after link join");
+      check(req_int(whoami_c, "account_id") == 1001 &&
+                req_str(whoami_c, "handle") == "pilot_one",
+            "machine C live whoami mismatch");
+
+      // Negative: `devices link join` MUST refuse to clobber existing registered
+      // keystore!
+      const auto clobber_join =
+          run_cli({"online", "devices", "link", "join", "A2B3-C4D5", "--label", "nope",
+                   "--state-dir", state_dir_c.string(), "--authority", "api.test.local",
+                   "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                   crt_path.string()});
+      check(clobber_join.exit_code != 0 && clobber_join.out.empty() &&
+                !clobber_join.err.empty(),
+            "devices link join must refuse to overwrite registered keystore");
+
+      // Negative: secondary machine CANNOT run `devices link create`!
+      const auto sec_create =
+          run_cli({"online", "devices", "link", "create", "--no-wait", "--state-dir",
+                   state_dir_c.string(), "--connect-host", "127.0.0.1", "--port",
+                   port_str, "--ca-bundle", crt_path.string()});
+      check(sec_create.exit_code != 0 && sec_create.out.empty() &&
+                sec_create.err.find("missing_root_key") != std::string::npos,
+            "devices link create on secondary device must fail with missing_root_key");
+
+      // (c) 1-command concurrent waiting `devices link create` (interactive "y\n" on
+      // io.in)
+      //     <-> `devices link join` (next link code A2B3-C4D5)!
+      const fs::path state_dir_d = base / "online-machine-d";
+      CliResult create_d_res{};
+      std::thread create_d_thread([&]() {
+        create_d_res =
+            run_cli({"online", "devices", "link", "create", "--label", "lap-d",
+                     "--poll-ms", "50", "--timeout-s", "15", "--state-dir",
+                     state_dir.string(), "--connect-host", "127.0.0.1", "--port",
+                     port_str, "--ca-bundle", crt_path.string()},
+                    "y\n");
+      });
+
+      CliResult join_d_res{};
+      for (int attempt = 0; attempt < 40; ++attempt) {
+        join_d_res = run_cli({"online",
+                              "devices",
+                              "link",
+                              "join",
+                              "A2B3-C4D5",
+                              "--label",
+                              "lap-d",
+                              "--poll-ms",
+                              "50",
+                              "--timeout-s",
+                              "15",
+                              "--state-dir",
+                              state_dir_d.string(),
+                              "--authority",
+                              "api.test.local",
+                              "--connect-host",
+                              "127.0.0.1",
+                              "--port",
+                              port_str,
+                              "--ca-bundle",
+                              crt_path.string()});
+        if (join_d_res.exit_code == 0)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+      }
+      create_d_thread.join();
+
+      const Value created_d =
+          parse_stdout_json(create_d_res, "1-command devices link create");
+      const Value joined_d =
+          parse_stdout_json(join_d_res, "1-command devices link join");
+      check(std::get<bool>(req_field(created_d, "approved").value()) &&
+                std::get<bool>(req_field(joined_d, "linked").value()) &&
+                req_str(created_d, "device_fingerprint") ==
+                    req_str(joined_d, "device_fingerprint") &&
+                req_str(joined_d, "safety_number") == expected_sn &&
+                !fs::exists(state_dir_d / "root.seed"),
+            "1-command concurrent devices link create/join mismatch");
+      {
+        std::ifstream log_in(req_log_path);
+        const std::string req_log{std::istreambuf_iterator<char>(log_in),
+                                  std::istreambuf_iterator<char>()};
+        check(req_log.find("429 /v1/device-links/inspect") != std::string::npos &&
+                  req_log.find("429 /v1/device-links/poll") != std::string::npos,
+              "both inspect and poll must survive HTTP 429 rate_limited via backoff");
+      }
+
+      // (d) `export-mpkey` -> mode 0600 + symlink refusal -> `recover --mpkey`
+      // roundtrip!
+      const fs::path mpkey_path = base / "backup.mpkey";
+      const std::string backup_pass = "correct-horse-battery-staple-42!";
+      const auto export_res =
+          run_cli({"online", "export-mpkey", "--out", mpkey_path.string(),
+                   "--passphrase-stdin", "--state-dir", state_dir.string()},
+                  backup_pass + "\n");
+      const Value exported = parse_stdout_json(export_res, "online export-mpkey");
+      check(std::get<bool>(req_field(exported, "exported").value()) &&
+                req_int(exported, "account_id") == 1001 &&
+                req_str(exported, "handle") == "pilot_one" &&
+                req_int(exported, "bytes") > 100,
+            "online export-mpkey JSON mismatch");
+      struct stat mpkey_st{};
+      check(::lstat(mpkey_path.c_str(), &mpkey_st) == 0 &&
+                (mpkey_st.st_mode & 0777U) == 0600U,
+            ".mpkey file must have mode 0600");
+      check((export_res.out + export_res.err).find(backup_pass) == std::string::npos &&
+                (export_res.out + export_res.err).find(expected_mprk) ==
+                    std::string::npos,
+            "export-mpkey must never leak passphrase or recovery key");
+
+      // Symlink --out MUST be refused!
+      const fs::path mpkey_symlink = base / "symlink.mpkey";
+      fs::create_symlink(mpkey_path, mpkey_symlink);
+      const auto bad_sym_export =
+          run_cli({"online", "export-mpkey", "--out", mpkey_symlink.string(),
+                   "--passphrase-stdin", "--state-dir", state_dir.string()},
+                  backup_pass + "\n");
+      check(bad_sym_export.exit_code != 0 && bad_sym_export.out.empty(),
+            "export-mpkey must refuse symlink --out");
+
+      // Recover from .mpkey into a fresh machine state dir!
+      const fs::path recovered_mpkey_dir = base / "online-recovered-mpkey";
+      const auto rec_mpkey_res =
+          run_cli({"online", "recover", "--mpkey", mpkey_path.string(),
+                   "--passphrase-stdin", "--device-label", "rescue-mpkey",
+                   "--state-dir", recovered_mpkey_dir.string(), "--authority",
+                   "api.test.local", "--connect-host", "127.0.0.1", "--port", port_str,
+                   "--ca-bundle", crt_path.string()},
+                  backup_pass + "\n");
+      const Value rec_mpkey =
+          parse_stdout_json(rec_mpkey_res, "online recover --mpkey");
+      check(
+          std::get<bool>(req_field(rec_mpkey, "recovered").value()) &&
+              req_int(rec_mpkey, "account_id") == 1001 &&
+              req_str(rec_mpkey, "handle") == "pilot_one" &&
+              req_str(rec_mpkey, "safety_number") == expected_sn &&
+              std::get<Value::Array>(req_field(rec_mpkey, "devices").value()).size() >=
+                  2U,
+          "online recover --mpkey JSON mismatch");
+      check(read_binary_file(recovered_mpkey_dir / "root.seed") == orig_root_bytes,
+            "recovered .mpkey keystore must restore exact root.seed byte-for-byte");
+      check((rec_mpkey_res.out + rec_mpkey_res.err).find(backup_pass) ==
+                std::string::npos,
+            "recover --mpkey must never leak passphrase");
+
+      // (e) `mprk1_...` stdin `recover` roundtrip into another fresh machine state dir!
+      const fs::path recovered_mprk_dir = base / "online-recovered-mprk";
+      const auto rec_mprk_res =
+          run_cli({"online", "recover", "--device-label", "rescue-mprk", "--state-dir",
+                   recovered_mprk_dir.string(), "--authority", "api.test.local",
+                   "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                   crt_path.string()},
+                  expected_mprk + "\n");
+      const Value rec_mprk =
+          parse_stdout_json(rec_mprk_res, "online recover mprk1 stdin");
+      check(std::get<bool>(req_field(rec_mprk, "recovered").value()) &&
+                req_int(rec_mprk, "account_id") == 1001 &&
+                req_str(rec_mprk, "handle") == "pilot_one" &&
+                req_str(rec_mprk, "safety_number") == expected_sn,
+            "online recover mprk1 stdin JSON mismatch");
+      check(read_binary_file(recovered_mprk_dir / "root.seed") == orig_root_bytes,
+            "recovered mprk1 keystore must restore exact root.seed byte-for-byte");
+      check((rec_mprk_res.out + rec_mprk_res.err).find(expected_mprk) ==
+                std::string::npos,
+            "recover must never echo recovery key");
+
+      // Recovered machine can immediately call `whoami` and `devices revoke`!
+      const Value rec_whoami = parse_stdout_json(
+          run_cli({"online", "whoami", "--state-dir", recovered_mprk_dir.string(),
+                   "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                   crt_path.string()}),
+          "recovered machine whoami");
+      check(req_int(rec_whoami, "account_id") == 1001,
+            "recovered machine live whoami failed");
+
+      // (f) ZERO secrets accepted on argv (exit 2 and NEVER echoed!)
+      const std::string fake_pass = "supersecret_argv_pass_999";
+      for (const std::vector<std::string> &bad_argv_cmd :
+           std::vector<std::vector<std::string>>{
+               {"online", "export-mpkey", "--out", (base / "x.mpkey").string(),
+                "--passphrase", fake_pass, "--state-dir", state_dir.string()},
+               {"online", "recover", "--recovery-key", expected_mprk, "--state-dir",
+                (base / "no-dir").string()},
+               {"online", "recover", expected_mprk, "--state-dir",
+                (base / "no-dir").string()},
+               {"online", "recover", "--mpkey", mpkey_path.string(), "--passphrase",
+                fake_pass, "--state-dir", (base / "no-dir").string()},
+           }) {
+        const auto bad = run_cli(bad_argv_cmd);
+        check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+              "secrets on argv must exit 2");
+        check(bad.err.find(fake_pass) == std::string::npos &&
+                  bad.err.find(expected_mprk) == std::string::npos,
+              "argv rejection error must NEVER echo secret material");
+      }
+      check(!fs::exists(base / "no-dir"),
+            "rejected recover argv must create zero directories");
+    }
 
     // online party attach CLI usage & fail-closed validation checks.
     const auto attach_help = run_cli({"online", "party", "attach", "--help"});

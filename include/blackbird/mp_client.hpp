@@ -277,6 +277,88 @@ struct RevokeDeviceResponse {
 // XXXX-XXXX in uppercase/lowercase, rejects I/L/O/U and controls, returns XXXX-XXXX).
 Result<std::string> normalize_web_user_code(std::string_view user_code);
 
+// Crockford Base32 device-link code normalizer (accepts XXXXXXXX or XXXX-XXXX in
+// uppercase/lowercase plus Crockford typo aliases O->0 and I/L->1, rejects U and
+// controls, returns canonical uppercase XXXX-XXXX).
+Result<std::string> normalize_device_link_code(std::string_view link_code);
+
+struct RecoverLookupResponse {
+  AccountId account_id;
+  std::string handle;
+  Ed25519PubKey root_pubkey{};
+  std::string safety_number;
+  std::vector<DeviceInfo> devices;
+  bool operator==(const RecoverLookupResponse &) const = default;
+};
+
+struct CreateDeviceLinkResponse {
+  std::string link_code;
+  std::uint64_t expires_at_ms = 0U;
+  bool operator==(const CreateDeviceLinkResponse &) const = default;
+};
+
+struct ClaimDeviceLinkResponse {
+  std::string poll_token;
+  std::string server_device_fingerprint;
+  std::string local_device_fingerprint;
+  std::uint64_t expires_at_ms = 0U;
+  bool operator==(const ClaimDeviceLinkResponse &) const = default;
+};
+
+enum class DeviceLinkState : std::uint8_t {
+  waiting_for_device = 0,
+  pending_approval = 1,
+};
+
+struct InspectDeviceLinkResponse {
+  DeviceLinkState state = DeviceLinkState::waiting_for_device;
+  std::optional<std::string> suggested_label;
+  std::optional<Ed25519PubKey> device_pubkey;
+  std::optional<std::string> server_device_fingerprint;
+  std::optional<std::string> local_device_fingerprint;
+  std::optional<std::string> device_label;
+  std::optional<std::string> requester_country;
+  std::uint64_t created_at_ms = 0U;
+  std::uint64_t expires_at_ms = 0U;
+  bool operator==(const InspectDeviceLinkResponse &) const = default;
+};
+
+struct ApproveDeviceLinkRequest {
+  std::string link_code;
+  Ed25519PubKey device_pubkey{};
+  std::vector<std::uint8_t> device_cwt;
+  std::string device_label;
+};
+
+struct ApproveDeviceLinkResponse {
+  bool approved = false;
+  AccountId account_id;
+  DeviceId device_id;
+  std::string device_label;
+  std::string device_fingerprint;
+  std::uint64_t cwt_expires_ms = 0U;
+  bool operator==(const ApproveDeviceLinkResponse &) const = default;
+};
+
+struct PollDeviceLinkRequest {
+  std::string link_code;
+  std::string poll_token;
+};
+
+struct PollDeviceLinkResponse {
+  bool pending = false;
+  bool approved = false;
+  std::optional<std::uint64_t> expires_at_ms;
+  std::optional<AccountId> account_id;
+  std::optional<std::string> handle;
+  std::optional<DeviceId> device_id;
+  std::optional<Ed25519PubKey> root_pubkey;
+  std::vector<std::uint8_t> device_cwt;
+  std::optional<std::uint64_t> cwt_expires_ms;
+  std::optional<std::string> safety_number;
+  bool operator==(const PollDeviceLinkResponse &) const = default;
+};
+
 struct WebSessionApproveResponse {
   bool approved = false;
   std::string scope;
@@ -467,6 +549,24 @@ public:
   Result<ResolvedAccount> resolve_handle(std::string_view handle);
   Result<EnrollDeviceResponse> enroll_device(const EnrollDeviceRequest &request);
   Result<RevokeDeviceResponse> revoke_device(DeviceId device_id);
+
+  // Identity Portability v1: recovery lookup (rec.<hex32> signed by root_signing_key)
+  Result<RecoverLookupResponse>
+  recover_account_lookup(const Ed25519SigningKey &root_signing_key);
+
+  // Identity Portability v1: Primary-Initiated Device Linking
+  Result<CreateDeviceLinkResponse>
+  create_device_link(const std::optional<std::string> &device_label = std::nullopt);
+  Result<ClaimDeviceLinkResponse>
+  claim_device_link(std::string_view link_code,
+                    const Ed25519SigningKey &device_signing_key,
+                    std::string_view device_label);
+  Result<InspectDeviceLinkResponse> inspect_device_link(std::string_view link_code);
+  Result<ApproveDeviceLinkResponse>
+  approve_device_link(const ApproveDeviceLinkRequest &request);
+  Result<PollDeviceLinkResponse>
+  poll_device_link(const Ed25519SigningKey &device_signing_key,
+                   const PollDeviceLinkRequest &request);
 
   // Web account portal approval (device-key signed POST /v1/web-sessions/approve)
   Result<WebSessionApproveResponse> approve_web_session(std::string_view user_code);

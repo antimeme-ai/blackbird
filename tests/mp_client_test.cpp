@@ -370,6 +370,21 @@ struct LoopbackServerState {
   int clock_skew_rejections = 0;
   int verified_rfc9421_calls = 0;
   std::string last_web_approve_code;
+  Ed25519PubKey link_device_pubkey{};
+  std::string link_code = "W4K9-M2P7";
+  std::string link_poll_token = "mpdl1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  std::string link_suggested_label;
+  std::string link_claimed_label;
+  std::string link_approved_cwt_b64;
+  std::string last_poll_nonce;
+  int link_status = 0; // 0=waiting_for_device, 1=pending_approval, 2=approved
+  bool spoof_recover_root_pubkey = false;
+  bool spoof_recover_safety_number = false;
+  bool spoof_poll_wrong_device_cwt = false;
+  bool spoof_poll_bad_root_cwt = false;
+  bool spoof_poll_safety_number = false;
+  std::string wrong_device_cwt_b64;
+  Ed25519PubKey wrong_root_pubkey{};
   bool ws_received_masked_endpoint_update = false;
   bool ws_received_masked_ping = false;
   bool ws_received_masked_pong = false;
@@ -709,15 +724,20 @@ private:
       return;
     }
 
-    // Determine whether .root or device key signed this request.
+    // Determine which key signed this request (.root, rec., link., or device).
     const auto parsed_si = parse_signature_input(headers["signature-input"]);
     require_ok(parsed_si.has_value());
     Ed25519PubKey verify_pk{};
     {
       std::lock_guard<std::mutex> lk{state_.mu};
-      verify_pk = std::holds_alternative<RootKeyId>(parsed_si.value().keyid)
-                      ? state_.registered_root_pubkey
-                      : state_.registered_device_pubkey;
+      if (std::holds_alternative<RootKeyId>(parsed_si.value().keyid) ||
+          std::holds_alternative<RecoveryKeyId>(parsed_si.value().keyid)) {
+        verify_pk = state_.registered_root_pubkey;
+      } else if (std::holds_alternative<DeviceLinkKeyId>(parsed_si.value().keyid)) {
+        verify_pk = state_.link_device_pubkey;
+      } else {
+        verify_pk = state_.registered_device_pubkey;
+      }
     }
     if (!verify_request_with_key(verify_pk)) {
       SSL_shutdown(ssl);
@@ -764,6 +784,155 @@ private:
       send_json(ssl, 200, "OK",
                 "{\"revoked\":true,\"evicted_parties\":[" +
                     std::to_string(state_.party_id) + "],\"pending_retries\":0}");
+    } else if (method_str == "POST" && path == "/v1/accounts/recover-lookup") {
+      require_ok(std::holds_alternative<RecoveryKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *rpk_field = json.value().find("root_pubkey_b64");
+      require_ok(rpk_field != nullptr &&
+                 std::holds_alternative<std::string>(rpk_field->value()));
+      const Ed25519PubKey resp_rpk = state_.spoof_recover_root_pubkey
+                                         ? state_.wrong_root_pubkey
+                                         : state_.registered_root_pubkey;
+      const std::string sn =
+          state_.spoof_recover_safety_number
+              ? "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"
+              : compute_safety_number(AccountId::create(state_.account_id).value(),
+                                      state_.registered_root_pubkey)
+                    .value();
+      const std::string body =
+          "{\"account_id\":" + std::to_string(state_.account_id) + ",\"handle\":\"" +
+          state_.handle + "\",\"root_pubkey_b64\":\"" + base64_encode_test(resp_rpk) +
+          "\",\"safety_number\":\"" + sn +
+          "\",\"devices\":[{\"device_id\":" + std::to_string(state_.device_id) +
+          ",\"pubkey_b64\":\"" + base64_encode_test(state_.registered_device_pubkey) +
+          "\",\"label\":\"laptop\",\"cwt_expires_ms\":" +
+          std::to_string(now_ms + 86400000U) +
+          ",\"generation\":1,\"pop_verified\":1,\"created_at_ms\":" +
+          std::to_string(now_ms) + ",\"revoked_at_ms\":null}]}";
+      send_json(ssl, 200, "OK", body);
+    } else if (method_str == "POST" && path == "/v1/device-links/create") {
+      require_ok(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      if (const Value *lbl = json.value().find("device_label");
+          lbl != nullptr && std::holds_alternative<std::string>(lbl->value())) {
+        state_.link_suggested_label = lbl->string();
+      } else {
+        state_.link_suggested_label.clear();
+      }
+      state_.link_status = 0;
+      state_.link_claimed_label.clear();
+      state_.link_approved_cwt_b64.clear();
+      state_.last_poll_nonce.clear();
+      send_json(ssl, 201, "Created",
+                "{\"link_code\":\"" + state_.link_code +
+                    "\",\"expires_at_ms\":" + std::to_string(now_ms + 300000U) + "}");
+    } else if (method_str == "POST" && path == "/v1/device-links/claim") {
+      require_ok(std::holds_alternative<DeviceLinkKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *lc = json.value().find("link_code");
+      const Value *lbl = json.value().find("device_label");
+      require_ok(lc != nullptr && std::holds_alternative<std::string>(lc->value()) &&
+                 lc->string() == state_.link_code);
+      require_ok(lbl != nullptr && std::holds_alternative<std::string>(lbl->value()));
+      state_.link_claimed_label = lbl->string();
+      state_.link_status = 1;
+      // Deliberately return a spoofed server device_fingerprint to verify client
+      // computes local_device_fingerprint locally!
+      send_json(ssl, 200, "OK",
+                "{\"poll_token\":\"" + state_.link_poll_token +
+                    "\",\"device_fingerprint\":\"00000000-00000000-00000000-00000000\","
+                    "\"expires_at_ms\":" +
+                    std::to_string(now_ms + 300000U) + "}");
+    } else if (method_str == "POST" && path == "/v1/device-links/inspect") {
+      require_ok(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *lc = json.value().find("link_code");
+      require_ok(lc != nullptr && std::holds_alternative<std::string>(lc->value()) &&
+                 lc->string() == state_.link_code);
+      if (state_.link_status == 0) {
+        send_json(ssl, 200, "OK",
+                  "{\"state\":\"waiting_for_device\",\"suggested_label\":\"" +
+                      state_.link_suggested_label +
+                      "\",\"created_at_ms\":" + std::to_string(now_ms) +
+                      ",\"expires_at_ms\":" + std::to_string(now_ms + 300000U) + "}");
+      } else {
+        // Deliberately send a bogus server device_fingerprint to prove client computes
+        // local_device_fingerprint from device_pubkey_b64!
+        send_json(
+            ssl, 200, "OK",
+            "{\"state\":\"pending_approval\",\"device_pubkey_b64\":\"" +
+                base64_encode_test(state_.link_device_pubkey) +
+                "\",\"device_fingerprint\":\"ffffffff-ffffffff-ffffffff-ffffffff\","
+                "\"device_label\":\"" +
+                state_.link_claimed_label +
+                "\",\"requester_country\":\"US\",\"created_at_ms\":" +
+                std::to_string(now_ms) +
+                ",\"expires_at_ms\":" + std::to_string(now_ms + 300000U) + "}");
+      }
+    } else if (method_str == "POST" && path == "/v1/device-links/approve") {
+      require_ok(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *lc = json.value().find("link_code");
+      const Value *cwt_f = json.value().find("device_cwt_b64");
+      const Value *lbl_f = json.value().find("device_label");
+      require_ok(lc != nullptr && lc->string() == state_.link_code);
+      require_ok(cwt_f != nullptr &&
+                 std::holds_alternative<std::string>(cwt_f->value()));
+      require_ok(lbl_f != nullptr &&
+                 std::holds_alternative<std::string>(lbl_f->value()));
+      state_.link_approved_cwt_b64 = cwt_f->string();
+      state_.link_claimed_label = lbl_f->string();
+      state_.link_status = 2;
+      const std::string fp =
+          compute_device_fingerprint(state_.link_device_pubkey).value();
+      send_json(
+          ssl, 200, "OK",
+          "{\"approved\":true,\"account_id\":" + std::to_string(state_.account_id) +
+              ",\"device_id\":2099,\"device_label\":\"" + state_.link_claimed_label +
+              "\",\"device_fingerprint\":\"" + fp +
+              "\",\"cwt_expires_ms\":" + std::to_string(now_ms + 86400000U) + "}");
+    } else if (method_str == "POST" && path == "/v1/device-links/poll") {
+      require_ok(std::holds_alternative<DeviceLinkKeyId>(parsed_si.value().keyid));
+      // Every poll MUST carry a fresh RFC 9421 nonce!
+      require_ok(parsed_si.value().nonce != state_.last_poll_nonce);
+      state_.last_poll_nonce = parsed_si.value().nonce;
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *lc = json.value().find("link_code");
+      const Value *pt = json.value().find("poll_token");
+      require_ok(lc != nullptr && lc->string() == state_.link_code);
+      require_ok(pt != nullptr && pt->string() == state_.link_poll_token);
+      if (state_.link_status < 2) {
+        send_json(ssl, 202, "Accepted",
+                  "{\"status\":\"pending\",\"expires_at_ms\":" +
+                      std::to_string(now_ms + 300000U) + "}");
+      } else {
+        const Ed25519PubKey resp_rpk = state_.spoof_poll_bad_root_cwt
+                                           ? state_.wrong_root_pubkey
+                                           : state_.registered_root_pubkey;
+        const std::string &resp_cwt_b64 = state_.spoof_poll_wrong_device_cwt
+                                              ? state_.wrong_device_cwt_b64
+                                              : state_.link_approved_cwt_b64;
+        const std::string resp_sn =
+            state_.spoof_poll_safety_number
+                ? "ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ"
+                : compute_safety_number(AccountId::create(state_.account_id).value(),
+                                        state_.registered_root_pubkey)
+                      .value();
+        send_json(ssl, 200, "OK",
+                  "{\"status\":\"approved\",\"account_id\":" +
+                      std::to_string(state_.account_id) + ",\"handle\":\"" +
+                      state_.handle + "\",\"device_id\":2099,\"root_pubkey_b64\":\"" +
+                      base64_encode_test(resp_rpk) + "\",\"device_cwt_b64\":\"" +
+                      resp_cwt_b64 +
+                      "\",\"cwt_expires_ms\":" + std::to_string(now_ms + 86400000U) +
+                      ",\"safety_number\":\"" + resp_sn + "\"}");
+      }
     } else if (method_str == "POST" && path == "/v1/web-sessions/approve") {
       require_ok(std::holds_alternative<DeviceKeyId>(parsed_si.value().keyid));
       const auto json = parse_json(body_str);
@@ -1861,9 +2030,198 @@ void test_loopback_tls_rest_and_ws() {
     require_ok(srv_state.health_calls == health_pre_ws + 1);
   }
 
+  // 12. Identity Portability v1 REST endpoints (recover-lookup + full 5-step
+  //     device-links flow + local CWT/pubkey/fingerprint/safety-number verification!)
+  {
+    // 12a. normalize_device_link_code (Crockford typo aliases O->0, I/L->1; reject U)
+    require_ok(normalize_device_link_code("w4k9-m2p7").value() == "W4K9-M2P7");
+    require_ok(normalize_device_link_code("w4k9m2p7").value() == "W4K9-M2P7");
+    require_ok(normalize_device_link_code("oOiI-lL01").value() == "0011-1101");
+    require_ok(!normalize_device_link_code("W4K9-M2PU").has_value());
+    require_ok(!normalize_device_link_code("W4K9-M2P\n").has_value());
+
+    const auto other_root_key = Ed25519SigningKey::generate().value();
+    const auto new_dev_key = Ed25519SigningKey::generate().value();
+    const auto expected_sn =
+        compute_safety_number(AccountId::create(1001U).value(), root_key.public_key())
+            .value();
+    const auto expected_dev_fp =
+        compute_device_fingerprint(new_dev_key.public_key()).value();
+    const auto wrong_dev_cwt =
+        encode_device_cwt(root_key, DeviceCwtMintRequest{dev_key.public_key(),
+                                                         now_s - 5, now_s + 86400})
+            .value();
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.link_device_pubkey = new_dev_key.public_key();
+      srv_state.wrong_root_pubkey = other_root_key.public_key();
+      srv_state.wrong_device_cwt_b64 = base64_encode_test(wrong_dev_cwt);
+    }
+
+    // 12b. recover_account_lookup: happy path + spoofed safety_number recomputed
+    // locally
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_recover_safety_number = true;
+      srv_state.spoof_recover_root_pubkey = false;
+    }
+    MpControlClient unauth_client{base_cfg};
+    const auto rec_ok = unauth_client.recover_account_lookup(root_key);
+    require_ok(rec_ok.has_value());
+    require_ok(rec_ok.value().account_id == AccountId::create(1001U).value());
+    require_ok(rec_ok.value().handle == "alice_test");
+    require_ok(rec_ok.value().root_pubkey == root_key.public_key());
+    require_ok(rec_ok.value().safety_number == expected_sn);
+    require_ok(rec_ok.value().devices.size() == 1U);
+
+    // 12c. recover_account_lookup MUST reject mismatched server root_pubkey!
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_recover_root_pubkey = true;
+      srv_state.spoof_recover_safety_number = false;
+    }
+    const auto rec_bad_pk = unauth_client.recover_account_lookup(root_key);
+    require_ok(!rec_bad_pk.has_value());
+    require_ok(mp_client_error_of(rec_bad_pk.error()) ==
+               MpClientError::http_response_schema);
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_recover_root_pubkey = false;
+    }
+
+    // 12d. Device-only client MUST be refused locally on .root-only create_device_link
+    {
+      MpIdentityState dev_only{};
+      dev_only.device_seed = dev_seed;
+      dev_only.account_id = AccountId::create(1001U).value();
+      dev_only.device_id = DeviceId::create(2001U).value();
+      dev_only.handle = "alice_test";
+      dev_only.authority = base_cfg.authority;
+      MpControlClient dev_client{base_cfg, std::move(dev_only)};
+      const auto no_root = dev_client.create_device_link("wintermute");
+      require_ok(!no_root.has_value());
+      require_ok(mp_client_error_of(no_root.error()) ==
+                 MpClientError::missing_root_key);
+    }
+
+    // 12e. Invalid device label rejected BEFORE hitting network
+    const auto bad_lbl = client.create_device_link(std::string{"bad\x1b[31m"});
+    require_ok(!bad_lbl.has_value());
+    require_ok(mp_error_of(bad_lbl.error()) == MpError::invalid_device_label);
+
+    // 12f. Step A: Primary (.root) creates device link
+    const auto link_created = client.create_device_link(std::string{"wintermute"});
+    require_ok(link_created.has_value());
+    require_ok(link_created.value().link_code == "W4K9-M2P7");
+    require_ok(link_created.value().expires_at_ms > 0U);
+
+    // 12g. Step C (before claim): inspect returns waiting_for_device
+    const auto insp_wait = client.inspect_device_link(link_created.value().link_code);
+    require_ok(insp_wait.has_value());
+    require_ok(insp_wait.value().state == DeviceLinkState::waiting_for_device);
+    require_ok(insp_wait.value().suggested_label ==
+               std::optional<std::string>{"wintermute"});
+    require_ok(!insp_wait.value().device_pubkey.has_value());
+
+    // 12h. Step B: New machine claims link (using lowercase without hyphen!)
+    const auto claimed =
+        unauth_client.claim_device_link("w4k9m2p7", new_dev_key, "wintermute");
+    require_ok(claimed.has_value());
+    require_ok(claimed.value().poll_token.starts_with("mpdl1_"));
+    // Client MUST compute local_device_fingerprint locally (ignoring spoofed server
+    // fp!)
+    require_ok(claimed.value().server_device_fingerprint ==
+               "00000000-00000000-00000000-00000000");
+    require_ok(claimed.value().local_device_fingerprint == expected_dev_fp);
+
+    // 12i. Step C (after claim): inspect returns pending_approval + local fingerprint
+    const auto insp_pending =
+        client.inspect_device_link(link_created.value().link_code);
+    require_ok(insp_pending.has_value());
+    require_ok(insp_pending.value().state == DeviceLinkState::pending_approval);
+    require_ok(insp_pending.value().device_pubkey.has_value() &&
+               *insp_pending.value().device_pubkey == new_dev_key.public_key());
+    require_ok(insp_pending.value().local_device_fingerprint ==
+               std::optional<std::string>{expected_dev_fp});
+    require_ok(insp_pending.value().requester_country ==
+               std::optional<std::string>{"US"});
+
+    // 12j. Step E (before approve): poll returns 202 pending
+    const auto poll_wait = unauth_client.poll_device_link(
+        new_dev_key, PollDeviceLinkRequest{link_created.value().link_code,
+                                           claimed.value().poll_token});
+    require_ok(poll_wait.has_value());
+    require_ok(poll_wait.value().pending);
+    require_ok(!poll_wait.value().approved);
+    require_ok(poll_wait.value().expires_at_ms.has_value());
+
+    // 12k. Step D: Primary signs 30-day CWT locally and approves!
+    const auto new_dev_cwt =
+        encode_device_cwt(root_key, DeviceCwtMintRequest{new_dev_key.public_key(),
+                                                         now_s - 5, now_s + 86400})
+            .value();
+    const auto approved = client.approve_device_link(ApproveDeviceLinkRequest{
+        link_created.value().link_code,
+        require_opt(insp_pending.value().device_pubkey),
+        new_dev_cwt,
+        "wintermute",
+    });
+    require_ok(approved.has_value());
+    require_ok(approved.value().approved);
+    require_ok(approved.value().account_id == AccountId::create(1001U).value());
+    require_ok(approved.value().device_id == DeviceId::create(2099U).value());
+    require_ok(approved.value().device_fingerprint == expected_dev_fp);
+
+    // 12l. Step E negative tests: poll MUST reject CWT for wrong device_pubkey OR wrong
+    //      root_pubkey!
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_poll_wrong_device_cwt = true;
+    }
+    const auto poll_bad_dev = unauth_client.poll_device_link(
+        new_dev_key, PollDeviceLinkRequest{link_created.value().link_code,
+                                           claimed.value().poll_token});
+    require_ok(!poll_bad_dev.has_value());
+    require_ok(mp_error_of(poll_bad_dev.error()) == MpError::cwt_device_key_mismatch);
+
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_poll_wrong_device_cwt = false;
+      srv_state.spoof_poll_bad_root_cwt = true;
+    }
+    const auto poll_bad_root = unauth_client.poll_device_link(
+        new_dev_key, PollDeviceLinkRequest{link_created.value().link_code,
+                                           claimed.value().poll_token});
+    require_ok(!poll_bad_root.has_value());
+    require_ok(mp_error_of(poll_bad_root.error()) == MpError::cwt_issuer_mismatch ||
+               mp_error_of(poll_bad_root.error()) == MpError::invalid_signature);
+
+    // 12m. Step E happy path: poll returns 200 approved, verifies CWT locally, and
+    //      recomputes safety_number locally (ignoring spoofed server safety_number!)
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.spoof_poll_bad_root_cwt = false;
+      srv_state.spoof_poll_safety_number = true;
+    }
+    const auto poll_ok = unauth_client.poll_device_link(
+        new_dev_key, PollDeviceLinkRequest{link_created.value().link_code,
+                                           claimed.value().poll_token});
+    require_ok(poll_ok.has_value());
+    require_ok(!poll_ok.value().pending);
+    require_ok(poll_ok.value().approved);
+    require_ok(poll_ok.value().account_id == AccountId::create(1001U).value());
+    require_ok(poll_ok.value().device_id == DeviceId::create(2099U).value());
+    require_ok(poll_ok.value().handle == std::optional<std::string>{"alice_test"});
+    require_ok(poll_ok.value().root_pubkey ==
+               std::optional<Ed25519PubKey>{root_key.public_key()});
+    require_ok(poll_ok.value().device_cwt == new_dev_cwt);
+    require_ok(poll_ok.value().safety_number ==
+               std::optional<std::string>{expected_sn});
+  }
+
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
-    require_ok(srv_state.verified_rfc9421_calls >= 15);
+    require_ok(srv_state.verified_rfc9421_calls >= 22);
   }
 
   std::cout << "PASS test_loopback_tls_rest_and_ws\n";

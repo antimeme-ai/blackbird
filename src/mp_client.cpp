@@ -2634,6 +2634,30 @@ std::optional<char> normalize_crockford_base32_char(char ch) noexcept {
   return up;
 }
 
+std::optional<char> normalize_crockford_link_char(char ch) noexcept {
+  if (ch >= '0' && ch <= '9') {
+    return ch;
+  }
+  char up = ch;
+  if (ch >= 'a' && ch <= 'z') {
+    up = static_cast<char>(ch - ('a' - 'A'));
+  }
+  if (up < 'A' || up > 'Z') {
+    return std::nullopt;
+  }
+  // Crockford typo aliases: O->0, I/L->1; reject U.
+  if (up == 'O') {
+    return '0';
+  }
+  if (up == 'I' || up == 'L') {
+    return '1';
+  }
+  if (up == 'U') {
+    return std::nullopt;
+  }
+  return up;
+}
+
 } // namespace
 
 Result<MpIdentityStore>
@@ -2777,6 +2801,33 @@ Result<std::string> normalize_web_user_code(std::string_view user_code) {
     }
     normalized.push_back(*ch);
     if (user_code.size() == 8U && i == 3U) {
+      normalized.push_back('-');
+    }
+  }
+  return Result<std::string>::success(std::move(normalized));
+}
+
+Result<std::string> normalize_device_link_code(std::string_view link_code) {
+  if (link_code.size() != 8U && link_code.size() != 9U) {
+    return fail_c<std::string>(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  if (link_code.size() == 9U && link_code[4] != '-') {
+    return fail_c<std::string>(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  std::string normalized;
+  normalized.reserve(9U);
+  for (std::size_t i = 0U; i < link_code.size(); ++i) {
+    if (link_code.size() == 9U && i == 4U) {
+      normalized.push_back('-');
+      continue;
+    }
+    const auto ch = normalize_crockford_link_char(link_code[i]);
+    if (!ch.has_value()) {
+      return fail_c<std::string>(ErrorCode::invalid_range,
+                                 MpClientError::invalid_config);
+    }
+    normalized.push_back(*ch);
+    if (link_code.size() == 8U && i == 3U) {
       normalized.push_back('-');
     }
   }
@@ -3464,6 +3515,74 @@ require_root_auth(const std::optional<MpIdentityState> &identity) {
       RootAuthContext{*identity->account_id, std::move(key).value()});
 }
 
+Result<std::optional<std::string>> get_optional_string(const Value &obj,
+                                                       std::string_view key) {
+  const Value *field = obj.find(key);
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::optional<std::string>>::success(std::nullopt);
+  }
+  const auto *s = std::get_if<std::string>(&field->value());
+  if (s == nullptr) {
+    return fail_c<std::optional<std::string>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+  }
+  return Result<std::optional<std::string>>::success(*s);
+}
+
+Result<std::vector<DeviceInfo>> parse_device_info_list(const Value &obj) {
+  std::vector<DeviceInfo> devices;
+  const Value *devs_field = obj.find("devices");
+  if (devs_field == nullptr) {
+    return Result<std::vector<DeviceInfo>>::success(std::move(devices));
+  }
+  const auto *arr = std::get_if<Value::Array>(&devs_field->value());
+  if (arr == nullptr) {
+    return fail_c<std::vector<DeviceInfo>>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+  devices.reserve(arr->size());
+  for (const auto &entry : *arr) {
+    if (!std::holds_alternative<Value::Object>(entry.value())) {
+      return fail_c<std::vector<DeviceInfo>>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    const auto did_raw = get_required_u64(entry, "device_id");
+    const auto dpk = get_required_pubkey_b64(entry, "pubkey_b64");
+    const auto label = get_required_string(entry, "label");
+    const auto cwt_exp = get_required_u64(entry, "cwt_expires_ms");
+    const auto gen = get_required_u64(entry, "generation");
+    const auto created_ms = get_required_u64(entry, "created_at_ms");
+    const Value *pop_field = entry.find("pop_verified");
+    if (!did_raw.has_value() || !dpk.has_value() || !label.has_value() ||
+        !cwt_exp.has_value() || !gen.has_value() || !created_ms.has_value() ||
+        pop_field == nullptr) {
+      return fail_c<std::vector<DeviceInfo>>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    const auto did = DeviceId::create(did_raw.value());
+    const auto pop = value_as_bool_or_flag(*pop_field);
+    if (!did.has_value() || !pop.has_value()) {
+      return fail_c<std::vector<DeviceInfo>>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    std::optional<std::uint64_t> revoked_ms;
+    if (const Value *rev_field = entry.find("revoked_at_ms");
+        rev_field != nullptr &&
+        !std::holds_alternative<std::nullptr_t>(rev_field->value())) {
+      const auto rev_u64 = value_as_u64(*rev_field);
+      if (!rev_u64.has_value()) {
+        return fail_c<std::vector<DeviceInfo>>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      revoked_ms = rev_u64.value();
+    }
+    devices.push_back(DeviceInfo{did.value(), dpk.value(), label.value(),
+                                 cwt_exp.value(), gen.value(), pop.value(),
+                                 created_ms.value(), revoked_ms});
+  }
+  return Result<std::vector<DeviceInfo>>::success(std::move(devices));
+}
+
 } // namespace
 
 Result<WhoamiResponse> MpControlClient::whoami() {
@@ -3506,52 +3625,9 @@ Result<WhoamiResponse> MpControlClient::whoami() {
                                   MpClientError::http_response_schema);
   }
 
-  std::vector<DeviceInfo> devices;
-  if (const Value *devs_field = obj.value().find("devices"); devs_field != nullptr) {
-    const auto *arr = std::get_if<Value::Array>(&devs_field->value());
-    if (arr == nullptr) {
-      return fail_c<WhoamiResponse>(ErrorCode::corrupt,
-                                    MpClientError::http_response_schema);
-    }
-    for (const auto &entry : *arr) {
-      if (!std::holds_alternative<Value::Object>(entry.value())) {
-        return fail_c<WhoamiResponse>(ErrorCode::corrupt,
-                                      MpClientError::http_response_schema);
-      }
-      const auto did_raw = get_required_u64(entry, "device_id");
-      const auto dpk = get_required_pubkey_b64(entry, "pubkey_b64");
-      const auto label = get_required_string(entry, "label");
-      const auto cwt_exp = get_required_u64(entry, "cwt_expires_ms");
-      const auto gen = get_required_u64(entry, "generation");
-      const auto created_ms = get_required_u64(entry, "created_at_ms");
-      const Value *pop_field = entry.find("pop_verified");
-      if (!did_raw.has_value() || !dpk.has_value() || !label.has_value() ||
-          !cwt_exp.has_value() || !gen.has_value() || !created_ms.has_value() ||
-          pop_field == nullptr) {
-        return fail_c<WhoamiResponse>(ErrorCode::corrupt,
-                                      MpClientError::http_response_schema);
-      }
-      const auto did = DeviceId::create(did_raw.value());
-      const auto pop = value_as_bool_or_flag(*pop_field);
-      if (!did.has_value() || !pop.has_value()) {
-        return fail_c<WhoamiResponse>(ErrorCode::corrupt,
-                                      MpClientError::http_response_schema);
-      }
-      std::optional<std::uint64_t> revoked_ms;
-      if (const Value *rev_field = entry.find("revoked_at_ms");
-          rev_field != nullptr &&
-          !std::holds_alternative<std::nullptr_t>(rev_field->value())) {
-        const auto rev_u64 = value_as_u64(*rev_field);
-        if (!rev_u64.has_value()) {
-          return fail_c<WhoamiResponse>(ErrorCode::corrupt,
-                                        MpClientError::http_response_schema);
-        }
-        revoked_ms = rev_u64.value();
-      }
-      devices.push_back(DeviceInfo{did.value(), dpk.value(), label.value(),
-                                   cwt_exp.value(), gen.value(), pop.value(),
-                                   created_ms.value(), revoked_ms});
-    }
+  auto devices = parse_device_info_list(obj.value());
+  if (!devices.has_value()) {
+    return Result<WhoamiResponse>::failure(devices.error());
   }
 
   std::vector<PartyId> active_parties;
@@ -3579,7 +3655,7 @@ Result<WhoamiResponse> MpControlClient::whoami() {
 
   return Result<WhoamiResponse>::success(
       WhoamiResponse{acct_id.value(), handle.value(), root_pk.value(),
-                     std::move(devices), std::move(active_parties)});
+                     std::move(devices).value(), std::move(active_parties)});
 }
 
 Result<ResolvedAccount> MpControlClient::resolve_handle(std::string_view handle) {
@@ -3752,6 +3828,552 @@ Result<RevokeDeviceResponse> MpControlClient::revoke_device(DeviceId device_id) 
   }
   return Result<RevokeDeviceResponse>::success(
       RevokeDeviceResponse{rev_flag.value(), std::move(evicted), pending.value()});
+}
+
+Result<RecoverLookupResponse>
+MpControlClient::recover_account_lookup(const Ed25519SigningKey &root_signing_key) {
+  if (!root_signing_key.valid()) {
+    return fail_c<RecoverLookupResponse>(ErrorCode::provider_auth,
+                                         MpClientError::missing_root_key);
+  }
+  const auto rec_keyid = recovery_key_id_for_pubkey(root_signing_key.public_key());
+  if (!rec_keyid.has_value()) {
+    return Result<RecoverLookupResponse>::failure(rec_keyid.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("root_pubkey_b64",
+                        Value{base64_encode(root_signing_key.public_key())});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<RecoverLookupResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/accounts/recover-lookup";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(config_, clock_offset_s_, root_signing_key,
+                                     KeyId{rec_keyid.value()}, req);
+  if (!resp.has_value()) {
+    return Result<RecoverLookupResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<RecoverLookupResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RecoverLookupResponse>::failure(obj.error());
+  }
+  const auto acct_raw = get_required_u64(obj.value(), "account_id");
+  const auto handle = get_required_string(obj.value(), "handle");
+  const auto root_pk = get_required_pubkey_b64(obj.value(), "root_pubkey_b64");
+  const auto server_sn = get_optional_string(obj.value(), "safety_number");
+  if (!acct_raw.has_value() || !handle.has_value() || !root_pk.has_value() ||
+      !server_sn.has_value()) {
+    return fail_c<RecoverLookupResponse>(ErrorCode::corrupt,
+                                         MpClientError::http_response_schema);
+  }
+  const auto acct_id = AccountId::create(acct_raw.value());
+  const auto parsed_handle = AccountHandle::parse(handle.value());
+  if (!acct_id.has_value() || !parsed_handle.has_value()) {
+    return fail_c<RecoverLookupResponse>(ErrorCode::corrupt,
+                                         MpClientError::http_response_schema);
+  }
+  // Never trust a mismatched root_pubkey from the server.
+  if (!constant_time_equal({root_pk.value(), root_signing_key.public_key()})) {
+    return fail_c<RecoverLookupResponse>(ErrorCode::corrupt,
+                                         MpClientError::http_response_schema);
+  }
+  // Always recompute the canonical Safety Number locally.
+  const auto local_sn = compute_safety_number(acct_id.value(), root_pk.value());
+  if (!local_sn.has_value()) {
+    return Result<RecoverLookupResponse>::failure(local_sn.error());
+  }
+  auto devices = parse_device_info_list(obj.value());
+  if (!devices.has_value()) {
+    return Result<RecoverLookupResponse>::failure(devices.error());
+  }
+
+  return Result<RecoverLookupResponse>::success(RecoverLookupResponse{
+      acct_id.value(),
+      handle.value(),
+      root_pk.value(),
+      local_sn.value(),
+      std::move(devices).value(),
+  });
+}
+
+Result<CreateDeviceLinkResponse>
+MpControlClient::create_device_link(const std::optional<std::string> &device_label) {
+  auto auth = require_root_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<CreateDeviceLinkResponse>::failure(auth.error());
+  }
+  if (device_label.has_value() && !valid_device_label(*device_label)) {
+    return fail_mp<CreateDeviceLinkResponse>(ErrorCode::invalid_range,
+                                             MpError::invalid_device_label);
+  }
+
+  Value::Object body_obj;
+  if (device_label.has_value()) {
+    body_obj.emplace_back("device_label", Value{*device_label});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<CreateDeviceLinkResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/device-links/create";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  auto resp = signed_rest_call(config_, clock_offset_s_, auth.value().signing_key,
+                               KeyId{RootKeyId{auth.value().account_id}}, req);
+  if (!resp.has_value()) {
+    return Result<CreateDeviceLinkResponse>::failure(resp.error());
+  }
+  CleanseVectorGuard resp_cleanse{resp.value().body};
+  if (resp.value().status != 201) {
+    return Result<CreateDeviceLinkResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<CreateDeviceLinkResponse>::failure(obj.error());
+  }
+  const auto raw_code = get_required_string(obj.value(), "link_code");
+  const auto exp_ms = get_required_u64(obj.value(), "expires_at_ms");
+  if (!raw_code.has_value() || !exp_ms.has_value() || exp_ms.value() == 0U ||
+      exp_ms.value() > kMaxSafeId) {
+    return fail_c<CreateDeviceLinkResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  const auto norm_code = normalize_device_link_code(raw_code.value());
+  if (!norm_code.has_value()) {
+    return fail_c<CreateDeviceLinkResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  return Result<CreateDeviceLinkResponse>::success(
+      CreateDeviceLinkResponse{norm_code.value(), exp_ms.value()});
+}
+
+Result<ClaimDeviceLinkResponse>
+MpControlClient::claim_device_link(std::string_view link_code,
+                                   const Ed25519SigningKey &device_signing_key,
+                                   std::string_view device_label) {
+  if (!device_signing_key.valid()) {
+    return fail_c<ClaimDeviceLinkResponse>(ErrorCode::provider_auth,
+                                           MpClientError::missing_device_key);
+  }
+  auto normalized = normalize_device_link_code(link_code);
+  if (!normalized.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(normalized.error());
+  }
+  CleanseStringGuard code_cleanse{normalized.value()};
+
+  if (!valid_device_label(device_label)) {
+    return fail_mp<ClaimDeviceLinkResponse>(ErrorCode::invalid_range,
+                                            MpError::invalid_device_label);
+  }
+  const auto link_keyid =
+      device_link_key_id_for_pubkey(device_signing_key.public_key());
+  if (!link_keyid.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(link_keyid.error());
+  }
+  const auto local_fp = compute_device_fingerprint(device_signing_key.public_key());
+  if (!local_fp.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(local_fp.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("link_code", Value{normalized.value()});
+  body_obj.emplace_back("device_pubkey_b64",
+                        Value{base64_encode(device_signing_key.public_key())});
+  body_obj.emplace_back("device_label", Value{std::string{device_label}});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/device-links/claim";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  auto resp = signed_rest_call(config_, clock_offset_s_, device_signing_key,
+                               KeyId{link_keyid.value()}, req);
+  if (!resp.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(resp.error());
+  }
+  CleanseVectorGuard resp_cleanse{resp.value().body};
+  if (resp.value().status != 200) {
+    return Result<ClaimDeviceLinkResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<ClaimDeviceLinkResponse>::failure(obj.error());
+  }
+  const auto poll_token = get_required_string(obj.value(), "poll_token");
+  const auto server_fp = get_required_string(obj.value(), "device_fingerprint");
+  const auto exp_ms = get_required_u64(obj.value(), "expires_at_ms");
+  if (!poll_token.has_value() || poll_token.value().empty() ||
+      poll_token.value().size() > 256U || contains_ctl_or_crlf(poll_token.value()) ||
+      !server_fp.has_value() || !exp_ms.has_value() || exp_ms.value() == 0U ||
+      exp_ms.value() > kMaxSafeId) {
+    return fail_c<ClaimDeviceLinkResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+  return Result<ClaimDeviceLinkResponse>::success(ClaimDeviceLinkResponse{
+      poll_token.value(),
+      server_fp.value(),
+      local_fp.value(),
+      exp_ms.value(),
+  });
+}
+
+Result<InspectDeviceLinkResponse>
+MpControlClient::inspect_device_link(std::string_view link_code) {
+  auto auth = require_root_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<InspectDeviceLinkResponse>::failure(auth.error());
+  }
+  auto normalized = normalize_device_link_code(link_code);
+  if (!normalized.has_value()) {
+    return Result<InspectDeviceLinkResponse>::failure(normalized.error());
+  }
+  CleanseStringGuard code_cleanse{normalized.value()};
+
+  Value::Object body_obj;
+  body_obj.emplace_back("link_code", Value{normalized.value()});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<InspectDeviceLinkResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/device-links/inspect";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(config_, clock_offset_s_, auth.value().signing_key,
+                                     KeyId{RootKeyId{auth.value().account_id}}, req);
+  if (!resp.has_value()) {
+    return Result<InspectDeviceLinkResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<InspectDeviceLinkResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<InspectDeviceLinkResponse>::failure(obj.error());
+  }
+  const auto state_str = get_required_string(obj.value(), "state");
+  const auto created_ms = get_required_u64(obj.value(), "created_at_ms");
+  const auto exp_ms = get_required_u64(obj.value(), "expires_at_ms");
+  const auto suggested = get_optional_string(obj.value(), "suggested_label");
+  const auto server_fp = get_optional_string(obj.value(), "device_fingerprint");
+  const auto dev_label = get_optional_string(obj.value(), "device_label");
+  const auto country = get_optional_string(obj.value(), "requester_country");
+  if (!state_str.has_value() || !created_ms.has_value() || !exp_ms.has_value() ||
+      created_ms.value() == 0U || created_ms.value() > kMaxSafeId ||
+      exp_ms.value() == 0U || exp_ms.value() > kMaxSafeId || !suggested.has_value() ||
+      !server_fp.has_value() || !dev_label.has_value() || !country.has_value()) {
+    return fail_c<InspectDeviceLinkResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+
+  InspectDeviceLinkResponse out{};
+  out.suggested_label = suggested.value();
+  out.server_device_fingerprint = server_fp.value();
+  out.device_label = dev_label.value();
+  out.requester_country = country.value();
+  out.created_at_ms = created_ms.value();
+  out.expires_at_ms = exp_ms.value();
+
+  if (state_str.value() == "waiting_for_device") {
+    out.state = DeviceLinkState::waiting_for_device;
+    return Result<InspectDeviceLinkResponse>::success(std::move(out));
+  }
+  if (state_str.value() == "pending_approval") {
+    out.state = DeviceLinkState::pending_approval;
+    const auto pk = get_required_pubkey_b64(obj.value(), "device_pubkey_b64");
+    if (!pk.has_value()) {
+      return Result<InspectDeviceLinkResponse>::failure(pk.error());
+    }
+    if (!out.device_label.has_value()) {
+      return fail_c<InspectDeviceLinkResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+    }
+    const auto local_fp = compute_device_fingerprint(pk.value());
+    if (!local_fp.has_value()) {
+      return Result<InspectDeviceLinkResponse>::failure(local_fp.error());
+    }
+    out.device_pubkey = pk.value();
+    out.local_device_fingerprint = local_fp.value();
+    return Result<InspectDeviceLinkResponse>::success(std::move(out));
+  }
+  return fail_c<InspectDeviceLinkResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+}
+
+Result<ApproveDeviceLinkResponse>
+MpControlClient::approve_device_link(const ApproveDeviceLinkRequest &request) {
+  auto auth = require_root_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(auth.error());
+  }
+  auto normalized = normalize_device_link_code(request.link_code);
+  if (!normalized.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(normalized.error());
+  }
+  CleanseStringGuard code_cleanse{normalized.value()};
+
+  if (const auto pk_ok = validate_ed25519_pubkey_strict(request.device_pubkey);
+      !pk_ok.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(pk_ok.error());
+  }
+  if (request.device_cwt.empty() || request.device_cwt.size() > kMaxCwtBytes) {
+    return fail_c<ApproveDeviceLinkResponse>(ErrorCode::invalid_range,
+                                             MpClientError::invalid_config);
+  }
+  if (!valid_device_label(request.device_label)) {
+    return fail_mp<ApproveDeviceLinkResponse>(ErrorCode::invalid_range,
+                                              MpError::invalid_device_label);
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("link_code", Value{normalized.value()});
+  body_obj.emplace_back("device_pubkey_b64",
+                        Value{base64_encode(request.device_pubkey)});
+  body_obj.emplace_back("device_cwt_b64", Value{base64_encode(request.device_cwt)});
+  body_obj.emplace_back("device_label", Value{request.device_label});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/device-links/approve";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(config_, clock_offset_s_, auth.value().signing_key,
+                                     KeyId{RootKeyId{auth.value().account_id}}, req);
+  if (!resp.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<ApproveDeviceLinkResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<ApproveDeviceLinkResponse>::failure(obj.error());
+  }
+  const Value *approved_field = obj.value().find("approved");
+  if (approved_field == nullptr) {
+    return fail_c<ApproveDeviceLinkResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  const auto approved_val = value_as_bool_or_flag(*approved_field);
+  const auto acct_raw = get_required_u64(obj.value(), "account_id");
+  const auto dev_raw = get_required_u64(obj.value(), "device_id");
+  const auto dev_label = get_required_string(obj.value(), "device_label");
+  const auto dev_fp = get_required_string(obj.value(), "device_fingerprint");
+  const auto cwt_exp = get_required_u64(obj.value(), "cwt_expires_ms");
+  if (!approved_val.has_value() || !acct_raw.has_value() || !dev_raw.has_value() ||
+      !dev_label.has_value() || !dev_fp.has_value() || !cwt_exp.has_value() ||
+      cwt_exp.value() == 0U || cwt_exp.value() > kMaxSafeId) {
+    return fail_c<ApproveDeviceLinkResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  const auto acct_id = AccountId::create(acct_raw.value());
+  const auto dev_id = DeviceId::create(dev_raw.value());
+  if (!acct_id.has_value() || !dev_id.has_value()) {
+    return fail_c<ApproveDeviceLinkResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  return Result<ApproveDeviceLinkResponse>::success(ApproveDeviceLinkResponse{
+      approved_val.value(),
+      acct_id.value(),
+      dev_id.value(),
+      dev_label.value(),
+      dev_fp.value(),
+      cwt_exp.value(),
+  });
+}
+
+Result<PollDeviceLinkResponse>
+MpControlClient::poll_device_link(const Ed25519SigningKey &device_signing_key,
+                                  const PollDeviceLinkRequest &request) {
+  if (!device_signing_key.valid()) {
+    return fail_c<PollDeviceLinkResponse>(ErrorCode::provider_auth,
+                                          MpClientError::missing_device_key);
+  }
+  auto normalized = normalize_device_link_code(request.link_code);
+  if (!normalized.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(normalized.error());
+  }
+  CleanseStringGuard code_cleanse{normalized.value()};
+
+  if (request.poll_token.empty() || request.poll_token.size() > 256U ||
+      contains_ctl_or_crlf(request.poll_token)) {
+    return fail_c<PollDeviceLinkResponse>(ErrorCode::invalid_range,
+                                          MpClientError::invalid_config);
+  }
+  const auto link_keyid =
+      device_link_key_id_for_pubkey(device_signing_key.public_key());
+  if (!link_keyid.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(link_keyid.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("link_code", Value{normalized.value()});
+  body_obj.emplace_back("poll_token", Value{request.poll_token});
+  body_obj.emplace_back("device_pubkey_b64",
+                        Value{base64_encode(device_signing_key.public_key())});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/device-links/poll";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  auto resp = signed_rest_call(config_, clock_offset_s_, device_signing_key,
+                               KeyId{link_keyid.value()}, req);
+  if (!resp.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(resp.error());
+  }
+  CleanseVectorGuard resp_cleanse{resp.value().body};
+
+  if (resp.value().status == 202) {
+    const std::string_view text{
+        reinterpret_cast<const char *>(resp.value().body.data()),
+        resp.value().body.size()};
+    const auto obj = parse_json_object_body(text);
+    if (!obj.has_value()) {
+      return Result<PollDeviceLinkResponse>::failure(obj.error());
+    }
+    const auto status_str = get_required_string(obj.value(), "status");
+    const auto exp_ms = get_required_u64(obj.value(), "expires_at_ms");
+    if (!status_str.has_value() || status_str.value() != "pending" ||
+        !exp_ms.has_value() || exp_ms.value() == 0U || exp_ms.value() > kMaxSafeId) {
+      return fail_c<PollDeviceLinkResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+    }
+    PollDeviceLinkResponse out{};
+    out.pending = true;
+    out.approved = false;
+    out.expires_at_ms = exp_ms.value();
+    return Result<PollDeviceLinkResponse>::success(std::move(out));
+  }
+
+  if (resp.value().status != 200) {
+    return Result<PollDeviceLinkResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(obj.error());
+  }
+  const auto status_str = get_required_string(obj.value(), "status");
+  const auto acct_raw = get_required_u64(obj.value(), "account_id");
+  const auto handle = get_required_string(obj.value(), "handle");
+  const auto dev_raw = get_required_u64(obj.value(), "device_id");
+  const auto root_pk = get_required_pubkey_b64(obj.value(), "root_pubkey_b64");
+  const auto cwt_b64 = get_required_string(obj.value(), "device_cwt_b64");
+  const auto cwt_exp = get_required_u64(obj.value(), "cwt_expires_ms");
+  const auto server_sn = get_optional_string(obj.value(), "safety_number");
+  if (!status_str.has_value() || status_str.value() != "approved" ||
+      !acct_raw.has_value() || !handle.has_value() || !dev_raw.has_value() ||
+      !root_pk.has_value() || !cwt_b64.has_value() || !cwt_exp.has_value() ||
+      cwt_exp.value() == 0U || cwt_exp.value() > kMaxSafeId || !server_sn.has_value()) {
+    return fail_c<PollDeviceLinkResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+  }
+  const auto acct_id = AccountId::create(acct_raw.value());
+  const auto dev_id = DeviceId::create(dev_raw.value());
+  const auto parsed_handle = AccountHandle::parse(handle.value());
+  const auto decoded_cwt = base64_decode(cwt_b64.value());
+  if (!acct_id.has_value() || !dev_id.has_value() || !parsed_handle.has_value() ||
+      !decoded_cwt.has_value() || decoded_cwt->empty() ||
+      decoded_cwt->size() > kMaxCwtBytes) {
+    return fail_c<PollDeviceLinkResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+  }
+
+  // Cryptographically verify the COSE_Sign1 CWT locally against root_pubkey AND our own
+  // device_pubkey, and recompute the canonical Safety Number locally before returning!
+  const auto effective_now_s = checked_add_i64(current_unix_seconds(), clock_offset_s_);
+  if (!effective_now_s.has_value()) {
+    return fail_c<PollDeviceLinkResponse>(ErrorCode::invalid_range,
+                                          MpClientError::invalid_config);
+  }
+  const auto verified_cwt = verify_device_cwt(DeviceCwtVerifyRequest{
+      *decoded_cwt,
+      root_pk.value(),
+      device_signing_key.public_key(),
+      *effective_now_s,
+  });
+  if (!verified_cwt.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(verified_cwt.error());
+  }
+
+  const auto local_sn = compute_safety_number(acct_id.value(), root_pk.value());
+  if (!local_sn.has_value()) {
+    return Result<PollDeviceLinkResponse>::failure(local_sn.error());
+  }
+
+  PollDeviceLinkResponse out{};
+  out.pending = false;
+  out.approved = true;
+  out.account_id = acct_id.value();
+  out.handle = handle.value();
+  out.device_id = dev_id.value();
+  out.root_pubkey = root_pk.value();
+  out.device_cwt = *decoded_cwt;
+  out.cwt_expires_ms = cwt_exp.value();
+  out.safety_number = local_sn.value();
+  return Result<PollDeviceLinkResponse>::success(std::move(out));
 }
 
 Result<WebSessionApproveResponse>
