@@ -13828,3 +13828,13 @@ Blackbird must not present itself as another product.
   `known_subtotal` vs `complete`), versioned cost estimation separate from observed charges,
   UTC vs monotonic clock-domain accounting, bounded sparkline projection, source-record
   drilldown, and stale-retaining refresh on upstream corruption/failure.
+
+## 2026-11-23 — Rock 6.2: Core Plan U5 Hot-Reloadable Native C++ Module Boundary (`NativeModuleHost`)
+
+- Added `include/blackbird/native_module_abi.h`, `include/blackbird/native_module.hpp`,
+  `src/native_module.cpp`, three shared-library test fixtures (`v1`, `v2`, `bad`), and
+  `tests/native_module_test.cpp` (registered as `native_module` in `CMakeLists.txt`).
+- Stages and validates versioned C ABI shared libraries (`dlopen(RTLD_LOCAL)`), activates
+  candidates atomically with monotonic generation IDs, pins callers via RAII
+  `ModuleGenerationLease` refcounts, defers `dlclose` until retired generations drain to
+  zero in-flight leases, and supports clean atomic rollback.

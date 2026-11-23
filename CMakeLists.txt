@@ -1167,3 +1167,30 @@ add_executable(metrics_consumer_test tests/metrics_consumer_test.cpp)
 target_link_libraries(metrics_consumer_test PRIVATE blackbird_foundation)
 add_test(NAME metrics_consumer COMMAND metrics_consumer_test)
 set_tests_properties(metrics_consumer PROPERTIES TIMEOUT 30)
+
+target_sources(blackbird_foundation PRIVATE src/native_module.cpp)
+target_link_libraries(blackbird_foundation PUBLIC ${CMAKE_DL_LIBS})
+add_library(native_module_fixture_v1 SHARED tests/native_module_fixture_v1.cpp)
+target_link_libraries(native_module_fixture_v1 PRIVATE blackbird_build)
+target_include_directories(native_module_fixture_v1 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(native_module_fixture_v1 PROPERTIES PREFIX "")
+add_library(native_module_fixture_v2 SHARED tests/native_module_fixture_v2.cpp)
+target_link_libraries(native_module_fixture_v2 PRIVATE blackbird_build)
+target_include_directories(native_module_fixture_v2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(native_module_fixture_v2 PROPERTIES PREFIX "")
+add_library(native_module_fixture_bad SHARED tests/native_module_fixture_bad.cpp)
+target_link_libraries(native_module_fixture_bad PRIVATE blackbird_build)
+target_include_directories(native_module_fixture_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(native_module_fixture_bad PROPERTIES PREFIX "")
+add_executable(native_module_test tests/native_module_test.cpp)
+target_link_libraries(native_module_test PRIVATE blackbird_foundation Threads::Threads)
+add_dependencies(native_module_test native_module_fixture_v1 native_module_fixture_v2 native_module_fixture_bad)
+target_compile_definitions(native_module_test PRIVATE
+  BLACKBIRD_NATIVE_FIXTURE_V1="$<TARGET_FILE:native_module_fixture_v1>"
+  BLACKBIRD_NATIVE_FIXTURE_V2="$<TARGET_FILE:native_module_fixture_v2>"
+  BLACKBIRD_NATIVE_FIXTURE_BAD="$<TARGET_FILE:native_module_fixture_bad>")
+add_test(NAME native_module COMMAND native_module_test
+  $<TARGET_FILE:native_module_fixture_v1>
+  $<TARGET_FILE:native_module_fixture_v2>
+  $<TARGET_FILE:native_module_fixture_bad>)
+set_tests_properties(native_module PROPERTIES TIMEOUT 30)
