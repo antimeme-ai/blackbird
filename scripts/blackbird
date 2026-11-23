@@ -28,9 +28,11 @@ if [ ! -x "$blackbird_executable" ]; then
 fi
 BLACKBIRD_SPRITE_ASSET=${BLACKBIRD_SPRITE_ASSET:-"$blackbird_root/assets/sr71.png"}
 export BLACKBIRD_SPRITE_ASSET
-if [ "${1:-}" = auth ] || [ "${1:-}" = --version ] || [ "${1:-}" = -V ]; then
-  exec "$blackbird_executable" "$@"
-fi
+case "${1:-}" in
+  auth|mcp|platoon|issues|memory|peer|capabilities|metrics|bridge|--version|-V)
+    exec "$blackbird_executable" "$@"
+    ;;
+esac
 blackbird_probe=false
 blackbird_application=false
 blackbird_session=''

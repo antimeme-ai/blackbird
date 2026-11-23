@@ -627,6 +627,191 @@ void test_concurrent_identity_init(const std::filesystem::path &base) {
   }
 }
 
+void test_kimi_review2_hardening(const std::filesystem::path &base) {
+  g_stage = "kimi_review2_hardening";
+  auto patrick =
+      must(PeerIdentityStore::open_or_create(base / "k2-patrick"), "create patrick");
+  auto buddy =
+      must(PeerIdentityStore::open_or_create(base / "k2-buddy"), "create buddy");
+
+  auto buddy_peers =
+      must(KnownPeersStore::open(base / "k2-buddy-peers"), "open buddy peers");
+  must(buddy_peers.pin_peer({"patrick", patrick.identity().public_key, "k2"}),
+       "pin patrick");
+
+  // 1. Mismatched signature_namespace must fail verification.
+  {
+    PeerIdentityConfig other_ns;
+    other_ns.signature_namespace = "other-namespace";
+    auto other_store =
+        must(PeerIdentityStore::open_existing(base / "k2-patrick", other_ns),
+             "open patrick with other namespace");
+    const auto env_other_ns = must(other_store.sign_envelope(PeerEnvelopeDraft{
+                                       "env-ns-01",
+                                       buddy.identity().fingerprint,
+                                       "thread-ns",
+                                       PeerEnvelopeKind::mail,
+                                       1730000001000000000,
+                                       Value::object({{"k", Value{"v"}}}),
+                                   }),
+                                   "sign with other namespace");
+    const auto bad_ns = buddy_peers.verify_envelope(env_other_ns);
+    check(!bad_ns.has_value() && bad_ns.error().code == ErrorCode::invalid_identity,
+          "mismatched signature_namespace was accepted");
+
+    auto other_peers =
+        must(KnownPeersStore::open(base / "k2-buddy-peers", other_ns), "open other ns");
+    must_void(other_peers.verify_envelope(env_other_ns),
+              "matching custom signature_namespace failed");
+  }
+
+  // 2. Trailing garbage after -----END SSH SIGNATURE----- must be rejected.
+  {
+    const auto valid_env = must(patrick.sign_envelope(PeerEnvelopeDraft{
+                                    "env-armor-01",
+                                    buddy.identity().fingerprint,
+                                    "thread-armor",
+                                    PeerEnvelopeKind::mail,
+                                    1730000002000000000,
+                                    Value::object({{"ok", Value{true}}}),
+                                }),
+                                "sign armor envelope");
+    must_void(buddy_peers.verify_envelope(valid_env), "verify clean armor");
+
+    PeerEnvelope garbage_sig = valid_env;
+    garbage_sig.signature += "TRAILING-GARBAGE\n";
+    const auto res = buddy_peers.verify_envelope(garbage_sig);
+    check(!res.has_value() && res.error().code == ErrorCode::invalid_identity,
+          "trailing armor garbage was accepted");
+
+    const auto parsed_reject = envelope_from_value(envelope_to_value(garbage_sig));
+    check(!parsed_reject.has_value() &&
+              parsed_reject.error().code == ErrorCode::invalid_identity,
+          "envelope_from_value accepted trailing armor garbage");
+  }
+
+  // 3. Numeric re-encoding equivalence: {"n":1e2} vs {"n":100} verify identically.
+  {
+    const auto sci_payload = must(parse_json(R"({"n":1e2})"), "parse 1e2");
+    const auto int_payload = must(parse_json(R"({"n":100})"), "parse 100");
+    const auto sci_env = must(patrick.sign_envelope(PeerEnvelopeDraft{
+                                  "env-num-01",
+                                  buddy.identity().fingerprint,
+                                  "thread-num",
+                                  PeerEnvelopeKind::decision,
+                                  1730000003000000000,
+                                  sci_payload,
+                              }),
+                              "sign 1e2 envelope");
+    must_void(buddy_peers.verify_envelope(sci_env), "verify 1e2 envelope");
+
+    PeerEnvelope reencoded = sci_env;
+    reencoded.payload = int_payload;
+    must_void(buddy_peers.verify_envelope(reencoded),
+              "re-encoded numeric 1e2 -> 100 failed verification");
+    check(must(canonical_envelope_payload(sci_env), "canon sci") ==
+              must(canonical_envelope_payload(reencoded), "canon int"),
+          "canonical payloads diverged for 1e2 vs 100");
+  }
+
+  // 4. IsolatedTempDir respects TMPDIR (L6).
+  {
+    const auto custom_tmp = base / "custom-tmpdir";
+    check(::mkdir(custom_tmp.c_str(), mode_t{0700}) == 0, "mkdir custom tmpdir failed");
+    const char *prev_raw = std::getenv("TMPDIR");
+    const std::optional<std::string> prev =
+        prev_raw != nullptr ? std::optional<std::string>{prev_raw} : std::nullopt;
+    struct RestoreTmpdir {
+      std::optional<std::string> prev_val;
+      ~RestoreTmpdir() {
+        if (prev_val.has_value())
+          (void)::setenv("TMPDIR", prev_val->c_str(), 1);
+        else
+          (void)::unsetenv("TMPDIR");
+      }
+    } restore{prev};
+    check(::setenv("TMPDIR", (custom_tmp.string() + "/").c_str(), 1) == 0,
+          "setenv TMPDIR failed");
+
+    const auto sig = must(patrick.sign_bytes("tmpdir-check"), "sign under TMPDIR");
+    must_void(
+        verify_detached_signature({patrick.identity().fingerprint,
+                                   patrick.identity().public_key, "tmpdir-check", sig}),
+        "verify under custom TMPDIR failed");
+    // Temp dir must have been cleaned up after verify_detached_signature returned.
+    check(std::filesystem::is_empty(custom_tmp),
+          "IsolatedTempDir left stale directory in TMPDIR");
+  }
+
+  // 5. Concurrent verify_grant vs revoke_grant (L5): once revoke_grant completes,
+  // no subsequent verify_grant may succeed, and concurrent threads never crash or
+  // corrupt.
+  {
+    const std::int64_t issued_ns = 1730000000000000000;
+    const std::int64_t expires_ns = issued_ns + 3600000000000LL;
+    const auto grant = must(patrick.sign_grant(CapabilityGrantDraft{
+                                "grant-race-01",
+                                CapabilityGrantMode::direct_support,
+                                buddy.identity().fingerprint,
+                                "worker-race",
+                                std::nullopt,
+                                10,
+                                10000,
+                                {"read_file"},
+                                issued_ns,
+                                expires_ns,
+                                true,
+                            }),
+                            "sign race grant");
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> revoked_done{false};
+    std::atomic<int> unexpected_errors{0};
+    std::atomic<int> post_revoke_accepts{0};
+
+    std::vector<std::thread> verifiers;
+    for (int i = 0; i < 4; ++i) {
+      verifiers.emplace_back([&]() {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int iter = 0; iter < 6; ++iter) {
+          const bool after_revoke = revoked_done.load(std::memory_order_acquire);
+          const auto res = buddy_peers.verify_grant(grant, issued_ns + 100);
+          if (res.has_value()) {
+            if (after_revoke)
+              post_revoke_accepts.fetch_add(1, std::memory_order_relaxed);
+          } else if (res.error().code != ErrorCode::conflict) {
+            unexpected_errors.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+    }
+
+    std::thread revoker([&]() {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+      auto rev = buddy_peers.revoke_grant({grant.grant_id, "concurrent kill"});
+      if (!rev.has_value())
+        unexpected_errors.fetch_add(1, std::memory_order_relaxed);
+      revoked_done.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    revoker.join();
+    for (auto &t : verifiers)
+      t.join();
+
+    check(unexpected_errors.load() == 0,
+          "concurrent verify_grant/revoke_grant hit unexpected error");
+    check(post_revoke_accepts.load() == 0,
+          "verify_grant succeeded after revoke_grant completed");
+    const auto final_check = buddy_peers.verify_grant(grant, issued_ns + 100);
+    check(!final_check.has_value() && final_check.error().code == ErrorCode::conflict,
+          "final verify_grant after revoke did not fail with conflict");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -651,6 +836,7 @@ int main() {
     test_signed_envelopes_and_tampering(base);
     test_capability_grants_expiry_and_revocation(base);
     test_concurrent_identity_init(base);
+    test_kimi_review2_hardening(base);
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "peer_identity_test failed at stage [" << g_stage << "]: " << ex.what()

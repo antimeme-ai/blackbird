@@ -35,6 +35,26 @@ struct ContextWorkbenchBlock {
   bool archived = false;
 };
 
+struct DecisionCompanionBlockHint {
+  std::uint64_t block_id = 0;
+  std::string category;
+  std::string reason;
+  std::optional<double> confidence;
+  bool operator==(const DecisionCompanionBlockHint &) const = default;
+};
+
+struct DecisionCompanionAdvisory {
+  std::string provider;
+  std::string model;
+  std::string summary;
+  std::vector<std::uint64_t> pin_ids;
+  std::vector<std::uint64_t> compressible_ids;
+  std::vector<std::uint64_t> stale_ids;
+  std::vector<DecisionCompanionBlockHint> hints;
+  bool stale = false;
+  bool operator==(const DecisionCompanionAdvisory &) const = default;
+};
+
 struct ContextWorkbenchSnapshot {
   std::uint64_t revision = 0;
   std::uint64_t upstream_epoch = 0;
@@ -44,6 +64,7 @@ struct ContextWorkbenchSnapshot {
   std::uint64_t pending_compactions = 0;
   std::optional<std::uint64_t> context_window_tokens;
   std::vector<ContextWorkbenchBlock> blocks;
+  std::optional<DecisionCompanionAdvisory> decision_advisory;
 };
 
 struct ContextWorkbenchAction {
@@ -68,9 +89,15 @@ public:
   void focus_view() noexcept { focused_ = open_; }
   bool needs_refresh() const noexcept { return refresh_; }
   bool showing_archived() const noexcept { return show_archived_; }
+  bool showing_advisory() const noexcept { return show_advisory_; }
+  const std::optional<DecisionCompanionAdvisory> &advisory() const noexcept {
+    return snapshot_.decision_advisory;
+  }
 
   void update(ContextWorkbenchSnapshot snapshot);
+  void set_advisory(std::optional<DecisionCompanionAdvisory> advisory);
   void toggle_archived();
+  void toggle_advisory();
   void page(bool forward);
   Result<void> act(tui::InspectorAction action);
   bool refresh(const ContextDetailReader &reader);
@@ -94,6 +121,7 @@ private:
   bool focused_ = false;
   bool refresh_ = true;
   bool show_archived_ = true;
+  bool show_advisory_ = false;
   std::string notice_;
 };
 

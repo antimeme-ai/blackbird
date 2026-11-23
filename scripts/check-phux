@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Standalone phux integration smoke check against an isolated private socket.
+
+Never touches the operator's default phux server: all operations dial a fresh
+temporary PHUX_SOCKET and tear down that private server on exit.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def run_cmd(
+    args: list[str],
+    *,
+    env: dict[str, str],
+    check: bool = True,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+        timeout=timeout,
+    )
+
+
+def run_phux_json(
+    phux: str,
+    args: list[str],
+    *,
+    env: dict[str, str],
+    timeout: float = 15.0,
+) -> dict:
+    proc = run_cmd([phux, *args], env=env, check=True, timeout=timeout)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"phux {' '.join(args)} did not emit valid JSON: {proc.stdout!r} (stderr={proc.stderr!r})"
+        ) from exc
+
+
+def wait_for_snapshot_text(
+    phux: str,
+    target: str,
+    needle: str,
+    *,
+    env: dict[str, str],
+    timeout: float = 5.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last_snap: dict | None = None
+    while time.monotonic() < deadline:
+        last_snap = run_phux_json(phux, ["snapshot", "--json", target], env=env)
+        if any(needle in line for line in last_snap.get("lines", [])):
+            return last_snap
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Timed out waiting for {needle!r} in snapshot of {target}; last snapshot={last_snap!r}"
+    )
+
+
+def wait_until_session_absent(
+    phux: str,
+    session_name: str,
+    *,
+    env: dict[str, str],
+    timeout: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        listing = run_phux_json(phux, ["ls", "--json"], env=env)
+        names = [s.get("name") for s in listing.get("sessions", [])]
+        if session_name not in names:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"Ephemeral session {session_name!r} remained present after process exit")
+
+
+def main() -> int:
+    phux = shutil.which("phux")
+    if not phux:
+        print("phux not found on PATH; skipping phux integration check.")
+        return 0
+
+    base_env = dict(os.environ)
+    base_env.pop("PHUX_PROFILE", None)
+
+    ver_proc = run_cmd([phux, "--version"], env=base_env, check=True)
+    version = ver_proc.stdout.strip()
+
+    # Launcher usage / wrapper sanity checks (no server touched).
+    for launcher in ("scripts/blackbird-phux", "scripts/arco-phux"):
+        help_proc = run_cmd([str(REPO_ROOT / launcher), "--help"], env=base_env, check=True)
+        assert "PHUX_SESSION" in help_proc.stdout, f"{launcher} --help missing usage"
+    bad_ephemeral = run_cmd(
+        [str(REPO_ROOT / "scripts/blackbird-phux"), "--ephemeral"],
+        env=base_env,
+        check=False,
+    )
+    assert bad_ephemeral.returncode == 2, (
+        f"expected exit 2 for missing session name, got {bad_ephemeral.returncode}"
+    )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="blackbird-phux-check-")).resolve()
+    sock = tmpdir / "phux-test.sock"
+    env = dict(base_env)
+    env["PHUX_SOCKET"] = str(sock)
+    env["PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE"] = "60"
+
+    try:
+        # 1. Atomic session create via `phux new --json`.
+        session_name = "bb-smoke"
+        probe_script = 'printf "PHUX_SMOKE_READY\\n"; read line; printf "PHUX_ECHO:%s\\n" "$line"; sleep 30'
+        created = run_phux_json(
+            phux,
+            [
+                "new",
+                "--json",
+                "--cwd",
+                str(REPO_ROOT),
+                "--session",
+                session_name,
+                "--",
+                "/bin/sh",
+                "-c",
+                probe_script,
+            ],
+            env=env,
+        )
+        assert created.get("schema_version", 0) >= 1, created
+        assert created.get("session") == session_name, created
+        tid = created.get("terminal_id")
+        assert isinstance(tid, int) and tid >= 1, created
+        target = f"@{tid}"
+
+        # Duplicate create-only contract: existing session name must fail.
+        dup = run_cmd(
+            [
+                phux,
+                "new",
+                "--json",
+                "--cwd",
+                str(REPO_ROOT),
+                "--session",
+                session_name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "exit 0",
+            ],
+            env=env,
+            check=False,
+        )
+        assert dup.returncode != 0, "duplicate phux new --json unexpectedly succeeded"
+
+        # 2. `phux ls --json` sees the session and terminal.
+        listing = run_phux_json(phux, ["ls", "--json"], env=env)
+        session_names = [s.get("name") for s in listing.get("sessions", [])]
+        assert session_name in session_names, listing
+        assert target in listing.get("terminals", []), listing
+
+        # 3. `phux agent set`, `agent show`, and `agent list`.
+        agent_set = run_phux_json(
+            phux,
+            [
+                "agent",
+                "set",
+                "--name",
+                "blackbird",
+                "--kind",
+                "blackbird",
+                "--state",
+                "idle",
+                "--session",
+                session_name,
+                "--json",
+                target,
+            ],
+            env=env,
+        )
+        record = agent_set.get("record", {})
+        assert agent_set.get("action") == "set", agent_set
+        assert agent_set.get("terminal") == target, agent_set
+        assert record.get("name") == "blackbird", agent_set
+        assert record.get("kind") == "blackbird", agent_set
+        assert record.get("state") == "idle", agent_set
+        assert record.get("session") == session_name, agent_set
+
+        agent_show = run_phux_json(phux, ["agent", "show", "--json", target], env=env)
+        shown = agent_show.get("agents", [])
+        assert len(shown) == 1 and shown[0].get("terminal") == target, agent_show
+        assert shown[0].get("agent", {}).get("id") == "blackbird", agent_show
+        assert shown[0].get("agent", {}).get("label") == "blackbird", agent_show
+        assert shown[0].get("address") == "%blackbird", agent_show
+
+        agent_list = run_phux_json(phux, ["agent", "list", "--json"], env=env)
+        listed_targets = [a.get("terminal") for a in agent_list.get("agents", [])]
+        assert target in listed_targets, agent_list
+
+        # 4. `phux snapshot --json`, `paste --json`, and `send-keys --json`.
+        snap = wait_for_snapshot_text(phux, target, "PHUX_SMOKE_READY", env=env)
+        assert snap.get("pane") == tid, snap
+        assert snap.get("cols", 0) > 0 and snap.get("rows", 0) > 0, snap
+
+        run_phux_json(phux, ["paste", "--json", target, "PHUX_PASTE_TOKEN"], env=env)
+        run_phux_json(phux, ["send-keys", "--json", target, "Enter"], env=env)
+        wait_for_snapshot_text(phux, target, "PHUX_ECHO:PHUX_PASTE_TOKEN", env=env)
+
+        # 5. Exclusive input handoff (`phux take` / `phux give`).
+        taken = run_phux_json(phux, ["take", "--ttl", "5", "--json", target], env=env)
+        assert taken.get("held") is True, taken
+        given = run_phux_json(phux, ["give", "--json", target], env=env)
+        assert given.get("held") is False, given
+
+        # 6. `--ephemeral` session exits cleanly when its process completes.
+        ephemeral_name = "bb-ephemeral"
+        ephemeral = run_phux_json(
+            phux,
+            [
+                "new",
+                "--json",
+                "--ephemeral",
+                "--cwd",
+                str(REPO_ROOT),
+                "--session",
+                ephemeral_name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "exit 0",
+            ],
+            env=env,
+        )
+        assert ephemeral.get("session") == ephemeral_name, ephemeral
+        wait_until_session_absent(phux, ephemeral_name, env=env)
+
+        # 7. Non-interactive `phux kill` requires `--yes`; `phux kill --yes` succeeds.
+        kill_refused = run_cmd([phux, "kill", session_name], env=env, check=False)
+        assert kill_refused.returncode == 2, (
+            f"expected exit 2 without --yes on non-TTY stdin, got {kill_refused.returncode}"
+        )
+        killed = run_phux_json(phux, ["kill", "--yes", "--json", session_name], env=env)
+        assert killed.get("target") == session_name, killed
+        assert killed.get("killed") == 1, killed
+
+        # 8. Private server teardown via `phux kill --server`.
+        run_cmd([phux, "kill", "--server"], env=env, check=True)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status = run_cmd([phux, "status", "--json"], env=env, check=False)
+            if status.returncode != 0:
+                payload = json.loads(status.stdout)
+                if payload.get("running") is False:
+                    break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("private phux server still running after `phux kill --server`")
+    finally:
+        run_cmd([phux, "kill", "--server"], env=env, check=False)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    assert not sock.exists(), f"private socket left behind: {sock}"
+    print(f"phux integration checks passed ({version}, isolated private socket)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

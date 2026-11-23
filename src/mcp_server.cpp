@@ -157,38 +157,53 @@ std::string ascii_upper(std::string_view text) {
   return out;
 }
 
+bool is_valid_mcp_extra_env_key(std::string_view key) noexcept {
+  if (key.empty() || key.size() > 256U)
+    return false;
+  auto is_alpha = [](char ch) noexcept {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+  };
+  auto is_alnum = [&](char ch) noexcept {
+    return is_alpha(ch) || (ch >= '0' && ch <= '9');
+  };
+  if (!is_alpha(key.front()) && key.front() != '_')
+    return false;
+  for (const char ch : key) {
+    if (!is_alnum(ch) && ch != '_')
+      return false;
+  }
+  return true;
+}
+
 bool is_disallowed_mcp_extra_env_key(std::string_view key) {
   const std::string upper = ascii_upper(key);
-  if (upper.starts_with("BLACKBIRD_PLATOON_") || upper.starts_with("LD_") ||
-      upper.starts_with("DYLD_"))
-    return true;
-  static constexpr std::array<std::string_view, 26> blocked_exact{
-      "PATH",
-      "GIT_SSH_COMMAND",
-      "GIT_SSH",
-      "GIT_EXEC_PATH",
-      "GIT_TEMPLATE_DIR",
-      "GIT_CONFIG_PARAMETERS",
-      "GIT_CONFIG_GLOBAL",
-      "GIT_CONFIG_SYSTEM",
-      "NODE_OPTIONS",
-      "PYTHONSTARTUP",
-      "PYTHONPATH",
-      "PYTHONHOME",
-      "CURL_HOME",
-      "ZDOTDIR",
-      "IFS",
-      "BASH_ENV",
-      "ENV",
-      "PROMPT_COMMAND",
-      "SHELL",
-      "EDITOR",
-      "VISUAL",
-      "PAGER",
-      "LUA_PATH",
-      "LUA_CPATH",
-      "LUA_INIT",
-      "LUA_INIT_5_5",
+  static constexpr std::array<std::string_view, 14> blocked_prefixes{
+      "BLACKBIRD_PLATOON_",
+      "GIT_",
+      "LD_",
+      "DYLD_",
+      "PERL5",
+      "RUBY",
+      "NPM_CONFIG_",
+      "JAVA_",
+      "_JAVA_",
+      "PYTHON",
+      "NODE_",
+      "BASH_",
+      "XDG_",
+      "LUA_",
+  };
+  for (const auto prefix : blocked_prefixes) {
+    if (upper.starts_with(prefix))
+      return true;
+  }
+  static constexpr std::array<std::string_view, 21> blocked_exact{
+      "ENV",           "BASH_ENV",   "ZDOTDIR",    "HOME",
+      "SSH_AUTH_SOCK", "GNUPGHOME",  "CARGO_HOME", "RUSTUP_HOME",
+      "GEM_HOME",      "GCONV_PATH", "LOCPATH",    "NLSPATH",
+      "IFS",           "PATH",       "CURL_HOME",  "PROMPT_COMMAND",
+      "SHELL",         "EDITOR",     "VISUAL",     "PAGER",
+      "TMPDIR",
   };
   if (std::ranges::find(blocked_exact, upper) != blocked_exact.end())
     return true;
@@ -1076,6 +1091,12 @@ struct McpCommandPostServer::Impl {
         if (!is_string(v))
           return make_tool_error(
               {"invalid_arguments", "extra_env values must be strings"});
+        if (!is_valid_mcp_extra_env_key(k))
+          return make_tool_error(
+              {"invalid_arguments", "invalid environment variable name in extra_env"});
+        if (!valid_utf8_no_nul(v.string()))
+          return make_tool_error(
+              {"invalid_arguments", "invalid environment variable value in extra_env"});
         if (is_disallowed_mcp_extra_env_key(k))
           return make_tool_error(
               {"invalid_arguments", "disallowed environment variable in extra_env"});

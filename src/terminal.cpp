@@ -161,7 +161,23 @@ const std::array builtin_commands{
                 "One selected-context colleague request; no tools or retries", "Tools"},
     ChatCommand{"/beads",
                 "configure JSON | ready | list | show ID | select ID | cached",
-                "Explicit native Beads refresh/selection (lazy binding)", "Tools"}};
+                "Explicit native Beads refresh/selection (lazy binding)", "Tools"},
+    ChatCommand{"/platoon", "[status|board|members|post TEXT]",
+                "Inspect or post to the project platoon board and worktree leases",
+                "Command Post"},
+    ChatCommand{"/issues", "[ready|list|create TITLE|claim ID|close ID]",
+                "Inspect or update project issues (.blackbird/issues)", "Command Post"},
+    ChatCommand{"/memory", "[recent|recall QUERY|record KIND TITLE :: BODY|verify]",
+                "Recall, record and SHA-256 verify project memory", "Command Post"},
+    ChatCommand{"/capabilities", "[list|show ID]",
+                "Inspect skills and recipes catalog (read-only; never executes)",
+                "Command Post"},
+    ChatCommand{"/metrics", "[summary]",
+                "Read-only tertiary metrics summary and Unicode sparklines",
+                "Command Post"},
+    ChatCommand{"/companion", "[status|ask QUESTION]",
+                "System One decision companions (jev/clef) status and advisory",
+                "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>
 command_catalog(std::size_t *capture_bound = nullptr) {
@@ -1385,6 +1401,10 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       return {};
     if (escape_.size() >= 3 && c >= 0x30U && c <= 0x3fU)
       return {};
+    if (inspecting && escape_ == "\x1b[15~") {
+      escape_.clear();
+      return {InputAction::workbench_action, "toggle_advisory"};
+    }
     if (inspecting &&
         (escape_ == "\x1b[17~" || escape_ == "\x1b[18~" || escape_ == "\x1b[19~")) {
       const auto name = escape_ == "\x1b[17~"   ? "pin_a"
@@ -3631,8 +3651,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               caption += " · " + std::string{view.notice()};
           });
           caption +=
-              context_wb ? " · F6 pin · F7 drop/restore · F8 flush · F9 archived · Tab "
-                           "focus · Esc draft"
+              context_wb ? " · F5 advisory · F6 pin · F7 drop/restore · F8 flush · F9 "
+                           "archived "
+                           "· Tab focus · Esc draft"
               : hooks_open
                   ? " · F6 enable/disable · F9 defs/history · Tab focus · Esc draft"
               : authored ? " · F6 A · F7 B · F8 interrupt · Ctrl-] close"
@@ -4062,9 +4083,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
              result.action == InputAction::workbench_action) &&
             workbench && workbench->open() && workbench->focused()) {
           if (result.action == InputAction::workbench_action &&
-              result.text == "toggle_archived") {
+              result.text == "toggle_advisory") {
+            workbench->toggle_advisory();
+          } else if (result.action == InputAction::workbench_action &&
+                     result.text == "toggle_archived") {
             workbench->toggle_archived();
-          } else {
+          } else if (result.action == InputAction::instrument_action) {
             const std::string_view verb = result.text == "pin_a"   ? "pin"
                                           : result.text == "pin_b" ? "drop_or_restore"
                                                                    : "flush";

@@ -835,12 +835,45 @@ void test_full_stdio_roundtrip(const RoundtripPaths &paths) {
               "forbidden_path",
           "dangling symlink escape must be rejected");
 
-    // Reserved BLACKBIRD_PLATOON_* spoofing and exec-hijack env vars must be rejected.
+    // Reserved BLACKBIRD_PLATOON_* spoofing, exec-hijack, and
+    // credential/config-redirect env vars (Kimi Review #2 M1) must all be rejected.
     std::int64_t env_test_id = 120;
-    for (const char *bad_env :
-         {"BLACKBIRD_PLATOON_BOARD", "BLACKBIRD_PLATOON_PEER_ID",
-          "BLACKBIRD_PLATOON_ROLE", "PATH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH",
-          "NODE_OPTIONS", "PYTHONSTARTUP", "PYTHONPATH", "CURL_HOME", "ZDOTDIR"}) {
+    for (const char *bad_env : {"BLACKBIRD_PLATOON_BOARD",
+                                "BLACKBIRD_PLATOON_PEER_ID",
+                                "BLACKBIRD_PLATOON_ROLE",
+                                "PATH",
+                                "GIT_SSH_COMMAND",
+                                "GIT_EXEC_PATH",
+                                "GIT_CONFIG_COUNT",
+                                "GIT_DIR",
+                                "GIT_WORK_TREE",
+                                "HOME",
+                                "SSH_AUTH_SOCK",
+                                "XDG_CONFIG_HOME",
+                                "LD_PRELOAD",
+                                "DYLD_INSERT_LIBRARIES",
+                                "PERL5OPT",
+                                "RUBYOPT",
+                                "NPM_CONFIG_PREFIX",
+                                "JAVA_TOOL_OPTIONS",
+                                "_JAVA_OPTIONS",
+                                "NODE_OPTIONS",
+                                "PYTHONSTARTUP",
+                                "PYTHONPATH",
+                                "BASH_ENV",
+                                "BASH_FUNC_x",
+                                "ENV",
+                                "GNUPGHOME",
+                                "CARGO_HOME",
+                                "RUSTUP_HOME",
+                                "GEM_HOME",
+                                "GCONV_PATH",
+                                "LOCPATH",
+                                "NLSPATH",
+                                "IFS",
+                                "CURL_HOME",
+                                "ZDOTDIR",
+                                "OPENAI_API_KEY"}) {
       const Value env_reject = require_reply(
           server.handle_message(rpc_tool_call(
               env_test_id++, "platoon_peer_spawn",
@@ -856,6 +889,86 @@ void test_full_stdio_roundtrip(const RoundtripPaths &paths) {
       check(req_str(parse_tool_payload(env_reject, true), "error") ==
                 "invalid_arguments",
             "disallowed extra_env variable must be rejected");
+    }
+
+    // Invalid extra_env key syntax (empty, leading digit, '=', whitespace) rejected.
+    for (const char *bad_key : {"", "1BAD", "FOO=BAR", "FOO BAR", "FOO\nBAR"}) {
+      const Value key_reject =
+          require_reply(server.handle_message(rpc_tool_call(
+                            env_test_id++, "platoon_peer_spawn",
+                            Value::object({
+                                {"peer_id", Value{"bad-key"}},
+                                {"role", Value{"worker"}},
+                                {"provider", Value{"openai"}},
+                                {"model", Value{"gpt-5"}},
+                                {"prompt", Value{"hi"}},
+                                {"extra_env", Value::object({{bad_key, Value{"val"}}})},
+                            }))),
+                        "invalid extra_env key missing reply");
+      check(req_str(parse_tool_payload(key_reject, true), "error") ==
+                "invalid_arguments",
+            "invalid extra_env key syntax must be rejected");
+    }
+
+    // Post-decode \u0000 NUL in extra_env key and value (Kimi Review #2 L1) rejected!
+    {
+      const std::string nul_key_line =
+          R"({"jsonrpc":"2.0","id":"nul-key","method":"tools/call","params":{"name":"platoon_peer_spawn","arguments":{"peer_id":"bad-nul-k","role":"worker","provider":"openai","model":"gpt-5","prompt":"hi","extra_env":{"SAFE\u0000EVIL":"ok"}}}})";
+      const Value nul_key_reply =
+          require_reply(server.handle_line(nul_key_line), "nul-key missing reply");
+      check(req_str(nul_key_reply, "id") == "nul-key", "string id echo mismatch");
+      check(req_str(parse_tool_payload(nul_key_reply, true), "error") ==
+                "invalid_arguments",
+            "decoded NUL in extra_env key must be rejected");
+
+      const std::string nul_val_line =
+          R"({"jsonrpc":"2.0","id":"nul-val","method":"tools/call","params":{"name":"platoon_peer_spawn","arguments":{"peer_id":"bad-nul-v","role":"worker","provider":"openai","model":"gpt-5","prompt":"hi","extra_env":{"SAFE_VAR":"ok\u0000evil"}}}})";
+      const Value nul_val_reply =
+          require_reply(server.handle_line(nul_val_line), "nul-val missing reply");
+      check(req_str(nul_val_reply, "id") == "nul-val", "string id echo mismatch");
+      check(req_str(parse_tool_payload(nul_val_reply, true), "error") ==
+                "invalid_arguments",
+            "decoded NUL in extra_env value must be rejected");
+    }
+
+    // Sibling prefix path rejection: /.../peer-work2 MUST NOT match /.../peer-work!
+    {
+      const fs::path sibling_dir = base / "peer-work2";
+      fs::create_directories(sibling_dir);
+      const Value sibling_reject =
+          require_reply(server.handle_message(rpc_tool_call(
+                            env_test_id++, "platoon_peer_spawn",
+                            Value::object({
+                                {"peer_id", Value{"bad-sibling"}},
+                                {"role", Value{"worker"}},
+                                {"provider", Value{"openai"}},
+                                {"model", Value{"gpt-5"}},
+                                {"prompt", Value{"hi"}},
+                                {"working_dir", Value{sibling_dir.string()}},
+                            }))),
+                        "sibling prefix reject missing reply");
+      check(req_str(parse_tool_payload(sibling_reject, true), "error") ==
+                "forbidden_path",
+            "sibling prefix path must be rejected");
+    }
+
+    // String JSON-RPC id echo on normal result and error replies.
+    {
+      const Value str_ping = require_reply(
+          server.handle_line(
+              R"({"jsonrpc":"2.0","id":"req-str-42","method":"ping","params":{}})"),
+          "string id ping missing reply");
+      check(req_str(str_ping, "id") == "req-str-42", "string id ping echo mismatch");
+      check(req_field(str_ping, "result").object().empty(),
+            "string id ping result not empty");
+
+      const Value str_err = require_reply(
+          server.handle_line(
+              R"({"jsonrpc":"2.0","id":"err-str-99","method":"no/such","params":{}})"),
+          "string id error missing reply");
+      check(req_str(str_err, "id") == "err-str-99", "string id error echo mismatch");
+      check(req_int(req_field(str_err, "error"), "code") == kJsonRpcMethodNotFound,
+            "string id error code mismatch");
     }
 
     const Value spawned = require_reply(

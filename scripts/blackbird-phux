@@ -1,22 +1,98 @@
 #!/bin/sh
 set -eu
-if [ "$#" -eq 0 ] || [ "$1" = --help ] || [ "$1" = -h ]; then
-  printf '%s\n' 'Usage: scripts/blackbird-phux PHUX_SESSION [blackbird options...]' \
+
+blackbird_phux_usage() {
+  printf '%s\n' \
+    'Usage: scripts/blackbird-phux [--ephemeral] PHUX_SESSION [blackbird options...]' \
     'Creates and attaches a new named phux session running Blackbird.' \
+    '  --ephemeral  End the phux session automatically when Blackbird exits.' \
     'Return later with: phux attach PHUX_SESSION' \
     'Choose a distinct --session directory for each running Blackbird.'
+}
+
+if [ "$#" -eq 0 ]; then
+  blackbird_phux_usage
   exit 0
 fi
+
+blackbird_phux_ephemeral=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help|-h)
+      blackbird_phux_usage
+      exit 0
+      ;;
+    --ephemeral)
+      blackbird_phux_ephemeral=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      printf 'Unknown option: %s\nRun with --help for usage.\n' "$1" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ "$#" -eq 0 ]; then
+  printf 'Missing PHUX_SESSION name.\nRun with --help for usage.\n' >&2
+  exit 2
+fi
+
 blackbird_phux_name=$1
 shift
-blackbird_phux_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
 if ! command -v phux >/dev/null 2>&1; then
   printf '%s\n' 'Install phux first: https://phux.sh/install' >&2
   exit 127
 fi
+
+blackbird_phux_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$blackbird_phux_dir/blackbird" ]; then
+  blackbird_phux_cmd="$blackbird_phux_dir/blackbird"
+elif command -v blackbird >/dev/null 2>&1; then
+  blackbird_phux_cmd=$(command -v blackbird)
+else
+  printf '%s\n' 'Could not find scripts/blackbird or blackbird on PATH.' >&2
+  exit 127
+fi
+
 # phux owns the terminal lifetime; scripts/blackbird owns restart/resume behavior.
 # Preserve the operator cwd and literal option boundaries. PHUX_SOCKET/profile
 # are inherited, allowing the same launcher against a private/local service.
-phux new --json --cwd "$PWD" --session "$blackbird_phux_name" -- \
-  "$blackbird_phux_root/scripts/blackbird" "$@" >/dev/null
+if "$blackbird_phux_ephemeral"; then
+  blackbird_phux_created=$(
+    phux new --json --ephemeral --cwd "$PWD" --session "$blackbird_phux_name" -- \
+      "$blackbird_phux_cmd" "$@"
+  )
+else
+  blackbird_phux_created=$(
+    phux new --json --cwd "$PWD" --session "$blackbird_phux_name" -- \
+      "$blackbird_phux_cmd" "$@"
+  )
+fi
+
+# Best-effort agent identity declaration (phux 0.162.0+); never block launch
+# if an older phux server does not support `phux agent set`.
+blackbird_phux_tid=$(
+  printf '%s\n' "$blackbird_phux_created" \
+    | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    | head -n 1
+)
+case "$blackbird_phux_tid" in
+  ''|*[!0-9]*) ;;
+  *)
+    phux agent set --name blackbird --kind blackbird --session "$blackbird_phux_name" \
+      "@$blackbird_phux_tid" >/dev/null 2>&1 \
+      || phux agent set --name blackbird "@$blackbird_phux_tid" >/dev/null 2>&1 \
+      || :
+    ;;
+esac
+
 exec phux attach "$blackbird_phux_name"

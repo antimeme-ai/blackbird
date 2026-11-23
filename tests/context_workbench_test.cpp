@@ -252,6 +252,66 @@ void test_workbench_navigation_and_actions() {
               chosen.view == tui::ViewRoute::context_workbench &&
               composer.text() == "keep my draft",
           "view picker selects context_workbench while preserving draft");
+
+  // DECISION_COMPANION advisory + F5 toggle (jev/clef operational briefing).
+  require(!wb.showing_advisory(), "advisory defaults hidden");
+  wb.toggle_archived(); // restore archived visibility
+  DecisionCompanionAdvisory adv;
+  adv.provider = "jev";
+  adv.model = "jev-1.13.0";
+  adv.summary = "Pin instruction #1; #2 exchange is compressible after summary.";
+  adv.pin_ids = {id1};
+  adv.compressible_ids = {id2};
+  adv.stale_ids = {id3};
+  adv.hints.push_back({.block_id = id1,
+                       .category = "pin",
+                       .reason = "Operator constraints must stay resident",
+                       .confidence = 0.94});
+  wb.set_advisory(adv);
+  require(wb.advisory().has_value() && wb.advisory()->provider == "jev",
+          "advisory stored on workbench");
+  require(wb.caption().find("F5 advisory") != std::string::npos,
+          "caption advertises F5 advisory when briefing is available");
+
+  // F5 escape sequence dispatches toggle_advisory while inspecting.
+  Composer f5_composer;
+  InputResult f5_res;
+  for (const char byte : std::string_view{"\x1b[15~"}) {
+    auto r = f5_composer.feed(byte, nullptr, true);
+    if (r.action != InputAction::none)
+      f5_res = std::move(r);
+  }
+  require(f5_res.action == InputAction::workbench_action &&
+              f5_res.text == "toggle_advisory",
+          "F5 emits toggle_advisory workbench action");
+
+  wb.toggle_advisory();
+  require(wb.showing_advisory(), "F5 toggle turns advisory on");
+  require(wb.refresh(reader), "refresh with advisory on");
+  grid.reset(100, 24);
+  (void)unwrap(wb.render(grid, {0, 2, 100, 20}));
+  const auto adv_screen = render_text(grid);
+  require(adv_screen.find("DECISION_COMPANION (jev/jev-1.13.0)") != std::string::npos,
+          "advisory renders provider/model header");
+  require(adv_screen.find("Pin: #1") != std::string::npos,
+          "advisory renders pin bucket");
+  require(adv_screen.find("Compressible: #2") != std::string::npos,
+          "advisory renders compressible bucket");
+  require(adv_screen.find("Stale: #3") != std::string::npos,
+          "advisory renders stale bucket");
+  require(adv_screen.find("[~pin]") != std::string::npos,
+          "advisory renders [~pin] tag on collection row");
+  require(adv_screen.find("[~cmp]") != std::string::npos,
+          "advisory renders [~cmp] tag on collection row");
+  require(adv_screen.find("[~stale]") != std::string::npos,
+          "advisory renders [~stale] tag on collection row");
+  require(wb.caption().find("companion:jev") != std::string::npos,
+          "caption shows active companion provider");
+
+  // Toggle advisory off cleanly via action_command("advisory").
+  const auto off = wb.action_command("advisory");
+  require(!wb.showing_advisory() && off.command.empty(),
+          "action_command(advisory) toggles advisory back off");
 }
 
 } // namespace

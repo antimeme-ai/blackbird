@@ -13913,3 +13913,33 @@ Blackbird must not present itself as another product.
   - `WorktreeLeaseManager`: `.leases/*.json` corrupt-entry quarantine (M4); PID-1/foreign-UID
     rejection + process start-time liveness verification (M5); `GIT_CONFIG_NOSYSTEM=1` +
     `-c core.hooksPath=/dev/null` (M6); iterative `0700` private directory creation (L5).
+
+## 2026-11-23 — Wave 3: Stage 0 `BoardBridge`, Command Post CLI & TUI Wiring, Kimi Review #2 Fixes, `phux 0.162.0`
+
+- **Multiplayer Stage 0 `BoardBridge` & Experiment 1 (`include/blackbird/board_bridge.hpp`,
+  `src/board_bridge.cpp`, `tests/board_bridge_test.cpp`):** distributed causal events
+  (`(actor_id, actor_seq)` + canonical SHA-256 `event_hash` + `causal_parents` + concurrent
+  claim detection), executable 4-stage receipt lifecycle (`transmitted` / `available` /
+  `opened_by_application` / `included_in_request` / `acknowledged` / `acted`), scoped
+  action-time unread-message guard, data-only quoted peer framing with delimiter escaping,
+  `SpendPolicy`/`SpendLedger` + tool-time cryptographic & local kill-switch grant
+  re-verification, live watcher presence heartbeats, bidirectional NDJSON pipe/SSH transport,
+  and automated Experiment 1 (Two-Owner Minimum Useful Transfer).
+- **Command Post CLI (`include/blackbird/command_post_cli.hpp`, `src/command_post_cli.cpp`,
+  `tests/command_post_cli_test.cpp`, `scripts/blackbird`, `src/main.cpp`):** wired
+  `blackbird mcp|platoon|issues|memory|peer|capabilities|metrics` with JSON stdout, clean
+  launcher passthrough, and strict `pid_t` bounds/process-group signaling guards.
+- **Kimi Review #2 Remediation (`papers/2026-11-23-command-post-kimi-review.md`,
+  `run-ft7h3k6q`):** hardened `McpCommandPostServer` `extra_env` key/value post-decode
+  validation and `GIT_*`/`HOME`/`XDG_*`/`SSH_AUTH_SOCK`/interpreter-hook blocking (M1/L1),
+  and closed `KnownPeersStore::verify_grant` concurrent revocation TOCTOU + `TMPDIR` honor
+  + trailing armor rejection (L5/L6).
+- **Live TUI Command Post Surfaces (`include/blackbird/command_post_tui.hpp`,
+  `src/command_post_tui.cpp`, `tests/command_post_tui_test.cpp`, `src/terminal.cpp`,
+  `src/context_workbench.cpp`):** wired `/platoon`, `/issues`, `/memory`, `/capabilities`,
+  `/metrics`, `/companion` slash commands + Context Workbench `F5` `DECISION_COMPANION`
+  advisory briefing.
+- **`phux 0.162.0` Compatibility (`scripts/blackbird-phux`, `scripts/check-phux`,
+  `docs/PHUX.md`):** refreshed launcher (`--ephemeral`, best-effort `phux agent set`,
+  `PATH` fallback), verified isolated private-socket smoke script against `phux 0.162.0`,
+  and updated `docs/PHUX.md`.

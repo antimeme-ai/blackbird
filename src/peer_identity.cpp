@@ -346,7 +346,15 @@ Result<void> write_file_atomic(int dir_fd, const AtomicWriteSpec &spec) {
 class IsolatedTempDir {
 public:
   static Result<IsolatedTempDir> create(const char *prefix) {
-    std::string tmpl = "/tmp/";
+    const char *env_tmpdir = std::getenv("TMPDIR");
+    std::string base = (env_tmpdir != nullptr && env_tmpdir[0] != '\0')
+                           ? std::string{env_tmpdir}
+                           : std::string{"/tmp"};
+    while (base.size() > 1 && base.back() == '/')
+      base.pop_back();
+    std::string tmpl = base;
+    if (tmpl.back() != '/')
+      tmpl.push_back('/');
     tmpl += prefix;
     tmpl += "-XXXXXX";
     char *created = ::mkdtemp(tmpl.data());
@@ -696,10 +704,16 @@ Result<void> validate_signature_armor(std::string_view signature) noexcept {
     return Result<void>::failure({ErrorCode::invalid_identity});
   if (signature.find('\0') != std::string_view::npos || !valid_utf8(signature))
     return Result<void>::failure({ErrorCode::invalid_identity});
-  if (!signature.starts_with("-----BEGIN SSH SIGNATURE-----") ||
-      signature.find("-----END SSH SIGNATURE-----") == std::string_view::npos) {
+  constexpr std::string_view kBegin = "-----BEGIN SSH SIGNATURE-----";
+  constexpr std::string_view kEnd = "-----END SSH SIGNATURE-----";
+  if (!signature.starts_with(kBegin))
     return Result<void>::failure({ErrorCode::invalid_identity});
-  }
+  const std::size_t end_pos = signature.find(kEnd, kBegin.size());
+  if (end_pos == std::string_view::npos)
+    return Result<void>::failure({ErrorCode::invalid_identity});
+  const std::string_view trailer = signature.substr(end_pos + kEnd.size());
+  if (!trailer.empty() && trailer != "\n" && trailer != "\r\n")
+    return Result<void>::failure({ErrorCode::invalid_identity});
   return Result<void>::success();
 }
 
@@ -2193,14 +2207,13 @@ Result<void> KnownPeersStore::verify_grant(const CapabilityGrant &grant,
   if (now_ns < grant.issued_at_ns)
     return Result<void>::failure({ErrorCode::invalid_range});
 
-  std::string grantor_public_key;
-  {
+  auto check_grant_trust = [&]() -> Result<std::string> {
     auto lock = ScopedFlock::acquire(dir_fd_, kKnownPeersLockFile, true);
     if (!lock.has_value())
-      return Result<void>::failure(lock.error());
+      return Result<std::string>::failure(lock.error());
     auto loaded = read_known_peers_locked(dir_fd_);
     if (!loaded.has_value())
-      return Result<void>::failure(loaded.error());
+      return Result<std::string>::failure(loaded.error());
     const KnownPeersDocument &doc = loaded.value();
 
     const PinnedPeer *grantor = nullptr;
@@ -2211,28 +2224,43 @@ Result<void> KnownPeersStore::verify_grant(const CapabilityGrant &grant,
       }
     }
     if (!grantor)
-      return Result<void>::failure({ErrorCode::invalid_identity});
+      return Result<std::string>::failure({ErrorCode::invalid_identity});
     if (grantor->revoked)
-      return Result<void>::failure({ErrorCode::conflict});
+      return Result<std::string>::failure({ErrorCode::conflict});
     for (const auto &revoked : doc.revoked_grants) {
       if (revoked.grant_id == grant.grant_id)
-        return Result<void>::failure({ErrorCode::conflict});
+        return Result<std::string>::failure({ErrorCode::conflict});
     }
-    grantor_public_key = grantor->public_key;
-  }
+    return Result<std::string>::success(grantor->public_key);
+  };
+
+  auto grantor_public_key = check_grant_trust();
+  if (!grantor_public_key.has_value())
+    return Result<void>::failure(grantor_public_key.error());
 
   auto canonical = canonical_grant_payload(grant);
   if (!canonical.has_value())
     return Result<void>::failure(canonical.error());
 
-  return verify_detached_signature(
+  auto verified = verify_detached_signature(
       DetachedSignatureVerification{
           grant.grantor_fingerprint,
-          grantor_public_key,
+          grantor_public_key.value(),
           canonical.value(),
           grant.signature,
       },
       config_);
+  if (!verified.has_value())
+    return verified;
+
+  // Re-check peer and local grant revocation under shared flock after
+  // ssh-keygen verification completes to close the concurrent revoke-vs-verify race.
+  auto rechecked = check_grant_trust();
+  if (!rechecked.has_value())
+    return Result<void>::failure(rechecked.error());
+  if (rechecked.value() != grantor_public_key.value())
+    return Result<void>::failure({ErrorCode::conflict});
+  return Result<void>::success();
 }
 
 } // namespace blackbird

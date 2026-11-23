@@ -3,6 +3,8 @@
 #include "blackbird/backstop.hpp"
 #include "blackbird/chat_provider.hpp"
 #include "blackbird/coding.hpp"
+#include "blackbird/command_post_cli.hpp"
+#include "blackbird/command_post_tui.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
 #include "blackbird/openrouter.hpp"
@@ -2399,9 +2401,22 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                           ? ""
                           : read_file(workflow, 16 * 1024 * 1024, &command_context))) {
                 publish_workflows(engine.workflows());
-              } else if (prompt.starts_with("/"))
-                emit("Unknown command: " + std::string{prompt} +
-                     ". /help lists commands; /quit or /exit closes Blackbird.\n");
+              } else if (prompt.starts_with("/")) {
+                CommandPostTuiContext cp_ctx;
+                cp_ctx.session_dir = session;
+                cp_ctx.audit_log = &log;
+                cp_ctx.session_id = session.filename().string();
+                cp_ctx.tui = tui;
+                if (const auto out = handle_command_post_slash(prompt, cp_ctx)) {
+                  if (tui)
+                    ui.notice("\n" + *out);
+                  else
+                    emit(*out);
+                } else {
+                  emit("Unknown command: " + std::string{prompt} +
+                       ". /help lists commands; /quit or /exit closes Blackbird.\n");
+                }
+              }
             }
 
             publish_workflows(engine.workflows());
@@ -3111,6 +3126,8 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && std::string_view{argv[1]} == "auth")
     return provider_auth_cli(argc - 1, argv + 1);
+  if (argc > 1 && is_command_post_subcommand(argv[1]))
+    return command_post_cli(argc - 1, argv + 1, std::cin, std::cout, std::cerr);
   if (argc > 1 &&
       (std::string_view{argv[1]} == "--version" || std::string_view{argv[1]} == "-V")) {
     std::cout << BLACKBIRD_VERSION_STRING << '\n';

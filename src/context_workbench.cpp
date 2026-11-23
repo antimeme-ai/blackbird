@@ -109,6 +109,36 @@ void append_text_lines(std::vector<ChatRow> &rows, std::string_view text,
   }
 }
 
+bool contains_block_id(const std::vector<std::uint64_t> &ids,
+                       std::uint64_t target) noexcept {
+  return std::find(ids.begin(), ids.end(), target) != ids.end();
+}
+
+std::string format_id_list(const std::vector<std::uint64_t> &ids) {
+  std::string out;
+  const std::size_t shown = std::min<std::size_t>(ids.size(), 8);
+  for (std::size_t i = 0; i < shown; ++i) {
+    if (i > 0)
+      out += ", ";
+    out += "#" + std::to_string(ids[i]);
+  }
+  if (ids.size() > shown)
+    out += " (+" + std::to_string(ids.size() - shown) + ")";
+  return out;
+}
+
+std::string block_advisory_tags(const DecisionCompanionAdvisory &advisory,
+                                std::uint64_t id) {
+  std::string tags;
+  if (contains_block_id(advisory.pin_ids, id))
+    tags += " [~pin]";
+  if (contains_block_id(advisory.compressible_ids, id))
+    tags += " [~cmp]";
+  if (contains_block_id(advisory.stale_ids, id))
+    tags += " [~stale]";
+  return tags;
+}
+
 } // namespace
 
 ContextWorkbench::ContextWorkbench()
@@ -135,7 +165,15 @@ void ContextWorkbench::first_page(RawEventRef) {
 }
 
 void ContextWorkbench::update(ContextWorkbenchSnapshot snapshot) {
+  auto existing_advisory = std::move(snapshot_.decision_advisory);
   snapshot_ = std::move(snapshot);
+  if (!snapshot_.decision_advisory.has_value() && existing_advisory.has_value())
+    snapshot_.decision_advisory = std::move(existing_advisory);
+  refresh_ = true;
+}
+
+void ContextWorkbench::set_advisory(std::optional<DecisionCompanionAdvisory> advisory) {
+  snapshot_.decision_advisory = std::move(advisory);
   refresh_ = true;
 }
 
@@ -144,6 +182,18 @@ void ContextWorkbench::toggle_archived() {
   detail_offset_ = 0;
   refresh_ = true;
   notice_ = show_archived_ ? "Showing live + archived" : "Showing live only";
+}
+
+void ContextWorkbench::toggle_advisory() {
+  show_advisory_ = !show_advisory_;
+  refresh_ = true;
+  if (show_advisory_) {
+    notice_ = snapshot_.decision_advisory.has_value()
+                  ? "Showing DECISION_COMPANION advisory"
+                  : "DECISION_COMPANION advisory on (no briefing loaded)";
+  } else {
+    notice_ = "Hiding DECISION_COMPANION advisory";
+  }
 }
 
 void ContextWorkbench::page(bool forward) {
@@ -191,6 +241,10 @@ std::optional<ContextWorkbenchBlock> ContextWorkbench::selected_block() const {
 }
 
 ContextWorkbenchAction ContextWorkbench::action_command(std::string_view verb) {
+  if (verb == "advisory") {
+    toggle_advisory();
+    return {{}, notice_};
+  }
   if (verb == "flush") {
     if (snapshot_.pending_compactions == 0) {
       notice_ = "No pending deferred compactions";
@@ -262,6 +316,8 @@ bool ContextWorkbench::refresh(const ContextDetailReader &reader) {
       flags += " [P]";
     if (block.open)
       flags += " [O]";
+    if (show_advisory_ && snapshot_.decision_advisory.has_value())
+      flags += block_advisory_tags(*snapshot_.decision_advisory, block.id);
     const auto preview = sanitize_single_line(block.preview, 44);
     std::string label = "#" + std::to_string(block.id) + " " + short_kind(block.kind) +
                         flags + " " + format_bytes(block.bytes);
@@ -284,10 +340,12 @@ bool ContextWorkbench::refresh(const ContextDetailReader &reader) {
       }
     }
   }
+  bool reset_anchor = false;
   if (!chosen && !visible.empty()) {
     chosen = visible.front();
     selected_id_ = chosen->id;
     detail_offset_ = 0;
+    reset_anchor = true;
   }
   if (!chosen)
     selected_id_.reset();
@@ -325,6 +383,61 @@ bool ContextWorkbench::refresh(const ContextDetailReader &reader) {
       detail.lines.push_back({{std::move(rep), Ink::muted}});
     }
     detail.lines.push_back({{"", Ink::normal}});
+    if (show_advisory_) {
+      if (snapshot_.decision_advisory.has_value()) {
+        const auto &adv = *snapshot_.decision_advisory;
+        std::string header = "DECISION_COMPANION";
+        if (!adv.provider.empty()) {
+          header += " (" + sanitize_single_line(adv.provider, 32);
+          if (!adv.model.empty())
+            header += "/" + sanitize_single_line(adv.model, 48);
+          header += ")";
+        }
+        if (adv.stale)
+          header += " [stale]";
+        detail.lines.push_back({{std::move(header), Ink::heading}});
+        if (!adv.summary.empty()) {
+          detail.lines.push_back(
+              {{"Briefing: " + sanitize_single_line(adv.summary, 200), Ink::normal}});
+        }
+        std::string buckets;
+        if (!adv.pin_ids.empty())
+          buckets += "Pin: " + format_id_list(adv.pin_ids);
+        if (!adv.compressible_ids.empty()) {
+          if (!buckets.empty())
+            buckets += " | ";
+          buckets += "Compressible: " + format_id_list(adv.compressible_ids);
+        }
+        if (!adv.stale_ids.empty()) {
+          if (!buckets.empty())
+            buckets += " | ";
+          buckets += "Stale: " + format_id_list(adv.stale_ids);
+        }
+        if (!buckets.empty())
+          detail.lines.push_back({{std::move(buckets), Ink::muted}});
+        for (const auto &hint : adv.hints) {
+          if (hint.block_id != chosen->id)
+            continue;
+          std::string hint_line = "Block #" + std::to_string(chosen->id) + " hint [" +
+                                  sanitize_single_line(hint.category, 24) +
+                                  "]: " + sanitize_single_line(hint.reason, 160);
+          if (hint.confidence.has_value()) {
+            std::ostringstream conf;
+            conf << std::fixed << std::setprecision(2) << *hint.confidence;
+            hint_line += " (p=" + conf.str() + ")";
+          }
+          detail.lines.push_back({{std::move(hint_line), Ink::muted}});
+        }
+        detail.lines.push_back({{"", Ink::normal}});
+      } else {
+        detail.lines.push_back(
+            {{"DECISION_COMPANION: no System One briefing loaded", Ink::heading}});
+        detail.lines.push_back(
+            {{"Use /companion status or /companion ask <question> (jev/clef).",
+              Ink::muted}});
+        detail.lines.push_back({{"", Ink::normal}});
+      }
+    }
 
     std::optional<ContextDetailSlice> slice;
     if (reader)
@@ -355,8 +468,13 @@ bool ContextWorkbench::refresh(const ContextDetailReader &reader) {
     return false;
   }
   if (chosen) {
-    if (const auto handle = host_.handle(collection_key); handle.has_value())
-      (void)host_.select(handle.value(), block_key(chosen->id));
+    if (const auto handle = host_.handle(collection_key); handle.has_value()) {
+      const auto key = block_key(chosen->id);
+      if (reset_anchor)
+        (void)host_.position(handle.value(), key, key);
+      else
+        (void)host_.select(handle.value(), key);
+    }
   }
   return true;
 }
@@ -374,6 +492,17 @@ std::string ContextWorkbench::caption() const {
   out += " · " + format_bytes(snapshot_.total_bytes);
   if (snapshot_.pending_compactions > 0)
     out += " · " + std::to_string(snapshot_.pending_compactions) + " pending";
+  if (show_advisory_) {
+    if (snapshot_.decision_advisory.has_value() &&
+        !snapshot_.decision_advisory->provider.empty()) {
+      out += " · companion:" +
+             sanitize_single_line(snapshot_.decision_advisory->provider, 24);
+    } else {
+      out += " · F5 advisory:on";
+    }
+  } else if (snapshot_.decision_advisory.has_value()) {
+    out += " · F5 advisory";
+  }
   if (!notice_.empty())
     out += " · " + notice_;
   return out;
