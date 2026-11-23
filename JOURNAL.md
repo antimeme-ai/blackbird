@@ -14082,3 +14082,15 @@ Blackbird must not present itself as another product.
 - **Wave 7B-3 — `blackbird party` CLI (`src/command_post_cli.cpp`, `tests/command_post_cli_test.cpp`, `scripts/blackbird`):**
   added `blackbird party roster|create|leave|add-leader|remove-leader|say` + `scripts/blackbird` direct passthrough.
 - **Linux ASan fix (`tests/party_chat_test.cpp`):** replaced hardcoded `55`-byte literal length with `sizeof(kEvilBody) - 1` after `wintermute` Linux ASan caught global-buffer-overflow (`context/linux/run-758qzwe_`). Archived `@dentist-2` Wave 7B report in `papers/2026-11-23-wave7b-party-ui-dispatch-bang-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #22 (Wave 7C-1 & Wave 8): Hero v24 Kitty Graphics SR-71 Engine, Rich Markdown ChatView, Lossless Context Hygiene & Native Single-Player Swarms
+
+- **Wave 7C-1 — Hero v24 Native C++23 RGBA & Kitty Graphics Protocol Engine (`include/blackbird/flight_deck_hero.hpp`, `src/flight_deck_hero.cpp`, `tests/flight_deck_hero_test.cpp`):**
+  ported `hero-flight-v24.html` directly to zero-dependency C++23 RGBA software rasterization (~1.31 ms/frame at `-O2`) with all 8 themes (`synthwave`, `tokyonight`, `gotham`, `kanagawa`, `nord`, `hackerman`, `retro82`, `dyingearth`), 3D chase-camera SR-71 with Mach shock-diamond afterburners, 3-flow physics token shower + additive bloom, critically-damped WASD/arrow steering + holographic fly-to-answer gates, chunked Kitty Graphics Protocol (`f=32`) RGBA encoder, and 24-bit half-block (`▀`) truecolor fallback.
+- **Wave 8A — Rich Markdown Typography & Compact Semantic Tool Cards (`include/blackbird/chat_view.hpp`, `src/chat_view.cpp`, `tests/chat_view_test.cpp`, `tests/snapshots/tui/expected/conversation-{ordinary,narrow}.snap`):**
+  upgraded assistant rendering with styled H1–H3 headings, hanging-indent bullet/numbered lists, bordered fenced code blocks with language pills, aligned box-drawn Markdown tables (with 1-byte stream-vs-cold parity), blockquotes, horizontal rules, and `format_compact_tool_header()`.
+- **Wave 8B — Lossless Context Hygiene Engine (`include/blackbird/context_hygiene.hpp`, `src/context_hygiene.cpp`, `tests/context_hygiene_test.cpp`):**
+  added `project_tool_output_for_context()` (4 KiB head + diagnostic-extract + tail with audit pointer) and `plan_tool_result_aging()` (sliding-window lossless `CompactOp::summarize` stubs preserving pinned entries, recent turns, and verbatim `AuditLog` originals).
+- **Wave 8C — Native Single-Player Blackbird Swarm Engine (`include/blackbird/local_swarm.hpp`, `src/local_swarm.cpp`, `tests/local_swarm_test.cpp`):**
+  added OS-native `kqueue`/`inotify` zero-token reactive `SwarmBoardWaiter`, `LocalSwarmCoordinator` with disjoint `owned_files` enforcement & git worktree leases, Kimi-style atomic `add_sharded_group`, built-in `@dentist` verifier preset, and in-place `switch_worker_model()`.
+- **Review Trail:** archived `@dentist-2`'s verification report in `papers/2026-11-23-wave7c1-and-wave8-dentist-review.md` and registered all 3 new test suites in `CMakeLists.txt` (317 total ctests).

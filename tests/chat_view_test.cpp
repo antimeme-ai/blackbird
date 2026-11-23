@@ -1,4 +1,5 @@
 #include "blackbird/chat_view.hpp"
+#include "blackbird/display_text.hpp"
 #include "blackbird/sprite.hpp"
 #include "blackbird/terminal.hpp"
 #include <cerrno>
@@ -97,6 +98,315 @@ void presenter_pipe() {
   ::close(descriptors[0]);
   ::close(descriptors[1]);
 }
+void test_rich_markdown_and_compact_tools() {
+  // 1. Headings hierarchy (H1 underline, H2 clean heading, H3 accent) + inline code.
+  {
+    ChatView view;
+    view.append(ChatKind::assistant, "# Main `API`\n## Overview\n### Details\n");
+    const auto &rows = view.rows(60);
+    const auto text = plain(rows);
+    require(text.find("# ") == std::string::npos &&
+                text.find("## ") == std::string::npos &&
+                text.find("### ") == std::string::npos,
+            "raw heading hashes must be stripped");
+    require(text.find("  │ Main API\n  │ ────────\n") != std::string::npos,
+            "H1 must render title followed by width-matched underline");
+    require(text.find("  │ Overview\n") != std::string::npos,
+            "H2 must render clean heading");
+    require(text.find("  │ › Details\n") != std::string::npos,
+            "H3 must render subtle accent heading");
+    bool h1_code_ink = false, h2_heading_ink = false, h3_heading_ink = false;
+    for (const auto &row : rows) {
+      for (const auto &span : row) {
+        if (span.text == "API" && span.ink == Ink::code)
+          h1_code_ink = true;
+        if (span.text == "Overview" && span.ink == Ink::heading)
+          h2_heading_ink = true;
+        if (span.text == "Details" && span.ink == Ink::heading)
+          h3_heading_ink = true;
+      }
+    }
+    require(h1_code_ink && h2_heading_ink && h3_heading_ink,
+            "headings preserve Ink::heading and inline Ink::code");
+  }
+
+  // 2. Hanging-indent bullet (-, *, +) and numbered lists (1., 12.) at narrow width=24.
+  {
+    ChatView view;
+    view.append(ChatKind::assistant, "- Alpha **bold** item wraps cleanly here\n"
+                                     "* Second bullet with `code`\n"
+                                     "+ Third bullet\n"
+                                     "1. Numbered item wraps nicely on narrow width\n"
+                                     "12. Double digit item also indents properly\n");
+    const auto &rows = view.rows(24);
+    for (const auto &row : rows)
+      require(display_cells(chat_plain(row)).value <= 24,
+              "list row exceeded narrow viewport width 24");
+    const auto text = plain(rows);
+    require(text.find("  │   • Alpha bold item ") != std::string::npos &&
+                text.find("  │     wraps cleanly he") != std::string::npos,
+            "bullet list must use hanging indent (4 spaces under text)");
+    require(text.find("  │   • Second bullet wi") != std::string::npos &&
+                text.find("  │   • Third bullet\n") != std::string::npos,
+            "* and + bullets must normalize to •");
+    require(text.find("  │   1. Numbered item w") != std::string::npos &&
+                text.find("  │      raps nicely on ") != std::string::npos,
+            "single-digit numbered list must align continuation under text");
+    require(text.find("  │   12. Double digit i") != std::string::npos &&
+                text.find("  │       tem also inden") != std::string::npos,
+            "two-digit numbered list must align continuation under text");
+  }
+
+  // 3. Bordered fenced code blocks with language pill + narrow clamping.
+  {
+    ChatView view;
+    view.append(ChatKind::assistant, "```cpp\nauto answer = \"café\";\n```\n"
+                                     "```\nplain line\n```\n");
+    const auto &wide = view.rows(52);
+    const auto wtext = plain(wide);
+    require(wtext.find("```") == std::string::npos,
+            "raw backtick fences must not clutter rendered output");
+    require(
+        wtext.find("  │ ╭─ cpp ─") != std::string::npos &&
+            wtext.find("  │ │ auto answer = \"café\";\n") != std::string::npos &&
+            wtext.find("  │ ╰───") != std::string::npos,
+        "fenced code block renders top border + language pill, │ bar, bottom border");
+    require(wtext.find("  │ ╭───") != std::string::npos &&
+                wtext.find("  │ │ plain line\n") != std::string::npos,
+            "unlabelled code fence renders clean border without language pill");
+    bool pill_code_ink = false, bar_code_ink = false, kw_ink = false;
+    for (const auto &row : wide) {
+      for (const auto &span : row) {
+        if (span.text == "cpp" && span.ink == Ink::code)
+          pill_code_ink = true;
+        if (span.text == "│ " && span.ink == Ink::code)
+          bar_code_ink = true;
+        if (span.text == "auto" && span.ink == Ink::keyword)
+          kw_ink = true;
+      }
+    }
+    require(pill_code_ink && bar_code_ink && kw_ink,
+            "fenced code block uses Ink::code pill/bar and syntax highlighting");
+    const auto &narrow = view.rows(24);
+    for (const auto &row : narrow)
+      require(display_cells(chat_plain(row)).value <= 24,
+              "fenced code row exceeded narrow width 24");
+  }
+
+  // 4. Aligned box-drawn Markdown tables (UTF-8, inline formatting, alignment, narrow).
+  {
+    ChatView view;
+    view.append(ChatKind::assistant, "| Name | `Code` | Count |\n"
+                                     "|:-----|:------:|------:|\n"
+                                     "| **界** | `a|b` | 7 |\n"
+                                     "| café \\| tea | ok | 1234 |\n");
+    const auto &wide = view.rows(60);
+    const auto wtext = plain(wide);
+    require(wtext.find("╭") != std::string::npos &&
+                wtext.find("├") != std::string::npos &&
+                wtext.find("┼") != std::string::npos &&
+                wtext.find("╰") != std::string::npos,
+            "table must render aligned box-drawing borders");
+    require(wtext.find("a|b") != std::string::npos &&
+                wtext.find("café | tea") != std::string::npos,
+            "pipes inside inline code and escaped pipes must not split columns");
+    std::size_t table_width = 0;
+    for (const auto &row : wide) {
+      const auto line = chat_plain(row);
+      const auto cells = display_cells(line).value;
+      require(cells <= 60, "table row exceeded width 60");
+      if (line.find("╭") != std::string::npos || line.find("├") != std::string::npos ||
+          line.find("╰") != std::string::npos ||
+          (line.starts_with("  │ │") && line.ends_with("│"))) {
+        if (table_width == 0)
+          table_width = cells;
+        require(cells == table_width,
+                "every box-drawn table row must align identically");
+      }
+    }
+    require(table_width > 0, "expected box-drawn table rows");
+    // Narrow width=24 must clamp & wrap cleanly with every row <= 24 cells.
+    const auto &narrow = view.rows(24);
+    std::size_t narrow_table_width = 0;
+    for (const auto &row : narrow) {
+      const auto line = chat_plain(row);
+      const auto cells = display_cells(line).value;
+      require(cells <= 24, "narrow table row exceeded width 24");
+      if (line.find("╭") != std::string::npos || line.find("├") != std::string::npos ||
+          line.find("╰") != std::string::npos ||
+          (line.starts_with("  │ │") && line.ends_with("│"))) {
+        if (narrow_table_width == 0)
+          narrow_table_width = cells;
+        require(cells == narrow_table_width,
+                "narrow wrapped table rows must stay column-aligned");
+      }
+    }
+    require(narrow_table_width > 0 && narrow_table_width <= 24,
+            "narrow table must fit within 24 columns");
+    // Extreme width=8 with 3 columns falls back without crash or overflow.
+    const auto &tiny = view.rows(8);
+    for (std::size_t idx = 1; idx < tiny.size(); ++idx)
+      require(display_cells(chat_plain(tiny[idx])).value <= 8,
+              "tiny table fallback exceeded width 8");
+  }
+
+  // 5. Blockquotes and horizontal rules (---, ***, ___).
+  {
+    ChatView view;
+    view.append(ChatKind::assistant,
+                "> Quoted **bold** and `code` wrapping nicely here\n"
+                "---\n"
+                "***\n"
+                "___\n"
+                "- - -\n");
+    const auto &rows = view.rows(24);
+    const auto text = plain(rows);
+    for (const auto &row : rows)
+      require(display_cells(chat_plain(row)).value <= 24,
+              "blockquote/hr row exceeded narrow width 24");
+    require(text.find("  │ ▎ Quoted bold and co") != std::string::npos &&
+                text.find("  │ ▎ de wrapping nicely") != std::string::npos,
+            "blockquote must render continuous ▎ left accent bar on wrapped lines");
+    std::size_t hr_count = 0;
+    const std::string expected_hr = "  │ ────────────────────";
+    for (const auto &row : rows)
+      if (chat_plain(row) == expected_hr)
+        ++hr_count;
+    require(hr_count == 4,
+            "all four horizontal rule forms must render bounded divider");
+  }
+
+  // 6. Full rich Markdown 1-byte stream vs cold parity (including tables & lists).
+  {
+    const std::string doc = "# Title\n## Sub\n### Leaf\n"
+                            "> Quote with `x`\n"
+                            "---\n"
+                            "- first **item**\n"
+                            "1. step one\n"
+                            "| A | B |\n"
+                            "|---|---:|\n"
+                            "foo | 42\n"
+                            "| bar | 99 |\n"
+                            "```lua\nlocal x = \"ok\"\n```\n"
+                            "End.\n";
+    ChatView stream, cold;
+    stream.begin(ChatKind::assistant);
+    for (const char ch : doc) {
+      stream.stream(std::string_view{&ch, 1});
+      cold.clear();
+      cold.append(ChatKind::assistant, doc.substr(0, stream.size()));
+      const auto &a = stream.rows(36);
+      const auto &b = cold.rows(36);
+      require(a.size() == b.size(), "rich stream/cold row count diverged");
+      for (std::size_t r = 0; r < a.size(); ++r) {
+        require(a[r].size() == b[r].size(), "rich stream/cold span count diverged");
+        for (std::size_t s = 0; s < a[r].size(); ++s)
+          require(a[r][s].text == b[r][s].text && a[r][s].ink == b[r][s].ink,
+                  "rich stream/cold span diverged");
+      }
+    }
+  }
+
+  // 7. Selection extraction compatibility & hostile ESC / control-char neutralization.
+  {
+    ChatView hostile;
+    static constexpr char raw_payload[] =
+        "# \x1b[2JEvil\n- item \x1b]52;c;YQ==\x07ok\n"
+        "> \xc2\x9b"
+        "31mquoted\n"
+        "| col\x1b[31m | val |\n|---|---|\n| a\0b | café |\n"
+        "```cpp\nauto x = \"\x1b[2J\";\n```\n";
+    hostile.append(ChatKind::assistant,
+                   std::string_view{raw_payload, sizeof(raw_payload) - 1});
+    const auto &rows = hostile.rows(48);
+    const auto rendered = plain(rows);
+    require(rendered.find('\x1b') == std::string::npos &&
+                rendered.find('\0') == std::string::npos,
+            "hostile ESC or NUL escaped rich Markdown renderer");
+    const auto selected =
+        terminal_extract_chat_selection(rows, {1, 0, rows.size() - 1, 40});
+    require(selected.find("Evil") != std::string::npos &&
+                selected.find("café") != std::string::npos,
+            "selection extraction works cleanly across rich Markdown rows");
+  }
+
+  // 8. Compact semantic tool headers + single card folding & JSON ESC defense.
+  {
+    require(format_compact_tool_header("▸ read_file · sample.txt") ==
+                "▸ read_file · sample.txt",
+            "plain tool header must stay unchanged");
+    require(format_compact_tool_header("▸ exec seq") == "▸ exec seq",
+            "simple exec header without separator must stay unchanged");
+    require(format_compact_tool_header("▸ read_file · \"src/chat_view.cpp\"") ==
+                "▸ read_file · src/chat_view.cpp",
+            "JSON-quoted path must unwrap cleanly");
+    require(format_compact_tool_header(
+                "▸ exec · [\"/bin/sh\",\"-c\",\"cmake --build build/debug\"]") ==
+                "▸ exec · cmake --build build/debug",
+            "shell argv array must extract inner command");
+    require(format_compact_tool_header(
+                "▸ exec · [\"/usr/bin/env\",\"bash\",\"-lc\",\"git status -s\"]") ==
+                "▸ exec · git status -s",
+            "env shell argv array must extract inner command");
+    require(format_compact_tool_header("▸ exec · [\"git\",\"diff\",\"--stat\"]") ==
+                "▸ exec · git diff --stat",
+            "plain argv array must join with spaces");
+    require(format_compact_tool_header(
+                "▸ edit_file · "
+                "{\"path\":\"src/chat_view.cpp\",\"old\":\"a\",\"new\":\"b\"}") ==
+                "▸ edit_file · src/chat_view.cpp",
+            "JSON object header must extract primary semantic key");
+    const auto safe_hdr = format_compact_tool_header(
+        "▸ exec · \"echo "
+        "\\u001b[2Jhi\\nnext\\u009b31m\\ud800\\u001b]52;c;YQ==\\u0007café\"");
+    require(safe_hdr.find('\x1b') == std::string::npos &&
+                safe_hdr.find('\n') == std::string::npos &&
+                safe_hdr.find("\xc2\x9b") == std::string::npos &&
+                safe_hdr.find("[2J") == std::string::npos &&
+                safe_hdr.find("31m") == std::string::npos &&
+                safe_hdr.find("52;c;") == std::string::npos &&
+                safe_hdr.find("echo") != std::string::npos &&
+                safe_hdr.find("hi") != std::string::npos &&
+                safe_hdr.find("café") != std::string::npos,
+            "compact tool header strips JSON-encoded ESC/OSC/C1 payloads while "
+            "preserving UTF-8");
+    const auto raw_c1_hdr = format_compact_tool_header("▸ exec · \"foo\x9b"
+                                                       "31mbar\xc2\x9d"
+                                                       "52;c;YQ==\xc2\x9c"
+                                                       "baz\x1b^pm\x1b\\\\qux\x1b"
+                                                       "cend界\"");
+    require(raw_c1_hdr.find('\x9b') == std::string::npos &&
+                raw_c1_hdr.find("31m") == std::string::npos &&
+                raw_c1_hdr.find("52;c;") == std::string::npos &&
+                raw_c1_hdr.find("pm") == std::string::npos &&
+                raw_c1_hdr == "▸ exec · foobarbazquxend界",
+            "compact tool header strips raw 8-bit C1, UTF-8 C1 OSC, ESC^, and 2-byte "
+            "ESC while preserving CJK");
+    const std::string trailing_junk = "▸ exec · {\"path\":\"a.cpp\"} junk {}";
+    require(format_compact_tool_header(trailing_junk) == trailing_junk,
+            "malformed JSON object with trailing junk must not be silently truncated");
+    const std::string trailing_empty = "▸ exec · {} junk {}";
+    require(format_compact_tool_header(trailing_empty) == trailing_empty,
+            "empty JSON object with trailing junk must be rejected");
+    const auto long_hdr =
+        format_compact_tool_header("▸ exec · \"" + std::string(300, 'z') + "\"");
+    require(display_cells(long_hdr).value <= 140 && long_hdr.ends_with("…"),
+            "verbose JSON tool header is bounded with ellipsis");
+
+    ChatView card;
+    card.tool_start("▸ exec · [\"/bin/sh\",\"-c\",\"seq 1 40\"]");
+    for (int i = 1; i <= 40; ++i)
+      card.tool_output("L" + std::to_string(i) + "\n");
+    card.tool_complete("exec completed · 9ms", Ink::success);
+    const auto card_text = plain(card.rows(80));
+    require(card_text.find("✓ exec · seq 1 40 · 9ms") != std::string::npos &&
+                card_text.find("┆ 34 more lines · Ctrl-O inspects") !=
+                    std::string::npos &&
+                card_text.find("L38") != std::string::npos &&
+                card_text.find("L40") != std::string::npos,
+            "compact tool card preserves in-place completion and middle fold");
+  }
+}
 int main(int argc, char **) {
   try {
     (void)std::setlocale(LC_CTYPE, "en_US.UTF-8");
@@ -150,6 +460,7 @@ int main(int argc, char **) {
       return 0;
     }
     presenter_pipe();
+    test_rich_markdown_and_compact_tools();
     const auto &idle_sprite = blackbird_sprite(false, 0);
     require(&idle_sprite == &blackbird_sprite(false, 999), "idle mascot animates");
     require(blackbird_sprite(true, 0) != blackbird_sprite(true, 1),

@@ -29,6 +29,7 @@ struct ChatSpan {
 };
 using ChatRow = std::vector<ChatSpan>;
 std::string chat_plain(const ChatRow &row);
+std::string format_compact_tool_header(std::string_view raw_header);
 
 // Bounded derived display. No durable state or audit authority.
 class ChatView {
