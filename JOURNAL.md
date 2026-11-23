@@ -13731,3 +13731,12 @@ Addressed six operator field notes from live TUI use:
   lease persistence with rollback, `base_sha` tracking, dirty-worktree refusal on
   non-forced release, and safe `reclaim_stale()` preserving dirty/corrupt leases in
   `orphaned_dirty`.
+
+## 2026-11-23 — Rock 1.3: Heterogeneous Tool-Using Peer Launcher (`PlatoonRunner`)
+
+- Added `include/blackbird/platoon_runner.hpp`, `src/platoon_runner.cpp`, and
+  `tests/platoon_runner_test.cpp` (registered as `platoon_runner` in `CMakeLists.txt`).
+- Spawns heterogeneous tool-using Blackbird peer processes via `posix_spawn` with
+  `POSIX_SPAWN_SETPGROUP`, race-free `addchdir`, `F_DUPFD_CLOEXEC` pipe normalization,
+  `detail::owned_children` custody, O(N) bounded UTF-8 ring tail capture, SIGTERM->SIGKILL
+  process-group escalation, loader/secret env filtering, and clean destructor teardown.
