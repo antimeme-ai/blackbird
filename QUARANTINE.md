@@ -1164,3 +1164,22 @@ Removed from tracked `papers/integrations-2026-10-06/teams/` and
 | `teams/sub-agents.md` | https://code.claude.com/docs/en/sub-agents.md | 107,435 | `2a447df088c10f4edef2c565da63bdbb850d889423dd90322977ab4c8a6a4b75` |
 | `mods/lifecycle-browser-capture.txt` | https://code.claude.com/docs/en/plugins/mods/{overview,events,interface,api,reference,test,create} | 30,540 | `bd313b205d5115cc89d306abc01c74e4fe538cd5b47befaa3927a9b8e330de76` |
 | `mods/official-docs-browser-capture.json` | https://code.claude.com/docs/en/plugins/mods/{overview,events,interface,api,reference,test,create} | 31,633 | `d927c918c7913bb73849416e43032d872e754e98084560477f880998c8c0eecd` |
+
+## Multiplayer agent references — 2026-11-23
+
+Ten study-only snapshots of public multiplayer agent systems and protocols were
+acquired on 2026-11-23 under ignored `quarantine/multiplayer-2026-11-23/`:
+`Oryntai/AgentLink`, `sshaipowered/magpie`, `langstroth-ai/ligus`,
+`wybe-labs/session-multiplayer`, `josephhaenel/Hivemind`, `a2aproject/A2A`,
+`agentclientprotocol/agent-client-protocol`, `humanlayer/humanlayer`,
+`block/buzz`, and PyPI `coopagents` `0.9.0` (sdist; no upstream GitHub URL
+published in `PKG-INFO`). Intact archives live under
+`quarantine/multiplayer-2026-11-23/archives/`; clean extracts under
+`quarantine/multiplayer-2026-11-23/<name>/` omit nested `.git` metadata,
+filesystem detritus, and symlinks. Exact commit SHAs/versions, archive URLs,
+byte lengths, SHA-256 digests, excluded symlink paths, and restoration commands
+are recorded in [manifest.json](papers/multiplayer-2026-11-23/manifest.json);
+comparative source findings and Stage 0 -> Stage 2 recommendations are in
+[STUDY.md](papers/multiplayer-2026-11-23/STUDY.md). No acquired code, installer,
+build script, or test was executed, and no dependency was adopted.
+

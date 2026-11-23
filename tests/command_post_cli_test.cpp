@@ -1,4 +1,5 @@
 #include "../src/native_process.hpp"
+#include "blackbird/board_bridge.hpp"
 #include "blackbird/capabilities.hpp"
 #include "blackbird/command_post_cli.hpp"
 #include "blackbird/json.hpp"
@@ -6,14 +7,18 @@
 #include "blackbird/value.hpp"
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -25,9 +30,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
-void check(bool condition, const char *message) {
+void check(bool condition, std::string_view message) {
   if (!condition)
-    throw std::runtime_error(message);
+    throw std::runtime_error(std::string{message});
 }
 
 class TempDir {
@@ -167,9 +172,116 @@ int run_fake_peer_child(int argc, char **argv) {
   return 0;
 }
 
+int run_sleep_child() {
+  if (::setpgid(0, 0) != 0)
+    return 98;
+  const pid_t grandchild = ::fork();
+  if (grandchild < 0)
+    return 97;
+  if (grandchild == 0) {
+    // Grandchild stays in the child's process group and sleeps until signaled.
+    for (int i = 0; i < 600; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    return 0;
+  }
+  std::cout << static_cast<long long>(::getpid()) << ' '
+            << static_cast<long long>(grandchild) << '\n'
+            << std::flush;
+  for (int i = 0; i < 600; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  return 0;
+}
+
+struct ScopedCwd {
+  fs::path previous;
+  explicit ScopedCwd(const fs::path &next) : previous(fs::current_path()) {
+    fs::current_path(next);
+  }
+  ScopedCwd(const ScopedCwd &) = delete;
+  ScopedCwd &operator=(const ScopedCwd &) = delete;
+  ~ScopedCwd() {
+    std::error_code ec;
+    fs::current_path(previous, ec);
+  }
+};
+
+struct SpawnedSleepGroup {
+  pid_t child = -1;
+  pid_t grandchild = -1;
+  int read_fd = -1;
+
+  SpawnedSleepGroup() = default;
+  SpawnedSleepGroup(const SpawnedSleepGroup &) = delete;
+  SpawnedSleepGroup &operator=(const SpawnedSleepGroup &) = delete;
+  ~SpawnedSleepGroup() {
+    if (read_fd >= 0)
+      (void)::close(read_fd);
+    if (grandchild > 1)
+      (void)::kill(grandchild, SIGKILL);
+    if (child > 1) {
+      (void)::kill(child, SIGKILL);
+      int status = 0;
+      (void)::waitpid(child, &status, 0);
+    }
+  }
+};
+
+bool wait_for_pid_exit(pid_t pid, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    int status = 0;
+    const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid)
+      return true;
+    if (::kill(pid, 0) != 0)
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  }
+  return ::kill(pid, 0) != 0;
+}
+
+void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
+  int pipefd[2]{-1, -1};
+  check(::pipe(pipefd) == 0, "pipe failed for sleep child");
+  const pid_t pid = ::fork();
+  check(pid >= 0, "fork failed for sleep child");
+  if (pid == 0) {
+    (void)::close(pipefd[0]);
+    (void)::dup2(pipefd[1], STDOUT_FILENO);
+    (void)::close(pipefd[1]);
+    std::string exe = self_exe.string();
+    std::string flag = "--sleep-child";
+    char *child_argv[] = {exe.data(), flag.data(), nullptr};
+    ::execv(exe.c_str(), child_argv);
+    ::_exit(127);
+  }
+  (void)::close(pipefd[1]);
+  out.child = pid;
+  out.read_fd = pipefd[0];
+
+  std::string line;
+  char ch = '\0';
+  while (::read(out.read_fd, &ch, 1) == 1) {
+    if (ch == '\n')
+      break;
+    line.push_back(ch);
+  }
+  (void)::close(out.read_fd);
+  out.read_fd = -1;
+
+  std::istringstream iss{line};
+  long long reported_child = 0;
+  long long reported_grandchild = 0;
+  check(static_cast<bool>(iss >> reported_child >> reported_grandchild),
+        "failed to parse sleep child pids");
+  check(reported_child == static_cast<long long>(pid) && reported_grandchild > 1,
+        "unexpected sleep child pid report");
+  out.grandchild = static_cast<pid_t>(reported_grandchild);
+}
+
 void test_subcommand_dispatch_table() {
-  for (const char *name :
-       {"mcp", "platoon", "issues", "memory", "peer", "capabilities", "metrics"}) {
+  for (const char *name : {"mcp", "platoon", "issues", "memory", "peer", "capabilities",
+                           "metrics", "bridge"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -369,6 +481,132 @@ void test_platoon_subcommand(const PlatoonTestPaths &paths) {
     check(!std::get<bool>(req_field(stop_res, "signaled").value()),
           "out-of-range pid must NEVER be signaled");
   }
+
+  // Verify default `platoon` board dir aligns with TUI `.blackbird/platoon`.
+  const fs::path default_dir_sandbox = base / "platoon-default-dir";
+  fs::create_directories(default_dir_sandbox);
+  {
+    ScopedCwd guard{default_dir_sandbox};
+    const Value default_status =
+        parse_stdout_json(run_cli({"platoon", "status"}), "platoon default status");
+    const fs::path reported_root = fs::path{req_str(default_status, "board_root")};
+    check(reported_root.filename() == "platoon" &&
+              reported_root.parent_path().filename() == ".blackbird",
+          "platoon default board dir must be .blackbird/platoon");
+  }
+
+  // Kimi Review #3 M6 regression tests for `platoon stop`:
+  // 1. Recycled PID (member.updated_ns earlier than process start time) MUST NOT be
+  //    signaled.
+  // 2. Live verified PID WITHOUT `--group` signals ONLY the individual PID (grandchild
+  // in
+  //    same process group survives).
+  // 3. Live verified PID WITH `--group` signals `-pid` (terminates entire process
+  // group).
+  {
+    SpawnedSleepGroup proc_group;
+    spawn_sleep_group(self_exe, proc_group);
+
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    PlatoonMember stale_recycled;
+    stale_recycled.id = "m6-recycled";
+    stale_recycled.role = "worker";
+    stale_recycled.state = PlatoonMemberState::working;
+    stale_recycled.pid = static_cast<std::int64_t>(proc_group.child);
+    stale_recycled.updated_ns = now_ns - 60'000'000'000LL;
+    check(board.value().upsert_member(stale_recycled).has_value(),
+          "upsert stale recycled member failed");
+
+    const Value recycled_res =
+        parse_stdout_json(run_cli({"platoon", "stop", "--board", board_dir.string(),
+                                   "--id", "m6-recycled", "--grace-ms", "100"}),
+                          "platoon stop recycled pid");
+    check(!std::get<bool>(req_field(recycled_res, "signaled").value()),
+          "recycled PID with older updated_ns must NOT be signaled");
+    check(::kill(proc_group.child, 0) == 0,
+          "live process behind recycled PID must remain alive");
+
+    // Poisoned INT64_MAX and far-future updated_ns MUST NOT overflow int64_t (UBSan)
+    // or bypass recycled-PID start-time verification.
+    for (const std::pair<const char *, std::int64_t> poisoned_ts :
+         std::vector<std::pair<const char *, std::int64_t>>{
+             {"m6-int64-max", std::numeric_limits<std::int64_t>::max()},
+             {"m6-far-future", now_ns + 3600LL * 1'000'000'000LL},
+         }) {
+      PlatoonMember future_member;
+      future_member.id = poisoned_ts.first;
+      future_member.role = "worker";
+      future_member.state = PlatoonMemberState::working;
+      future_member.pid = static_cast<std::int64_t>(proc_group.child);
+      future_member.updated_ns = poisoned_ts.second;
+      check(board.value().upsert_member(future_member).has_value(),
+            "upsert far-future member failed");
+
+      const Value future_res =
+          parse_stdout_json(run_cli({"platoon", "stop", "--board", board_dir.string(),
+                                     "--id", poisoned_ts.first, "--grace-ms", "100"}),
+                            "platoon stop poisoned updated_ns");
+      check(!std::get<bool>(req_field(future_res, "signaled").value()),
+            "poisoned INT64_MAX / far-future updated_ns must NOT signal process");
+      check(::kill(proc_group.child, 0) == 0,
+            "live process must survive poisoned updated_ns stop");
+    }
+
+    PlatoonMember live_single;
+    live_single.id = "m6-single";
+    live_single.role = "worker";
+    live_single.state = PlatoonMemberState::working;
+    live_single.pid = static_cast<std::int64_t>(proc_group.child);
+    live_single.updated_ns = 0; // upsert_member stamps wall_now_ns() >= proc start time
+    check(board.value().upsert_member(live_single).has_value(),
+          "upsert live single member failed");
+
+    const Value single_res =
+        parse_stdout_json(run_cli({"platoon", "stop", "--board", board_dir.string(),
+                                   "--id", "m6-single", "--grace-ms", "1000"}),
+                          "platoon stop single pid");
+    check(std::get<bool>(req_field(single_res, "signaled").value()),
+          "verified live PID must be signaled");
+    check(!std::get<bool>(req_field(single_res, "group").value()),
+          "default platoon stop must not use --group");
+    check(wait_for_pid_exit(proc_group.child, std::chrono::milliseconds{2000}),
+          "signaled single PID did not exit");
+    proc_group.child = -1;
+    check(::kill(proc_group.grandchild, 0) == 0,
+          "default platoon stop without --group must NOT kill sibling/grandchild in "
+          "pgrp");
+  }
+
+  {
+    SpawnedSleepGroup proc_group;
+    spawn_sleep_group(self_exe, proc_group);
+
+    PlatoonMember live_group;
+    live_group.id = "m6-group";
+    live_group.role = "worker";
+    live_group.state = PlatoonMemberState::working;
+    live_group.pid = static_cast<std::int64_t>(proc_group.child);
+    live_group.updated_ns = 0;
+    check(board.value().upsert_member(live_group).has_value(),
+          "upsert live group member failed");
+
+    const Value group_res = parse_stdout_json(
+        run_cli({"platoon", "stop", "--board", board_dir.string(), "--id", "m6-group",
+                 "--grace-ms", "1000", "--group"}),
+        "platoon stop --group");
+    check(std::get<bool>(req_field(group_res, "signaled").value()),
+          "verified live group PID must be signaled");
+    check(std::get<bool>(req_field(group_res, "group").value()),
+          "platoon stop --group must report group=true");
+    check(wait_for_pid_exit(proc_group.child, std::chrono::milliseconds{2000}),
+          "signaled group leader did not exit");
+    proc_group.child = -1;
+    check(wait_for_pid_exit(proc_group.grandchild, std::chrono::milliseconds{2000}),
+          "platoon stop --group must terminate grandchild in process group");
+    proc_group.grandchild = -1;
+  }
 }
 
 void test_issues_subcommand(const fs::path &base) {
@@ -494,6 +732,60 @@ void test_peer_subcommand(const fs::path &base) {
       run_cli({"peer", "verify", "--root", bob_root.string()}, signed_res.out),
       "peer verify");
   check(std::get<bool>(req_field(verified, "verified").value()), "peer verify failed");
+  check(req_str(verified, "type") == "envelope", "peer verify envelope type mismatch");
+
+  // Kimi Review #3 M7 regression tests for `peer verify`:
+  // 1. Type-confused envelope carrying a spurious top-level "grant_id" MUST be
+  // rejected.
+  {
+    const auto *obj = std::get_if<Value::Object>(&signed_env.value());
+    check(obj != nullptr, "expected object for signed envelope");
+    Value::Object mutated = *obj;
+    mutated.emplace_back("grant_id", Value{"grant-spoof-m7"});
+    auto dumped = dump_json(Value::object(std::move(mutated)));
+    check(dumped.has_value(), "dump_json failed for confused envelope");
+    const auto confused_res =
+        run_cli({"peer", "verify", "--root", bob_root.string()}, dumped.value());
+    check(confused_res.exit_code != 0 && confused_res.out.empty() &&
+              !confused_res.err.empty(),
+          "type-confused envelope carrying spurious grant_id must be rejected");
+  }
+  // 2. Partial object carrying only "grant_id" MUST be rejected.
+  {
+    const auto partial_res = run_cli({"peer", "verify", "--root", bob_root.string()},
+                                     R"({"grant_id":"grant-partial"})");
+    check(partial_res.exit_code != 0 && partial_res.out.empty() &&
+              !partial_res.err.empty(),
+          "partial grant_id-only object must be rejected by peer verify");
+  }
+  // 3. Valid grant passes strict grant schema; grant with spurious "envelope_id" fails.
+  {
+    const auto grant_res =
+        run_cli({"bridge", "grant-issue", "--peers", alice_root.string(), "--to",
+                 bob_fp, "--target-peer", "reviewer", "--mode", "direct_support",
+                 "--tool", "platoon_read", "--grant-id", "grant-m7-valid"});
+    const Value grant_val = parse_stdout_json(grant_res, "grant-issue for M7");
+
+    const Value verified_grant = parse_stdout_json(
+        run_cli({"peer", "verify", "--root", bob_root.string()}, grant_res.out),
+        "peer verify valid grant");
+    check(std::get<bool>(req_field(verified_grant, "verified").value()) &&
+              req_str(verified_grant, "type") == "grant" &&
+              req_str(verified_grant, "grant_id") == "grant-m7-valid",
+          "peer verify valid grant mismatch");
+
+    const auto *obj = std::get_if<Value::Object>(&grant_val.value());
+    check(obj != nullptr, "expected object for signed grant");
+    Value::Object mutated = *obj;
+    mutated.emplace_back("envelope_id", Value{"env-spoof-m7"});
+    auto dumped = dump_json(Value::object(std::move(mutated)));
+    check(dumped.has_value(), "dump_json failed for confused grant");
+    const auto confused_res =
+        run_cli({"peer", "verify", "--root", bob_root.string()}, dumped.value());
+    check(confused_res.exit_code != 0 && confused_res.out.empty() &&
+              !confused_res.err.empty(),
+          "type-confused grant carrying spurious envelope_id must be rejected");
+  }
 
   // Revoke grant & revoke peer
   const Value rev_grant =
@@ -589,11 +881,273 @@ void test_metrics_subcommand(const fs::path &base) {
         "sparkline glyphs/count mismatch");
 }
 
+void test_bridge_subcommand(const fs::path &base) {
+  const fs::path alice_peers = base / "bridge-peers-alice";
+  const fs::path bob_peers = base / "bridge-peers-bob";
+  const fs::path alice_bridge = base / "bridge-store-alice";
+  const fs::path bob_bridge = base / "bridge-store-bob";
+
+  const Value alice_id = parse_stdout_json(
+      run_cli({"peer", "id", "--root", alice_peers.string()}), "bridge peer id alice");
+  const Value bob_id = parse_stdout_json(
+      run_cli({"peer", "id", "--root", bob_peers.string()}), "bridge peer id bob");
+  const std::string alice_fp = req_str(alice_id, "fingerprint");
+  const std::string alice_pub = req_str(alice_id, "public_key");
+  const std::string bob_fp = req_str(bob_id, "fingerprint");
+  const std::string bob_pub = req_str(bob_id, "public_key");
+
+  // Out-of-band pinning on both sides.
+  (void)parse_stdout_json(
+      run_cli({"peer", "pin", "--root", alice_peers.string(), "--alias", "bob",
+               "--public-key", bob_pub, "--trust-note", "alice->bob"}),
+      "alice pins bob");
+  (void)parse_stdout_json(
+      run_cli({"peer", "pin", "--root", bob_peers.string(), "--alias", "alice",
+               "--public-key", alice_pub, "--trust-note", "bob->alice"}),
+      "bob pins alice");
+  (void)parse_stdout_json(
+      run_cli({"peer", "pin", "--root", bob_peers.string(), "--alias", "bob",
+               "--public-key", bob_pub, "--trust-note", "bob-self"}),
+      "bob pins self");
+
+  // 1. Alice `bridge send` using alias `bob` -> emits ONE compact NDJSON line on
+  // stdout.
+  const auto send1 = run_cli({"bridge", "send", "--bridge", alice_bridge.string(),
+                              "--peers", alice_peers.string(), "--to", "bob", "--kind",
+                              "handoff", "--scope", "src/auth.cpp", "--body",
+                              "Ready for Stage 0 review", "--thread", "thread-2p"});
+  check(send1.exit_code == 0, "alice bridge send failed: " + send1.err);
+  check(!send1.out.empty() && send1.out.back() == '\n',
+        "bridge send must end with newline");
+  check(send1.out.find('\n') == send1.out.size() - 1,
+        "bridge send must emit exactly ONE compact NDJSON line");
+  const Value env1 = parse_stdout_json(send1, "alice bridge send envelope");
+  check(req_str(env1, "from_fingerprint") == alice_fp &&
+            req_str(env1, "to_fingerprint") == bob_fp &&
+            req_str(env1, "kind") == "handoff" &&
+            req_str(env1, "thread_id") == "thread-2p",
+        "bridge send envelope header mismatch");
+  const Value &payload1 = req_field(env1, "payload");
+  check(req_str(payload1, "body") == "Ready for Stage 0 review",
+        "bridge send body mismatch");
+  const Value &ev1 = req_field(payload1, "causal_event");
+  check(req_int(ev1, "actor_seq") == 1 &&
+            req_str(ev1, "resource_scope") == "src/auth.cpp",
+        "bridge send causal_event mismatch");
+  const std::string ev1_hash = req_str(ev1, "event_hash");
+
+  // 2. Pipe Alice's NDJSON line directly into Bob `bridge receive`.
+  const Value recv1 =
+      parse_stdout_json(run_cli({"bridge", "receive", "--bridge", bob_bridge.string(),
+                                 "--peers", bob_peers.string()},
+                                send1.out),
+                        "bob bridge receive");
+  check(req_int(recv1, "accepted") == 1 && req_int(recv1, "duplicates") == 0 &&
+            req_int(recv1, "rejected") == 0 &&
+            !std::get<bool>(req_field(recv1, "incomplete_trailing_frame").value()),
+        "bob bridge receive counts mismatch");
+  const auto &quoted = req_field(recv1, "quoted_frames").array();
+  check(quoted.size() == 1 &&
+            quoted[0].string().find("UNTRUSTED FOREIGN PEER DATA ONLY") !=
+                std::string::npos &&
+            quoted[0].string().find("Ready for Stage 0 review") != std::string::npos,
+        "bob bridge receive quoted_frames mismatch");
+
+  // Replay of same frame is deduplicated idempotently.
+  const Value recv1_dup =
+      parse_stdout_json(run_cli({"bridge", "receive", "--bridge", bob_bridge.string(),
+                                 "--peers", bob_peers.string()},
+                                send1.out),
+                        "bob bridge receive duplicate");
+  check(req_int(recv1_dup, "accepted") == 0 && req_int(recv1_dup, "duplicates") == 1 &&
+            req_field(recv1_dup, "quoted_frames").array().empty(),
+        "duplicate frame must not emit new quoted frame");
+
+  // 3. Bob `bridge guard` on `src/auth.cpp` is BLOCKED (exit 2).
+  const auto guard_blocked =
+      run_cli({"bridge", "guard", "--bridge", bob_bridge.string(), "--peers",
+               bob_peers.string(), "--scope", "src/auth.cpp"});
+  check(guard_blocked.exit_code == 2, "expected bridge guard exit code 2 when blocked");
+  const auto guard_blocked_val = parse_json(guard_blocked.out);
+  check(guard_blocked_val.has_value(), "bridge guard blocked output invalid JSON");
+  check(!std::get<bool>(req_field(guard_blocked_val.value(), "allowed").value()),
+        "expected allowed=false when blocked");
+  const auto &blockers =
+      req_field(guard_blocked_val.value(), "blocking_event_hashes").array();
+  check(blockers.size() == 1 && blockers[0].string() == ev1_hash,
+        "blocking_event_hashes mismatch");
+
+  // 4. Bob `bridge receipt --stage included_in_request` requires --request-hash.
+  const auto missing_req_hash = run_cli(
+      {"bridge", "receipt", "--bridge", bob_bridge.string(), "--peers",
+       bob_peers.string(), "--event", ev1_hash, "--stage", "included_in_request"});
+  check(missing_req_hash.exit_code == 2 && missing_req_hash.out.empty() &&
+            !missing_req_hash.err.empty(),
+        "included_in_request without --request-hash must fail with usage error");
+
+  const std::string req_hash = board_bridge_sha256_hex("bob-request-1");
+  const auto rcpt_send =
+      run_cli({"bridge", "receipt", "--bridge", bob_bridge.string(), "--peers",
+               bob_peers.string(), "--event", ev1_hash, "--stage",
+               "included_in_request", "--request-hash", req_hash, "--to", "alice"});
+  check(rcpt_send.exit_code == 0, "bob bridge receipt failed: " + rcpt_send.err);
+  check(rcpt_send.out.find('\n') == rcpt_send.out.size() - 1,
+        "bridge receipt --to must emit ONE compact NDJSON line");
+  (void)parse_stdout_json(rcpt_send, "bob bridge receipt envelope");
+
+  // 5. Bob `bridge guard` on `src/auth.cpp` is now ALLOWED (exit 0).
+  const auto guard_allowed =
+      run_cli({"bridge", "guard", "--bridge", bob_bridge.string(), "--peers",
+               bob_peers.string(), "--scope", "src/auth.cpp"});
+  check(guard_allowed.exit_code == 0, "expected bridge guard exit code 0 when allowed");
+  const Value guard_allowed_val =
+      parse_stdout_json(guard_allowed, "bridge guard allowed");
+  check(std::get<bool>(req_field(guard_allowed_val, "allowed").value()) &&
+            req_field(guard_allowed_val, "blocking_event_hashes").array().empty(),
+        "bridge guard allowed payload mismatch");
+
+  // 6. Bidirectional `bridge serve`: Alice sends event #2 (with parent=ev1_hash),
+  //    Bob `bridge serve` replays Bob's outbound receipt on stdout (pure NDJSON)
+  //    and ingests Alice's event #2, printing JSON summary on stderr.
+  const auto send2 =
+      run_cli({"bridge", "send", "--bridge", alice_bridge.string(), "--peers",
+               alice_peers.string(), "--to", "bob", "--kind", "review", "--scope",
+               "src/auth.cpp", "--body", "Follow-up note", "--parent", ev1_hash});
+  const Value env2 = parse_stdout_json(send2, "alice bridge send 2");
+  check(req_int(req_field(req_field(env2, "payload"), "causal_event"), "actor_seq") ==
+            2,
+        "expected auto-incremented actor_seq == 2");
+
+  const auto serve_bob = run_cli({"bridge", "serve", "--bridge", bob_bridge.string(),
+                                  "--peers", bob_peers.string()},
+                                 send2.out);
+  check(serve_bob.exit_code == 0, "bob bridge serve failed: " + serve_bob.err);
+  const auto serve_err_json = parse_json(serve_bob.err);
+  check(serve_err_json.has_value(), "bridge serve stderr must be compact JSON report");
+  check(req_int(serve_err_json.value(), "replayed_outbound") == 1 &&
+            req_int(serve_err_json.value(), "accepted") == 1,
+        "bridge serve counts mismatch");
+  check(!serve_bob.out.empty() && serve_bob.out.back() == '\n',
+        "bridge serve stdout must contain NDJSON outbound replay");
+
+  // Pipe Bob's `bridge serve` stdout directly into Alice `bridge receive`.
+  const Value alice_recv_rcpt =
+      parse_stdout_json(run_cli({"bridge", "receive", "--bridge", alice_bridge.string(),
+                                 "--peers", alice_peers.string()},
+                                serve_bob.out),
+                        "alice bridge receive from bob serve");
+  check(req_int(alice_recv_rcpt, "accepted") == 1,
+        "alice should accept bob's replayed receipt envelope");
+
+  // 7. `bridge events --scope` + concurrent claim conflict detection.
+  const auto alice_claim =
+      run_cli({"bridge", "send", "--bridge", alice_bridge.string(), "--peers",
+               alice_peers.string(), "--to", "bob", "--kind", "decision", "--scope",
+               "src/conflict.cpp", "--body", "Alice claims conflict.cpp"});
+  check(alice_claim.exit_code == 0, "alice conflict send failed");
+  const auto bob_claim =
+      run_cli({"bridge", "send", "--bridge", bob_bridge.string(), "--peers",
+               bob_peers.string(), "--to", "alice", "--kind", "decision", "--scope",
+               "src/conflict.cpp", "--body", "Bob concurrently claims conflict.cpp"});
+  check(bob_claim.exit_code == 0, "bob conflict send failed");
+  (void)parse_stdout_json(run_cli({"bridge", "receive", "--bridge", bob_bridge.string(),
+                                   "--peers", bob_peers.string()},
+                                  alice_claim.out),
+                          "bob receives alice conflict");
+
+  const Value events_res =
+      parse_stdout_json(run_cli({"bridge", "events", "--bridge", bob_bridge.string(),
+                                 "--scope", "src/conflict.cpp"}),
+                        "bob bridge events conflict");
+  check(req_int(events_res, "count") == 2 && req_int(events_res, "conflict_count") == 1,
+        "bridge events should report 2 scoped events and 1 concurrent conflict");
+
+  // 8. `bridge presence` heartbeat + signed transmission + `--list`.
+  const auto pres_send =
+      run_cli({"bridge", "presence", "--bridge", bob_bridge.string(), "--peers",
+               bob_peers.string(), "--scope", "src/auth.cpp", "--status", "reviewing",
+               "--name", "bob-op", "--ttl", "300", "--to", "alice"});
+  check(pres_send.exit_code == 0, "bob bridge presence failed: " + pres_send.err);
+  (void)parse_stdout_json(
+      run_cli({"bridge", "receive", "--bridge", alice_bridge.string(), "--peers",
+               alice_peers.string()},
+              pres_send.out),
+      "alice receives bob presence");
+
+  const Value pres_list = parse_stdout_json(
+      run_cli({"bridge", "presence", "--bridge", alice_bridge.string(), "--list",
+               "--scope", "src/auth.cpp"}),
+      "alice bridge presence --list");
+  check(req_int(pres_list, "count") == 1, "expected 1 active watcher on alice bridge");
+  const Value &watcher0 = req_field(pres_list, "watchers").array()[0];
+  check(req_str(watcher0, "display_name") == "bob-op" &&
+            req_str(watcher0, "status") == "reviewing",
+        "presence watcher fields mismatch");
+
+  // 9. `bridge grant-issue` -> `bridge grant-check` allowed -> `peer revoke-grant` ->
+  //    `bridge grant-check` denied!
+  const auto grant_issue = run_cli({"bridge",        "grant-issue",
+                                    "--peers",       alice_peers.string(),
+                                    "--to",          "bob",
+                                    "--target-peer", "reviewer",
+                                    "--mode",        "direct_support",
+                                    "--tool",        "platoon_read",
+                                    "--tool",        "platoon_post",
+                                    "--max-turns",   "4",
+                                    "--max-tokens",  "20000",
+                                    "--ttl",         "3600",
+                                    "--grant-id",    "grant-2p-01"});
+  const Value grant_val = parse_stdout_json(grant_issue, "alice bridge grant-issue");
+  check(req_str(grant_val, "grant_id") == "grant-2p-01" &&
+            req_str(grant_val, "grantee_fingerprint") == bob_fp,
+        "grant-issue output mismatch");
+  const fs::path grant_path = base / "grant-2p-01.json";
+  write_text_file(grant_path, grant_issue.out);
+
+  const auto check_allowed =
+      run_cli({"bridge", "grant-check", "--peers", bob_peers.string(), "--grant-file",
+               grant_path.string(), "--tool", "platoon_read", "--cost", "0.10"});
+  check(check_allowed.exit_code == 0,
+        "expected grant-check exit 0 when allowed: " + check_allowed.err);
+  const Value check_allowed_val =
+      parse_stdout_json(check_allowed, "bob bridge grant-check allowed");
+  check(std::get<bool>(req_field(check_allowed_val, "allowed").value()),
+        "grant-check allowed field must be true");
+
+  const auto check_wrong_tool =
+      run_cli({"bridge", "grant-check", "--peers", bob_peers.string(), "--grant-file",
+               grant_path.string(), "--tool", "shell_exec"});
+  check(check_wrong_tool.exit_code == 2,
+        "expected grant-check exit 2 for disallowed tool");
+  const auto wrong_tool_val = parse_json(check_wrong_tool.out);
+  check(wrong_tool_val.has_value() &&
+            !std::get<bool>(req_field(wrong_tool_val.value(), "allowed").value()),
+        "grant-check disallowed tool must emit allowed=false");
+
+  (void)parse_stdout_json(
+      run_cli({"peer", "revoke-grant", "--root", bob_peers.string(), "--grant-id",
+               "grant-2p-01", "--reason", "finished"}),
+      "bob revoke-grant");
+
+  const auto check_revoked =
+      run_cli({"bridge", "grant-check", "--peers", bob_peers.string(), "--grant-file",
+               grant_path.string(), "--tool", "platoon_read"});
+  check(check_revoked.exit_code == 2,
+        "expected grant-check exit 2 after local revoke-grant");
+  const auto revoked_val = parse_json(check_revoked.out);
+  check(revoked_val.has_value() &&
+            !std::get<bool>(req_field(revoked_val.value(), "allowed").value()) &&
+            req_str(revoked_val.value(), "denial_code") == "conflict",
+        "grant-check after revoke-grant must deny with conflict");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   if (argc > 1 && std::string_view{argv[1]} == "--session")
     return run_fake_peer_child(argc, argv);
+  if (argc > 1 && std::string_view{argv[1]} == "--sleep-child")
+    return run_sleep_child();
 
   try {
     const fs::path self_exe = fs::canonical(argv[0]);
@@ -607,6 +1161,7 @@ int main(int argc, char **argv) {
     test_peer_subcommand(temp.path());
     test_capabilities_subcommand(temp.path());
     test_metrics_subcommand(temp.path());
+    test_bridge_subcommand(temp.path());
 
     std::cout << "PASS command_post_cli\n";
     return 0;

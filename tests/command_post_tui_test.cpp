@@ -399,6 +399,80 @@ void test_companion_status_and_bounded_ask() {
           "companion ask runs bounded System One advisory query");
 }
 
+void test_c1_raw_and_utf8_sanitization_regression() {
+  TempDir dir("bb-cptui-c1");
+  CommandPostTuiContext ctx;
+  ctx.project_root = dir.path;
+  ctx.actor = "lead-1";
+  ctx.include_default_user_capabilities = false;
+
+  // H1 regression: bare single-byte C1 (0x9B CSI) passed to TUI surfaces must be
+  // hex-escaped as "\x9b" with ZERO raw 0x9B bytes emitted, while valid UTF-8
+  // (sparklines "▁▂█" and accented chars "é") passes through cleanly.
+  const auto cap_out =
+      handle_command_post_slash("/capabilities show a\x9b"
+                                "6nb \xe2\x96\x81\xe2\x96\x82\xe2\x96\x88 caf\xc3\xa9",
+                                ctx);
+  require(cap_out.has_value() &&
+              cap_out->find("a\\x9b"
+                            "6nb") != std::string::npos &&
+              cap_out->find('\x9b') == std::string::npos &&
+              cap_out->find("▁▂█ café") != std::string::npos,
+          "sanitize_inline escapes raw 0x9B C1 while preserving valid UTF-8");
+
+  // Also test malformed UTF-8 lead before 0x9B ("\xe2\x9b6n") and DEL (0x7F)
+  // through /companion ask question + response rendering.
+  ctx.decision_evaluator = [](const Value &) -> Value {
+    return Value::object(
+        {{"model", Value{"m\x9b"
+                         "6n"}},
+         {"answers",
+          Value::object({{"advisory", Value::object({{"type", Value{"choice"}},
+                                                     {"choice", Value{"ok\x7f\xe2\x9b"
+                                                                      "6n"}}})}})}});
+  };
+  const auto comp_out = handle_command_post_slash("/companion ask --provider clef a\x9b"
+                                                  "6nb",
+                                                  ctx);
+  require(comp_out.has_value() &&
+              comp_out->find("a\\x9b"
+                             "6nb") != std::string::npos &&
+              comp_out->find("m\\x9b"
+                             "6n") != std::string::npos &&
+              comp_out->find("ok\\x7f\\xe2\\x9b"
+                             "6n") != std::string::npos &&
+              comp_out->find('\x9b') == std::string::npos &&
+              comp_out->find('\x7f') == std::string::npos,
+          "companion ask escapes raw 0x9B, DEL, and malformed UTF-8 lead + 0x9B");
+
+  // Platoon post / board quoting: UTF-8 C1 (0xC2 0x9B) and DEL (0x7F) are
+  // hex-escaped while valid multi-byte UTF-8 ("▁▂█ café") passes cleanly, and
+  // raw invalid-UTF-8 0x9B never leaks raw 0x9B bytes into stdout.
+  const auto platoon_raw_c1 = handle_command_post_slash("/platoon post a\x9b"
+                                                        "6nb",
+                                                        ctx);
+  require(platoon_raw_c1.has_value() &&
+              platoon_raw_c1->find('\x9b') == std::string::npos,
+          "platoon post never emits raw 0x9B bytes");
+
+  const auto platoon_utf8_c1 = handle_command_post_slash("/platoon post a\xc2\x9b"
+                                                         "6nb \x7f ▁▂█ café",
+                                                         ctx);
+  require(platoon_utf8_c1.has_value() &&
+              platoon_utf8_c1->find("a\\xc2\\x9b"
+                                    "6nb \\x7f ▁▂█ café") != std::string::npos &&
+              platoon_utf8_c1->find('\x9b') == std::string::npos &&
+              platoon_utf8_c1->find('\x7f') == std::string::npos,
+          "platoon post escapes UTF-8 C1 and DEL while preserving valid UTF-8");
+
+  const auto board_out = handle_command_post_slash("/platoon board", ctx);
+  require(board_out.has_value() &&
+              board_out->find("\"a\\xc2\\x9b"
+                              "6nb \\x7f ▁▂█ café\"") != std::string::npos &&
+              board_out->find('\x9b') == std::string::npos,
+          "platoon board preserves valid UTF-8 and escapes C1 controls");
+}
+
 } // namespace
 
 int main() {
@@ -410,6 +484,7 @@ int main() {
     test_capabilities_read_only_precedence();
     test_metrics_readonly_tristate_and_sparklines();
     test_companion_status_and_bounded_ask();
+    test_c1_raw_and_utf8_sanitization_regression();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {

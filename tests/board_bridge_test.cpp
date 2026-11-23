@@ -5,10 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -588,13 +590,13 @@ void test_experiment_1_two_owner_transfer(const std::filesystem::path &base) {
   }};
   const auto auth_read =
       must(authorize_tool_call(bob_peers, received_grant, "read_file", kT0 + 300,
-                               bob_ledger, 0.25),
+                               bob_ledger, 0.25, bob_fp),
            "authorize read_file");
   check(auth_read.allowed, "allowed tool read_file was refused");
 
   const auto auth_shell =
       must(authorize_tool_call(bob_peers, received_grant, "shell_exec", kT0 + 300,
-                               bob_ledger, 0.10),
+                               bob_ledger, 0.10, bob_fp),
            "authorize shell_exec");
   check(!auth_shell.allowed && auth_shell.denial_code == ErrorCode::unsupported,
         "disallowed tool shell_exec was not refused");
@@ -679,7 +681,7 @@ void test_experiment_1_two_owner_transfer(const std::filesystem::path &base) {
        "revoke grant locally");
   const auto auth_after_revoke =
       must(authorize_tool_call(bob_peers, received_grant, "read_file", kT0 + 500,
-                               bob_ledger, 0.05),
+                               bob_ledger, 0.05, bob_fp),
            "authorize after revoke");
   check(!auth_after_revoke.allowed &&
             auth_after_revoke.denial_code == ErrorCode::conflict,
@@ -694,17 +696,21 @@ void test_spend_ceilings_and_tool_authorization(const std::filesystem::path &bas
   auto bob_id = must(PeerIdentityStore::open_or_create(base / "spend-bob"), "bob id");
   auto carol_id =
       must(PeerIdentityStore::open_or_create(base / "spend-carol"), "carol id");
+  auto dave_id =
+      must(PeerIdentityStore::open_or_create(base / "spend-dave"), "dave id");
   auto peers = must(KnownPeersStore::open(base / "spend-peers"), "open spend peers");
 
   must(peers.pin_peer({"alice", alice_id.identity().public_key, "grantor"}),
        "pin alice");
   must(peers.pin_peer({"carol", carol_id.identity().public_key, "peer2"}), "pin carol");
 
+  const std::string &bob_fp = bob_id.identity().fingerprint;
+
   constexpr std::int64_t kT0 = 1700000000000000000LL;
   const auto grant = must(alice_id.sign_grant(CapabilityGrantDraft{
                               "grant-spend-1",
                               CapabilityGrantMode::direct_support,
-                              bob_id.identity().fingerprint,
+                              bob_fp,
                               "bob-worker",
                               std::nullopt,
                               4,
@@ -722,43 +728,76 @@ void test_spend_ceilings_and_tool_authorization(const std::filesystem::path &bas
       .max_cost_usd_per_platoon = 1.50,
   }};
 
+  // M4 regression: unpinned grantee must be denied when local_actor_fingerprint is
+  // omitted or does not match; self-as-grantee with matching local_actor_fingerprint
+  // is allowed; unpinned third-party grantee (dave) is denied even when Bob passes
+  // his own local_actor_fingerprint.
+  const auto unpinned_no_self =
+      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.10),
+           "unpinned grantee without local_actor_fingerprint");
+  check(!unpinned_no_self.allowed &&
+            unpinned_no_self.denial_code == ErrorCode::conflict,
+        "unpinned grantee allowed without local_actor_fingerprint");
+
+  const auto third_party_grant = must(alice_id.sign_grant(CapabilityGrantDraft{
+                                          "grant-spend-dave",
+                                          CapabilityGrantMode::direct_support,
+                                          dave_id.identity().fingerprint,
+                                          "dave-worker",
+                                          std::nullopt,
+                                          4,
+                                          5000,
+                                          {"read_file"},
+                                          kT0,
+                                          kT0 + 60000000000LL,
+                                          true,
+                                      }),
+                                      "sign unpinned third-party grant");
+  const auto unpinned_third_party =
+      must(authorize_tool_call(peers, third_party_grant, "read_file", kT0 + 10, ledger,
+                               0.10, bob_fp),
+           "unpinned third-party grantee");
+  check(!unpinned_third_party.allowed &&
+            unpinned_third_party.denial_code == ErrorCode::conflict,
+        "unpinned third-party grantee was not denied");
+
   // Time bounds checks: before issued_at and at/after expires_at refused.
-  const auto too_early =
-      must(authorize_tool_call(peers, grant, "read_file", kT0 - 1, ledger, 0.10),
-           "before issued_at");
+  const auto too_early = must(
+      authorize_tool_call(peers, grant, "read_file", kT0 - 1, ledger, 0.10, bob_fp),
+      "before issued_at");
   check(!too_early.allowed && too_early.denial_code == ErrorCode::invalid_range,
         "grant accepted before issued_at_ns");
-  const auto expired = must(
-      authorize_tool_call(peers, grant, "read_file", kT0 + 60000000000LL, ledger, 0.10),
-      "at expires_at");
+  const auto expired =
+      must(authorize_tool_call(peers, grant, "read_file", kT0 + 60000000000LL, ledger,
+                               0.10, bob_fp),
+           "at expires_at");
   check(!expired.allowed && expired.denial_code == ErrorCode::stale_handle,
         "expired grant accepted");
 
   // Spend ceiling: per-peer max_cost_usd_per_peer.
-  must_void(ledger.record_turn(TurnAttribution{bob_id.identity().fingerprint,
-                                               alice_id.identity().fingerprint,
+  must_void(ledger.record_turn(TurnAttribution{bob_fp, alice_id.identity().fingerprint,
                                                grant.grant_id, 500, 500, 0.80}),
             "record turn 0.80");
-  check(must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.20),
+  check(must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.20,
+                                 bob_fp),
              "exact boundary 1.00")
             .allowed,
         "exact peer budget boundary refused");
-  const auto over_peer_cost =
-      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.25),
-           "over peer cost");
+  const auto over_peer_cost = must(
+      authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.25, bob_fp),
+      "over peer cost");
   check(!over_peer_cost.allowed && over_peer_cost.denial_code == ErrorCode::capacity,
         "per-peer cost ceiling violation not refused");
 
   // Spend ceiling: platoon max_cost_usd_per_platoon across multiple peers.
-  must_void(ledger.record_turn(TurnAttribution{bob_id.identity().fingerprint,
-                                               carol_id.identity().fingerprint,
+  must_void(ledger.record_turn(TurnAttribution{bob_fp, carol_id.identity().fingerprint,
                                                "grant-carol-other", 200, 200, 0.65}),
             "record carol 0.65");
   // Total platoon spend is now 1.45; peer Alice is only at 0.80, so 0.10 fits
   // per-peer (0.90 <= 1.00) but exceeds platoon (1.55 > 1.50)!
-  const auto over_platoon =
-      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.10),
-           "over platoon cost");
+  const auto over_platoon = must(
+      authorize_tool_call(peers, grant, "read_file", kT0 + 10, ledger, 0.10, bob_fp),
+      "over platoon cost");
   check(!over_platoon.allowed && over_platoon.denial_code == ErrorCode::capacity,
         "platoon cost ceiling violation not refused");
 
@@ -768,19 +807,81 @@ void test_spend_ceilings_and_tool_authorization(const std::filesystem::path &bas
       .max_cost_usd_per_peer = 10.0,
       .max_cost_usd_per_platoon = 20.0,
   }};
-  must_void(turn_ledger.record_turn(TurnAttribution{bob_id.identity().fingerprint,
-                                                    alice_id.identity().fingerprint,
-                                                    grant.grant_id, 100, 100, 0.01}),
-            "turn 1");
-  must_void(turn_ledger.record_turn(TurnAttribution{bob_id.identity().fingerprint,
-                                                    alice_id.identity().fingerprint,
-                                                    grant.grant_id, 100, 100, 0.01}),
-            "turn 2");
-  const auto over_turns =
-      must(authorize_tool_call(peers, grant, "edit_file", kT0 + 10, turn_ledger, 0.01),
-           "over peer turns");
+  must_void(
+      turn_ledger.record_turn(TurnAttribution{bob_fp, alice_id.identity().fingerprint,
+                                              grant.grant_id, 100, 100, 0.01}),
+      "turn 1");
+  must_void(
+      turn_ledger.record_turn(TurnAttribution{bob_fp, alice_id.identity().fingerprint,
+                                              grant.grant_id, 100, 100, 0.01}),
+      "turn 2");
+  const auto over_turns = must(authorize_tool_call(peers, grant, "edit_file", kT0 + 10,
+                                                   turn_ledger, 0.01, bob_fp),
+                               "over peer turns");
   check(!over_turns.allowed && over_turns.denial_code == ErrorCode::capacity,
         "max_turns_per_peer violation not refused");
+
+  // M5 regression: varying requested_by_actor strings under the same grant_id MUST
+  // NOT bypass policy.max_turns_per_peer or policy.max_cost_usd_per_peer!
+  {
+    const auto big_grant = must(alice_id.sign_grant(CapabilityGrantDraft{
+                                    "grant-spend-evasion",
+                                    CapabilityGrantMode::direct_support,
+                                    bob_fp,
+                                    "bob-worker",
+                                    std::nullopt,
+                                    100,
+                                    100000,
+                                    {"read_file"},
+                                    kT0,
+                                    kT0 + 60000000000LL,
+                                    true,
+                                }),
+                                "sign evasion grant");
+
+    SpendLedger evade_turns{SpendPolicy{
+        .max_turns_per_peer = 2,
+        .max_cost_usd_per_peer = 50.0,
+        .max_cost_usd_per_platoon = 100.0,
+    }};
+    must_void(evade_turns.record_turn(TurnAttribution{
+                  bob_fp, "spoofed-peer-a", big_grant.grant_id, 10, 10, 0.01}),
+              "evasion turn 1");
+    must_void(evade_turns.record_turn(TurnAttribution{
+                  bob_fp, "spoofed-peer-b", big_grant.grant_id, 10, 10, 0.01}),
+              "evasion turn 2");
+    check(evade_turns.turns_for_grant(big_grant.grant_id) == 2,
+          "turns_for_grant mismatch");
+    const auto blocked_turn_evasion =
+        must(authorize_tool_call(peers, big_grant, "read_file", kT0 + 10, evade_turns,
+                                 0.01, bob_fp),
+             "turn attribution evasion");
+    check(!blocked_turn_evasion.allowed &&
+              blocked_turn_evasion.denial_code == ErrorCode::capacity,
+          "varying requested_by_actor bypassed policy.max_turns_per_peer");
+
+    SpendLedger evade_cost{SpendPolicy{
+        .max_turns_per_peer = 100,
+        .max_cost_usd_per_peer = 1.00,
+        .max_cost_usd_per_platoon = 100.0,
+    }};
+    must_void(evade_cost.record_turn(TurnAttribution{bob_fp, "spoofed-peer-c",
+                                                     big_grant.grant_id, 10, 10, 0.60}),
+              "evasion cost 1");
+    must_void(evade_cost.record_turn(TurnAttribution{bob_fp, "spoofed-peer-d",
+                                                     big_grant.grant_id, 10, 10, 0.35}),
+              "evasion cost 2");
+    check(evade_cost.cost_usd_for_grant(big_grant.grant_id) >= 0.9499 &&
+              evade_cost.cost_usd_for_grant(big_grant.grant_id) <= 0.9501,
+          "cost_usd_for_grant mismatch");
+    const auto blocked_cost_evasion =
+        must(authorize_tool_call(peers, big_grant, "read_file", kT0 + 10, evade_cost,
+                                 0.10, bob_fp),
+             "cost attribution evasion");
+    check(!blocked_cost_evasion.allowed &&
+              blocked_cost_evasion.denial_code == ErrorCode::capacity,
+          "varying requested_by_actor bypassed policy.max_cost_usd_per_peer");
+  }
 
   // Grant max_tokens ceiling.
   SpendLedger token_ledger{SpendPolicy{
@@ -788,13 +889,13 @@ void test_spend_ceilings_and_tool_authorization(const std::filesystem::path &bas
       .max_cost_usd_per_peer = 10.0,
       .max_cost_usd_per_platoon = 20.0,
   }};
-  must_void(token_ledger.record_turn(TurnAttribution{bob_id.identity().fingerprint,
-                                                     alice_id.identity().fingerprint,
-                                                     grant.grant_id, 3000, 2000, 0.05}),
-            "turn hitting 5000 tokens");
-  const auto over_tokens =
-      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, token_ledger, 0.01),
-           "over grant max_tokens");
+  must_void(
+      token_ledger.record_turn(TurnAttribution{bob_fp, alice_id.identity().fingerprint,
+                                               grant.grant_id, 3000, 2000, 0.05}),
+      "turn hitting 5000 tokens");
+  const auto over_tokens = must(authorize_tool_call(peers, grant, "read_file", kT0 + 10,
+                                                    token_ledger, 0.01, bob_fp),
+                                "over grant max_tokens");
   check(!over_tokens.allowed && over_tokens.denial_code == ErrorCode::capacity,
         "grant max_tokens violation not refused");
 
@@ -803,7 +904,8 @@ void test_spend_ceilings_and_tool_authorization(const std::filesystem::path &bas
   must(peers.revoke_peer({alice_id.identity().fingerprint, "compromised key"}),
        "revoke alice peer");
   const auto after_peer_revoke =
-      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, fresh_ledger, 0.01),
+      must(authorize_tool_call(peers, grant, "read_file", kT0 + 10, fresh_ledger, 0.01,
+                               bob_fp),
            "after peer revoke");
   check(!after_peer_revoke.allowed &&
             after_peer_revoke.denial_code == ErrorCode::conflict,
@@ -1111,6 +1213,282 @@ void test_reconnect_replay_forgery_and_concurrent_conflicts(
         "conflict was not resolved after causal merge event");
 }
 
+void test_kimi3_guard_presence_corruption_and_boundaries(
+    const std::filesystem::path &base) {
+  g_stage = "kimi3_guard_presence_corruption_and_boundaries";
+
+  auto alice_id =
+      must(PeerIdentityStore::open_or_create(base / "k3-alice"), "alice id");
+  auto bob_id = must(PeerIdentityStore::open_or_create(base / "k3-bob"), "bob id");
+  auto bob_peers = must(KnownPeersStore::open(base / "k3-bob-peers"), "bob peers");
+  must(bob_peers.pin_peer({"alice", alice_id.identity().public_key, "peer"}),
+       "pin alice");
+
+  const std::string &alice_fp = alice_id.identity().fingerprint;
+  const std::string &bob_fp = bob_id.identity().fingerprint;
+
+  // M1 regression: foreign non-passive event with empty resource_scope MUST block
+  // check_action_guard (acting as wildcard), while passive empty-scope events do not.
+  {
+    auto alice_bridge =
+        must(BoardBridge::open(base / "k3-m1-alice"), "m1 alice bridge");
+    auto bob_bridge = must(BoardBridge::open(base / "k3-m1-bob"), "m1 bob bridge");
+    constexpr std::int64_t kT0 = 1700000000000000000LL;
+
+    const auto passive_ev = must(alice_bridge.emit_causal_event(CausalEventDraft{
+                                     alice_fp,
+                                     0,
+                                     {},
+                                     kT0,
+                                     "",
+                                     "presence",
+                                     Value::object({{"ok", Value{true}}})}),
+                                 "emit passive empty-scope event");
+    const auto passive_env = must(BoardBridge::sign_causal_event_envelope(
+                                      alice_id, passive_ev,
+                                      PeerEnvelopeMeta{"env-m1-passive", bob_fp, "t-m1",
+                                                       PeerEnvelopeKind::mail, kT0}),
+                                  "sign passive empty-scope env");
+
+    std::stringstream p1;
+    must_void(alice_bridge.send_envelope(p1, passive_env), "send passive");
+    must(bob_bridge.pump_inbound(p1, bob_peers), "pump passive");
+    check(must(bob_bridge.check_action_guard(bob_fp, "src/x.cpp"),
+               "guard after passive empty-scope")
+              .allowed,
+          "passive empty-scope event erroneously blocked action guard");
+
+    const auto claim_ev =
+        must(alice_bridge.emit_causal_event(CausalEventDraft{
+                 alice_fp,
+                 0,
+                 {},
+                 kT0 + 10,
+                 "",
+                 "claim",
+                 Value::object({{"note", Value{"unscoped foreign claim"}}})}),
+             "emit claim empty-scope event");
+    const auto claim_env =
+        must(BoardBridge::sign_causal_event_envelope(
+                 alice_id, claim_ev,
+                 PeerEnvelopeMeta{"env-m1-claim", bob_fp, "t-m1",
+                                  PeerEnvelopeKind::handoff, kT0 + 10}),
+             "sign claim empty-scope env");
+    std::stringstream p2;
+    must_void(alice_bridge.send_envelope(p2, claim_env), "send claim");
+    must(bob_bridge.pump_inbound(p2, bob_peers), "pump claim");
+
+    const auto blocked = must(bob_bridge.check_action_guard(bob_fp, "src/x.cpp"),
+                              "guard after empty-scope claim");
+    check(!blocked.allowed && blocked.blocking_event_hashes.size() == 1 &&
+              blocked.blocking_event_hashes[0] == claim_ev.event_hash,
+          "empty-scope foreign claim bypassed check_action_guard");
+
+    must(bob_bridge.record_receipt(MessageReceipt{
+             claim_ev.event_hash, bob_fp, ReceiptStage::included_in_request, kT0 + 20,
+             board_bridge_sha256_hex("req-m1"), std::nullopt, std::nullopt}),
+         "include empty-scope claim");
+    check(must(bob_bridge.check_action_guard(bob_fp, "src/x.cpp"),
+               "guard after including empty-scope claim")
+              .allowed,
+          "empty-scope claim stayed blocked after included_in_request");
+  }
+
+  // M2 regression: far-future presence updated_ns = INT64_MAX, ttl_ns = 1 MUST be
+  // clamped at ingest AND rejected by presence_is_expired when beyond skew tolerance.
+  {
+    auto alice_bridge =
+        must(BoardBridge::open(base / "k3-m2-alice"), "m2 alice bridge");
+    const auto bob_dir = base / "k3-m2-bob";
+    auto bob_bridge = must(BoardBridge::open(bob_dir), "m2 bob bridge");
+
+    const auto wall_ns = static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const PresenceRecord hostile_pres{
+        alice_fp,
+        "Alice",
+        "src/m2.cpp",
+        "pinning-forever",
+        std::numeric_limits<std::int64_t>::max(),
+        1,
+    };
+    const auto hostile_env =
+        must(BoardBridge::sign_presence_envelope(
+                 alice_id, hostile_pres,
+                 PeerEnvelopeMeta{"env-m2-hostile", bob_fp, "t-m2",
+                                  PeerEnvelopeKind::mail, wall_ns}),
+             "sign far-future presence");
+    std::stringstream pipe;
+    must_void(alice_bridge.send_envelope(pipe, hostile_env), "send far-future pres");
+    must(bob_bridge.pump_inbound(pipe, bob_peers), "pump far-future pres");
+
+    // Past the 60s clock-skew tolerance + TTL, the clamped record MUST have expired.
+    const auto after_skew =
+        must(bob_bridge.active_watchers(
+                 "src/m2.cpp", wall_ns + kBoardBridgeMaxFutureSkewNs + 5000000000LL),
+             "watchers after skew");
+    check(after_skew.empty(),
+          "far-future presence pinned active_watchers past clock-skew + TTL");
+
+    // Direct record_presence() also clamps updated_ns to wall_now + skew.
+    const auto recorded_bob = must(bob_bridge.record_presence(PresenceRecord{
+                                       bob_fp, "Bob", "src/m2-local.cpp", "pinning",
+                                       std::numeric_limits<std::int64_t>::max(), 1}),
+                                   "record local far-future presence");
+    check(recorded_bob.updated_ns < std::numeric_limits<std::int64_t>::max(),
+          "record_presence did not clamp INT64_MAX updated_ns");
+    const auto local_after_skew = must(
+        bob_bridge.active_watchers("src/m2-local.cpp", recorded_bob.updated_ns + 1),
+        "local watchers after clamped ttl");
+    check(local_after_skew.empty(), "clamped local presence did not expire after TTL");
+
+    // Even if an unclamped INT64_MAX presence record already exists on disk in
+    // bridge.jsonl, presence_is_expired() rejects it when updated_ns > now_ns + skew.
+    {
+      const Value raw_rec = Value::object({
+          {"v", Value{Number{kBoardBridgeSchemaVersion}}},
+          {"record_type", Value{"presence"}},
+          {"presence", presence_to_value(PresenceRecord{
+                           alice_fp, "Alice", "src/m2-disk.cpp", "raw-disk-pin",
+                           std::numeric_limits<std::int64_t>::max(), 1})},
+      });
+      const auto line = must(dump_json(raw_rec), "dump raw presence") + "\n";
+      const int fd = ::open((bob_dir / "bridge.jsonl").c_str(), O_WRONLY | O_APPEND);
+      check(fd >= 0, "open bridge.jsonl for raw presence injection");
+      check(::write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size()),
+            "write raw presence failed");
+      check(::close(fd) == 0, "close raw presence fd");
+    }
+    const auto raw_disk_watchers =
+        must(bob_bridge.active_watchers("src/m2-disk.cpp", wall_ns),
+             "watchers on raw disk INT64_MAX record");
+    check(raw_disk_watchers.empty(),
+          "presence_is_expired failed to reject far-future on-disk record");
+  }
+
+  // M3 regression: corrupt bridge.jsonl MUST cause pump_inbound() to return fatal
+  // ErrorCode::corrupt (never silently masked as report.rejected++), while an
+  // untrusted incoming frame with a malformed embedded causal_event is still counted
+  // as report.rejected++.
+  {
+    const auto bob_dir = base / "k3-m3-bob";
+    auto bob_bridge = must(BoardBridge::open(bob_dir), "m3 bob bridge");
+    constexpr std::int64_t kT0 = 1700000000000000000LL;
+
+    // First verify bad embedded payload inside a signed envelope increments rejected
+    // without falsely reporting local store corruption.
+    const auto bad_embedded_env =
+        must(alice_id.sign_envelope(PeerEnvelopeDraft{
+                 "env-m3-bad-embedded",
+                 bob_fp,
+                 "t-m3",
+                 PeerEnvelopeKind::mail,
+                 kT0,
+                 Value::object(
+                     {{"causal_event", Value::object({{"bad", Value{"schema"}}})}}),
+             }),
+             "sign bad embedded env");
+    std::stringstream bad_frame_stream;
+    bad_frame_stream << must(dump_json(envelope_to_value(bad_embedded_env)),
+                             "dump bad embedded")
+                     << '\n';
+    const auto bad_frame_report =
+        must(bob_bridge.pump_inbound(bad_frame_stream, bob_peers),
+             "pump bad embedded frame");
+    check(bad_frame_report.accepted == 0 && bad_frame_report.rejected == 1,
+          "bad embedded causal_event should increment rejected without fatal error");
+
+    // Now corrupt local bridge.jsonl with a '\n'-terminated corrupt JSON line.
+    {
+      const int fd = ::open((bob_dir / "bridge.jsonl").c_str(),
+                            O_WRONLY | O_CREAT | O_APPEND, mode_t{0600});
+      check(fd >= 0, "open bridge.jsonl for corruption test");
+      const std::string_view corrupt_line = "{\"v\":1,\"record_type\":\"broken\n";
+      check(::write(fd, corrupt_line.data(), corrupt_line.size()) ==
+                static_cast<ssize_t>(corrupt_line.size()),
+            "write corrupt line");
+      check(::close(fd) == 0, "close corrupt fd");
+    }
+
+    const auto valid_env = must(alice_id.sign_envelope(PeerEnvelopeDraft{
+                                    "env-m3-valid",
+                                    bob_fp,
+                                    "t-m3",
+                                    PeerEnvelopeKind::mail,
+                                    kT0 + 1,
+                                    Value::object({{"msg", Value{"hello"}}}),
+                                }),
+                                "sign valid m3 env");
+    std::stringstream valid_stream;
+    valid_stream << must(dump_json(envelope_to_value(valid_env)), "dump valid m3")
+                 << '\n';
+    const auto corrupt_res = bob_bridge.pump_inbound(valid_stream, bob_peers);
+    check(!corrupt_res.has_value() && corrupt_res.error().code == ErrorCode::corrupt,
+          "corrupt bridge.jsonl was masked instead of returning ErrorCode::corrupt");
+  }
+
+  // Boundary-frame tests for pump_inbound():
+  // 1. Exact kBoardBridgeMaxLineBytes bytes + '\n' -> accepted == 1, rejected == 0.
+  // 2. kBoardBridgeMaxLineBytes + 1 bytes + '\n' -> rejected == 1,
+  //    incomplete_trailing_frame == false.
+  // 3. EOF immediately after '\r' -> incomplete_trailing_frame == true, no UB.
+  {
+    auto bob_bridge = must(BoardBridge::open(base / "k3-boundary-bob"), "boundary bob");
+    constexpr std::int64_t kT0 = 1700000000000000000LL;
+
+    const auto exact_env = must(alice_id.sign_envelope(PeerEnvelopeDraft{
+                                    "env-boundary-exact",
+                                    bob_fp,
+                                    "t-bound",
+                                    PeerEnvelopeKind::mail,
+                                    kT0,
+                                    Value::object({{"ok", Value{true}}}),
+                                }),
+                                "sign exact boundary env");
+    const std::string compact =
+        must(dump_json(envelope_to_value(exact_env)), "dump exact env");
+    check(compact.size() < kBoardBridgeMaxLineBytes, "compact env exceeds max line");
+    const std::size_t pad = kBoardBridgeMaxLineBytes - compact.size();
+
+    std::string exact_frame;
+    exact_frame.reserve(kBoardBridgeMaxLineBytes + 1);
+    exact_frame.append(pad, ' ');
+    exact_frame.append(compact);
+    check(exact_frame.size() == kBoardBridgeMaxLineBytes, "exact frame length wrong");
+    exact_frame.push_back('\n');
+
+    std::istringstream exact_in(exact_frame);
+    const auto exact_rep =
+        must(bob_bridge.pump_inbound(exact_in, bob_peers), "pump exact max frame");
+    check(exact_rep.accepted == 1 && exact_rep.rejected == 0 &&
+              !exact_rep.incomplete_trailing_frame,
+          "exact kBoardBridgeMaxLineBytes frame was not accepted cleanly");
+
+    std::string over_frame;
+    over_frame.reserve(kBoardBridgeMaxLineBytes + 2);
+    over_frame.append(pad + 1, ' ');
+    over_frame.append(compact);
+    check(over_frame.size() == kBoardBridgeMaxLineBytes + 1, "over frame length wrong");
+    over_frame.push_back('\n');
+
+    std::istringstream over_in(over_frame);
+    const auto over_rep =
+        must(bob_bridge.pump_inbound(over_in, bob_peers), "pump max+1 frame");
+    check(over_rep.accepted == 0 && over_rep.rejected == 1 &&
+              !over_rep.incomplete_trailing_frame,
+          "kBoardBridgeMaxLineBytes + 1 frame was not rejected cleanly");
+
+    std::istringstream cr_eof_in("\r");
+    const auto cr_eof_rep =
+        must(bob_bridge.pump_inbound(cr_eof_in, bob_peers), "pump EOF after CR");
+    check(cr_eof_rep.accepted == 0 && cr_eof_rep.rejected == 0 &&
+              cr_eof_rep.incomplete_trailing_frame,
+          "EOF immediately after '\\r' not handled cleanly");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1136,6 +1514,7 @@ int main() {
     test_quoted_framing_injection_escape(base);
     test_presence_heartbeats_and_expiry(base);
     test_reconnect_replay_forgery_and_concurrent_conflicts(base);
+    test_kimi3_guard_presence_corruption_and_boundaries(base);
     std::cout << "board_bridge_test: ALL PASSED\n";
     return 0;
   } catch (const std::exception &ex) {

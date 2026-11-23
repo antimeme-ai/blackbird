@@ -13943,3 +13943,38 @@ Blackbird must not present itself as another product.
   `docs/PHUX.md`):** refreshed launcher (`--ephemeral`, best-effort `phux agent set`,
   `PATH` fallback), verified isolated private-socket smoke script against `phux 0.162.0`,
   and updated `docs/PHUX.md`.
+
+## 2026-11-23 — Wave 4: 2-Player `blackbird bridge` CLI, Kimi Review #3 Fixes, Modern `README.md`, & Multiplayer Research
+
+- **2-Player `blackbird bridge` CLI (`src/command_post_cli.cpp`,
+  `tests/command_post_cli_test.cpp`, `docs/TWO_PLAYER_QUICKSTART.md`):** wired
+  `blackbird bridge {send,receive,serve,events,receipt,guard,presence,grant-issue,grant-check}`
+  over NDJSON stdio pipes (ready for SSH / Tailscale SSH / async file drop), aligned
+  `blackbird platoon` default board directory to `.blackbird/platoon` matching TUI `/platoon`,
+  and documented the full 2-player workflow in `docs/TWO_PLAYER_QUICKSTART.md`.
+- **Kimi Review #3 Remediation (`papers/2026-11-23-wave3-kimi-review.md`, `run-hat5p5a8`):**
+  - `H1` (`src/command_post_tui.cpp`): unified strict UTF-8 validation & byte sanitization
+    escaping bare/orphan C1 bytes (`0x80..0x9F`, incl. `0x9B` CSI) and `0x7F` DEL.
+  - `M1`–`M5` (`include/blackbird/board_bridge.hpp`, `src/board_bridge.cpp`): empty-scope
+    non-passive foreign event guard blocking, 60s future-skew presence clamp/rejection, fatal
+    local-store `ErrorCode::corrupt` propagation in `pump_inbound()`, pinned-or-self grantee
+    requirement on `authorize_tool_call()` (wired with `local_actor_fingerprint` in
+    `bridge grant-check`), and grant-scoped spend/turn ceiling enforcement.
+  - `M6`–`M7` (`src/command_post_cli.cpp`): overflow-safe UID + start-time PID verification
+    and explicit `--group` opt-in for PGID signaling in `platoon stop`; strict grant-schema
+    dispatch in `peer verify`.
+- **Public Front Door & Opus `NEON_LEADER_NOTE.md` Closure (`README.md`):** rewrote
+  `README.md` as a crisp current front door linking to `https://multiplayer.tech/blackbird/`
+  and `docs/TWO_PLAYER_QUICKSTART.md`; folded all completed public-hygiene items from Opus's
+  `NEON_LEADER_NOTE.md` (Claude subscription removal `3a05139`, personal-path/host scrub &
+  39 third-party quarantines `e559385`, `--application`/`--list-sessions`/portable Linux
+  `release` `a9a6b33`, ambient-secret isolation `11679ac`/`d36f489`, Kimi reviews #1–#3)
+  into `JOURNAL.md` and deleted untracked `NEON_LEADER_NOTE.md`. Remaining optional follow-up:
+  archiving older October campaign plans from `docs/` into `docs/history/` and running a
+  dedicated full-history secret scanner before public launch.
+- **Multiplayer Reference Acquisition & Gaming Netcode Wisdom (`QUARANTINE.md`,
+  `papers/multiplayer-2026-11-23/{STUDY.md,manifest.json,GAMING_WISDOM.md}`):** acquired 10
+  pinned, `.git`/symlink-stripped study snapshots (`AgentLink`, `magpie`, `ligus`,
+  `session-multiplayer`, `Hivemind`, `A2A`, `agent-client-protocol`, `humanlayer`,
+  `block/buzz`, `coopagents 0.9.0`) into ignored `quarantine/multiplayer-2026-11-23/` with
+  comparative architecture & multiplayer game-netcode analyses.

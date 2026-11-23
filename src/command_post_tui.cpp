@@ -50,80 +50,84 @@ SplitToken split_first_token(std::string_view input) noexcept {
   return {trimmed.substr(0, sep), trim_view(trimmed.substr(sep + 1))};
 }
 
-// Sanitize untrusted strings for safe display in TUI notices and plain stdout:
-// strips/escapes ASCII controls (<0x20), DEL (0x7F), and UTF-8 C1 controls
-// (U+0080..U+009F) so terminal escape sequences cannot be injected.
-std::string sanitize_inline(std::string_view text, std::size_t max_bytes) {
-  std::string out;
-  out.reserve(std::min(text.size(), max_bytes));
-  constexpr char kHex[] = "0123456789abcdef";
-  bool truncated = false;
-  for (std::size_t i = 0; i < text.size(); ++i) {
-    const auto b = static_cast<unsigned char>(text[i]);
-    const bool is_c1 = b == 0xc2U && i + 1 < text.size() &&
-                       static_cast<unsigned char>(text[i + 1]) >= 0x80U &&
-                       static_cast<unsigned char>(text[i + 1]) <= 0x9fU;
-    std::string chunk;
-    if (b == '\n') {
-      chunk = "\\n";
-    } else if (b == '\r') {
-      chunk = "\\r";
-    } else if (b == '\t') {
-      chunk = " ";
-    } else if (b < 0x20U || b == 0x7fU) {
-      chunk = "\\x";
-      chunk += kHex[b >> 4U];
-      chunk += kHex[b & 0x0fU];
-    } else if (is_c1) {
-      const auto next = static_cast<unsigned char>(text[++i]);
-      chunk = "\\x";
-      chunk += kHex[b >> 4U];
-      chunk += kHex[b & 0x0fU];
-      chunk += "\\x";
-      chunk += kHex[next >> 4U];
-      chunk += kHex[next & 0x0fU];
-    } else {
-      std::size_t seq_len = 1;
-      if ((b & 0xe0U) == 0xc0U)
-        seq_len = 2;
-      else if ((b & 0xf0U) == 0xe0U)
-        seq_len = 3;
-      else if ((b & 0xf8U) == 0xf0U)
-        seq_len = 4;
-      if (i + seq_len > text.size())
-        seq_len = 1;
-      chunk.assign(text.data() + i, seq_len);
-      i += seq_len - 1;
-    }
-    if (out.size() + chunk.size() > max_bytes) {
-      truncated = true;
-      break;
-    }
-    out += chunk;
+enum class SanitizeMode : std::uint8_t {
+  inline_text,
+  quoted_peer,
+};
+
+// Validate a single UTF-8 sequence starting at text[i], rejecting overlong
+// forms, UTF-16 surrogates, out-of-range scalars, and bare continuation bytes.
+std::size_t valid_utf8_seq_len(std::string_view text, std::size_t i) noexcept {
+  if (i >= text.size())
+    return 0;
+  const auto b0 = static_cast<unsigned char>(text[i]);
+  if (b0 < 0x80U)
+    return 1;
+  if ((b0 & 0xe0U) == 0xc0U) {
+    if (b0 < 0xc2U || i + 1 >= text.size())
+      return 0;
+    const auto b1 = static_cast<unsigned char>(text[i + 1]);
+    return (b1 & 0xc0U) == 0x80U ? 2 : 0;
   }
-  if (truncated)
-    out += "...";
-  return out;
+  if ((b0 & 0xf0U) == 0xe0U) {
+    if (i + 2 >= text.size())
+      return 0;
+    const auto b1 = static_cast<unsigned char>(text[i + 1]);
+    const auto b2 = static_cast<unsigned char>(text[i + 2]);
+    if ((b1 & 0xc0U) != 0x80U || (b2 & 0xc0U) != 0x80U)
+      return 0;
+    if (b0 == 0xe0U && b1 < 0xa0U)
+      return 0;
+    if (b0 == 0xedU && b1 >= 0xa0U)
+      return 0;
+    return 3;
+  }
+  if ((b0 & 0xf8U) == 0xf0U) {
+    if (b0 > 0xf4U || i + 3 >= text.size())
+      return 0;
+    const auto b1 = static_cast<unsigned char>(text[i + 1]);
+    const auto b2 = static_cast<unsigned char>(text[i + 2]);
+    const auto b3 = static_cast<unsigned char>(text[i + 3]);
+    if ((b1 & 0xc0U) != 0x80U || (b2 & 0xc0U) != 0x80U || (b3 & 0xc0U) != 0x80U)
+      return 0;
+    if (b0 == 0xf0U && b1 < 0x90U)
+      return 0;
+    if (b0 == 0xf4U && b1 >= 0x90U)
+      return 0;
+    return 4;
+  }
+  return 0;
 }
 
-// Wrap untrusted peer text inside explicit quotes in a single pass so control
-// escape sequences (e.g. \x1b) are emitted cleanly without double-escaping.
-std::string quote_untrusted_peer_text(std::string_view text, std::size_t max_bytes) {
+// Sanitize untrusted bytes for safe display in TUI notices and plain stdout:
+// hex-escapes ASCII controls (<0x20), DEL (0x7F), raw single-byte C1 controls
+// (0x80..0x9F, incl. 0x9B CSI), UTF-8 C1 controls (0xC2 0x80..0x9F), and any
+// invalid/truncated UTF-8 bytes while preserving valid multi-byte UTF-8.
+std::string sanitize_bytes(std::string_view text, std::size_t max_bytes,
+                           SanitizeMode mode) {
+  const bool escape_quotes = mode == SanitizeMode::quoted_peer;
   std::string out;
-  out.reserve(std::min(text.size(), max_bytes) + 2);
-  out += '"';
+  out.reserve(std::min(text.size(), max_bytes) + (escape_quotes ? 2U : 0U));
+  if (escape_quotes)
+    out += '"';
   constexpr char kHex[] = "0123456789abcdef";
+  auto hex_escape = [&](unsigned char byte) {
+    std::string esc = "\\x";
+    esc += kHex[byte >> 4U];
+    esc += kHex[byte & 0x0fU];
+    return esc;
+  };
   std::size_t body_bytes = 0;
   bool truncated = false;
   for (std::size_t i = 0; i < text.size(); ++i) {
     const auto b = static_cast<unsigned char>(text[i]);
-    const bool is_c1 = b == 0xc2U && i + 1 < text.size() &&
-                       static_cast<unsigned char>(text[i + 1]) >= 0x80U &&
-                       static_cast<unsigned char>(text[i + 1]) <= 0x9fU;
+    const bool is_utf8_c1 = b == 0xc2U && i + 1 < text.size() &&
+                            static_cast<unsigned char>(text[i + 1]) >= 0x80U &&
+                            static_cast<unsigned char>(text[i + 1]) <= 0x9fU;
     std::string chunk;
-    if (b == '\\') {
+    if (escape_quotes && b == '\\') {
       chunk = "\\\\";
-    } else if (b == '"') {
+    } else if (escape_quotes && b == '"') {
       chunk = "\\\"";
     } else if (b == '\n') {
       chunk = "\\n";
@@ -131,30 +135,19 @@ std::string quote_untrusted_peer_text(std::string_view text, std::size_t max_byt
       chunk = "\\r";
     } else if (b == '\t') {
       chunk = " ";
-    } else if (b < 0x20U || b == 0x7fU) {
-      chunk = "\\x";
-      chunk += kHex[b >> 4U];
-      chunk += kHex[b & 0x0fU];
-    } else if (is_c1) {
+    } else if (b < 0x20U || b == 0x7fU || (b >= 0x80U && b <= 0x9fU)) {
+      chunk = hex_escape(b);
+    } else if (is_utf8_c1) {
       const auto next = static_cast<unsigned char>(text[++i]);
-      chunk = "\\x";
-      chunk += kHex[b >> 4U];
-      chunk += kHex[b & 0x0fU];
-      chunk += "\\x";
-      chunk += kHex[next >> 4U];
-      chunk += kHex[next & 0x0fU];
+      chunk = hex_escape(b) + hex_escape(next);
     } else {
-      std::size_t seq_len = 1;
-      if ((b & 0xe0U) == 0xc0U)
-        seq_len = 2;
-      else if ((b & 0xf0U) == 0xe0U)
-        seq_len = 3;
-      else if ((b & 0xf8U) == 0xf0U)
-        seq_len = 4;
-      if (i + seq_len > text.size())
-        seq_len = 1;
-      chunk.assign(text.data() + i, seq_len);
-      i += seq_len - 1;
+      const std::size_t seq_len = valid_utf8_seq_len(text, i);
+      if (seq_len == 0) {
+        chunk = hex_escape(b);
+      } else {
+        chunk.assign(text.data() + i, seq_len);
+        i += seq_len - 1;
+      }
     }
     if (body_bytes + chunk.size() > max_bytes) {
       truncated = true;
@@ -165,8 +158,19 @@ std::string quote_untrusted_peer_text(std::string_view text, std::size_t max_byt
   }
   if (truncated)
     out += "...";
-  out += '"';
+  if (escape_quotes)
+    out += '"';
   return out;
+}
+
+std::string sanitize_inline(std::string_view text, std::size_t max_bytes) {
+  return sanitize_bytes(text, max_bytes, SanitizeMode::inline_text);
+}
+
+// Wrap untrusted peer text inside explicit quotes in a single pass so control
+// escape sequences (e.g. \x1b, \x9b) are emitted cleanly without double-escaping.
+std::string quote_untrusted_peer_text(std::string_view text, std::size_t max_bytes) {
+  return sanitize_bytes(text, max_bytes, SanitizeMode::quoted_peer);
 }
 
 std::string bound_output(std::string text) {

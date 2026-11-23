@@ -25,6 +25,7 @@ inline constexpr std::size_t kBoardBridgeMaxCausalParents = 64;
 inline constexpr std::size_t kBoardBridgeMaxUntrustedSources = 64;
 inline constexpr std::size_t kBoardBridgeMaxLineBytes = 4 * 1024 * 1024;
 inline constexpr std::int64_t kBoardBridgeMaxTtlNs = 24LL * 60LL * 60LL * 1000000000LL;
+inline constexpr std::int64_t kBoardBridgeMaxFutureSkewNs = 60LL * 1000000000LL;
 
 // Distinct non-mutually-convertible view wrappers for multi-string APIs so
 // callers can pass string literals, std::string, or std::string_view directly
@@ -176,6 +177,7 @@ public:
   std::uint32_t turns_for_grant(std::string_view grant_id) const noexcept;
   std::uint64_t tokens_for_grant(std::string_view grant_id) const noexcept;
   double cost_usd_for_peer(std::string_view peer_actor) const noexcept;
+  double cost_usd_for_grant(std::string_view grant_id) const noexcept;
   double total_cost_usd() const noexcept;
 
 private:
@@ -193,7 +195,8 @@ struct ToolAuthorization {
 Result<ToolAuthorization>
 authorize_tool_call(const KnownPeersStore &known_peers, const CapabilityGrant &grant,
                     std::string_view tool_name, std::int64_t now_ns,
-                    const SpendLedger &ledger, double projected_cost_usd);
+                    const SpendLedger &ledger, double projected_cost_usd,
+                    std::string_view local_actor_fingerprint = {});
 
 // 6. Live Watcher Presence Heartbeats (Grok #5)
 struct PresenceRecord {

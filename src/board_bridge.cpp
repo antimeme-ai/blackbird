@@ -536,13 +536,26 @@ bool is_passive_event_kind(std::string_view kind) noexcept {
 
 bool scope_matches_guard(std::string_view event_scope,
                          std::string_view action_scope) noexcept {
-  if (event_scope.empty() || action_scope.empty())
+  if (action_scope.empty())
     return false;
+  // Treat an empty scope on a non-passive foreign event as wildcard blocking
+  // so unaddressed work orders/claims cannot slip past check_action_guard.
+  if (event_scope.empty())
+    return true;
   return event_scope == action_scope || event_scope == "*" || action_scope == "*";
 }
 
+std::int64_t max_allowed_presence_ns(std::int64_t now_ns) noexcept {
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  if (now_ns > kMax - kBoardBridgeMaxFutureSkewNs)
+    return kMax;
+  return now_ns + kBoardBridgeMaxFutureSkewNs;
+}
+
 bool presence_is_expired(const PresenceRecord &record, std::int64_t now_ns) noexcept {
-  if (record.ttl_ns <= 0)
+  if (record.ttl_ns <= 0 || record.updated_ns < 0)
+    return true;
+  if (record.updated_ns > max_allowed_presence_ns(now_ns))
     return true;
   if (now_ns <= record.updated_ns)
     return false;
@@ -907,6 +920,103 @@ Result<void> check_peer_budget_for_actor(const SpendLedger &ledger,
     return Result<void>::success();
   }
   return Result<void>::success();
+}
+
+enum class IngestErrorOrigin : std::uint8_t {
+  none,
+  untrusted_frame,
+  local_store,
+};
+
+struct EnvelopeIngestOutcome {
+  std::optional<EnvelopeIngestResult> value;
+  Error error{};
+  IngestErrorOrigin error_origin = IngestErrorOrigin::none;
+};
+
+EnvelopeIngestOutcome ingest_envelope_internal(int dir_fd, const PeerEnvelope &envelope,
+                                               const KnownPeersStore &known_peers) {
+  if (dir_fd < 0) {
+    return {std::nullopt, {ErrorCode::stale_handle}, IngestErrorOrigin::local_store};
+  }
+
+  // Always cryptographically verify every inbound envelope before trusting any field.
+  auto verified = known_peers.verify_envelope(envelope);
+  if (!verified.has_value()) {
+    const ErrorCode code = verified.error().code;
+    const bool fatal_store = code == ErrorCode::io || code == ErrorCode::stale_handle ||
+                             code == ErrorCode::allocation ||
+                             code == ErrorCode::interrupted;
+    return {std::nullopt, verified.error(),
+            fatal_store ? IngestErrorOrigin::local_store
+                        : IngestErrorOrigin::untrusted_frame};
+  }
+
+  auto embedded = extract_and_bind_embedded_records(envelope);
+  if (!embedded.has_value()) {
+    const bool fatal_store = embedded.error().code == ErrorCode::allocation;
+    return {std::nullopt, embedded.error(),
+            fatal_store ? IngestErrorOrigin::local_store
+                        : IngestErrorOrigin::untrusted_frame};
+  }
+
+  try {
+    auto lock = ScopedFlock::acquire(dir_fd, kBridgeLockFile, false);
+    if (!lock.has_value())
+      return {std::nullopt, lock.error(), IngestErrorOrigin::local_store};
+    auto state = replay_bridge_log_locked(dir_fd);
+    if (!state.has_value())
+      return {std::nullopt, state.error(), IngestErrorOrigin::local_store};
+
+    const auto &records = embedded.value();
+    const EnvelopeKey key{envelope.from_fingerprint, envelope.envelope_id};
+    if (state.value().seen_inbound_envelopes.contains(key)) {
+      std::optional<std::string> dup_hash;
+      if (records.causal_event.has_value())
+        dup_hash = records.causal_event->event_hash;
+      return {EnvelopeIngestResult{
+                  EnvelopeIngestStatus::duplicate,
+                  envelope.envelope_id,
+                  envelope.from_fingerprint,
+                  std::move(dup_hash),
+              },
+              {},
+              IngestErrorOrigin::none};
+    }
+
+    std::vector<Value> batch;
+    batch.push_back(wrap_envelope_record("inbound", envelope));
+    std::optional<std::string> event_hash;
+    if (records.causal_event.has_value()) {
+      event_hash = records.causal_event->event_hash;
+      if (!state.value().seen_event_hashes.contains(*event_hash))
+        batch.push_back(wrap_causal_event_record(*records.causal_event));
+    }
+    if (records.receipt.has_value())
+      batch.push_back(wrap_receipt_record(*records.receipt));
+    if (records.presence.has_value()) {
+      PresenceRecord clamped = *records.presence;
+      const std::int64_t max_ns = max_allowed_presence_ns(wall_now_ns());
+      if (clamped.updated_ns > max_ns)
+        clamped.updated_ns = max_ns;
+      batch.push_back(wrap_presence_record(clamped));
+    }
+
+    auto appended = append_records_locked(dir_fd, state.value(), batch);
+    if (!appended.has_value())
+      return {std::nullopt, appended.error(), IngestErrorOrigin::local_store};
+
+    return {EnvelopeIngestResult{
+                EnvelopeIngestStatus::accepted,
+                envelope.envelope_id,
+                envelope.from_fingerprint,
+                std::move(event_hash),
+            },
+            {},
+            IngestErrorOrigin::none};
+  } catch (const std::bad_alloc &) {
+    return {std::nullopt, {ErrorCode::allocation}, IngestErrorOrigin::local_store};
+  }
 }
 
 } // namespace
@@ -1480,6 +1590,17 @@ double SpendLedger::cost_usd_for_peer(std::string_view peer_actor) const noexcep
   return total;
 }
 
+double SpendLedger::cost_usd_for_grant(std::string_view grant_id) const noexcept {
+  if (grant_id.empty())
+    return 0.0;
+  double total = 0.0;
+  for (const auto &entry : entries_) {
+    if (entry.grant_id == grant_id)
+      total += entry.cost_usd;
+  }
+  return total;
+}
+
 double SpendLedger::total_cost_usd() const noexcept {
   double total = 0.0;
   for (const auto &entry : entries_)
@@ -1490,7 +1611,8 @@ double SpendLedger::total_cost_usd() const noexcept {
 Result<ToolAuthorization>
 authorize_tool_call(const KnownPeersStore &known_peers, const CapabilityGrant &grant,
                     std::string_view tool_name, std::int64_t now_ns,
-                    const SpendLedger &ledger, double projected_cost_usd) {
+                    const SpendLedger &ledger, double projected_cost_usd,
+                    std::string_view local_actor_fingerprint) {
   auto policy_ok = validate_spend_policy(ledger.policy());
   if (!policy_ok.has_value())
     return Result<ToolAuthorization>::failure(policy_ok.error());
@@ -1498,6 +1620,10 @@ authorize_tool_call(const KnownPeersStore &known_peers, const CapabilityGrant &g
     return Result<ToolAuthorization>::failure({ErrorCode::invalid_range});
   if (now_ns < 0)
     return Result<ToolAuthorization>::failure({ErrorCode::invalid_range});
+  if (!local_actor_fingerprint.empty() &&
+      !valid_peer_fingerprint(local_actor_fingerprint)) {
+    return Result<ToolAuthorization>::failure({ErrorCode::invalid_identity});
+  }
   if (!valid_safe_token(tool_name,
                         {.max_bytes = kPeerMaxIdLength, .allow_empty = false})) {
     return Result<ToolAuthorization>::success(
@@ -1575,19 +1701,41 @@ authorize_tool_call(const KnownPeersStore &known_peers, const CapabilityGrant &g
   if (!grantee_peer.has_value())
     return Result<ToolAuthorization>::failure(grantee_peer.error());
   const auto &maybe_grantee = grantee_peer.value();
-  if (maybe_grantee.has_value() && maybe_grantee->revoked) {
-    return Result<ToolAuthorization>::success(
-        ToolAuthorization{false, ErrorCode::conflict, "grantee peer revoked"});
+  if (maybe_grantee.has_value()) {
+    if (maybe_grantee->revoked) {
+      return Result<ToolAuthorization>::success(
+          ToolAuthorization{false, ErrorCode::conflict, "grantee peer revoked"});
+    }
+  } else {
+    const bool is_local_self = !local_actor_fingerprint.empty() &&
+                               grant.grantee_fingerprint == local_actor_fingerprint;
+    if (!is_local_self) {
+      return Result<ToolAuthorization>::success(
+          ToolAuthorization{false, ErrorCode::conflict, "grantee peer unpinned"});
+    }
   }
 
   // Enforce grant turn and token ceilings.
-  if (ledger.turns_for_grant(grant.grant_id) >= grant.max_turns) {
+  const std::uint32_t grant_turns = ledger.turns_for_grant(grant.grant_id);
+  if (grant_turns >= grant.max_turns) {
     return Result<ToolAuthorization>::success(ToolAuthorization{
         false, ErrorCode::capacity, "capability grant max_turns exceeded"});
   }
   if (ledger.tokens_for_grant(grant.grant_id) >= grant.max_tokens) {
     return Result<ToolAuthorization>::success(ToolAuthorization{
         false, ErrorCode::capacity, "capability grant max_tokens exceeded"});
+  }
+
+  // Enforce per-peer turn & cost ceilings against grant_id totals as well, so
+  // varying requested_by_actor strings under the same grant cannot evade them.
+  if (grant_turns >= ledger.policy().max_turns_per_peer) {
+    return Result<ToolAuthorization>::success(ToolAuthorization{
+        false, ErrorCode::capacity, "grant max_turns_per_peer ceiling exceeded"});
+  }
+  if (ledger.cost_usd_for_grant(grant.grant_id) + projected_cost_usd >
+      ledger.policy().max_cost_usd_per_peer + kSpendEpsilon) {
+    return Result<ToolAuthorization>::success(ToolAuthorization{
+        false, ErrorCode::capacity, "grant max_cost_usd_per_peer ceiling exceeded"});
   }
 
   // Enforce platoon-wide spend ceiling.
@@ -1949,11 +2097,15 @@ BoardBridge::check_action_guard(ActorIdRef actor_id,
 Result<PresenceRecord> BoardBridge::record_presence(PresenceRecord record) {
   if (dir_fd_ < 0)
     return Result<PresenceRecord>::failure({ErrorCode::stale_handle});
+  const std::int64_t now_ns = wall_now_ns();
   if (record.updated_ns == 0)
-    record.updated_ns = wall_now_ns();
+    record.updated_ns = now_ns;
   auto valid = validate_presence_fields(record);
   if (!valid.has_value())
     return Result<PresenceRecord>::failure(valid.error());
+  const std::int64_t max_ns = max_allowed_presence_ns(now_ns);
+  if (record.updated_ns > max_ns)
+    record.updated_ns = max_ns;
 
   try {
     auto lock = ScopedFlock::acquire(dir_fd_, kBridgeLockFile, false);
@@ -2104,66 +2256,10 @@ Result<std::size_t> BoardBridge::replay_outbound(std::ostream &out) const {
 Result<EnvelopeIngestResult>
 BoardBridge::receive_envelope(const PeerEnvelope &envelope,
                               const KnownPeersStore &known_peers) {
-  if (dir_fd_ < 0)
-    return Result<EnvelopeIngestResult>::failure({ErrorCode::stale_handle});
-
-  // Always cryptographically verify every inbound envelope before trusting any field.
-  auto verified = known_peers.verify_envelope(envelope);
-  if (!verified.has_value())
-    return Result<EnvelopeIngestResult>::failure(verified.error());
-
-  auto embedded = extract_and_bind_embedded_records(envelope);
-  if (!embedded.has_value())
-    return Result<EnvelopeIngestResult>::failure(embedded.error());
-
-  try {
-    auto lock = ScopedFlock::acquire(dir_fd_, kBridgeLockFile, false);
-    if (!lock.has_value())
-      return Result<EnvelopeIngestResult>::failure(lock.error());
-    auto state = replay_bridge_log_locked(dir_fd_);
-    if (!state.has_value())
-      return Result<EnvelopeIngestResult>::failure(state.error());
-
-    const auto &records = embedded.value();
-    const EnvelopeKey key{envelope.from_fingerprint, envelope.envelope_id};
-    if (state.value().seen_inbound_envelopes.contains(key)) {
-      std::optional<std::string> dup_hash;
-      if (records.causal_event.has_value())
-        dup_hash = records.causal_event->event_hash;
-      return Result<EnvelopeIngestResult>::success(EnvelopeIngestResult{
-          EnvelopeIngestStatus::duplicate,
-          envelope.envelope_id,
-          envelope.from_fingerprint,
-          std::move(dup_hash),
-      });
-    }
-
-    std::vector<Value> batch;
-    batch.push_back(wrap_envelope_record("inbound", envelope));
-    std::optional<std::string> event_hash;
-    if (records.causal_event.has_value()) {
-      event_hash = records.causal_event->event_hash;
-      if (!state.value().seen_event_hashes.contains(*event_hash))
-        batch.push_back(wrap_causal_event_record(*records.causal_event));
-    }
-    if (records.receipt.has_value())
-      batch.push_back(wrap_receipt_record(*records.receipt));
-    if (records.presence.has_value())
-      batch.push_back(wrap_presence_record(*records.presence));
-
-    auto appended = append_records_locked(dir_fd_, state.value(), batch);
-    if (!appended.has_value())
-      return Result<EnvelopeIngestResult>::failure(appended.error());
-
-    return Result<EnvelopeIngestResult>::success(EnvelopeIngestResult{
-        EnvelopeIngestStatus::accepted,
-        envelope.envelope_id,
-        envelope.from_fingerprint,
-        std::move(event_hash),
-    });
-  } catch (const std::bad_alloc &) {
-    return Result<EnvelopeIngestResult>::failure({ErrorCode::allocation});
-  }
+  auto outcome = ingest_envelope_internal(dir_fd_, envelope, known_peers);
+  if (!outcome.value.has_value())
+    return Result<EnvelopeIngestResult>::failure(outcome.error);
+  return Result<EnvelopeIngestResult>::success(std::move(*outcome.value));
 }
 
 Result<BridgePumpReport> BoardBridge::pump_inbound(std::istream &in,
@@ -2206,17 +2302,14 @@ Result<BridgePumpReport> BoardBridge::pump_inbound(std::istream &in,
           ++report.rejected;
           continue;
         }
-        auto ingested = receive_envelope(env.value(), known_peers);
-        if (!ingested.has_value()) {
-          if (ingested.error().code == ErrorCode::io ||
-              ingested.error().code == ErrorCode::stale_handle ||
-              ingested.error().code == ErrorCode::allocation) {
-            return Result<BridgePumpReport>::failure(ingested.error());
-          }
+        auto outcome = ingest_envelope_internal(dir_fd_, env.value(), known_peers);
+        if (!outcome.value.has_value()) {
+          if (outcome.error_origin == IngestErrorOrigin::local_store)
+            return Result<BridgePumpReport>::failure(outcome.error);
           ++report.rejected;
           continue;
         }
-        auto ingested_val = std::move(ingested).value();
+        auto ingested_val = std::move(*outcome.value);
         if (ingested_val.status == EnvelopeIngestStatus::duplicate) {
           ++report.duplicates;
         } else {
