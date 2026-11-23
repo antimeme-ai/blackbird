@@ -481,7 +481,7 @@ void test_offline_zero_disk_and_zero_secret_leak() {
   require(fs::is_empty(tmp.path), "doctor created unexpected files in tmp!");
 
   require(report.healthy, "clean offline report must be healthy");
-  require(report.checks.size() == 7U, "expected 7 doctor checks");
+  require(report.checks.size() == 8U, "expected 8 doctor checks");
 
   const auto &bin = find_check(report, "binary");
   require(bin.status == DoctorStatus::ok, "binary check must be ok");
@@ -509,6 +509,13 @@ void test_offline_zero_disk_and_zero_secret_leak() {
 
   const auto &lobby = find_check(report, "party_lobby");
   require(lobby.status == DoctorStatus::info, "absent party_lobby must be info");
+
+  const auto &brakes_chk = find_check(report, "brakes");
+  require(brakes_chk.status == DoctorStatus::ok ||
+              brakes_chk.status == DoctorStatus::info,
+          "default brakes check must be ok/info");
+  require(brakes_chk.summary.find("sandbox=") != std::string::npos,
+          "brakes check summary must include sandbox backend");
 
   // Also test existing empty auth dir (must NOT create lock file inside!).
   const fs::path empty_auth_dir = tmp.path / "empty-auth-0700";

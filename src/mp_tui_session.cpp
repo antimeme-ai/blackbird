@@ -1011,7 +1011,7 @@ void MpTuiSession::handle_runtime_event_locked(const MpRuntimeEvent &event) {
     msg.sender_host = resolve_authenticated_peer_label_locked(sender_dev);
     msg.sender_fingerprint = compute_fingerprint_safe(event.peer_pubkey);
     msg.verified_peer = true;
-    msg.untrusted_remote = false;
+    msg.untrusted_remote = true;
     const std::string_view raw_target =
         event.chat->target_selector.empty()
             ? std::string_view{"@all"}

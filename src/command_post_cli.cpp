@@ -1,6 +1,7 @@
 #include "blackbird/command_post_cli.hpp"
 
 #include "blackbird/board_bridge.hpp"
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
 #include "blackbird/doctor.hpp"
@@ -12,6 +13,7 @@
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_party_bridge.hpp"
+#include "blackbird/os_sandbox.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
@@ -11067,13 +11069,138 @@ int run_lan_cli(std::span<char *> args, CliIo io) {
   return fail_usage(io, "lan: unknown subcommand: " + std::string{sub});
 }
 
+int run_brakes_cli(std::span<char *> args, CliIo io) {
+  std::string_view sub = "status";
+  bool json_out = false;
+  std::size_t idx = 1U;
+  if (idx < args.size()) {
+    const std::string_view first{args[idx]};
+    if (!first.starts_with('-')) {
+      sub = first;
+      ++idx;
+    }
+  }
+  for (; idx < args.size(); ++idx) {
+    const std::string_view arg{args[idx]};
+    if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--help" || arg == "-h") {
+      io.out << "Usage:\n"
+                "  blackbird brakes [status|probe] [--json]\n"
+                "Inspect unified Brakes policy floor (/etc/multiplayer/policy.toml +\n"
+                "~/.config/blackbird/policy.toml) and OS kernel containment backend.\n";
+      return 0;
+    } else {
+      return fail_usage(io, "brakes: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (sub != "status" && sub != "probe") {
+    return fail_usage(io, "brakes: unknown subcommand: " + std::string{sub});
+  }
+
+  const auto caps = sandbox::probe_os_sandbox_capabilities();
+  const auto pol = brakes::load_effective_policy();
+
+  if (sub == "probe") {
+    Value::Array caveats;
+    for (const auto &c : caps.caveats) {
+      caveats.emplace_back(c);
+    }
+    if (json_out) {
+      const int rc = emit_json(
+          io, Value::object({
+                  {"platform", Value{caps.platform}},
+                  {"available", Value{caps.available}},
+                  {"backend", Value{caps.backend_name}},
+                  {"landlock_abi_version",
+                   Value{Number{static_cast<std::int64_t>(caps.landlock_abi_version)}}},
+                  {"supports_network_airgap", Value{caps.supports_network_airgap}},
+                  {"caveats", Value{std::move(caveats)}},
+              }));
+      if (rc != 0)
+        return rc;
+    } else {
+      io.out << "OS Sandbox Probe\n"
+             << "  Platform:       " << caps.platform << '\n'
+             << "  Available:      " << (caps.available ? "yes" : "no") << '\n'
+             << "  Backend:        " << caps.backend_name << '\n';
+      if (caps.landlock_abi_version > 0) {
+        io.out << "  Landlock ABI:   v" << caps.landlock_abi_version << '\n';
+      }
+      io.out << "  Network Airgap: " << (caps.supports_network_airgap ? "yes" : "no")
+             << '\n';
+      for (const auto &c : caps.caveats) {
+        io.out << "  Caveat:         " << c << '\n';
+      }
+    }
+    return caps.available ? 0 : 1;
+  }
+
+  if (!pol.has_value()) {
+    return fail_error(io, "brakes", pol.error());
+  }
+  const auto &eff = pol.value();
+
+  if (json_out) {
+    return emit_json(
+        io,
+        Value::object({
+            {"effective_profile",
+             Value{std::string{brakes::brakes_profile_name(eff.effective_profile)}}},
+            {"min_profile",
+             Value{std::string{brakes::brakes_profile_name(eff.brakes.min_profile)}}},
+            {"default_profile", Value{std::string{brakes::brakes_profile_name(
+                                    eff.brakes.default_profile)}}},
+            {"allow_escalation", Value{eff.brakes.allow_escalation}},
+            {"require_local_auth_for_escalation",
+             Value{eff.brakes.require_local_auth_for_escalation}},
+            {"system_policy_loaded", Value{eff.system_policy_loaded}},
+            {"user_policy_loaded", Value{eff.user_policy_loaded}},
+            {"clamped_to_system_floor", Value{eff.clamped_to_system_floor}},
+            {"party_trust_max_default",
+             Value{std::string{brakes::party_trust_profile_name(
+                 eff.party_trust.max_default_profile)}}},
+            {"party_trust_max_external_guest",
+             Value{std::string{brakes::party_trust_profile_name(
+                 eff.party_trust.max_external_guest_profile)}}},
+            {"sandbox_available", Value{caps.available}},
+            {"sandbox_backend", Value{caps.backend_name}},
+            {"sandbox_network_airgap", Value{caps.supports_network_airgap}},
+        }));
+  }
+
+  io.out << "Blackbird Brakes & Containment\n"
+         << "  Effective Profile: "
+         << brakes::brakes_profile_name(eff.effective_profile)
+         << (eff.clamped_to_system_floor ? " (clamped to system floor)" : "") << '\n'
+         << "  System Floor:      "
+         << (eff.system_policy_loaded
+                 ? std::string{brakes::brakes_profile_name(eff.brakes.min_profile)} +
+                       " (/etc/multiplayer/policy.toml)"
+                 : "none (default black-flag YOLO)")
+         << '\n'
+         << "  User Policy:       " << (eff.user_policy_loaded ? "loaded" : "default")
+         << '\n'
+         << "  Party Trust Cap:   "
+         << brakes::party_trust_profile_name(eff.party_trust.max_default_profile)
+         << " (external guest cap: "
+         << brakes::party_trust_profile_name(eff.party_trust.max_external_guest_profile)
+         << ")\n"
+         << "  OS Sandbox:        " << caps.backend_name << " ("
+         << (caps.available ? "ready" : "unavailable")
+         << (caps.supports_network_airgap ? ", airgap-ready" : "") << ")\n";
+  return 0;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
-         arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan";
+         arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan" ||
+         arg == "brakes";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -11116,6 +11243,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_doctor_cli(args, io);
     if (subcommand == "lan")
       return run_lan_cli(args, io);
+    if (subcommand == "brakes")
+      return run_brakes_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

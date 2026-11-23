@@ -3942,6 +3942,31 @@ int main(int argc, char **argv) {
             "lan status --json must emit valid policy JSON");
     }
 
+    // Brakes subcommand smoke (status & probe --json)
+    {
+      check(is_command_post_subcommand("brakes"),
+            "brakes must be registered as a command_post subcommand");
+      const auto brakes_help = run_cli({"brakes", "--help"});
+      check(brakes_help.exit_code == 0 &&
+                brakes_help.out.find("blackbird brakes") != std::string::npos,
+            "brakes --help must exit 0");
+      const auto brakes_status = run_cli({"brakes", "status", "--json"});
+      check(brakes_status.exit_code == 0, "brakes status --json must exit 0");
+      const auto bval = parse_json(brakes_status.out);
+      check(bval.has_value() &&
+                std::holds_alternative<Value::Object>(bval.value().value()) &&
+                bval.value().find("effective_profile") != nullptr &&
+                bval.value().find("sandbox_backend") != nullptr,
+            "brakes status --json must emit valid JSON");
+      const auto brakes_probe = run_cli({"brakes", "probe", "--json"});
+      const auto pval = parse_json(brakes_probe.out);
+      check(pval.has_value() &&
+                std::holds_alternative<Value::Object>(pval.value().value()) &&
+                pval.value().find("platform") != nullptr &&
+                pval.value().find("backend") != nullptr,
+            "brakes probe --json must emit valid JSON");
+    }
+
     std::cout << "PASS command_post_cli\n";
     return 0;
   } catch (const Error &e) {

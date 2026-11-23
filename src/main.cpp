@@ -1143,6 +1143,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                "[--restart]\n"
                "blackbird doctor [--offline] [--no-update-check] [--json]\n"
                "blackbird lan {status|scan|host|join} [options]\n"
+               "blackbird brakes [status|probe] [--json]\n"
                "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
                "[--model NAME] [--workflow FILE] "
                "[--once "

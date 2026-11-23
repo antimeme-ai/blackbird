@@ -1,4 +1,5 @@
 #include "blackbird/command_post_tui.hpp"
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_view.hpp"
@@ -8,6 +9,7 @@
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
+#include "blackbird/os_sandbox.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
@@ -4184,6 +4186,57 @@ std::string handle_lan(std::string_view args) {
   return "Usage: /lan [status|scan [1..60]|help]\n";
 }
 
+std::string handle_brakes(std::string_view args) {
+  const auto [sub, rest] = split_first_token(trim_view(args));
+  if (sub == "help") {
+    return "Brakes & Containment:\n"
+           "  /brakes [status]  Show effective policy floor and OS sandbox readiness\n"
+           "  /brakes probe     Probe kernel containment capabilities on this host\n";
+  }
+  if (!rest.empty()) {
+    return "Usage: /brakes [status|probe|help]\n";
+  }
+  const auto caps = sandbox::probe_os_sandbox_capabilities();
+  if (sub == "probe") {
+    std::string out = "OS Sandbox Probe:\n";
+    out += "  Platform:       " + caps.platform + "\n";
+    out += "  Available:      " + std::string{caps.available ? "yes" : "no"} + "\n";
+    out += "  Backend:        " + caps.backend_name + "\n";
+    if (caps.landlock_abi_version > 0) {
+      out += "  Landlock ABI:   v" + std::to_string(caps.landlock_abi_version) + "\n";
+    }
+    out += "  Network Airgap: " +
+           std::string{caps.supports_network_airgap ? "yes" : "no"} + "\n";
+    return out;
+  }
+  if (sub.empty() || sub == "status") {
+    const auto pol = brakes::load_effective_policy();
+    if (!pol.has_value()) {
+      return "Brakes policy load failed: " +
+             std::string{
+                 brakes::brakes_error_name(brakes::brakes_error_of(pol.error()))} +
+             "\n";
+    }
+    const auto &eff = pol.value();
+    std::string out = "Blackbird Brakes & Containment:\n";
+    out += "  Effective Profile: " +
+           std::string{brakes::brakes_profile_name(eff.effective_profile)} +
+           (eff.clamped_to_system_floor ? " (system floor)" : "") + "\n";
+    out += "  Party Trust Cap:   " +
+           std::string{
+               brakes::party_trust_profile_name(eff.party_trust.max_default_profile)} +
+           " (external guest: " +
+           std::string{brakes::party_trust_profile_name(
+               eff.party_trust.max_external_guest_profile)} +
+           ")\n";
+    out += "  OS Sandbox:        " + caps.backend_name + " (" +
+           std::string{caps.available ? "ready" : "unavailable"} +
+           (caps.supports_network_airgap ? ", airgap-ready" : "") + ")\n";
+    return out;
+  }
+  return "Usage: /brakes [status|probe|help]\n";
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -4217,6 +4270,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_doctor(args));
     if (cmd == "/lan")
       return bound_output(handle_lan(args));
+    if (cmd == "/brakes")
+      return bound_output(handle_brakes(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

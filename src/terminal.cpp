@@ -1,4 +1,5 @@
 #include "blackbird/terminal.hpp"
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/command_inspector.hpp"
 #include "blackbird/display_text.hpp"
 #include "blackbird/flight_deck_hero.hpp"
@@ -10,6 +11,7 @@
 #include "blackbird/raw_file.hpp"
 #include "blackbird/raw_runtime.hpp"
 #include "blackbird/retained_state.hpp"
+#include "blackbird/right_rail.hpp"
 #include "blackbird/sprite.hpp"
 #include "blackbird/task_view.hpp"
 #include "blackbird/terminal_custody.hpp"
@@ -206,6 +208,14 @@ const std::array builtin_commands{
                 "Command Post"},
     ChatCommand{"/lan", "[status|scan|help]",
                 "Inspect opt-in LAN Party! (mp1-lan/1) policy or scan local lobbies",
+                "Command Post"},
+    ChatCommand{"/brakes", "[status|probe|help]",
+                "Inspect unified Brakes containment policy floor & OS kernel sandbox",
+                "Command Post"},
+    ChatCommand{"/rail",
+                "[toggle|show|hide|auto|escalations|tokenomics|tasks|anchors|"
+                "multiplayer|next|prev|refresh]",
+                "Toggle or switch tabs in the Adaptive Right Rail (Alt+I, Alt+,/.)",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>
@@ -634,7 +644,8 @@ std::string terminal_key_help() {
          "  Ctrl-\\      View picker; switch views without replacing the draft\n"
          "  Ctrl-X       Current-session command center; preserve draft/cursor\n"
          "  Ctrl-]       Authored result lab; F6/F7 pin A/B; F8 request interrupt\n"
-         "  Alt+F/P !cmd Alt+F flightdeck; Alt+P party (Shift hide); !cmd shell\n"
+         "  Alt+F/P/I    Alt+F flightdeck; Alt+P party (Shift hide); Alt+I right rail "
+         "(Alt+,/. tabs); !cmd shell\n"
          "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Esc draft/close\n"
          "  Center       T tasks, P participants, J command runs; + means more\n"
          "               Ctrl-Left/Right: list pages or output pages by focus\n"
@@ -672,7 +683,7 @@ std::string terminal_help() {
       "\nLocal TUI controls run immediately, even during work. Other commands queue\n"
       "behind the active turn; they do not mutate an in-flight provider request.\n\n";
   return out + "Keyboard: /keys · Tab completes commands · PgUp/PgDn browse · "
-               "Alt+F cockpit · Alt+P party · !cmd shell\n";
+               "Alt+F cockpit · Alt+P party · Alt+I rail · !cmd shell\n";
 }
 bool terminal_is_bang_shell_command(std::string_view draft) noexcept {
   return !draft.empty() && draft.front() == '!';
@@ -837,6 +848,87 @@ void terminal_render_party_pane(ChatGrid &grid, const PartyChatPane &pane,
   }
   if (layout.row + layout.height - 1U < grid.height)
     grid.line(layout.row + layout.height - 1U, {{bot, border_ink}}, layout.col);
+}
+void terminal_render_right_rail(ChatGrid &grid, const RightRailPane &pane,
+                                const RightRailLayout &layout) {
+  if (!layout.visible || layout.width == 0 || layout.height == 0 ||
+      layout.col >= grid.width || layout.row >= grid.height) {
+    return;
+  }
+  struct RailBox {
+    std::size_t col = 0;
+    std::size_t row = 0;
+    std::size_t w = 0;
+    std::size_t h = 0;
+    bool boxed_border = false;
+  };
+  const auto render_lines = [&](const RailBox &box) {
+    const auto frame = pane.render(static_cast<int>(box.w), static_cast<int>(box.h));
+    const Ink border_ink = frame.has_priority_escalation ? Ink::selected : Ink::border;
+    const auto line_ink_for = [&](std::size_t idx, std::size_t total) noexcept -> Ink {
+      if (idx == 0)
+        return frame.has_priority_escalation ? Ink::selected : Ink::heading;
+      if (idx == 1)
+        return Ink::muted;
+      if (total >= 2 && idx + 1 == total)
+        return Ink::muted;
+      return Ink::normal;
+    };
+    if (!box.boxed_border) {
+      for (std::size_t r = 0; r < grid.height; ++r) {
+        if (layout.main_width < grid.width)
+          grid.line(r, {{"│", border_ink}}, layout.main_width);
+        if (layout.main_width + 1 < grid.width)
+          grid.line(r, {{" ", Ink::normal}}, layout.main_width + 1);
+      }
+      const std::size_t count = std::min(frame.lines.size(), box.h);
+      for (std::size_t r = 0; r < count && box.row + r < grid.height; ++r) {
+        grid.line(box.row + r, {{frame.lines[r], line_ink_for(r, count)}}, box.col);
+      }
+      return;
+    }
+    std::string top = "╭";
+    std::string bot = "╰";
+    const std::string_view label = frame.has_priority_escalation
+                                       ? " Right Rail · ACTION · Alt+I "
+                                       : " Right Rail · Alt+I hide · Alt+,/. tabs ";
+    const std::string clipped_label =
+        box.w > 2 ? terminal_lines(label, box.w)[0] : std::string{};
+    top += clipped_label;
+    for (std::size_t c = display_width(clipped_label); c < box.w; ++c)
+      top += "─";
+    top += "╮";
+    for (std::size_t c = 0; c < box.w; ++c)
+      bot += "─";
+    bot += "╯";
+    grid.line(layout.row, {{top, border_ink}}, layout.col);
+    for (std::size_t r = 0; r < box.h && box.row + r < grid.height; ++r) {
+      const std::string content =
+          r < frame.lines.size() ? frame.lines[r] : std::string(box.w, ' ');
+      const std::size_t used = display_width(content);
+      const std::string pad =
+          used < box.w ? std::string(box.w - used, ' ') : std::string{};
+      grid.line(box.row + r,
+                {{"│", border_ink},
+                 {content, line_ink_for(r, box.h)},
+                 {pad, Ink::normal},
+                 {"│", border_ink}},
+                layout.col);
+    }
+    if (layout.row + layout.height - 1U < grid.height)
+      grid.line(layout.row + layout.height - 1U, {{bot, border_ink}}, layout.col);
+  };
+  if (layout.docked) {
+    render_lines({layout.col, layout.row, layout.width, layout.height, false});
+    return;
+  }
+  const bool boxed = layout.width >= 10 && layout.height >= 6;
+  if (!boxed) {
+    render_lines({layout.col, layout.row, layout.width, layout.height, false});
+    return;
+  }
+  render_lines(
+      {layout.col + 1U, layout.row + 1U, layout.width - 2U, layout.height - 2U, true});
 }
 bool terminal_party_is_active(const PartySnapshot &snapshot) noexcept {
   if (snapshot.room_scope.empty())
@@ -1620,6 +1712,29 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       palette_open_ = slash_open_ = false;
       escape_.clear();
       return {InputAction::party_hide, {}};
+    }
+    if (escape_ == "\x1b"
+                   "i" ||
+        escape_ == "\x1b"
+                   "I" ||
+        escape_ == "\x1b[105;3u" || escape_ == "\x1b[73;3u") {
+      palette_open_ = slash_open_ = false;
+      escape_.clear();
+      return {InputAction::right_rail_toggle, {}};
+    }
+    if (escape_ == "\x1b"
+                   "," ||
+        escape_ == "\x1b[44;3u") {
+      palette_open_ = slash_open_ = false;
+      escape_.clear();
+      return {InputAction::right_rail_prev_tab, {}};
+    }
+    if (escape_ == "\x1b"
+                   "." ||
+        escape_ == "\x1b[46;3u") {
+      palette_open_ = slash_open_ = false;
+      escape_.clear();
+      return {InputAction::right_rail_next_tab, {}};
     }
     // Mouse reports: SGR CSI < button ; column ; row M|m, or X10 CSI M Cb Cx Cy
     // from terminals that ignore ?1006. X10 coordinates are raw bytes, so this
@@ -2821,6 +2936,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       party_pane.update(std::move(snap).value());
   };
   refresh_party_passive();
+  RightRailPane right_rail_pane;
+  std::vector<RightRailAnchor> right_rail_anchors;
+  std::string right_rail_brakes_profile = "BLACK-FLAG";
+  std::vector<double> right_rail_tps_history;
+  auto refresh_right_rail_static = [&] {
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec && !cwd.empty()) {
+      right_rail_anchors = discover_repo_anchors(cwd);
+    }
+    if (const auto pol = brakes::load_effective_policy(); pol.has_value()) {
+      right_rail_brakes_profile =
+          std::string{brakes::brakes_profile_name(pol.value().effective_profile)};
+    }
+  };
+  refresh_right_rail_static();
   const bool flightdeck_kitty_capable = kitty_graphics_capable();
   const bool flightdeck_kitty_shm_capable = kitty_shm_capable();
   bool flightdeck_open = false;
@@ -3528,8 +3659,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                               message.text, false, message.enqueue);
           if (message.kind == Kind::usage)
             observed_usage = message.text;
-          if (message.kind == Kind::telemetry && message.telemetry)
+          if (message.kind == Kind::telemetry && message.telemetry) {
             live_telemetry = *message.telemetry;
+            if (live_telemetry.last_duration_ms >= 50ULL &&
+                (live_telemetry.last_output > 0 || live_telemetry.last_reasoning > 0)) {
+              const double secs =
+                  static_cast<double>(live_telemetry.last_duration_ms) / 1000.0;
+              const double tps = static_cast<double>(live_telemetry.last_output +
+                                                     live_telemetry.last_reasoning) /
+                                 secs;
+              if (std::isfinite(tps) && tps >= 0.0) {
+                if (right_rail_tps_history.size() >= kRightRailSparklineSamples)
+                  right_rail_tps_history.erase(right_rail_tps_history.begin());
+                right_rail_tps_history.push_back(tps);
+              }
+            }
+          }
           if (message.kind == Kind::context_workbench && message.workbench_snapshot) {
             latest_workbench_snapshot = *message.workbench_snapshot;
             if (workbench)
@@ -4064,12 +4209,20 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         const bool show_task_pane = !inspecting && !welcoming && !tasks_hidden &&
                                     !show_party_docked && (has_tasks || tasks_forced) &&
                                     width >= 90 && rows >= 18;
+        const auto right_rail_layout = right_rail_pane.layout(width, rows);
+        const bool show_right_rail_docked = !inspecting && !welcoming &&
+                                            !show_party_docked && !show_task_pane &&
+                                            right_rail_layout.docked;
+        const bool show_right_rail_overlay = !inspecting && !welcoming &&
+                                             !show_party_overlay &&
+                                             right_rail_layout.overlay;
         const auto pane_width =
             show_task_pane ? std::clamp(width / 3, std::size_t{28}, std::size_t{36})
                            : 0;
-        const auto main_width = show_party_docked ? party_layout.main_width
-                                : show_task_pane  ? width - pane_width - 2
-                                                  : width;
+        const auto main_width = show_party_docked        ? party_layout.main_width
+                                : show_right_rail_docked ? right_rail_layout.main_width
+                                : show_task_pane         ? width - pane_width - 2
+                                                         : width;
         const auto inner_width = main_width - 4;
         const auto composed =
             terminal_powerword_lines("> " + composer.text(), inner_width);
@@ -4082,13 +4235,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         const auto height =
             static_cast<std::size_t>(rows - 5) - draft_height - palette.size();
         const bool show_sprite = !inspecting && !welcoming && mascot_enabled &&
-                                 !show_party_docked &&
+                                 !show_party_docked && !show_right_rail_docked &&
                                  (!tasks_expanded || show_task_pane) &&
                                  width >= (graphics_enabled ? 70U : 90U) &&
                                  height + 2 >= blackbird_sprite_height;
-        const auto header_width = (show_task_pane || show_party_docked) ? main_width
-                                  : show_sprite ? width - blackbird_sprite_width - 2
-                                                : width;
+        const auto header_width =
+            (show_task_pane || show_party_docked || show_right_rail_docked) ? main_width
+            : show_sprite ? width - blackbird_sprite_width - 2
+                          : width;
         // The square occupies a right gutter, including beside the first chat rows.
         // Wrap into the remaining columns so a sprite can never overwrite content.
         const std::vector<ChatRow> empty_lines;
@@ -4426,6 +4580,77 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         if (show_party_docked || show_party_overlay) {
           terminal_render_party_pane(grid, party_pane, party_layout);
           if (show_party_overlay)
+            chat_height = 0;
+        } else if (show_right_rail_docked || show_right_rail_overlay) {
+          RightRailSnapshot rsnap{};
+          if (question) {
+            RightRailEscalation esc{};
+            esc.kind = RightRailEscalationKind::user_question;
+            esc.id = "question";
+            esc.title = question->heading;
+            esc.source_label = "operator";
+            for (const auto &ch : question->choices) {
+              if (esc.actions.size() < 4U)
+                esc.actions.push_back(ch.name);
+            }
+            rsnap.escalations.push_back(std::move(esc));
+          }
+          rsnap.tokenomics.model = title;
+          rsnap.tokenomics.input_tokens = live_telemetry.total_input > 0
+                                              ? live_telemetry.total_input
+                                              : live_telemetry.last_input;
+          rsnap.tokenomics.cached_tokens = live_telemetry.total_cached > 0
+                                               ? live_telemetry.total_cached
+                                               : live_telemetry.last_cached;
+          rsnap.tokenomics.output_tokens = live_telemetry.total_output > 0
+                                               ? live_telemetry.total_output
+                                               : live_telemetry.last_output;
+          rsnap.tokenomics.reasoning_tokens = live_telemetry.last_reasoning;
+          if (live_telemetry.last_input > 0) {
+            rsnap.tokenomics.cache_hit_ratio =
+                std::clamp(static_cast<double>(live_telemetry.last_cached) /
+                               static_cast<double>(live_telemetry.last_input),
+                           0.0, 1.0);
+          }
+          if (live_telemetry.context_window && *live_telemetry.context_window > 0 &&
+              live_telemetry.last_input > 0) {
+            rsnap.tokenomics.context_fill_ratio =
+                std::clamp(static_cast<double>(live_telemetry.last_input) /
+                               static_cast<double>(*live_telemetry.context_window),
+                           0.0, 1.0);
+          }
+          if (!right_rail_tps_history.empty()) {
+            rsnap.tokenomics.tok_per_sec = right_rail_tps_history.back();
+          }
+          rsnap.tokenomics.throughput_samples = right_rail_tps_history;
+          rsnap.tokenomics.brakes_profile = right_rail_brakes_profile;
+          for (const auto &item : field(task_page, "items").array()) {
+            RightRailTaskItem t{};
+            t.id = string_field(item, "id");
+            t.title = string_field(item, "title");
+            t.source = RightRailTaskSource::builtin;
+            const auto st = string_field(item, "status");
+            if (st == "in_progress" || st == "active")
+              t.status = RightRailTaskStatus::active;
+            else if (st == "done" || st == "completed" || st == "closed")
+              t.status = RightRailTaskStatus::done;
+            else if (st == "blocked")
+              t.status = RightRailTaskStatus::blocked;
+            else
+              t.status = RightRailTaskStatus::open;
+            rsnap.tasks.push_back(std::move(t));
+          }
+          rsnap.anchors = right_rail_anchors;
+          const auto &ps = party_pane.snapshot();
+          if (terminal_party_is_active(ps)) {
+            rsnap.multiplayer.transport = RightRailPartyTransport::online;
+            rsnap.multiplayer.room_scope = ps.room_scope;
+            rsnap.multiplayer.peer_count = ps.participants.size();
+            rsnap.multiplayer.party_status = "connected";
+          }
+          right_rail_pane.update(std::move(rsnap));
+          terminal_render_right_rail(grid, right_rail_pane, right_rail_layout);
+          if (show_right_rail_overlay)
             chat_height = 0;
         }
         const auto cursor_line = height + palette.size() + 4 + cursor_row - draft_begin;
@@ -5066,6 +5291,16 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           party_docked = false;
           party_user_hidden = true;
         }
+        if (result.action == InputAction::right_rail_toggle) {
+          refresh_right_rail_static();
+          right_rail_pane.toggle_for_viewport(columns);
+        }
+        if (result.action == InputAction::right_rail_prev_tab) {
+          right_rail_pane.cycle_tab(-1);
+        }
+        if (result.action == InputAction::right_rail_next_tab) {
+          right_rail_pane.cycle_tab(1);
+        }
         if (result.action == InputAction::select_view) {
           if (result.view) {
             if (!select_view(*result.view, result.source.record, false, false))
@@ -5463,6 +5698,63 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               party_docked = false;
               party_user_hidden = true;
               transcript.append(ChatKind::notice, "Party Chat hidden (Alt+P reopens).");
+              scroll = 0;
+            } else if (result.text == "/rail" || result.text.starts_with("/rail ")) {
+              std::string_view rarg = result.text.size() > 5U
+                                          ? std::string_view{result.text}.substr(5)
+                                          : std::string_view{};
+              while (!rarg.empty() && (rarg.front() == ' ' || rarg.front() == '\t'))
+                rarg.remove_prefix(1);
+              while (!rarg.empty() && (rarg.back() == ' ' || rarg.back() == '\t'))
+                rarg.remove_suffix(1);
+              if (rarg.empty() || rarg == "toggle") {
+                refresh_right_rail_static();
+                right_rail_pane.toggle_for_viewport(columns);
+                transcript.append(ChatKind::notice,
+                                  right_rail_pane.is_dismissed()
+                                      ? "Right Rail hidden (Alt+I reopens)."
+                                      : "Right Rail toggled (Alt+,/. switches tabs).");
+              } else if (rarg == "show" || rarg == "open") {
+                refresh_right_rail_static();
+                right_rail_pane.set_open(true);
+                transcript.append(ChatKind::notice, "Right Rail shown.");
+              } else if (rarg == "hide" || rarg == "close") {
+                right_rail_pane.dismiss();
+                transcript.append(ChatKind::notice,
+                                  "Right Rail hidden (Alt+I reopens).");
+              } else if (rarg == "refresh") {
+                refresh_right_rail_static();
+                transcript.append(ChatKind::notice,
+                                  "Right Rail anchors & brakes policy refreshed.");
+              } else if (rarg == "next") {
+                right_rail_pane.cycle_tab(1);
+              } else if (rarg == "prev") {
+                right_rail_pane.cycle_tab(-1);
+              } else if (rarg == "auto") {
+                right_rail_pane.pin_tab(RightRailTab::auto_context);
+                right_rail_pane.set_open(true);
+              } else if (rarg == "escalations") {
+                right_rail_pane.pin_tab(RightRailTab::escalations);
+                right_rail_pane.set_open(true);
+              } else if (rarg == "tokenomics") {
+                right_rail_pane.pin_tab(RightRailTab::tokenomics);
+                right_rail_pane.set_open(true);
+              } else if (rarg == "tasks") {
+                right_rail_pane.pin_tab(RightRailTab::tasks);
+                right_rail_pane.set_open(true);
+              } else if (rarg == "anchors") {
+                refresh_right_rail_static();
+                right_rail_pane.pin_tab(RightRailTab::anchors);
+                right_rail_pane.set_open(true);
+              } else if (rarg == "multiplayer") {
+                right_rail_pane.pin_tab(RightRailTab::multiplayer);
+                right_rail_pane.set_open(true);
+              } else {
+                transcript.append(
+                    ChatKind::notice,
+                    "Usage: /rail [toggle|show|hide|auto|escalations|tokenomics|"
+                    "tasks|anchors|multiplayer|next|prev|refresh]");
+              }
               scroll = 0;
             } else if (result.text == "/commands") {
               (void)composer.feed(0);

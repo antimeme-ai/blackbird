@@ -57,7 +57,10 @@ enum class InputAction {
   party_toggle,
   party_hide,
   party_send,
-  flightdeck_toggle
+  flightdeck_toggle,
+  right_rail_toggle,
+  right_rail_prev_tab,
+  right_rail_next_tab
 };
 struct InputResult {
   InputAction action = InputAction::none;

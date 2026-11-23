@@ -1461,8 +1461,9 @@ void test_live_two_peer_iroh_e2e() {
     require_ok(bob_snap1.messages.size() == 1U, "bob has 1 chat message");
     const PartyMessage &m1 = bob_snap1.messages[0];
     require_ok(m1.body == "hello from TUI!", "body matches");
-    require_ok(m1.verified_peer && !m1.untrusted_remote,
-               "verified_peer true via TLS 1.3 Mutual RPK + CWT");
+    require_ok(m1.verified_peer && m1.untrusted_remote,
+               "verified_peer true via TLS 1.3 Mutual RPK + CWT; remote content stays "
+               "untrusted_remote");
     require_ok(m1.sender_id == "alice_trusted",
                "anti-spoofing: sender_id strictly from authenticated peer_metadata");
     require_ok(m1.sender_id != "spoofed_root_admin",

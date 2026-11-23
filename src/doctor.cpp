@@ -1,6 +1,8 @@
 #include "blackbird/doctor.hpp"
 
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/mp_protocol.hpp"
+#include "blackbird/os_sandbox.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/self_upgrade.hpp"
 
@@ -1904,6 +1906,58 @@ DoctorCheck check_party_lobby(const DoctorConfig &cfg) {
   return chk;
 }
 
+// ---------------------------------------------------------------------------
+// Check 8: Brakes & OS containment (strictly passive policy + kernel probe)
+// ---------------------------------------------------------------------------
+
+DoctorCheck check_brakes() {
+  DoctorCheck chk{};
+  chk.id = "brakes";
+  chk.label = "Brakes";
+
+  const auto pol = brakes::load_effective_policy();
+  const auto caps = sandbox::probe_os_sandbox_capabilities();
+
+  const std::string backend =
+      caps.available ? sanitize_terminal_text(caps.backend_name) : "unavailable";
+
+  if (!pol.has_value()) {
+    chk.status = DoctorStatus::fail;
+    chk.summary =
+        "policy load failed (" +
+        std::string{brakes::brakes_error_name(brakes::brakes_error_of(pol.error()))} +
+        ") · sandbox=" + backend;
+    chk.hint =
+        "Inspect /etc/multiplayer/policy.toml and ~/.config/blackbird/policy.toml "
+        "(run: blackbird brakes status)";
+    return chk;
+  }
+
+  const auto &eff = pol.value();
+  std::string summary =
+      std::string{brakes::brakes_profile_name(eff.effective_profile)} +
+      " · sandbox=" + backend;
+  if (caps.supports_network_airgap) {
+    summary += " (airgap-ready)";
+  }
+  if (eff.system_policy_loaded) {
+    summary += " · sys-floor=" +
+               std::string{brakes::brakes_profile_name(eff.brakes.min_profile)};
+  }
+
+  if (brakes::is_contained_profile(eff.effective_profile) && !caps.available) {
+    chk.status = DoctorStatus::warn;
+    chk.summary = std::move(summary);
+    chk.hint = "Active brakes profile requires OS containment, but kernel sandbox "
+               "probe reported unavailable";
+    return chk;
+  }
+
+  chk.status = caps.available ? DoctorStatus::ok : DoctorStatus::info;
+  chk.summary = std::move(summary);
+  return chk;
+}
+
 std::string_view status_badge_padded(DoctorStatus status) noexcept {
   switch (status) {
   case DoctorStatus::ok:
@@ -1936,7 +1990,7 @@ std::string_view doctor_status_name(DoctorStatus status) noexcept {
 
 DoctorReport run_blackbird_doctor(const DoctorConfig &cfg) {
   DoctorReport report{};
-  report.checks.reserve(7U);
+  report.checks.reserve(8U);
 
   auto binary = check_binary(cfg);
   report.target = std::move(binary.target);
@@ -1949,6 +2003,7 @@ DoctorReport run_blackbird_doctor(const DoctorConfig &cfg) {
   report.checks.push_back(check_control_plane(cfg));
   report.checks.push_back(check_relay(cfg));
   report.checks.push_back(check_party_lobby(cfg));
+  report.checks.push_back(check_brakes());
 
   report.healthy = true;
   for (const auto &chk : report.checks) {

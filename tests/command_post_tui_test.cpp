@@ -2676,6 +2676,21 @@ srv.serve_forever()
   }
 }
 
+void test_brakes_slash_status_and_probe() {
+  CommandPostTuiContext ctx{};
+  const auto status_out = handle_command_post_slash("/brakes status", ctx);
+  require(status_out.has_value() &&
+              status_out->find("Blackbird Brakes & Containment:") !=
+                  std::string::npos &&
+              status_out->find("Effective Profile:") != std::string::npos,
+          "/brakes status must report effective profile");
+  const auto probe_out = handle_command_post_slash("/brakes probe", ctx);
+  require(probe_out.has_value() &&
+              probe_out->find("OS Sandbox Probe:") != std::string::npos &&
+              probe_out->find("Backend:") != std::string::npos,
+          "/brakes probe must report host OS sandbox backend");
+}
+
 } // namespace
 
 int main() {
@@ -2694,6 +2709,7 @@ int main() {
     test_wave9b2_flightdeck_detach_and_party_zero_ceremony();
     test_party_live_lobby_socket_zero_party_json();
     test_online_tui_slash_env_validation_and_loopback_tls13();
+    test_brakes_slash_status_and_probe();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {
