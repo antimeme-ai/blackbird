@@ -1633,6 +1633,9 @@ Error map_http_error(int status, bool is_clock_skew) noexcept {
             static_cast<std::int64_t>(MpClientError::http_clock_skew)};
   }
   switch (status) {
+  case 400:
+    return {ErrorCode::invalid_range,
+            static_cast<std::int64_t>(MpClientError::http_bad_request)};
   case 401:
     return {ErrorCode::provider_auth,
             static_cast<std::int64_t>(MpClientError::http_unauthorized)};
@@ -1645,6 +1648,9 @@ Error map_http_error(int status, bool is_clock_skew) noexcept {
   case 409:
     return {ErrorCode::conflict,
             static_cast<std::int64_t>(MpClientError::http_conflict)};
+  case 410:
+    return {ErrorCode::stale_handle,
+            static_cast<std::int64_t>(MpClientError::http_gone)};
   case 429:
     return {ErrorCode::provider_rate_limit,
             static_cast<std::int64_t>(MpClientError::http_rate_limited)};
@@ -1907,6 +1913,10 @@ const char *mp_client_error_name(MpClientError detail) noexcept {
     return "http_json_invalid";
   case MpClientError::http_response_schema:
     return "http_response_schema";
+  case MpClientError::http_bad_request:
+    return "http_bad_request";
+  case MpClientError::http_gone:
+    return "http_gone";
   case MpClientError::keystore_invalid_path:
     return "keystore_invalid_path";
   case MpClientError::keystore_not_found:
@@ -2230,6 +2240,547 @@ Result<MpIdentityStore> MpIdentityStore::save(const std::filesystem::path &dir,
     return Result<MpIdentityStore>::failure(up.error());
   }
   return Result<MpIdentityStore>::success(std::move(store));
+}
+
+namespace {
+
+// Strict deterministic CBOR reader for validating COSE_Sign1 / CWT structure and
+// extracting embedded cnf device_pubkey before installing a secondary-device CWT.
+struct CwtCborHead {
+  std::uint8_t major = 0U;
+  std::uint64_t arg = 0U;
+};
+
+template <typename T> Result<T> fail_mp(ErrorCode code, MpError detail) {
+  return Result<T>::failure({code, static_cast<std::int64_t>(detail)});
+}
+
+class StrictCwtCborReader {
+public:
+  explicit StrictCwtCborReader(std::span<const std::uint8_t> bytes) noexcept
+      : bytes_(bytes) {}
+
+  Result<CwtCborHead> read_head(MpError err) {
+    if (pos_ >= bytes_.size()) {
+      return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+    }
+    const std::uint8_t initial = bytes_[pos_++];
+    const auto major = static_cast<std::uint8_t>((initial >> 5U) & 0x07U);
+    const auto ai = static_cast<std::uint8_t>(initial & 0x1fU);
+    if (ai < 24U) {
+      return Result<CwtCborHead>::success(CwtCborHead{major, ai});
+    }
+    if (ai == 24U) {
+      if (bytes_.size() - pos_ < 1U) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      const std::uint64_t val = bytes_[pos_++];
+      if (val < 24U) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      return Result<CwtCborHead>::success(CwtCborHead{major, val});
+    }
+    if (ai == 25U) {
+      if (bytes_.size() - pos_ < 2U) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      const std::uint64_t val = (static_cast<std::uint64_t>(bytes_[pos_]) << 8U) |
+                                static_cast<std::uint64_t>(bytes_[pos_ + 1U]);
+      pos_ += 2U;
+      if (val <= 0xffU) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      return Result<CwtCborHead>::success(CwtCborHead{major, val});
+    }
+    if (ai == 26U) {
+      if (bytes_.size() - pos_ < 4U) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      std::uint64_t val = 0U;
+      for (std::size_t i = 0U; i < 4U; ++i) {
+        val = (val << 8U) | static_cast<std::uint64_t>(bytes_[pos_ + i]);
+      }
+      pos_ += 4U;
+      if (val <= 0xffffU) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      return Result<CwtCborHead>::success(CwtCborHead{major, val});
+    }
+    if (ai == 27U) {
+      if (bytes_.size() - pos_ < 8U) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      std::uint64_t val = 0U;
+      for (std::size_t i = 0U; i < 8U; ++i) {
+        val = (val << 8U) | static_cast<std::uint64_t>(bytes_[pos_ + i]);
+      }
+      pos_ += 8U;
+      if (val <= 0xffffffffULL) {
+        return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+      }
+      return Result<CwtCborHead>::success(CwtCborHead{major, val});
+    }
+    return fail_mp<CwtCborHead>(ErrorCode::corrupt, err);
+  }
+
+  Result<std::int64_t> read_i64(MpError err) {
+    const auto head = read_head(err);
+    if (!head.has_value()) {
+      return Result<std::int64_t>::failure(head.error());
+    }
+    constexpr auto kMaxI64 =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (head.value().major == 0U) {
+      if (head.value().arg > kMaxI64) {
+        return fail_mp<std::int64_t>(ErrorCode::corrupt, err);
+      }
+      return Result<std::int64_t>::success(static_cast<std::int64_t>(head.value().arg));
+    }
+    if (head.value().major == 1U) {
+      if (head.value().arg > kMaxI64) {
+        return fail_mp<std::int64_t>(ErrorCode::corrupt, err);
+      }
+      return Result<std::int64_t>::success(-1 -
+                                           static_cast<std::int64_t>(head.value().arg));
+    }
+    return fail_mp<std::int64_t>(ErrorCode::corrupt, err);
+  }
+
+  Result<std::span<const std::uint8_t>> read_bstr(MpError err) {
+    const auto head = read_head(err);
+    if (!head.has_value()) {
+      return Result<std::span<const std::uint8_t>>::failure(head.error());
+    }
+    if (head.value().major != 2U || head.value().arg > bytes_.size() - pos_) {
+      return fail_mp<std::span<const std::uint8_t>>(ErrorCode::corrupt, err);
+    }
+    const auto len = static_cast<std::size_t>(head.value().arg);
+    const auto slice = bytes_.subspan(pos_, len);
+    pos_ += len;
+    return Result<std::span<const std::uint8_t>>::success(slice);
+  }
+
+  Result<std::string> read_tstr(MpError err) {
+    const auto head = read_head(err);
+    if (!head.has_value()) {
+      return Result<std::string>::failure(head.error());
+    }
+    if (head.value().major != 3U || head.value().arg > bytes_.size() - pos_) {
+      return fail_mp<std::string>(ErrorCode::corrupt, err);
+    }
+    const auto len = static_cast<std::size_t>(head.value().arg);
+    const auto slice = bytes_.subspan(pos_, len);
+    pos_ += len;
+    std::string out;
+    out.reserve(len);
+    for (const std::uint8_t b : slice) {
+      out.push_back(static_cast<char>(b));
+    }
+    return Result<std::string>::success(std::move(out));
+  }
+
+  bool at_end() const noexcept { return pos_ == bytes_.size(); }
+
+private:
+  std::span<const std::uint8_t> bytes_;
+  std::size_t pos_ = 0U;
+};
+
+bool is_lower_hex_64(std::string_view text) noexcept {
+  if (text.size() != 64U) {
+    return false;
+  }
+  for (const char ch : text) {
+    const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Result<Ed25519PubKey> parse_cwt_cnf_ed25519(StrictCwtCborReader &reader) {
+  const auto cnf_head = reader.read_head(MpError::cwt_invalid_claims);
+  if (!cnf_head.has_value()) {
+    return Result<Ed25519PubKey>::failure(cnf_head.error());
+  }
+  if (cnf_head.value().major != 5U || cnf_head.value().arg != 1U) {
+    return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  const auto cnf_key = reader.read_i64(MpError::cwt_invalid_claims);
+  if (!cnf_key.has_value() || cnf_key.value() != 1) {
+    return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  const auto key_head = reader.read_head(MpError::cwt_invalid_claims);
+  if (!key_head.has_value()) {
+    return Result<Ed25519PubKey>::failure(key_head.error());
+  }
+  if (key_head.value().major != 5U || key_head.value().arg > 16U) {
+    return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+
+  std::optional<std::int64_t> kty;
+  std::optional<std::int64_t> alg;
+  std::optional<std::int64_t> crv;
+  std::optional<Ed25519PubKey> x;
+  for (std::uint64_t i = 0U; i < key_head.value().arg; ++i) {
+    const auto mk = reader.read_i64(MpError::cwt_invalid_claims);
+    if (!mk.has_value()) {
+      return Result<Ed25519PubKey>::failure(mk.error());
+    }
+    switch (mk.value()) {
+    case 1: { // kty == OKP (1)
+      if (kty.has_value()) {
+        return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto mv = reader.read_i64(MpError::cwt_invalid_claims);
+      if (!mv.has_value()) {
+        return Result<Ed25519PubKey>::failure(mv.error());
+      }
+      kty = mv.value();
+      break;
+    }
+    case 3: { // alg == Ed25519 (-19)
+      if (alg.has_value()) {
+        return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto mv = reader.read_i64(MpError::cwt_invalid_claims);
+      if (!mv.has_value()) {
+        return Result<Ed25519PubKey>::failure(mv.error());
+      }
+      alg = mv.value();
+      break;
+    }
+    case -1: { // crv == Ed25519 (6)
+      if (crv.has_value()) {
+        return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto mv = reader.read_i64(MpError::cwt_invalid_claims);
+      if (!mv.has_value()) {
+        return Result<Ed25519PubKey>::failure(mv.error());
+      }
+      crv = mv.value();
+      break;
+    }
+    case -2: { // x == 32-byte pubkey
+      if (x.has_value()) {
+        return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto mv = reader.read_bstr(MpError::cwt_invalid_claims);
+      if (!mv.has_value() || mv.value().size() != 32U) {
+        return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      Ed25519PubKey pub{};
+      std::memcpy(pub.data(), mv.value().data(), pub.size());
+      x = pub;
+      break;
+    }
+    default:
+      return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+    }
+  }
+  if (!kty.has_value() || *kty != 1 || !alg.has_value() || *alg != -19 ||
+      !crv.has_value() || *crv != 6 || !x.has_value()) {
+    return fail_mp<Ed25519PubKey>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  return Result<Ed25519PubKey>::success(*x);
+}
+
+Result<CwtClaims>
+parse_device_cwt_unverified(std::span<const std::uint8_t> bytes,
+                            const Ed25519PubKey &expected_device_pubkey,
+                            std::int64_t now_s) {
+  if (bytes.empty() || bytes.size() > kMaxCwtBytes) {
+    return fail_mp<CwtClaims>(ErrorCode::capacity, MpError::cwt_too_large);
+  }
+  // Tag 18 (0xd2) + array(4) (0x84) + bstr(3) protected {1:-19} + empty map {} (0xa0).
+  static constexpr std::array<std::uint8_t, 7> kSign1Prefix = {
+      0xd2U, 0x84U, 0x43U, 0xa1U, 0x01U, 0x32U, 0xa0U};
+  if (bytes.size() <= kSign1Prefix.size() ||
+      std::memcmp(bytes.data(), kSign1Prefix.data(), kSign1Prefix.size()) != 0) {
+    return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_envelope_shape);
+  }
+
+  StrictCwtCborReader outer{bytes.subspan(kSign1Prefix.size())};
+  const auto payload_bytes = outer.read_bstr(MpError::cwt_invalid_cbor);
+  if (!payload_bytes.has_value()) {
+    return Result<CwtClaims>::failure(payload_bytes.error());
+  }
+  const auto sig_bytes = outer.read_bstr(MpError::cwt_invalid_cbor);
+  if (!sig_bytes.has_value()) {
+    return Result<CwtClaims>::failure(sig_bytes.error());
+  }
+  if (!outer.at_end()) {
+    return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_cbor);
+  }
+  if (sig_bytes.value().size() != 64U) {
+    return fail_mp<CwtClaims>(ErrorCode::corrupt,
+                              MpError::cwt_invalid_signature_length);
+  }
+
+  StrictCwtCborReader payload_reader{payload_bytes.value()};
+  const auto map_head = payload_reader.read_head(MpError::cwt_invalid_claims);
+  if (!map_head.has_value()) {
+    return Result<CwtClaims>::failure(map_head.error());
+  }
+  if (map_head.value().major != 5U || map_head.value().arg > 16U) {
+    return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+
+  std::optional<std::string> iss;
+  std::optional<std::int64_t> exp;
+  std::optional<std::int64_t> iat;
+  std::optional<Ed25519PubKey> device_pubkey;
+  for (std::uint64_t i = 0U; i < map_head.value().arg; ++i) {
+    const auto key = payload_reader.read_i64(MpError::cwt_invalid_claims);
+    if (!key.has_value()) {
+      return Result<CwtClaims>::failure(key.error());
+    }
+    switch (key.value()) {
+    case 1: { // iss
+      if (iss.has_value()) {
+        return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto val = payload_reader.read_tstr(MpError::cwt_invalid_claims);
+      if (!val.has_value() || !is_lower_hex_64(val.value())) {
+        return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      iss = val.value();
+      break;
+    }
+    case 4: { // exp
+      if (exp.has_value()) {
+        return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto val = payload_reader.read_i64(MpError::cwt_invalid_claims);
+      if (!val.has_value()) {
+        return Result<CwtClaims>::failure(val.error());
+      }
+      exp = val.value();
+      break;
+    }
+    case 6: { // iat
+      if (iat.has_value()) {
+        return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto val = payload_reader.read_i64(MpError::cwt_invalid_claims);
+      if (!val.has_value()) {
+        return Result<CwtClaims>::failure(val.error());
+      }
+      iat = val.value();
+      break;
+    }
+    case 8: { // cnf
+      if (device_pubkey.has_value()) {
+        return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+      }
+      const auto val = parse_cwt_cnf_ed25519(payload_reader);
+      if (!val.has_value()) {
+        return Result<CwtClaims>::failure(val.error());
+      }
+      device_pubkey = val.value();
+      break;
+    }
+    default:
+      return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+    }
+  }
+  if (!payload_reader.at_end() || !iss.has_value() || !exp.has_value() ||
+      !iat.has_value() || !device_pubkey.has_value()) {
+    return fail_mp<CwtClaims>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  if (const auto dev_ok = validate_ed25519_pubkey_strict(*device_pubkey);
+      !dev_ok.has_value()) {
+    return Result<CwtClaims>::failure(dev_ok.error());
+  }
+  if (!constant_time_equal({*device_pubkey, expected_device_pubkey})) {
+    return fail_mp<CwtClaims>(ErrorCode::provider_auth,
+                              MpError::cwt_device_key_mismatch);
+  }
+  if (*iat < 0) {
+    return fail_mp<CwtClaims>(ErrorCode::invalid_range, MpError::cwt_invalid_claims);
+  }
+  const auto ttl = checked_sub_i64(*exp, *iat);
+  if (!ttl.has_value() || *ttl <= 0 || *ttl > kMaxCwtTtlSecs) {
+    return fail_mp<CwtClaims>(ErrorCode::invalid_range, MpError::cwt_ttl_exceeded);
+  }
+  const auto max_iat = checked_add_i64(now_s, kMaxCwtIatSkewSecs);
+  if (max_iat.has_value() && *iat > *max_iat) {
+    return fail_mp<CwtClaims>(ErrorCode::clock_regressed,
+                              MpError::cwt_future_issued_at);
+  }
+  if (now_s >= *exp) {
+    return fail_mp<CwtClaims>(ErrorCode::provider_auth, MpError::cwt_expired);
+  }
+  return Result<CwtClaims>::success(
+      CwtClaims{std::move(*iss), *iat, *exp, *device_pubkey});
+}
+
+std::optional<char> normalize_crockford_base32_char(char ch) noexcept {
+  if (ch >= '0' && ch <= '9') {
+    return ch;
+  }
+  char up = ch;
+  if (ch >= 'a' && ch <= 'z') {
+    up = static_cast<char>(ch - ('a' - 'A'));
+  }
+  if (up < 'A' || up > 'Z') {
+    return std::nullopt;
+  }
+  // Strict Crockford Base32 excludes I, L, O, U.
+  if (up == 'I' || up == 'L' || up == 'O' || up == 'U') {
+    return std::nullopt;
+  }
+  return up;
+}
+
+} // namespace
+
+Result<MpIdentityStore>
+MpIdentityStore::open_or_init_device(const std::filesystem::path &dir,
+                                     std::string_view authority) {
+  if (const auto auth_ok = extract_tls_hostname(authority); !auth_ok.has_value()) {
+    return Result<MpIdentityStore>::failure(auth_ok.error());
+  }
+  auto existing = open_existing(dir);
+  if (existing.has_value()) {
+    return existing;
+  }
+  const auto err = mp_client_error_of(existing.error());
+  if (err == MpClientError::keystore_corrupt) {
+    // Allow initializing a pre-existing empty 0700 directory ONLY if all 4 keystore
+    // files are absent (ENOENT); fail closed if any partial/corrupt file or symlink
+    // exists.
+    std::filesystem::path normalized;
+    auto dir_fd = open_keystore_dir(dir, /*create=*/false, normalized);
+    if (!dir_fd.has_value()) {
+      return Result<MpIdentityStore>::failure(dir_fd.error());
+    }
+    for (const char *fname :
+         {kRootSeedFile, kDeviceSeedFile, kDeviceCwtFile, kIdentityMetaFile}) {
+      struct stat fst{};
+      if (::fstatat(dir_fd.value().get(), fname, &fst, AT_SYMLINK_NOFOLLOW) == 0) {
+        return existing;
+      }
+      if (errno != ENOENT) {
+        return fail_c<MpIdentityStore>(ErrorCode::io,
+                                       MpClientError::keystore_io_failed);
+      }
+    }
+  } else if (err != MpClientError::keystore_not_found) {
+    return existing;
+  }
+
+  auto dev_seed = CleansedSeed::generate();
+  if (!dev_seed.has_value()) {
+    return Result<MpIdentityStore>::failure(dev_seed.error());
+  }
+  MpIdentityState state{};
+  state.root_seed = std::nullopt;
+  state.device_seed = std::move(dev_seed).value();
+  state.account_id = std::nullopt;
+  state.device_id = std::nullopt;
+  state.handle.clear();
+  state.authority = std::string{authority};
+  state.device_cwt.clear();
+  return save(dir, state);
+}
+
+Result<void> MpIdentityStore::install_cwt(const InstallDeviceCwtRequest &request) {
+  if (dir_fd_ < 0) {
+    return fail_cv(ErrorCode::io, MpClientError::keystore_io_failed);
+  }
+  std::optional<Ed25519PubKey> effective_root_pk = request.expected_root_pubkey;
+  if (state_.root_seed.has_value()) {
+    if (!state_.account_id.has_value() || *state_.account_id != request.account_id) {
+      return fail_cv(ErrorCode::conflict, MpClientError::invalid_config);
+    }
+    const auto local_root_key = root_signing_key();
+    if (!local_root_key.has_value()) {
+      return Result<void>::failure(local_root_key.error());
+    }
+    const Ed25519PubKey &local_root_pk = local_root_key.value().public_key();
+    if (request.expected_root_pubkey.has_value() &&
+        !constant_time_equal({*request.expected_root_pubkey, local_root_pk})) {
+      return Result<void>::failure(
+          {ErrorCode::conflict,
+           static_cast<std::int64_t>(MpError::cwt_issuer_mismatch)});
+    }
+    effective_root_pk = local_root_pk;
+  }
+  if (const auto handle_ok = AccountHandle::parse(request.handle);
+      !handle_ok.has_value()) {
+    return Result<void>::failure(handle_ok.error());
+  }
+  if (request.authority.has_value()) {
+    if (const auto auth_ok = extract_tls_hostname(*request.authority);
+        !auth_ok.has_value()) {
+      return Result<void>::failure(auth_ok.error());
+    }
+  }
+  if (request.device_cwt.empty() || request.device_cwt.size() > kMaxCwtBytes) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::keystore_corrupt);
+  }
+
+  const auto dev_key = device_signing_key();
+  if (!dev_key.has_value()) {
+    return Result<void>::failure(dev_key.error());
+  }
+  const std::int64_t now_s = request.now_s.value_or(current_unix_seconds());
+  if (effective_root_pk.has_value()) {
+    const auto verified = verify_device_cwt(DeviceCwtVerifyRequest{
+        request.device_cwt,
+        *effective_root_pk,
+        dev_key.value().public_key(),
+        now_s,
+    });
+    if (!verified.has_value()) {
+      return Result<void>::failure(verified.error());
+    }
+  } else {
+    const auto parsed = parse_device_cwt_unverified(
+        request.device_cwt, dev_key.value().public_key(), now_s);
+    if (!parsed.has_value()) {
+      return Result<void>::failure(parsed.error());
+    }
+  }
+
+  MpIdentityState next = state_;
+  next.account_id = request.account_id;
+  next.device_id = request.device_id;
+  next.handle = request.handle;
+  if (request.authority.has_value()) {
+    next.authority = *request.authority;
+  }
+  next.device_cwt = request.device_cwt;
+  return update(next);
+}
+
+Result<std::string> normalize_web_user_code(std::string_view user_code) {
+  if (user_code.size() != 8U && user_code.size() != 9U) {
+    return fail_c<std::string>(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  if (user_code.size() == 9U && user_code[4] != '-') {
+    return fail_c<std::string>(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  std::string normalized;
+  normalized.reserve(9U);
+  for (std::size_t i = 0U; i < user_code.size(); ++i) {
+    if (user_code.size() == 9U && i == 4U) {
+      normalized.push_back('-');
+      continue;
+    }
+    const auto ch = normalize_crockford_base32_char(user_code[i]);
+    if (!ch.has_value()) {
+      return fail_c<std::string>(ErrorCode::invalid_range,
+                                 MpClientError::invalid_config);
+    }
+    normalized.push_back(*ch);
+    if (user_code.size() == 8U && i == 3U) {
+      normalized.push_back('-');
+    }
+  }
+  return Result<std::string>::success(std::move(normalized));
 }
 
 Result<Ed25519SigningKey> MpIdentityStore::device_signing_key() const {
@@ -3201,6 +3752,86 @@ Result<RevokeDeviceResponse> MpControlClient::revoke_device(DeviceId device_id) 
   }
   return Result<RevokeDeviceResponse>::success(
       RevokeDeviceResponse{rev_flag.value(), std::move(evicted), pending.value()});
+}
+
+Result<WebSessionApproveResponse>
+MpControlClient::approve_web_session(std::string_view user_code) {
+  auto normalized = normalize_web_user_code(user_code);
+  if (!normalized.has_value()) {
+    return Result<WebSessionApproveResponse>::failure(normalized.error());
+  }
+  CleanseStringGuard code_cleanse{normalized.value()};
+
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<WebSessionApproveResponse>::failure(auth.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("user_code", Value{normalized.value()});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<WebSessionApproveResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/web-sessions/approve";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<WebSessionApproveResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<WebSessionApproveResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<WebSessionApproveResponse>::failure(obj.error());
+  }
+  const Value *approved_field = obj.value().find("approved");
+  if (approved_field == nullptr) {
+    return fail_c<WebSessionApproveResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  const auto approved_val = value_as_bool_or_flag(*approved_field);
+  if (!approved_val.has_value()) {
+    return fail_c<WebSessionApproveResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  std::string scope;
+  if (const Value *scope_field = obj.value().find("scope");
+      scope_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(scope_field->value())) {
+    const auto *s = std::get_if<std::string>(&scope_field->value());
+    if (s == nullptr) {
+      return fail_c<WebSessionApproveResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+    }
+    scope = *s;
+  }
+  std::optional<std::uint64_t> expires_at_ms;
+  if (const Value *exp_field = obj.value().find("expires_at_ms");
+      exp_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(exp_field->value())) {
+    const auto exp_u64 = value_as_u64(*exp_field);
+    if (!exp_u64.has_value()) {
+      return fail_c<WebSessionApproveResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+    }
+    expires_at_ms = exp_u64.value();
+  }
+  return Result<WebSessionApproveResponse>::success(
+      WebSessionApproveResponse{approved_val.value(), std::move(scope), expires_at_ms});
 }
 
 Result<std::vector<FriendEdge>> MpControlClient::list_friends() {

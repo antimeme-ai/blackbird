@@ -2176,6 +2176,7 @@ constexpr std::string_view kOnlineHelpText =
     "  /online party join <party_id|mppi1_...>            Join party by ID or invite\n"
     "  /online party leave <party_id>                     Leave party\n"
     "  /online party disband <party_id> [epoch]           Disband party\n"
+    "  /online web-approve <XXXX-XXXX>                    Approve web portal sign-in\n"
     "  /online help                                       Show this usage summary\n";
 
 bool valid_online_path_env(std::string_view raw, bool require_file_leaf) noexcept {
@@ -3041,6 +3042,37 @@ std::string handle_online(std::string_view args) {
     }
     if (edges.size() > shown) {
       out += "  ... (" + std::to_string(edges.size() - shown) + " more)\n";
+    }
+    return out;
+  }
+
+  if (cmd == "web-approve") {
+    const auto [code_tok, extra] = split_first_token(rest);
+    if (code_tok.empty() || !extra.empty())
+      return "Usage: /online web-approve <XXXX-XXXX>\n";
+    const auto normalized = mp::normalize_web_user_code(code_tok);
+    if (!normalized.has_value()) {
+      return "Invalid web-approve code '" + sanitize_inline(code_tok, 32) +
+             "' (expected 8 Crockford Base32 chars XXXX-XXXX, no I/L/O/U)\n";
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto approved = opened.client->approve_web_session(normalized.value());
+    if (!approved.has_value()) {
+      return "Online web-approve failed: " + format_mp_error_detail(approved.error()) +
+             "\n";
+    }
+    std::string out = "Approved web session:\n";
+    out += "  user_code:     " + normalized.value() + "\n";
+    out += "  approved:      " +
+           std::string{approved.value().approved ? "true" : "false"} + "\n";
+    if (!approved.value().scope.empty()) {
+      out += "  scope:         " + sanitize_inline(approved.value().scope, 64) + "\n";
+    }
+    if (approved.value().expires_at_ms.has_value()) {
+      out +=
+          "  expires_at_ms: " + std::to_string(*approved.value().expires_at_ms) + "\n";
     }
     return out;
   }

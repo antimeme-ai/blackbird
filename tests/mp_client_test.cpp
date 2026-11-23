@@ -369,6 +369,7 @@ struct LoopbackServerState {
   int health_calls = 0;
   int clock_skew_rejections = 0;
   int verified_rfc9421_calls = 0;
+  std::string last_web_approve_code;
   bool ws_received_masked_endpoint_update = false;
   bool ws_received_masked_ping = false;
   bool ws_received_masked_pong = false;
@@ -763,6 +764,27 @@ private:
       send_json(ssl, 200, "OK",
                 "{\"revoked\":true,\"evicted_parties\":[" +
                     std::to_string(state_.party_id) + "],\"pending_retries\":0}");
+    } else if (method_str == "POST" && path == "/v1/web-sessions/approve") {
+      require_ok(std::holds_alternative<DeviceKeyId>(parsed_si.value().keyid));
+      const auto json = parse_json(body_str);
+      require_ok(json.has_value());
+      const Value *uc = json.value().find("user_code");
+      require_ok(uc != nullptr && std::holds_alternative<std::string>(uc->value()));
+      const std::string &code = uc->string();
+      state_.last_web_approve_code = code;
+      if (code == "ABCD-EFGH") {
+        send_json(ssl, 200, "OK",
+                  "{\"approved\":true,\"scope\":\"account:read\",\"expires_at_ms\":" +
+                      std::to_string(now_ms + 3600000U) + "}");
+      } else if (code == "4040-0000") {
+        send_json(ssl, 404, "Not Found", "{\"error\":\"not_found\"}");
+      } else if (code == "4100-0000") {
+        send_json(ssl, 410, "Gone", "{\"error\":\"expired\"}");
+      } else if (code == "4000-0000") {
+        send_json(ssl, 400, "Bad Request", "{\"error\":\"invalid_user_code\"}");
+      } else {
+        send_json(ssl, 404, "Not Found", "{\"error\":\"not_found\"}");
+      }
     } else if (method_str == "GET" && path == "/v1/friends") {
       send_json(
           ssl, 200, "OK",
@@ -1139,6 +1161,192 @@ void test_identity_store() {
   moved_to.cleanse();
   require_ok(moved_to.bytes() == all_zero);
 
+  // 10. Secondary device store: open_or_init_device & install_cwt validation.
+  {
+    const auto sec_dir = tmp.path / "secondary_device";
+    auto sec_store = MpIdentityStore::open_or_init_device(sec_dir, "api.example.test");
+    require_ok(sec_store.has_value());
+    require_ok(!sec_store.value().state().root_seed.has_value());
+    require_ok(!sec_store.value().state().account_id.has_value());
+    require_ok(!sec_store.value().state().device_id.has_value());
+    require_ok(sec_store.value().state().device_cwt.empty());
+    require_ok(sec_store.value().state().authority == "api.example.test");
+    require_ok(!std::filesystem::exists(sec_dir / "root.seed"));
+    const auto sec_dev_pk = sec_store.value().device_signing_key().value().public_key();
+
+    // Calling open_or_init_device again preserves existing device key (never clobbers).
+    auto reopened = MpIdentityStore::open_or_init_device(sec_dir, "other.example");
+    require_ok(reopened.has_value());
+    require_ok(reopened.value().device_signing_key().value().public_key() ==
+               sec_dev_pk);
+    require_ok(reopened.value().state().authority == "api.example.test");
+
+    // Installing a CWT minted for a DIFFERENT device key MUST fail closed before disk
+    // modification!
+    const auto bad_install = reopened.value().install_cwt(InstallDeviceCwtRequest{
+        AccountId::create(1001U).value(),
+        DeviceId::create(2005U).value(),
+        "alice_sec",
+        cwt, // minted for dev_key, NOT sec_dev_pk!
+        std::nullopt,
+        std::nullopt,
+        now_s,
+    });
+    require_ok(!bad_install.has_value());
+    require_ok(mp_error_of(bad_install.error()) == MpError::cwt_device_key_mismatch);
+    require_ok(!reopened.value().state().account_id.has_value());
+    require_ok(reopened.value().state().device_cwt.empty());
+
+    // Mint valid CWT for sec_dev_pk signed by root_key.
+    const auto sec_cwt =
+        encode_device_cwt(root_key,
+                          DeviceCwtMintRequest{sec_dev_pk, now_s - 5, now_s + 86400})
+            .value();
+
+    // Wrong expected_root_pubkey MUST fail signature/issuer verification.
+    const auto wrong_root_seed = CleansedSeed::generate().value();
+    const auto wrong_root_key =
+        Ed25519SigningKey::from_seed(wrong_root_seed.bytes()).value();
+    const auto bad_sig_install = reopened.value().install_cwt(InstallDeviceCwtRequest{
+        AccountId::create(1001U).value(),
+        DeviceId::create(2005U).value(),
+        "alice_sec",
+        sec_cwt,
+        std::nullopt,
+        wrong_root_key.public_key(),
+        now_s,
+    });
+    require_ok(!bad_sig_install.has_value());
+    require_ok(!reopened.value().state().account_id.has_value());
+
+    // Valid CWT with expected_root_pubkey succeeds and persists atomically.
+    const auto ok_install = reopened.value().install_cwt(InstallDeviceCwtRequest{
+        AccountId::create(1001U).value(),
+        DeviceId::create(2005U).value(),
+        "alice_sec",
+        sec_cwt,
+        std::nullopt,
+        root_key.public_key(),
+        now_s,
+    });
+    require_ok(ok_install.has_value());
+    require_ok(!std::filesystem::exists(sec_dir / "root.seed"));
+    const auto after_install = MpIdentityStore::open_existing(sec_dir);
+    require_ok(after_install.has_value());
+    require_ok(!after_install.value().state().root_seed.has_value());
+    require_ok(after_install.value().state().account_id ==
+               AccountId::create(1001U).value());
+    require_ok(after_install.value().state().device_id ==
+               DeviceId::create(2005U).value());
+    require_ok(after_install.value().state().handle == "alice_sec");
+    require_ok(after_install.value().state().device_cwt == sec_cwt);
+
+    // Keystore with existing root_seed MUST reject install_cwt for a different account,
+    // AND for a matching account MUST always verify against local root_seed (rejecting
+    // forged CWTs and foreign expected_root_pubkey!).
+    const auto root_dir = tmp.path / "root_conflict";
+    auto root_store = MpIdentityStore::save(root_dir, state);
+    require_ok(root_store.has_value());
+    const auto conflict_install =
+        root_store.value().install_cwt(InstallDeviceCwtRequest{
+            AccountId::create(9999U).value(),
+            DeviceId::create(2001U).value(),
+            "other_acct",
+            cwt,
+            std::nullopt,
+            std::nullopt,
+            now_s,
+        });
+    require_ok(!conflict_install.has_value());
+    require_ok(conflict_install.error().code == ErrorCode::conflict);
+
+    // Forged CWT (signed by wrong_root_key for local dev_key) on matching account_id:
+    const auto forged_cwt =
+        encode_device_cwt(
+            wrong_root_key,
+            DeviceCwtMintRequest{dev_key.public_key(), now_s - 5, now_s + 86400})
+            .value();
+    const auto forged_no_root = root_store.value().install_cwt(InstallDeviceCwtRequest{
+        AccountId::create(1001U).value(),
+        DeviceId::create(2001U).value(),
+        "alice_ks",
+        forged_cwt,
+        std::nullopt,
+        std::nullopt,
+        now_s,
+    });
+    require_ok(!forged_no_root.has_value());
+    require_ok(root_store.value().state().device_cwt == cwt);
+
+    const auto forged_foreign_root =
+        root_store.value().install_cwt(InstallDeviceCwtRequest{
+            AccountId::create(1001U).value(),
+            DeviceId::create(2001U).value(),
+            "alice_ks",
+            forged_cwt,
+            std::nullopt,
+            wrong_root_key.public_key(),
+            now_s,
+        });
+    require_ok(!forged_foreign_root.has_value());
+    require_ok(forged_foreign_root.error().code == ErrorCode::conflict);
+    require_ok(mp_error_of(forged_foreign_root.error()) ==
+               MpError::cwt_issuer_mismatch);
+    require_ok(root_store.value().state().device_cwt == cwt);
+
+    // Legitimate renewed CWT signed by local root_key succeeds even when
+    // expected_root_pubkey is omitted (verified against local root_seed).
+    const auto renewed_cwt =
+        encode_device_cwt(root_key, DeviceCwtMintRequest{dev_key.public_key(),
+                                                         now_s - 2, now_s + 7200})
+            .value();
+    const auto renewed_ok = root_store.value().install_cwt(InstallDeviceCwtRequest{
+        AccountId::create(1001U).value(),
+        DeviceId::create(2001U).value(),
+        "alice_ks",
+        renewed_cwt,
+        std::nullopt,
+        std::nullopt,
+        now_s,
+    });
+    require_ok(renewed_ok.has_value());
+    require_ok(root_store.value().state().device_cwt == renewed_cwt);
+
+    // Pre-existing empty 0700 directory: open_or_init_device succeeds.
+    const auto empty_0700_dir = tmp.path / "empty_0700";
+    require_ok(::mkdir(empty_0700_dir.c_str(), mode_t{0700}) == 0);
+    const auto from_empty =
+        MpIdentityStore::open_or_init_device(empty_0700_dir, "api.empty.test");
+    require_ok(from_empty.has_value());
+    require_ok(!from_empty.value().state().root_seed.has_value());
+    require_ok(from_empty.value().state().authority == "api.empty.test");
+    require_ok(std::filesystem::exists(empty_0700_dir / "device.seed"));
+
+    // Partial directory containing ONLY root.seed: open_or_init_device MUST fail closed
+    // with keystore_corrupt and preserve root.seed byte-for-byte!
+    const auto partial_dir = tmp.path / "partial_root_only";
+    require_ok(::mkdir(partial_dir.c_str(), mode_t{0700}) == 0);
+    const auto partial_root_path = partial_dir / "root.seed";
+    {
+      std::ofstream ofs{partial_root_path, std::ios::binary};
+      ofs.write(reinterpret_cast<const char *>(root_seed.bytes().data()), 32);
+    }
+    require_ok(::chmod(partial_root_path.c_str(), mode_t{0600}) == 0);
+    const auto partial_res =
+        MpIdentityStore::open_or_init_device(partial_dir, "api.partial.test");
+    require_ok(!partial_res.has_value());
+    require_ok(mp_client_error_of(partial_res.error()) ==
+               MpClientError::keystore_corrupt);
+    require_ok(!std::filesystem::exists(partial_dir / "device.seed"));
+    {
+      std::ifstream ifs{partial_root_path, std::ios::binary};
+      Ed25519Seed after_bytes{};
+      ifs.read(reinterpret_cast<char *>(after_bytes.data()), 32);
+      require_ok(ifs.gcount() == 32);
+      require_ok(after_bytes == root_seed.bytes());
+    }
+  }
+
   std::cout << "PASS test_identity_store\n";
 }
 
@@ -1356,6 +1564,71 @@ void test_loopback_tls_rest_and_ws() {
   require_ok(revoked.has_value());
   require_ok(revoked.value().revoked);
   require_ok(revoked.value().evicted_parties.size() == 1U);
+
+  // 7b. Web account portal approval: approve_web_session() validation, normalization,
+  //     and 400/404/410 HTTP error mapping.
+  {
+    const auto ok_upper = client.approve_web_session("ABCD-EFGH");
+    require_ok(ok_upper.has_value());
+    require_ok(ok_upper.value().approved);
+    require_ok(ok_upper.value().scope == "account:read");
+    require_ok(ok_upper.value().expires_at_ms.has_value());
+
+    const auto ok_lower_hyphen = client.approve_web_session("abcd-efgh");
+    require_ok(ok_lower_hyphen.has_value());
+    require_ok(ok_lower_hyphen.value().approved);
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      require_ok(srv_state.last_web_approve_code == "ABCD-EFGH");
+    }
+
+    const auto ok_lower_no_hyphen = client.approve_web_session("abcdefgh");
+    require_ok(ok_lower_no_hyphen.has_value());
+    require_ok(ok_lower_no_hyphen.value().approved);
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      require_ok(srv_state.last_web_approve_code == "ABCD-EFGH");
+    }
+
+    // Invalid codes MUST be rejected with ErrorCode::invalid_range BEFORE hitting the
+    // network!
+    const int calls_before_invalid = [&]() {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      return srv_state.verified_rfc9421_calls;
+    }();
+    for (const std::string_view bad_code : std::array<std::string_view, 9>{
+             "",
+             "123",
+             "ABCD-EFGI",
+             "ABCD-EFGL",
+             "ABCD-EFGO",
+             "ABCD-EFGU",
+             "ABC-DEFGH",
+             "ABCD-EFGH-1",
+             "ABCD-EFG\n",
+         }) {
+      const auto bad = client.approve_web_session(bad_code);
+      require_ok(!bad.has_value());
+      require_ok(bad.error().code == ErrorCode::invalid_range);
+    }
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      require_ok(srv_state.verified_rfc9421_calls == calls_before_invalid);
+    }
+
+    // HTTP 404, 410, and 400 error mapping
+    const auto err_404 = client.approve_web_session("4040-0000");
+    require_ok(!err_404.has_value());
+    require_ok(mp_client_error_of(err_404.error()) == MpClientError::http_not_found);
+
+    const auto err_410 = client.approve_web_session("4100-0000");
+    require_ok(!err_410.has_value());
+    require_ok(mp_client_error_of(err_410.error()) == MpClientError::http_gone);
+
+    const auto err_400 = client.approve_web_session("4000-0000");
+    require_ok(!err_400.has_value());
+    require_ok(mp_client_error_of(err_400.error()) == MpClientError::http_bad_request);
+  }
 
   // 8. Social graph (friends & blocks)
   const auto bob_id = AccountId::create(1002U).value();

@@ -9,6 +9,7 @@
 #include "blackbird/mcp_server.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
+#include "blackbird/mp_party_bridge.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -5863,6 +5865,8 @@ struct FlightDeckRateTracker {
   std::uint64_t last_out_rsn_tokens = 0;
   double total_tok_per_sec = 0.0;
   double out_rsn_tok_per_sec = 0.0;
+  std::optional<fs::path> consumer_session;
+  std::optional<MetricsConsumer> consumer;
 };
 
 fs::path strip_trailing_slashes(const fs::path &path) {
@@ -5899,11 +5903,15 @@ HeroTelemetryInput observe_flightdeck_telemetry(const std::optional<fs::path> &s
   if (ec || fs::is_symlink(st) || !fs::is_directory(st))
     return telemetry;
 
-  MetricsConsumer consumer = MetricsConsumer::from_token_usage_directory(clean_session);
-  if (!consumer.refresh().has_value())
+  if (!tracker.consumer.has_value() || !tracker.consumer_session.has_value() ||
+      *tracker.consumer_session != clean_session) {
+    tracker.consumer = MetricsConsumer::from_token_usage_directory(clean_session);
+    tracker.consumer_session = clean_session;
+  }
+  if (!tracker.consumer->refresh().has_value())
     return telemetry;
 
-  const MetricsSnapshot &snap = consumer.snapshot();
+  const MetricsSnapshot &snap = tracker.consumer->snapshot();
   telemetry.input_tokens = snap.usage.total_input_tokens.value.value_or(0);
   telemetry.cached_tokens = snap.usage.total_cached_tokens.value.value_or(0);
   telemetry.reasoning_tokens = snap.usage.total_reasoning_tokens.value.value_or(0);
@@ -6120,12 +6128,15 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
       std::chrono::microseconds{1'000'000LL / static_cast<std::int64_t>(fps)};
   constexpr auto kKeyHoldDuration = std::chrono::milliseconds{180};
   constexpr auto kTelemetryRefreshInterval = std::chrono::milliseconds{500};
+  constexpr auto kSessionRescanInterval = std::chrono::milliseconds{5000};
   constexpr auto kBareEscTimeout = std::chrono::milliseconds{25};
   constexpr std::size_t kMaxPendingInputBytes = 256U;
 
   auto last_frame_time = SteadyClock::now();
   auto next_frame_time = last_frame_time;
   auto last_telemetry_time = last_frame_time;
+  auto last_session_scan_time = last_frame_time;
+  std::optional<fs::path> active_session = observed_session;
 
   SteadyClock::time_point left_until{};
   SteadyClock::time_point right_until{};
@@ -6133,6 +6144,7 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
   SteadyClock::time_point down_until{};
 
   std::optional<FlightDeckViewportCells> prev_cells;
+  std::vector<std::string> prev_hb_rows;
   std::string pending_input;
   std::optional<SteadyClock::time_point> esc_deadline;
 
@@ -6157,10 +6169,12 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
     const auto now = SteadyClock::now();
 
     if (now - last_telemetry_time >= kTelemetryRefreshInterval) {
-      const std::optional<fs::path> target_session =
-          explicit_session.has_value() ? explicit_session
-                                       : find_newest_flightdeck_session();
-      engine.set_telemetry(observe_flightdeck_telemetry(target_session, rate_tracker));
+      if (!explicit_session.has_value() &&
+          now - last_session_scan_time >= kSessionRescanInterval) {
+        active_session = find_newest_flightdeck_session();
+        last_session_scan_time = now;
+      }
+      engine.set_telemetry(observe_flightdeck_telemetry(active_session, rate_tracker));
       last_telemetry_time = now;
     }
 
@@ -6183,7 +6197,7 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
     prev_cells = cells;
 
     if (use_kitty) {
-      const std::string encoded = encode_kitty_rgba_frame(
+      const std::string encoded = encode_kitty_rgb_frame(
           frame, HeroKittyPlacement{.row = 0,
                                     .column = 0,
                                     .columns = cells.columns,
@@ -6203,19 +6217,24 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
     } else {
       const auto lines = encode_truecolor_halfblock_frame(
           frame, HeroHalfBlockOptions{.columns = cells.columns, .rows = cells.rows});
-      std::string out;
-      out.reserve(lines.size() * cells.columns * 12U + 96U);
-      out += "\x1b[?2026h";
-      if (resized)
-        out += "\x1b[2J";
-      for (std::size_t r = 0; r < lines.size(); ++r) {
-        out += "\x1b[";
-        out += std::to_string(r + 1);
-        out += ";1H";
-        out += lines[r];
+      const std::string diff = encode_halfblock_diff(HeroHalfBlockDiff{
+          .prev_rows = prev_hb_rows,
+          .curr_rows = lines,
+          .full_redraw = resized,
+      });
+      prev_hb_rows = lines;
+      if (resized || !diff.empty()) {
+        std::string out;
+        out.reserve(diff.size() + 48U);
+        out += "\x1b[?2026h";
+        if (resized)
+          out += "\x1b[2J";
+        out += diff;
+        if (resized)
+          out += "\x1b[0m\x1b[J";
+        out += "\x1b[?2026l";
+        write_fd_all(STDOUT_FILENO, out);
       }
-      out += "\x1b[0m\x1b[J\x1b[?2026l";
-      write_fd_all(STDOUT_FILENO, out);
     }
 
     next_frame_time += frame_period;
@@ -6457,6 +6476,34 @@ bool valid_online_label_arg(std::string_view raw) noexcept {
   return raw.size() <= 128U && !has_forbidden_online_scalar(raw);
 }
 
+std::string shell_quote_arg(std::string_view raw) {
+  if (raw.empty())
+    return "''";
+  bool safe_unquoted = true;
+  for (const char ch : raw) {
+    const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == ':' ||
+                    ch == '@' || ch == '/' || ch == '+' || ch == '=' || ch == '-';
+    if (!ok) {
+      safe_unquoted = false;
+      break;
+    }
+  }
+  if (safe_unquoted)
+    return std::string{raw};
+  std::string out;
+  out.reserve(raw.size() + 2U);
+  out.push_back('\'');
+  for (const char ch : raw) {
+    if (ch == '\'')
+      out.append("'\\''");
+    else
+      out.push_back(ch);
+  }
+  out.push_back('\'');
+  return out;
+}
+
 std::string online_base64_encode(std::span<const std::uint8_t> bytes) {
   static constexpr char kAlphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -6505,11 +6552,15 @@ std::optional<std::uint8_t> online_base64_val(char ch) noexcept {
   return std::nullopt;
 }
 
-std::optional<mp::Ed25519PubKey> online_decode_pubkey_b64(std::string_view text) {
+std::optional<std::vector<std::uint8_t>>
+online_base64_decode(std::string_view text, std::size_t max_decoded_bytes) {
   if (text.empty() || (text.size() % 4U) != 0U)
     return std::nullopt;
+  const std::size_t max_out = (text.size() / 4U) * 3U;
+  if (max_out > max_decoded_bytes + 2U)
+    return std::nullopt;
   std::vector<std::uint8_t> out;
-  out.reserve((text.size() / 4U) * 3U);
+  out.reserve(max_out);
   for (std::size_t i = 0U; i < text.size(); i += 4U) {
     const bool is_last = (i + 4U == text.size());
     const auto v0 = online_base64_val(text[i]);
@@ -6541,10 +6592,17 @@ std::optional<mp::Ed25519PubKey> online_decode_pubkey_b64(std::string_view text)
     out.push_back(static_cast<std::uint8_t>(((*v1 & 0x0fU) << 4U) | (*v2 >> 2U)));
     out.push_back(static_cast<std::uint8_t>(((*v2 & 0x03U) << 6U) | *v3));
   }
-  if (out.size() != 32U)
+  if (out.size() > max_decoded_bytes)
+    return std::nullopt;
+  return out;
+}
+
+std::optional<mp::Ed25519PubKey> online_decode_pubkey_b64(std::string_view text) {
+  const auto out = online_base64_decode(text, 32U);
+  if (!out.has_value() || out->size() != 32U)
     return std::nullopt;
   mp::Ed25519PubKey pk{};
-  std::memcpy(pk.data(), out.data(), pk.size());
+  std::memcpy(pk.data(), out->data(), pk.size());
   return pk;
 }
 
@@ -6935,24 +6993,25 @@ int run_online_health(std::span<char *> args, CliIo io) {
                        }));
 }
 
-int preflight_online_register_dir(const fs::path &state_dir, CliIo io) {
+int preflight_online_register_dir(const fs::path &state_dir,
+                                  std::string_view context_name, CliIo io) {
   struct stat lst{};
   if (::lstat(state_dir.c_str(), &lst) != 0) {
     if (errno == ENOENT)
       return 0;
-    return fail_mp_error(io, "online register",
+    return fail_mp_error(io, context_name,
                          {ErrorCode::io, static_cast<std::int64_t>(
                                              mp::MpClientError::keystore_io_failed)});
   }
   if (S_ISLNK(lst.st_mode)) {
     return fail_mp_error(
-        io, "online register",
+        io, context_name,
         {ErrorCode::io,
          static_cast<std::int64_t>(mp::MpClientError::keystore_symlink_rejected)});
   }
   if (!S_ISDIR(lst.st_mode)) {
     return fail_mp_error(
-        io, "online register",
+        io, context_name,
         {ErrorCode::io,
          static_cast<std::int64_t>(mp::MpClientError::keystore_invalid_path)});
   }
@@ -6964,7 +7023,7 @@ int preflight_online_register_dir(const fs::path &state_dir, CliIo io) {
     const auto detail = (errno == ELOOP || errno == ENOTDIR)
                             ? mp::MpClientError::keystore_symlink_rejected
                             : mp::MpClientError::keystore_io_failed;
-    return fail_mp_error(io, "online register",
+    return fail_mp_error(io, context_name,
                          {ErrorCode::io, static_cast<std::int64_t>(detail)});
   }
   struct FdGuard {
@@ -6977,19 +7036,19 @@ int preflight_online_register_dir(const fs::path &state_dir, CliIo io) {
 
   struct stat dst{};
   if (::fstat(fd, &dst) != 0) {
-    return fail_mp_error(io, "online register",
+    return fail_mp_error(io, context_name,
                          {ErrorCode::io, static_cast<std::int64_t>(
                                              mp::MpClientError::keystore_io_failed)});
   }
   if (!S_ISDIR(dst.st_mode)) {
     return fail_mp_error(
-        io, "online register",
+        io, context_name,
         {ErrorCode::io,
          static_cast<std::int64_t>(mp::MpClientError::keystore_invalid_path)});
   }
   if (dst.st_uid != ::geteuid() || (dst.st_mode & 0077U) != 0U) {
     return fail_mp_error(
-        io, "online register",
+        io, context_name,
         {ErrorCode::io,
          static_cast<std::int64_t>(mp::MpClientError::keystore_insecure_permissions)});
   }
@@ -6997,12 +7056,12 @@ int preflight_online_register_dir(const fs::path &state_dir, CliIo io) {
        {"root.seed", "device.seed", "device.cwt", "identity.json"}) {
     struct stat fst{};
     if (::fstatat(fd, fname, &fst, AT_SYMLINK_NOFOLLOW) == 0) {
-      return fail_message(
-          io, "online register: keystore already exists in --state-dir; refusing to "
-              "overwrite existing identity");
+      return fail_message(io, std::string{context_name} +
+                                  ": keystore already exists in --state-dir; refusing "
+                                  "to overwrite existing identity");
     }
     if (errno != ENOENT) {
-      return fail_mp_error(io, "online register",
+      return fail_mp_error(io, context_name,
                            {ErrorCode::io, static_cast<std::int64_t>(
                                                mp::MpClientError::keystore_io_failed)});
     }
@@ -7077,7 +7136,8 @@ int run_online_register(std::span<char *> args, CliIo io) {
 
   // Preflight state_dir before generating keys or redeeming the single-use invite:
   // reject symlinks, non-directories, insecure modes, or an existing keystore.
-  if (const int preflight_rc = preflight_online_register_dir(*state_dir, io);
+  if (const int preflight_rc =
+          preflight_online_register_dir(*state_dir, "online register", io);
       preflight_rc != 0) {
     return preflight_rc;
   }
@@ -7340,6 +7400,231 @@ int run_online_resolve(std::span<char *> args, CliIo io) {
           }));
 }
 
+int run_online_devices_init(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::string label{kDefaultOnlineDeviceLabel};
+
+  for (std::size_t i = 3; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird online devices init [--label <lbl>] "
+                "[--state-dir DIR] [--authority HOST]\n";
+      return 0;
+    }
+    if (arg == "--state-dir") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_path_arg(*v, /*require_filename=*/false))
+        return fail_usage(io, "online devices init: invalid --state-dir path");
+      opts.state_dir = strip_trailing_slashes_party(fs::path{*v});
+    } else if (arg == "--authority") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_host_arg(*v))
+        return fail_usage(io, "online devices init: invalid --authority");
+      opts.authority = std::move(*v);
+    } else if (arg == "--label") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_label_arg(*v) || v->empty())
+        return fail_usage(io, "online devices init: invalid --label");
+      label = std::move(*v);
+    } else {
+      return fail_usage(io, "online devices init: unknown option: " + std::string{arg});
+    }
+  }
+
+  const auto state_dir = resolve_online_state_dir(opts, io);
+  if (!state_dir.has_value())
+    return 2;
+  const auto cfg = resolve_online_client_config(opts, {}, io);
+  if (!cfg.has_value())
+    return 2;
+
+  if (const int preflight_rc =
+          preflight_online_register_dir(*state_dir, "online devices init", io);
+      preflight_rc != 0) {
+    return preflight_rc;
+  }
+
+  auto device_seed = mp::CleansedSeed::generate();
+  if (!device_seed.has_value())
+    return fail_mp_error(io, "online devices init", device_seed.error());
+  auto device_key = mp::Ed25519SigningKey::from_seed(device_seed.value().bytes());
+  if (!device_key.has_value())
+    return fail_mp_error(io, "online devices init", device_key.error());
+
+  mp::MpIdentityState identity{};
+  identity.root_seed = std::nullopt;
+  identity.device_seed = std::move(device_seed).value();
+  identity.account_id = std::nullopt;
+  identity.device_id = std::nullopt;
+  identity.handle.clear();
+  identity.authority = cfg->authority;
+  identity.device_cwt.clear();
+
+  auto saved = mp::MpIdentityStore::save(*state_dir, identity);
+  if (!saved.has_value())
+    return fail_mp_error(io, "online devices init", saved.error());
+
+  const std::string dev_pub_b64 = online_base64_encode(device_key.value().public_key());
+  const auto dev_sha = online_pubkey_sha256_hex(device_key.value().public_key());
+  if (!dev_sha.has_value())
+    return fail_mp_error(io, "online devices init", dev_sha.error());
+
+  const std::string next_step =
+      "On your root machine run: blackbird online devices enroll --label " +
+      shell_quote_arg(label) + " --pubkey-b64 " + dev_pub_b64;
+
+  return emit_json(io, Value::object({
+                           {"initialized", Value{true}},
+                           {"state_dir", Value{saved.value().directory().string()}},
+                           {"authority", Value{cfg->authority}},
+                           {"device_pubkey_b64", Value{dev_pub_b64}},
+                           {"device_pubkey_sha256", Value{dev_sha.value()}},
+                           {"next_step", Value{next_step}},
+                       }));
+}
+
+int run_online_devices_install_cwt(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::optional<std::string> account_id_arg;
+  std::optional<std::string> device_id_arg;
+  std::optional<std::string> handle_arg;
+  std::optional<std::string> cwt_b64_arg;
+  std::optional<std::string> root_pubkey_b64_arg;
+
+  for (std::size_t i = 3; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird online devices install-cwt --account-id <id> "
+                "--device-id <id> --handle <handle> --cwt-b64 <b64> "
+                "[--root-pubkey-b64 <b64>] [--authority HOST] [--state-dir DIR]\n";
+      return 0;
+    }
+    if (arg == "--state-dir") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_path_arg(*v, /*require_filename=*/false))
+        return fail_usage(io, "online devices install-cwt: invalid --state-dir path");
+      opts.state_dir = strip_trailing_slashes_party(fs::path{*v});
+    } else if (arg == "--authority") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_host_arg(*v))
+        return fail_usage(io, "online devices install-cwt: invalid --authority");
+      opts.authority = std::move(*v);
+    } else if (arg == "--account-id") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      account_id_arg = std::move(*v);
+    } else if (arg == "--device-id") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      device_id_arg = std::move(*v);
+    } else if (arg == "--handle") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      handle_arg = std::move(*v);
+    } else if (arg == "--cwt-b64") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cwt_b64_arg = std::move(*v);
+    } else if (arg == "--root-pubkey-b64") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      root_pubkey_b64_arg = std::move(*v);
+    } else {
+      return fail_usage(io, "online devices install-cwt: unknown option: " +
+                                std::string{arg});
+    }
+  }
+
+  if (!account_id_arg.has_value() || account_id_arg->empty())
+    return fail_usage(io, "online devices install-cwt: --account-id is required");
+  if (!device_id_arg.has_value() || device_id_arg->empty())
+    return fail_usage(io, "online devices install-cwt: --device-id is required");
+  if (!handle_arg.has_value() || handle_arg->empty())
+    return fail_usage(io, "online devices install-cwt: --handle is required");
+  if (!cwt_b64_arg.has_value() || cwt_b64_arg->empty())
+    return fail_usage(io, "online devices install-cwt: --cwt-b64 is required");
+
+  const auto account_id = mp::AccountId::parse_decimal(*account_id_arg);
+  if (!account_id.has_value())
+    return fail_usage(io, "online devices install-cwt: invalid --account-id");
+  const auto device_id = mp::DeviceId::parse_decimal(*device_id_arg);
+  if (!device_id.has_value())
+    return fail_usage(io, "online devices install-cwt: invalid --device-id");
+  const auto parsed_handle = mp::AccountHandle::parse(*handle_arg);
+  if (!parsed_handle.has_value())
+    return fail_usage(io, "online devices install-cwt: invalid --handle");
+
+  const auto decoded_cwt = online_base64_decode(*cwt_b64_arg, mp::kMaxCwtBytes);
+  if (!decoded_cwt.has_value() || decoded_cwt->empty())
+    return fail_usage(io, "online devices install-cwt: invalid --cwt-b64");
+
+  std::optional<mp::Ed25519PubKey> expected_root_pk;
+  if (root_pubkey_b64_arg.has_value()) {
+    const auto decoded_root = online_decode_pubkey_b64(*root_pubkey_b64_arg);
+    if (!decoded_root.has_value() ||
+        !mp::validate_ed25519_pubkey_strict(*decoded_root).has_value()) {
+      return fail_usage(
+          io, "online devices install-cwt: invalid --root-pubkey-b64 Ed25519 key");
+    }
+    expected_root_pk = *decoded_root;
+  }
+
+  const auto state_dir = resolve_online_state_dir(opts, io);
+  if (!state_dir.has_value())
+    return 2;
+
+  auto store = mp::MpIdentityStore::open_existing(*state_dir);
+  if (!store.has_value())
+    return fail_mp_error(io, "online devices install-cwt", store.error());
+
+  const auto installed = store.value().install_cwt(mp::InstallDeviceCwtRequest{
+      .account_id = account_id.value(),
+      .device_id = device_id.value(),
+      .handle = std::string{parsed_handle.value().display()},
+      .device_cwt = *decoded_cwt,
+      .authority = opts.authority,
+      .expected_root_pubkey = expected_root_pk,
+      .now_s = std::nullopt,
+  });
+  if (!installed.has_value())
+    return fail_mp_error(io, "online devices install-cwt", installed.error());
+
+  const auto dev_key = store.value().device_signing_key();
+  if (!dev_key.has_value())
+    return fail_mp_error(io, "online devices install-cwt", dev_key.error());
+  const auto dev_sha = online_pubkey_sha256_hex(dev_key.value().public_key());
+  if (!dev_sha.has_value())
+    return fail_mp_error(io, "online devices install-cwt", dev_sha.error());
+
+  const mp::MpIdentityState &st = store.value().state();
+  return emit_json(
+      io, Value::object({
+              {"installed", Value{true}},
+              {"account_id", Value{Number{account_id.value().value()}}},
+              {"device_id", Value{Number{device_id.value().value()}}},
+              {"handle", Value{st.handle}},
+              {"authority", Value{st.authority}},
+              {"device_pubkey_sha256", Value{dev_sha.value()}},
+              {"device_cwt_bytes",
+               Value{Number{static_cast<std::uint64_t>(st.device_cwt.size())}}},
+          }));
+}
+
 int run_online_devices_enroll(std::span<char *> args, CliIo io) {
   OnlineCommonOpts opts{};
   std::optional<std::string> label;
@@ -7398,6 +7683,7 @@ int run_online_devices_enroll(std::span<char *> args, CliIo io) {
   auto cwt = mint_online_device_cwt(root_key.value(), *decoded_pk);
   if (!cwt.has_value())
     return fail_mp_error(io, "online devices enroll", cwt.error());
+  const std::string device_cwt_b64 = online_base64_encode(cwt.value());
 
   const auto enrolled = opened.ctx->client.enroll_device(mp::EnrollDeviceRequest{
       .device_pubkey = *decoded_pk,
@@ -7407,13 +7693,38 @@ int run_online_devices_enroll(std::span<char *> args, CliIo io) {
   if (!enrolled.has_value())
     return fail_mp_error(io, "online devices enroll", enrolled.error());
 
+  const mp::MpIdentityState &st = opened.ctx->store.state();
+  if (!st.account_id.has_value()) {
+    return fail_mp_error(
+        io, "online devices enroll",
+        {ErrorCode::provider_auth,
+         static_cast<std::int64_t>(mp::MpClientError::missing_account_identity)});
+  }
+  const std::string root_pubkey_b64 =
+      online_base64_encode(root_key.value().public_key());
+  const std::string &authority = opened.ctx->client.config().authority;
+  std::string install_cmd = "blackbird online devices install-cwt --account-id " +
+                            st.account_id->to_decimal() + " --device-id " +
+                            enrolled.value().device_id.to_decimal() + " --handle " +
+                            shell_quote_arg(st.handle) + " --cwt-b64 " +
+                            device_cwt_b64 + " --root-pubkey-b64 " + root_pubkey_b64;
+  if (authority != mp::kDefaultMpAuthority) {
+    install_cmd += " --authority " + shell_quote_arg(authority);
+  }
+
   return emit_json(
       io, Value::object({
               {"enrolled", Value{true}},
+              {"account_id", Value{Number{st.account_id->value()}}},
               {"device_id", Value{Number{enrolled.value().device_id.value()}}},
+              {"handle", Value{st.handle}},
+              {"authority", Value{authority}},
               {"label", Value{*label}},
               {"pubkey_b64", Value{online_base64_encode(*decoded_pk)}},
+              {"root_pubkey_b64", Value{root_pubkey_b64}},
+              {"device_cwt_b64", Value{device_cwt_b64}},
               {"cwt_expires_ms", Value{Number{enrolled.value().cwt_expires_ms}}},
+              {"install_cwt_command", Value{install_cmd}},
           }));
 }
 
@@ -7472,18 +7783,79 @@ int run_online_devices_revoke(std::span<char *> args, CliIo io) {
 }
 
 int run_online_devices(std::span<char *> args, CliIo io) {
-  if (args.size() < 3)
-    return fail_usage(io, "online devices: expected action (enroll|revoke)");
+  if (args.size() < 3) {
+    return fail_usage(
+        io, "online devices: expected action (init|install-cwt|enroll|revoke)");
+  }
   const std::string_view action{args[2]};
   if (action == "--help" || action == "-h") {
-    io.err << "usage: blackbird online devices {enroll|revoke} [options]\n";
+    io.err << "usage: blackbird online devices {init|install-cwt|enroll|revoke} "
+              "[options]\n";
     return 0;
   }
+  if (action == "init")
+    return run_online_devices_init(args, io);
+  if (action == "install-cwt")
+    return run_online_devices_install_cwt(args, io);
   if (action == "enroll")
     return run_online_devices_enroll(args, io);
   if (action == "revoke")
     return run_online_devices_revoke(args, io);
   return fail_usage(io, "online devices: unknown action: " + std::string{action});
+}
+
+int run_online_web_approve(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::optional<std::string> user_code_arg;
+  OnlineCleanseOptStringGuard code_arg_guard{user_code_arg};
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird online web-approve <XXXX-XXXX> [--state-dir DIR] "
+                "[--authority HOST] [--connect-host HOST] [--port N] "
+                "[--ca-bundle PATH]\n";
+      return 0;
+    }
+    const int common = parse_online_common_flag(args, i, opts, true, io);
+    if (common == 1)
+      continue;
+    if (common == 2)
+      return 2;
+    if (arg.starts_with('-'))
+      return fail_usage(io, "online web-approve: unknown option: " + std::string{arg});
+    if (user_code_arg.has_value())
+      return fail_usage(io, "online web-approve: unexpected extra argument");
+    user_code_arg = std::string{arg};
+  }
+
+  if (!user_code_arg.has_value() || user_code_arg->empty())
+    return fail_usage(io, "online web-approve: <XXXX-XXXX> user code is required");
+
+  const auto normalized = mp::normalize_web_user_code(*user_code_arg);
+  if (!normalized.has_value()) {
+    return fail_usage(
+        io, "online web-approve: invalid user code (expected Crockford Base32 "
+            "XXXX-XXXX)");
+  }
+
+  auto opened = open_online_context(opts, "online web-approve", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  const auto res = opened.ctx->client.approve_web_session(normalized.value());
+  if (!res.has_value())
+    return fail_mp_error(io, "online web-approve", res.error());
+
+  return emit_json(io,
+                   Value::object({
+                       {"approved", Value{res.value().approved}},
+                       {"user_code", Value{normalized.value()}},
+                       {"scope", Value{res.value().scope}},
+                       {"expires_at_ms", res.value().expires_at_ms.has_value()
+                                             ? Value{Number{*res.value().expires_at_ms}}
+                                             : Value{nullptr}},
+                   }));
 }
 
 int run_online_friends_list(std::span<char *> args, std::size_t start_idx, CliIo io) {
@@ -8181,15 +8553,220 @@ int run_online_party_disband(std::span<char *> args, CliIo io) {
                    }));
 }
 
+std::atomic<bool> g_mp_attach_stop{false};
+
+void mp_attach_signal_handler(int /*signum*/) noexcept {
+  g_mp_attach_stop.store(true, std::memory_order_relaxed);
+}
+
+class MpAttachSignalGuard {
+public:
+  MpAttachSignalGuard() noexcept {
+    g_mp_attach_stop.store(false, std::memory_order_relaxed);
+    struct sigaction sa{};
+    sa.sa_handler = mp_attach_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    if (::sigaction(SIGINT, &sa, &prev_int_) == 0)
+      installed_int_ = true;
+    if (::sigaction(SIGTERM, &sa, &prev_term_) == 0)
+      installed_term_ = true;
+  }
+
+  MpAttachSignalGuard(const MpAttachSignalGuard &) = delete;
+  MpAttachSignalGuard &operator=(const MpAttachSignalGuard &) = delete;
+
+  ~MpAttachSignalGuard() {
+    if (installed_int_)
+      (void)::sigaction(SIGINT, &prev_int_, nullptr);
+    if (installed_term_)
+      (void)::sigaction(SIGTERM, &prev_term_, nullptr);
+  }
+
+private:
+  struct sigaction prev_int_{};
+  struct sigaction prev_term_{};
+  bool installed_int_ = false;
+  bool installed_term_ = false;
+};
+
+int run_online_party_attach(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::optional<std::string> party_arg;
+  MpAttachMode mode = MpAttachMode::jsonl;
+  std::optional<mp::RelayPolicy> explicit_relay_policy;
+  std::optional<std::string> explicit_relay_url;
+  std::string room_scope{kMpAttachDefaultRoomScope};
+  std::optional<fs::path> party_socket;
+  std::optional<std::string> party_room;
+  bool listen_only = false;
+  bool exit_on_eof = false;
+
+  for (std::size_t i = 3; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird online party attach <party_id> "
+                "[--mode jsonl|plain] [--plain] [--relay-policy allow|force|no] "
+                "[--relay-url URL] [--room-scope SCOPE] "
+                "[--party-socket PATH --party-room ROOM] [--listen-only] "
+                "[--exit-on-eof] [--state-dir DIR] [--authority HOST] "
+                "[--connect-host HOST] [--port N] [--ca-bundle PATH]\n";
+      return 0;
+    }
+    const int common = parse_online_common_flag(args, i, opts, true, io);
+    if (common == 1)
+      continue;
+    if (common == 2)
+      return 2;
+    if (arg == "--mode") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_mp_attach_mode(*v);
+      if (!parsed.has_value())
+        return fail_usage(io, "online party attach: invalid --mode (jsonl|plain)");
+      mode = parsed.value();
+    } else if (arg == "--plain") {
+      mode = MpAttachMode::plain;
+    } else if (arg == "--relay-policy") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_online_relay_policy(*v);
+      if (!parsed.has_value()) {
+        return fail_usage(
+            io, "online party attach: invalid --relay-policy (allow|force|no)");
+      }
+      explicit_relay_policy = *parsed;
+    } else if (arg == "--relay-url") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty() || v->size() > 200U || !v->starts_with("https://"))
+        return fail_usage(io, "online party attach: --relay-url must be https://...");
+      explicit_relay_url = std::move(*v);
+    } else if (arg == "--room-scope") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty() || v->size() > kP2pPartyMaxRoomScopeBytes)
+        return fail_usage(io, "online party attach: invalid --room-scope");
+      room_scope = std::move(*v);
+    } else if (arg == "--party-socket") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_path_arg(*v, /*require_filename=*/true))
+        return fail_usage(io, "online party attach: invalid --party-socket path");
+      party_socket = fs::path{std::move(*v)};
+    } else if (arg == "--party-room") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_party_room_id(*v))
+        return fail_usage(io, "online party attach: invalid --party-room");
+      party_room = std::move(*v);
+    } else if (arg == "--listen-only") {
+      listen_only = true;
+    } else if (arg == "--exit-on-eof") {
+      exit_on_eof = true;
+    } else if (arg.starts_with('-')) {
+      return fail_usage(io, "online party attach: unknown option: " + std::string{arg});
+    } else {
+      if (party_arg.has_value())
+        return fail_usage(io, "online party attach: unexpected extra argument");
+      party_arg = std::string{arg};
+    }
+  }
+
+  if (!party_arg.has_value())
+    return fail_usage(io, "online party attach: <party_id> is required");
+  const auto pid = mp::PartyId::parse_decimal(*party_arg);
+  if (!pid.has_value())
+    return fail_usage(io, "online party attach: invalid <party_id>");
+  if (party_socket.has_value() != party_room.has_value()) {
+    return fail_usage(
+        io,
+        "online party attach: --party-socket and --party-room must be set together");
+  }
+
+  auto opened = open_online_context(opts, "online party attach", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  mp::RelayPolicy local_policy = mp::RelayPolicy::force_relays;
+  std::optional<std::string> relay_url = explicit_relay_url;
+  if (explicit_relay_policy.has_value()) {
+    local_policy = *explicit_relay_policy;
+    if (local_policy == mp::RelayPolicy::no_relays) {
+      relay_url = std::nullopt;
+    } else if (!relay_url.has_value()) {
+      relay_url = std::string{kDefaultOnlineRelayUrl};
+    }
+  } else {
+    const auto summary = opened.ctx->client.get_party(pid.value());
+    if (!summary.has_value())
+      return fail_mp_error(io, "online party attach", summary.error());
+    local_policy = summary.value().relay_policy;
+    if (local_policy == mp::RelayPolicy::no_relays) {
+      relay_url = std::nullopt;
+    } else if (!relay_url.has_value()) {
+      relay_url = summary.value().pinned_relay_url.empty()
+                      ? std::string{kDefaultOnlineRelayUrl}
+                      : summary.value().pinned_relay_url;
+    }
+  }
+
+  const auto resolved_cfg =
+      resolve_online_client_config(opts, opened.ctx->store.state().authority, io);
+  if (!resolved_cfg.has_value())
+    return 2;
+
+  MpPartyRuntimeConfig rt_cfg{
+      .client_config = *resolved_cfg,
+      .identity = opened.ctx->store.state(),
+      .party_id = pid.value(),
+      .local_relay_policy = local_policy,
+      .relay_url = relay_url,
+  };
+
+  auto runtime = MpPartyRuntime::attach(std::move(rt_cfg));
+  if (!runtime.has_value()) {
+    return fail_message(io, "online party attach: failed to attach (" +
+                                std::string{error_name(runtime.error().code)} + ", " +
+                                std::string{mp_party_runtime_error_name(
+                                    mp_party_runtime_error_of(runtime.error()))} +
+                                ")");
+  }
+
+  MpAttachSignalGuard signal_guard{};
+  MpAttachConfig attach_cfg{};
+  attach_cfg.mode = mode;
+  attach_cfg.input_fd = listen_only ? -1 : STDIN_FILENO;
+  attach_cfg.emit_line = make_mp_attach_ostream_emitter(io.out);
+  attach_cfg.stop_flag = &g_mp_attach_stop;
+  attach_cfg.exit_on_eof = exit_on_eof;
+  attach_cfg.default_room_scope = std::move(room_scope);
+  attach_cfg.local_party_socket = std::move(party_socket);
+  attach_cfg.local_party_room_id = std::move(party_room);
+
+  const auto summary = run_mp_party_attach_loop(runtime.value(), std::move(attach_cfg));
+  if (!summary.has_value()) {
+    return fail_message(io, "online party attach: runtime loop failed (" +
+                                std::string{error_name(summary.error().code)} + ")");
+  }
+  return 0;
+}
+
 int run_online_party(std::span<char *> args, CliIo io) {
   if (args.size() < 3) {
     return fail_usage(io, "online party: expected action "
-                          "(create|info|invite|join|kick|leave|disband)");
+                          "(create|info|invite|join|attach|kick|leave|disband)");
   }
   const std::string_view action{args[2]};
   if (action == "--help" || action == "-h") {
-    io.err << "usage: blackbird online party {create|info|invite|join|kick|leave|"
-              "disband} [options]\n";
+    io.err
+        << "usage: blackbird online party {create|info|invite|join|attach|kick|leave|"
+           "disband} [options]\n";
     return 0;
   }
   if (action == "create")
@@ -8200,6 +8777,8 @@ int run_online_party(std::span<char *> args, CliIo io) {
     return run_online_party_invite(args, io);
   if (action == "join")
     return run_online_party_join(args, io);
+  if (action == "attach")
+    return run_online_party_attach(args, io);
   if (action == "kick")
     return run_online_party_kick(args, io);
   if (action == "leave")
@@ -8213,12 +8792,15 @@ int run_online_cli(std::span<char *> args, CliIo io) {
   if (args.size() < 2) {
     return fail_usage(
         io, "online: expected action (health|register|whoami|resolve|devices|friends|"
-            "party)");
+            "party|web-approve)");
   }
   const std::string_view action{args[1]};
   if (action == "--help" || action == "-h") {
     io.err << "usage: blackbird online "
-              "{health|register|whoami|resolve|devices|friends|party} [options]\n";
+              "{health|register|whoami|resolve|devices|friends|party|web-approve} "
+              "[options]\n"
+              "  devices: blackbird online devices {init|install-cwt|enroll|revoke} "
+              "[options]\n";
     return 0;
   }
   if (action == "health")
@@ -8235,6 +8817,8 @@ int run_online_cli(std::span<char *> args, CliIo io) {
     return run_online_friends(args, io);
   if (action == "party")
     return run_online_party(args, io);
+  if (action == "web-approve")
+    return run_online_web_approve(args, io);
   return fail_usage(io, "online: unknown action: " + std::string{action});
 }
 

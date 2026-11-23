@@ -51,6 +51,8 @@ enum class MpClientError : std::int64_t {
   http_clock_skew = 1111,
   http_json_invalid = 1112,
   http_response_schema = 1113,
+  http_bad_request = 1114,
+  http_gone = 1115,
 
   // Local keystore
   keystore_invalid_path = 1200,
@@ -132,10 +134,27 @@ struct MpIdentityState {
   bool operator==(const MpIdentityState &) const = default;
 };
 
+struct InstallDeviceCwtRequest {
+  AccountId account_id;
+  DeviceId device_id;
+  std::string handle;
+  std::vector<std::uint8_t> device_cwt;
+  std::optional<std::string> authority;
+  std::optional<Ed25519PubKey> expected_root_pubkey;
+  std::optional<std::int64_t> now_s;
+};
+
 class MpIdentityStore {
 public:
   // Fails closed without creating directories or files.
   static Result<MpIdentityStore> open_existing(const std::filesystem::path &dir);
+
+  // Opens an existing keystore if present, or initializes a new device-only keystore
+  // (no root_seed, no account_id/device_id, empty device_cwt) with 0700/0600 perms.
+  // Fails closed on symlinks, insecure permissions, or corrupt files.
+  static Result<MpIdentityStore>
+  open_or_init_device(const std::filesystem::path &dir,
+                      std::string_view authority = kDefaultMpAuthority);
 
   // Creates directory with 0700 and writes files atomically with 0600,
   // cleansing temporary buffers.
@@ -152,6 +171,10 @@ public:
   const MpIdentityState &state() const noexcept { return state_; }
 
   Result<void> update(const MpIdentityState &state);
+  // Validates account/device/handle and confirms the CWT's embedded cnf device_pubkey
+  // matches this store's device key (plus full Ed25519 signature + expiry verification
+  // when expected_root_pubkey is provided) before atomically updating disk.
+  Result<void> install_cwt(const InstallDeviceCwtRequest &request);
   Result<Ed25519SigningKey> device_signing_key() const;
   Result<Ed25519SigningKey> root_signing_key() const;
 
@@ -248,6 +271,17 @@ struct RevokeDeviceResponse {
   std::vector<PartyId> evicted_parties;
   std::uint64_t pending_retries = 0U;
   bool operator==(const RevokeDeviceResponse &) const = default;
+};
+
+// Strict Crockford Base32 web-session user code normalizer (accepts XXXXXXXX or
+// XXXX-XXXX in uppercase/lowercase, rejects I/L/O/U and controls, returns XXXX-XXXX).
+Result<std::string> normalize_web_user_code(std::string_view user_code);
+
+struct WebSessionApproveResponse {
+  bool approved = false;
+  std::string scope;
+  std::optional<std::uint64_t> expires_at_ms;
+  bool operator==(const WebSessionApproveResponse &) const = default;
 };
 
 enum class FriendEdgeState : std::uint8_t {
@@ -433,6 +467,9 @@ public:
   Result<ResolvedAccount> resolve_handle(std::string_view handle);
   Result<EnrollDeviceResponse> enroll_device(const EnrollDeviceRequest &request);
   Result<RevokeDeviceResponse> revoke_device(DeviceId device_id);
+
+  // Web account portal approval (device-key signed POST /v1/web-sessions/approve)
+  Result<WebSessionApproveResponse> approve_web_session(std::string_view user_code);
 
   // Social graph (friends & blocks)
   Result<std::vector<FriendEdge>> list_friends();

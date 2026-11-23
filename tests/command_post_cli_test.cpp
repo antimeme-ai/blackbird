@@ -2163,6 +2163,9 @@ void test_online_cli_subcommand(const fs::path &base) {
            {"online", "whoami", "--help"},
            {"online", "resolve", "--help"},
            {"online", "devices", "--help"},
+           {"online", "devices", "init", "--help"},
+           {"online", "devices", "install-cwt", "--help"},
+           {"online", "web-approve", "--help"},
            {"online", "friends", "--help"},
            {"online", "party", "--help"},
            {"online", "party", "create", "--help"},
@@ -2171,6 +2174,13 @@ void test_online_cli_subcommand(const fs::path &base) {
     const auto help_res = run_cli(cmd);
     check(help_res.exit_code == 0 && help_res.out.empty() && !help_res.err.empty(),
           "online --help must exit 0 with usage on stderr");
+  }
+  {
+    const auto top_help = run_cli({"online", "--help"});
+    check(top_help.err.find("web-approve") != std::string::npos &&
+              top_help.err.find("init") != std::string::npos &&
+              top_help.err.find("install-cwt") != std::string::npos,
+          "online --help must list web-approve and devices init|install-cwt");
   }
 
   // 2. Invalid paths (.. traversal, C1, BiDi, BOM) fail closed with exit 2 and ZERO
@@ -2209,6 +2219,7 @@ void test_online_cli_subcommand(const fs::path &base) {
            {"online", "resolve", "wingman", "--state-dir", absent_state.string()},
            {"online", "friends", "list", "--state-dir", absent_state.string()},
            {"online", "party", "info", "5001", "--state-dir", absent_state.string()},
+           {"online", "web-approve", "ABCD-EFGH", "--state-dir", absent_state.string()},
        }) {
     const auto res = run_cli(cmd);
     check(res.exit_code != 0 && res.out.empty() && !res.err.empty(),
@@ -2349,7 +2360,7 @@ def read_http_request(conn):
 def send_json(conn, status, payload):
     body = json.dumps(payload).encode("utf-8")
     reason = {200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized",
-              404: "Not Found", 409: "Conflict"}.get(status, "Error")
+              404: "Not Found", 409: "Conflict", 410: "Gone"}.get(status, "Error")
     resp = (
         f"HTTP/1.1 {status} {reason}\r\n"
         "Content-Type: application/json\r\n"
@@ -2439,6 +2450,18 @@ def handle_request(method, target, headers, body_bytes):
             if d["device_id"] == did:
                 d["revoked_at_ms"] = now_ms
         return 200, {"revoked": True, "evicted_parties": [], "pending_retries": 0}
+
+    if method == "POST" and path == "/v1/web-sessions/approve":
+        uc = body.get("user_code", "")
+        if uc == "WXYZ-2345":
+            return 200, {
+                "approved": True,
+                "scope": "account:manage",
+                "expires_at_ms": now_ms + 3600 * 1000,
+            }
+        if uc == "9999-9999":
+            return 410, {"error": "expired"}
+        return 404, {"error": "not_found"}
 
     if method == "GET" and path == "/v1/friends":
         edges = [
@@ -2935,6 +2958,238 @@ finally:
               req_int(disbanded, "party_id") == 5001 &&
               req_int(disbanded, "party_epoch") == 5,
           "online party disband auto-epoch mismatch");
+  }
+
+  // 13. `online web-approve`: lowercase normalization, invalid Crockford rejection
+  //     before network, and 410 Gone error handling.
+  {
+    const Value approved = parse_stdout_json(
+        run_cli({"online", "web-approve", "wxyz2345", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online web-approve");
+    check(std::get<bool>(req_field(approved, "approved").value()) &&
+              req_str(approved, "user_code") == "WXYZ-2345" &&
+              req_str(approved, "scope") == "account:manage" &&
+              req_int(approved, "expires_at_ms") > 1000,
+          "online web-approve JSON mismatch");
+
+    const std::string log_before_bad = [&]() {
+      std::ifstream in(req_log_path);
+      return std::string{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>()};
+    }();
+    const auto bad_code =
+        run_cli({"online", "web-approve", "ABCD-EFGI", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    check(bad_code.exit_code == 2 && bad_code.out.empty() && !bad_code.err.empty(),
+          "invalid Crockford code must fail with exit 2");
+    const std::string log_after_bad = [&]() {
+      std::ifstream in(req_log_path);
+      return std::string{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>()};
+    }();
+    check(log_before_bad == log_after_bad,
+          "invalid web-approve code must make ZERO HTTP requests");
+
+    const auto expired =
+        run_cli({"online", "web-approve", "9999-9999", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    check(expired.exit_code == 1 && expired.out.empty() &&
+              expired.err.find("http_gone") != std::string::npos,
+          "410 web-approve must report http_gone cleanly");
+  }
+
+  // 14. Full 2-machine secondary-device linking WITHOUT root-key copying:
+  //     Machine B `devices init` -> Machine A `devices enroll` ->
+  //     Machine B `devices install-cwt` -> Machine B `whoami --local` + live `whoami`
+  //     (with ZERO root.seed on Machine B!), plus negative tests!
+  {
+    const fs::path state_dir_b = base / "online-machine-b";
+
+    // Step A: Machine B runs `devices init` (offline, device_seed ONLY).
+    const auto init_res =
+        run_cli({"online", "devices", "init", "--label", "work-box", "--state-dir",
+                 state_dir_b.string(), "--authority", "api.test.local"});
+    const Value init_json = parse_stdout_json(init_res, "online devices init");
+    const std::string dev_b_pub_b64 = req_str(init_json, "device_pubkey_b64");
+    check(std::get<bool>(req_field(init_json, "initialized").value()) &&
+              req_str(init_json, "authority") == "api.test.local" &&
+              req_str(init_json, "device_pubkey_sha256").size() == 64U &&
+              req_str(init_json, "next_step")
+                      .find("blackbird online devices enroll --label work-box "
+                            "--pubkey-b64 " +
+                            dev_b_pub_b64) != std::string::npos,
+          "online devices init JSON mismatch");
+
+    // Verify 0700/0600 perms, NO root.seed, and ZERO raw seed leakage!
+    struct stat st{};
+    check(::stat(state_dir_b.c_str(), &st) == 0 && (st.st_mode & 0777U) == 0700U,
+          "machine B keystore dir must be 0700");
+    check(!fs::exists(state_dir_b / "root.seed"),
+          "machine B must NOT have root.seed after devices init");
+    const auto dev_b_seed = read_binary_file(state_dir_b / "device.seed");
+    check(dev_b_seed.size() == 32U, "machine B device.seed must be 32 bytes");
+    const std::string init_combined = init_res.out + "\n" + init_res.err;
+    check(init_combined.find(mp::hex_lower(dev_b_seed)) == std::string::npos &&
+              init_combined.find(test_base64_encode(dev_b_seed)) == std::string::npos,
+          "devices init must NEVER leak raw device_seed");
+
+    // Negative test: running `devices init` again on existing keystore MUST fail closed
+    // and preserve device.seed byte-for-byte!
+    const auto dup_init =
+        run_cli({"online", "devices", "init", "--label", "clobber", "--state-dir",
+                 state_dir_b.string(), "--authority", "api.test.local"});
+    check(dup_init.exit_code != 0 && dup_init.out.empty() && !dup_init.err.empty(),
+          "devices init must refuse existing keystore");
+    check(read_binary_file(state_dir_b / "device.seed") == dev_b_seed,
+          "duplicate devices init must preserve existing device.seed byte-for-byte");
+
+    // Step B: Machine A (root keystore) enrolls Machine B's pubkey and emits
+    // device_cwt_b64 + root_pubkey_b64 + copy-pasteable install_cwt_command (zero
+    // root_seed!).
+    const auto enroll_res =
+        run_cli({"online", "devices", "enroll", "--label", "work-box", "--pubkey-b64",
+                 dev_b_pub_b64, "--state-dir", state_dir.string(), "--connect-host",
+                 "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()});
+    const Value enroll_json = parse_stdout_json(enroll_res, "machine A devices enroll");
+    const std::int64_t dev_b_id = req_int(enroll_json, "device_id");
+    const std::string dev_b_cwt_b64 = req_str(enroll_json, "device_cwt_b64");
+    const std::string root_pub_b64 = req_str(enroll_json, "root_pubkey_b64");
+    const std::string install_cmd = req_str(enroll_json, "install_cwt_command");
+    check(std::get<bool>(req_field(enroll_json, "enrolled").value()) &&
+              req_int(enroll_json, "account_id") == 1001 &&
+              req_str(enroll_json, "handle") == "pilot_one" && !dev_b_cwt_b64.empty() &&
+              !root_pub_b64.empty() &&
+              install_cmd.find("blackbird online devices install-cwt") !=
+                  std::string::npos &&
+              install_cmd.find(dev_b_cwt_b64) != std::string::npos,
+          "devices enroll enhanced JSON mismatch");
+    const auto root_seed_a = read_binary_file(state_dir / "root.seed");
+    const std::string enroll_combined = enroll_res.out + "\n" + enroll_res.err;
+    check(enroll_combined.find(mp::hex_lower(root_seed_a)) == std::string::npos &&
+              enroll_combined.find(test_base64_encode(root_seed_a)) ==
+                  std::string::npos,
+          "devices enroll must NEVER leak root_seed");
+
+    // Negative test: Machine B `devices install-cwt` MUST reject a CWT minted for a
+    // DIFFERENT device_pubkey without modifying disk!
+    const auto wrong_dev_enroll = parse_stdout_json(
+        run_cli({"online", "devices", "enroll", "--label", "other-box", "--pubkey-b64",
+                 extra_dev_pub_b64, "--state-dir", state_dir.string(), "--connect-host",
+                 "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()}),
+        "enroll mismatched device for negative test");
+    const std::string wrong_cwt_b64 = req_str(wrong_dev_enroll, "device_cwt_b64");
+    const auto bad_install =
+        run_cli({"online", "devices", "install-cwt", "--account-id", "1001",
+                 "--device-id", std::to_string(dev_b_id), "--handle", "pilot_one",
+                 "--cwt-b64", wrong_cwt_b64, "--state-dir", state_dir_b.string()});
+    check(bad_install.exit_code != 0 && bad_install.out.empty() &&
+              !bad_install.err.empty(),
+          "devices install-cwt must reject CWT for mismatched device_pubkey");
+    const Value loc_after_bad = parse_stdout_json(
+        run_cli({"online", "whoami", "--local", "--state-dir", state_dir_b.string()}),
+        "machine B whoami --local after rejected install-cwt");
+    check(!std::get<bool>(req_field(loc_after_bad, "registered").value()) &&
+              req_int(loc_after_bad, "device_cwt_bytes") == 0,
+          "rejected install-cwt must NOT modify machine B keystore on disk");
+
+    // Negative test: wrong --root-pubkey-b64 MUST also be rejected!
+    const auto bad_root_install = run_cli(
+        {"online", "devices", "install-cwt", "--account-id", "1001", "--device-id",
+         std::to_string(dev_b_id), "--handle", "pilot_one", "--cwt-b64", dev_b_cwt_b64,
+         "--root-pubkey-b64", wingman_pub_b64, "--state-dir", state_dir_b.string()});
+    check(bad_root_install.exit_code != 0 && bad_root_install.out.empty() &&
+              !bad_root_install.err.empty(),
+          "devices install-cwt must reject wrong --root-pubkey-b64");
+
+    // Step C: Machine B installs its valid CWT (with full --root-pubkey-b64 signature
+    // verification).
+    const Value installed = parse_stdout_json(
+        run_cli({"online", "devices", "install-cwt", "--account-id", "1001",
+                 "--device-id", std::to_string(dev_b_id), "--handle", "pilot_one",
+                 "--cwt-b64", dev_b_cwt_b64, "--root-pubkey-b64", root_pub_b64,
+                 "--state-dir", state_dir_b.string()}),
+        "machine B devices install-cwt");
+    check(std::get<bool>(req_field(installed, "installed").value()) &&
+              req_int(installed, "account_id") == 1001 &&
+              req_int(installed, "device_id") == dev_b_id &&
+              req_str(installed, "handle") == "pilot_one" &&
+              req_str(installed, "authority") == "api.test.local" &&
+              req_str(installed, "device_pubkey_sha256").size() == 64U &&
+              req_int(installed, "device_cwt_bytes") > 0,
+          "machine B devices install-cwt JSON mismatch");
+    check(!fs::exists(state_dir_b / "root.seed"),
+          "machine B must STILL have zero root.seed after install-cwt");
+
+    // Step D: Machine B `whoami --local` + live `whoami` + live `web-approve` all work
+    // with ZERO root key on Machine B!
+    const Value loc_b = parse_stdout_json(
+        run_cli({"online", "whoami", "--local", "--state-dir", state_dir_b.string()}),
+        "machine B whoami --local");
+    check(std::get<bool>(req_field(loc_b, "registered").value()) &&
+              !std::get<bool>(req_field(loc_b, "has_root_key").value()) &&
+              req_int(loc_b, "account_id") == 1001 &&
+              req_int(loc_b, "device_id") == dev_b_id &&
+              req_str(loc_b, "handle") == "pilot_one" &&
+              req_int(loc_b, "device_cwt_bytes") > 0,
+          "machine B whoami --local mismatch");
+
+    const Value live_b = parse_stdout_json(
+        run_cli({"online", "whoami", "--state-dir", state_dir_b.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "machine B live whoami");
+    check(req_int(live_b, "account_id") == 1001 &&
+              req_str(live_b, "handle") == "pilot_one",
+          "machine B live whoami mismatch");
+
+    const Value web_b = parse_stdout_json(
+        run_cli({"online", "web-approve", "WXYZ-2345", "--state-dir",
+                 state_dir_b.string(), "--connect-host", "127.0.0.1", "--port",
+                 port_str, "--ca-bundle", crt_path.string()}),
+        "machine B live web-approve");
+    check(std::get<bool>(req_field(web_b, "approved").value()) &&
+              req_str(web_b, "user_code") == "WXYZ-2345",
+          "machine B live web-approve mismatch");
+
+    // Regression test (dentist-2 #272): shell metacharacters, spaces, and single quotes
+    // in `--label` MUST be POSIX single-quoted in `devices init`'s `next_step`!
+    const fs::path state_dir_quoted = base / "online-machine-quoted";
+    const Value quoted_init = parse_stdout_json(
+        run_cli({"online", "devices", "init", "--label", "Work's $(id) Laptop",
+                 "--state-dir", state_dir_quoted.string(), "--authority",
+                 "api.test.local"}),
+        "devices init shell-quoted label");
+    const std::string quoted_pk = req_str(quoted_init, "device_pubkey_b64");
+    check(
+        req_str(quoted_init, "next_step")
+                .find("--label 'Work'\\''s $(id) Laptop' --pubkey-b64 " + quoted_pk) !=
+            std::string::npos,
+        "devices init next_step must POSIX shell-quote --label with spaces/quotes/$()");
+
+    // online party attach CLI usage & fail-closed validation checks.
+    const auto attach_help = run_cli({"online", "party", "attach", "--help"});
+    check(attach_help.exit_code == 0 &&
+              attach_help.err.find("blackbird online party attach") !=
+                  std::string::npos,
+          "online party attach --help must exit 0 with usage");
+    const auto attach_no_id = run_cli({"online", "party", "attach"});
+    check(attach_no_id.exit_code == 2 &&
+              attach_no_id.err.find("<party_id> is required") != std::string::npos,
+          "online party attach without party_id must fail usage");
+    const auto attach_bad_mode =
+        run_cli({"online", "party", "attach", "5001", "--mode", "bogus"});
+    check(attach_bad_mode.exit_code == 2 &&
+              attach_bad_mode.err.find("invalid --mode") != std::string::npos,
+          "online party attach must reject invalid --mode");
+    const auto attach_half_lobby = run_cli(
+        {"online", "party", "attach", "5001", "--party-socket", "/tmp/test.sock"});
+    check(attach_half_lobby.exit_code == 2 &&
+              attach_half_lobby.err.find("must be set together") != std::string::npos,
+          "online party attach must require --party-socket and --party-room together");
   }
 }
 

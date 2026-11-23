@@ -298,6 +298,164 @@ void test_kitty_encoder_roundtrip_and_erase() {
         "small frame emits single m=0 chunk");
 }
 
+void test_kitty_rgb_encoder_roundtrip() {
+  using namespace blackbird;
+
+  HeroFlightDeckEngine engine(HeroCanvasConfig{
+      .size = HeroSize{.width = 160, .height = 100},
+      .theme = HeroThemeId::hackerman,
+      .seed = 7,
+  });
+  const auto &frame = engine.step_and_render(0.05F);
+  const HeroKittyPlacement placement{.row = 2,
+                                     .column = 4,
+                                     .columns = 60,
+                                     .rows = 20,
+                                     .image_id = 72172,
+                                     .placement_id = 1};
+  const std::string rgba_enc = encode_kitty_rgba_frame(frame, placement);
+  const std::string rgb_enc = encode_kitty_rgb_frame(frame, placement);
+
+  check(rgb_enc.starts_with(
+            "\x1b"
+            "7\x1b[3;5H\x1b_Ga=T,f=24,s=160,v=100,i=72172,p=1,q=2,C=1,c=60,r=20,m=1;"),
+        "kitty rgb prefix header uses f=24");
+  check(rgb_enc.ends_with("\x1b\\"
+                          "\x1b"
+                          "8"),
+        "kitty rgb trailer ends with ST + DECRC");
+  check(rgb_enc.size() * 100U < rgba_enc.size() * 78U,
+        "kitty f=24 RGB payload is ~25% smaller than f=32 RGBA");
+
+  std::size_t pos = rgb_enc.find("\x1b_G");
+  std::string all_b64;
+  std::size_t chunk_count = 0;
+  bool saw_final_m0 = false;
+  while (pos != std::string::npos) {
+    const std::size_t semi = rgb_enc.find(';', pos);
+    const std::size_t st = rgb_enc.find("\x1b\\", semi);
+    check(semi != std::string::npos && st != std::string::npos,
+          "valid RGB APC framing");
+    if (semi == std::string::npos || st == std::string::npos) {
+      break;
+    }
+    const std::string_view header(rgb_enc.data() + pos + 3, semi - (pos + 3));
+    const std::string_view payload(rgb_enc.data() + semi + 1, st - (semi + 1));
+    check(payload.size() <= 4096U, "RGB base64 chunk <= 4096 bytes");
+    const bool is_m0 = header.find("m=0") != std::string_view::npos;
+    const bool is_m1 = header.find("m=1") != std::string_view::npos;
+    check(is_m0 != is_m1, "RGB chunk specifies exactly one of m=0 or m=1");
+    if (is_m0) {
+      saw_final_m0 = true;
+    } else {
+      check(payload.size() == 4096U, "non-final RGB chunk is full 4096 base64 bytes");
+    }
+    all_b64.append(payload);
+    ++chunk_count;
+    pos = rgb_enc.find("\x1b_G", st + 2);
+  }
+  check(chunk_count > 1U, "160x100 RGB splits into multiple Kitty chunks");
+  check(saw_final_m0, "final RGB chunk ends with m=0");
+
+  const auto decoded = decode_base64(all_b64);
+  const std::size_t expected_rgb_bytes = static_cast<std::size_t>(frame.width) *
+                                         static_cast<std::size_t>(frame.height) * 3U;
+  check(decoded.size() == expected_rgb_bytes,
+        "kitty rgb decoded byte count == width * height * 3");
+  bool pixels_match = decoded.size() == expected_rgb_bytes;
+  for (std::size_t p = 0; pixels_match && p < expected_rgb_bytes / 3U; ++p) {
+    if (decoded[p * 3U] != frame.rgba[p * 4U] ||
+        decoded[p * 3U + 1U] != frame.rgba[p * 4U + 1U] ||
+        decoded[p * 3U + 2U] != frame.rgba[p * 4U + 2U]) {
+      pixels_match = false;
+    }
+  }
+  check(pixels_match, "kitty rgb decoded bytes match frame RGBA with alpha stripped");
+
+  // Single-chunk tiny RGB frame (8x8x3 = 192 bytes -> m=0).
+  HeroFrame tiny{
+      .width = 8, .height = 8, .rgba = std::vector<std::uint8_t>(8 * 8 * 4, 200)};
+  const std::string tiny_rgb = encode_kitty_rgb_frame(
+      tiny, HeroKittyPlacement{.row = 0, .column = 0, .columns = 4, .rows = 2});
+  check(tiny_rgb.find("f=24,") != std::string::npos &&
+            tiny_rgb.find("m=0;") != std::string::npos &&
+            tiny_rgb.find("m=1;") == std::string::npos,
+        "small RGB frame emits single m=0 chunk");
+}
+
+void test_halfblock_coalescing_and_diff() {
+  using namespace blackbird;
+
+  // 1) Solid frame coalesces identical top == bot cells to ASCII spaces with bg only.
+  HeroFrame solid{
+      .width = 16, .height = 8, .rgba = std::vector<std::uint8_t>(16 * 8 * 4)};
+  for (std::size_t p = 0; p < 16U * 8U; ++p) {
+    solid.rgba[p * 4U] = 12;
+    solid.rgba[p * 4U + 1U] = 34;
+    solid.rgba[p * 4U + 2U] = 56;
+    solid.rgba[p * 4U + 3U] = 255;
+  }
+  const auto solid_rows = encode_truecolor_halfblock_frame(
+      solid, HeroHalfBlockOptions{.columns = 8, .rows = 4});
+  check(solid_rows.size() == 4U, "solid halfblock produces exact row count");
+  for (const auto &row : solid_rows) {
+    check(row == "\x1b[48;2;12;34;56m        \x1b[0m",
+          "solid row coalesces to single bg SGR + ASCII spaces without half-block");
+    check(row.find("\xE2\x96\x80") == std::string::npos, "solid row omits half-block");
+    check(row.find("\x1b[38;2;") == std::string::npos, "solid row omits fg SGR");
+  }
+
+  // 2) Mixed top/bot frame preserves exact RGB colors and keeps prev_fg across spaces.
+  HeroFrame mixed{
+      .width = 4, .height = 2, .rgba = std::vector<std::uint8_t>(4 * 2 * 4, 255)};
+  auto set_px = [&](std::size_t x, std::size_t y, HeroRgb rgb) {
+    const std::size_t off = (y * 4U + x) * 4U;
+    mixed.rgba[off] = rgb.r;
+    mixed.rgba[off + 1U] = rgb.g;
+    mixed.rgba[off + 2U] = rgb.b;
+    mixed.rgba[off + 3U] = 255;
+  };
+  set_px(0, 0, HeroRgb{10, 20, 30});
+  set_px(0, 1, HeroRgb{40, 50, 60});
+  set_px(1, 0, HeroRgb{40, 50, 60});
+  set_px(1, 1, HeroRgb{40, 50, 60});
+  set_px(2, 0, HeroRgb{10, 20, 30});
+  set_px(2, 1, HeroRgb{40, 50, 60});
+  set_px(3, 0, HeroRgb{70, 80, 90});
+  set_px(3, 1, HeroRgb{40, 50, 60});
+  const auto mixed_rows = encode_truecolor_halfblock_frame(
+      mixed, HeroHalfBlockOptions{.columns = 4, .rows = 1});
+  check(mixed_rows.size() == 1U, "mixed halfblock produces 1 row");
+  const std::string expected_mixed =
+      "\x1b[38;2;10;20;30m\x1b[48;2;40;50;60m\xE2\x96\x80 \xE2\x96\x80"
+      "\x1b[38;2;70;80;90m\xE2\x96\x80\x1b[0m";
+  check(mixed_rows[0] == expected_mixed,
+        "mixed halfblock preserves exact RGB and elides redundant fg/bg across spaces");
+
+  // 3) Row diffing: full redraw, identical 0-byte frame, single-row diff, size
+  // mismatch.
+  const std::vector<std::string> prev = {"row0", "row1", "row2", "row3"};
+  const std::string full = encode_halfblock_diff(
+      HeroHalfBlockDiff{.prev_rows = prev, .curr_rows = prev, .full_redraw = true});
+  check(full == "\x1b[1;1Hrow0\x1b[2;1Hrow1\x1b[3;1Hrow2\x1b[4;1Hrow3",
+        "full_redraw emits every row");
+
+  const std::string same = encode_halfblock_diff(
+      HeroHalfBlockDiff{.prev_rows = prev, .curr_rows = prev, .full_redraw = false});
+  check(same.empty(), "identical frame diff emits 0 bytes");
+
+  std::vector<std::string> one_changed = prev;
+  one_changed[2] = "row2_updated";
+  const std::string single = encode_halfblock_diff(HeroHalfBlockDiff{
+      .prev_rows = prev, .curr_rows = one_changed, .full_redraw = false});
+  check(single == "\x1b[3;1Hrow2_updated", "single changed row emits only that row");
+
+  const std::vector<std::string> shorter = {"row0", "row1"};
+  const std::string resized = encode_halfblock_diff(
+      HeroHalfBlockDiff{.prev_rows = shorter, .curr_rows = prev, .full_redraw = false});
+  check(resized == full, "row count mismatch emits all rows");
+}
+
 void test_halfblock_and_hostile_labels() {
   using namespace blackbird;
 
@@ -334,11 +492,17 @@ void test_halfblock_and_hostile_labels() {
       frame, HeroHalfBlockOptions{.columns = 80, .rows = 24});
   check(lines.size() == 24U, "halfblock produces exact rows lines");
 
+  std::size_t rows_with_halfblock = 0;
   for (const auto &line : lines) {
-    check(line.find("\x1b[38;2;") != std::string::npos, "line has 24-bit fg ANSI");
     check(line.find("\x1b[48;2;") != std::string::npos, "line has 24-bit bg ANSI");
-    check(line.find("\xE2\x96\x80") != std::string::npos,
-          "line contains half-block glyph");
+    const bool has_halfblock = line.find("\xE2\x96\x80") != std::string::npos;
+    if (has_halfblock) {
+      ++rows_with_halfblock;
+      check(line.find("\x1b[38;2;") != std::string::npos,
+            "half-block row has 24-bit fg ANSI");
+    } else {
+      check(line.find(' ') != std::string::npos, "coalesced row emits ASCII spaces");
+    }
     check(line.ends_with("\x1b[0m"), "line resets SGR");
     // Ensure zero raw C0/BEL/DEL/OSC/APC control bytes anywhere in encoded output.
     for (std::size_t i = 0; i < line.size(); ++i) {
@@ -351,6 +515,7 @@ void test_halfblock_and_hostile_labels() {
       check(b >= 0x20U && b != 0x7FU, "zero raw control chars in halfblock output");
     }
   }
+  check(rows_with_halfblock >= 16U, "rendered scene contains half-block rows");
 }
 
 void test_determinism_and_performance() {
@@ -378,6 +543,47 @@ void test_determinism_and_performance() {
   std::cout << "hero_flightdeck_480x300_ms_per_frame=" << ms_per_frame << "\n";
   // Generous ceiling so unoptimized debug+ASan builds still pass comfortably.
   check(ms_per_frame < 250.0, "render performance within budget");
+
+  // Measure Kitty RGBA vs RGB payload sizes (480x300 and smart 384x240) and
+  // half-block full vs steady-state diff bytes at 180x50.
+  const HeroKittyPlacement kitty_place{
+      .row = 0, .column = 0, .columns = 128, .rows = 40};
+  const std::string kitty_480_rgba = encode_kitty_rgba_frame(e1.frame(), kitty_place);
+  const std::string kitty_480_rgb = encode_kitty_rgb_frame(e1.frame(), kitty_place);
+  HeroFlightDeckEngine e_kitty(HeroCanvasConfig{
+      .size = HeroSize{.width = 384, .height = 240},
+      .theme = HeroThemeId::synthwave,
+      .seed = 12345,
+  });
+  const auto &fk = e_kitty.step_and_render(1.0F / 30.0F);
+  const std::string kitty_384_rgb = encode_kitty_rgb_frame(fk, kitty_place);
+  std::cout << "hero_kitty_480x300_rgba_bytes=" << kitty_480_rgba.size() << "\n";
+  std::cout << "hero_kitty_480x300_rgb_bytes=" << kitty_480_rgb.size() << "\n";
+  std::cout << "hero_kitty_384x240_rgb_bytes=" << kitty_384_rgb.size() << "\n";
+
+  HeroFlightDeckEngine e_hb(HeroCanvasConfig{
+      .size = HeroSize{.width = 180, .height = 100},
+      .theme = HeroThemeId::synthwave,
+      .seed = 12345,
+  });
+  const HeroHalfBlockOptions hb_opts{.columns = 180, .rows = 50};
+  auto prev_hb =
+      encode_truecolor_halfblock_frame(e_hb.step_and_render(1.0F / 30.0F), hb_opts);
+  const std::string full_hb = encode_halfblock_diff(
+      HeroHalfBlockDiff{.prev_rows = {}, .curr_rows = prev_hb, .full_redraw = true});
+  std::size_t diff_hb_total = 0;
+  for (int i = 0; i < 10; ++i) {
+    auto curr_hb =
+        encode_truecolor_halfblock_frame(e_hb.step_and_render(1.0F / 30.0F), hb_opts);
+    diff_hb_total += encode_halfblock_diff(HeroHalfBlockDiff{.prev_rows = prev_hb,
+                                                             .curr_rows = curr_hb,
+                                                             .full_redraw = false})
+                         .size();
+    prev_hb = std::move(curr_hb);
+  }
+  std::cout << "hero_halfblock_180x50_full_bytes=" << full_hb.size() << "\n";
+  std::cout << "hero_halfblock_180x50_steady_diff_bytes=" << (diff_hb_total / 10U)
+            << "\n";
 }
 
 void test_kitty_capability_env() {
@@ -446,6 +652,8 @@ void test_safety_hardening_regressions() {
   };
   const std::string kitty_wrap = encode_kitty_rgba_frame(wrap_frame);
   check(kitty_wrap.empty(), "kitty encoder rejects 64-bit overflow dimensions");
+  check(encode_kitty_rgb_frame(wrap_frame).empty(),
+        "kitty rgb encoder rejects 64-bit overflow dimensions");
   const auto hb_wrap = encode_truecolor_halfblock_frame(
       wrap_frame, HeroHalfBlockOptions{.columns = 8, .rows = 4});
   check(hb_wrap.size() == 4U, "halfblock encoder safely handles overflow dimensions");
@@ -458,6 +666,15 @@ void test_safety_hardening_regressions() {
                              .rows = 2})
           .empty(),
       "kitty encoder rejects max row overflow");
+  check(
+      encode_kitty_rgb_frame(
+          HeroFrame{.width = 4, .height = 4, .rgba = std::vector<std::uint8_t>(64, 1)},
+          HeroKittyPlacement{.row = std::numeric_limits<std::size_t>::max(),
+                             .column = 0,
+                             .columns = 4,
+                             .rows = 2})
+          .empty(),
+      "kitty rgb encoder rejects max row overflow");
   check(
       encode_truecolor_halfblock_frame(
           HeroFrame{.width = 4, .height = 4, .rgba = std::vector<std::uint8_t>(64, 1)},
@@ -525,6 +742,8 @@ int main() {
   test_steering_and_spring_return();
   test_fly_to_answer_and_key_answer();
   test_kitty_encoder_roundtrip_and_erase();
+  test_kitty_rgb_encoder_roundtrip();
+  test_halfblock_coalescing_and_diff();
   test_halfblock_and_hostile_labels();
   test_determinism_and_performance();
   test_kitty_capability_env();

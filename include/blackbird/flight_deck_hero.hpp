@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -196,6 +197,12 @@ struct HeroHalfBlockOptions {
   std::size_t rows = 24;
 };
 
+struct HeroHalfBlockDiff {
+  std::span<const std::string> prev_rows{};
+  std::span<const std::string> curr_rows{};
+  bool full_redraw = false;
+};
+
 // Zero-dependency physics particle token shower + additive glow/fog buffers.
 class HeroParticleSystem {
 public:
@@ -254,6 +261,9 @@ private:
   std::vector<float> acc_;
   std::vector<float> glow_buf_;
   std::vector<float> fog_buf_;
+  mutable std::vector<float> fog_blur_;
+  mutable std::vector<float> glow_blur_;
+  mutable std::vector<float> blur_tmp_;
   std::uint32_t matrix_cols_ = 0;
   std::uint32_t matrix_rows_ = 0;
   std::vector<float> matrix_bright_;
@@ -371,13 +381,24 @@ bool kitty_graphics_capable();
 std::string encode_kitty_rgba_frame(const HeroFrame &frame,
                                     const HeroKittyPlacement &placement = {});
 
+// Encodes an RGBA8888 HeroFrame as 24-bit RGB (f=24, stripping opaque alpha)
+// into 4096-byte base64-chunked Kitty APC sequences anchored at
+// (placement.row, placement.column).
+std::string encode_kitty_rgb_frame(const HeroFrame &frame,
+                                   const HeroKittyPlacement &placement = {});
+
 // Deletes the uploaded Kitty graphics image and its placements.
 std::string encode_kitty_erase(std::uint32_t image_id = hero_default_kitty_image_id);
 
 // Encodes an RGBA8888 HeroFrame into 24-bit truecolor half-block ("▀") rows
-// with per-row run-length color deduplication for non-Kitty terminals.
+// with per-row run-length color deduplication and same-color space coalescing
+// for non-Kitty terminals.
 std::vector<std::string>
 encode_truecolor_halfblock_frame(const HeroFrame &frame,
                                  const HeroHalfBlockOptions &options = {});
+
+// Emits cursor-addressed ANSI updates for changed half-block rows only
+// (or all rows when diff.full_redraw is true or row counts differ).
+std::string encode_halfblock_diff(const HeroHalfBlockDiff &diff);
 
 } // namespace blackbird

@@ -2826,6 +2826,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   std::string flightdeck_escape;
   auto flightdeck_escape_deadline = std::chrono::steady_clock::time_point::max();
   std::shared_ptr<const TerminalQuestion> flightdeck_synced_question;
+  std::vector<std::string> flightdeck_prev_hb_rows;
   auto route = tui::ViewRoute::conversation;
   std::string_view route_notice;
   const auto select_view = [&](tui::ViewRoute requested, RawEventRef origin,
@@ -3798,11 +3799,17 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (!flightdeck_engine)
             flightdeck_engine.emplace(HeroCanvasConfig{});
           const std::uint32_t target_w =
-              std::clamp<std::uint32_t>(static_cast<std::uint32_t>(width) * 5U,
-                                        hero_min_width, hero_default_width);
+              flightdeck_kitty_capable
+                  ? std::clamp<std::uint32_t>(static_cast<std::uint32_t>(width) * 3U,
+                                              hero_min_width, 384U)
+                  : std::clamp<std::uint32_t>(static_cast<std::uint32_t>(width),
+                                              hero_min_width, 320U);
           const std::uint32_t target_h =
-              std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows) * 10U,
-                                        hero_min_height, hero_default_height);
+              flightdeck_kitty_capable
+                  ? std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows) * 6U,
+                                              hero_min_height, 240U)
+                  : std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows) * 2U,
+                                              hero_min_height, 200U);
           if (flightdeck_engine->width() != target_w ||
               flightdeck_engine->height() != target_h) {
             flightdeck_engine->resize(HeroSize{.width = target_w, .height = target_h});
@@ -3900,7 +3907,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               std::chrono::duration<float>(now - flightdeck_last_step).count(), 0.01F,
               0.10F);
           flightdeck_last_step = now;
-          flightdeck_next_frame = now + std::chrono::milliseconds{60};
+          flightdeck_next_frame = now + std::chrono::milliseconds{33};
           const auto &hero_frame = flightdeck_engine->step_and_render(dt);
           if (const auto picked = flightdeck_engine->take_answered_index();
               picked.has_value()) {
@@ -3939,7 +3946,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             pending_image_loaded = false;
           }
           if (flightdeck_kitty_capable) {
-            payload += encode_kitty_rgba_frame(
+            payload += encode_kitty_rgb_frame(
                 hero_frame, HeroKittyPlacement{.row = 0,
                                                .column = 0,
                                                .columns = width,
@@ -3948,13 +3955,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                                .placement_id = 1});
             flightdeck_kitty_emitted = true;
           } else {
-            payload += "\x1b[H\x1b[0m";
-            const auto hb_rows = encode_truecolor_halfblock_frame(
+            auto hb_rows = encode_truecolor_halfblock_frame(
                 hero_frame, HeroHalfBlockOptions{.columns = width, .rows = rows});
-            for (std::size_t r = 0; r < hb_rows.size(); ++r) {
-              payload += "\x1b[" + std::to_string(r + 1U) + ";1H";
-              payload += hb_rows[r];
+            const std::string hb_diff = encode_halfblock_diff(HeroHalfBlockDiff{
+                .prev_rows = flightdeck_prev_hb_rows,
+                .curr_rows = hb_rows,
+                .full_redraw = flightdeck_first_frame || geometry_changed,
+            });
+            if (!hb_diff.empty()) {
+              payload += "\x1b[0m";
+              payload += hb_diff;
             }
+            flightdeck_prev_hb_rows = std::move(hb_rows);
           }
           payload += "\x1b[?2026l";
           flightdeck_first_frame = false;
@@ -4532,15 +4544,28 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
          {notifications.read_fd(), POLLIN, 0},
          {STDOUT_FILENO, static_cast<short>(output.pending() ? POLLOUT : 0), 0},
          {resize_->read_fd(), POLLIN, 0}}};
-    const auto ready = terminal_native_poll(
-        &terminal_context, inputs,
-        composer.escape_pending() || !child_escape.empty() || !party_escape.empty() ||
-                !flightdeck_escape.empty()
-            ? 50
-        : flightdeck_open                                    ? 55
-        : busy || commands                                   ? 40
-        : context_blinking(std::chrono::steady_clock::now()) ? 125
-                                                             : 1000);
+    const int poll_timeout_ms = [&]() -> int {
+      if (flightdeck_open) {
+        const auto poll_now = std::chrono::steady_clock::now();
+        auto next_wake = flightdeck_next_frame;
+        if (!flightdeck_escape.empty() && flightdeck_escape_deadline < next_wake)
+          next_wake = flightdeck_escape_deadline;
+        if (next_wake <= poll_now)
+          return 1;
+        const auto remaining_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(next_wake - poll_now)
+                .count();
+        return static_cast<int>(std::clamp<std::int64_t>(remaining_ms, 1, 33));
+      }
+      if (composer.escape_pending() || !child_escape.empty() || !party_escape.empty())
+        return 50;
+      if (busy || commands)
+        return 40;
+      if (context_blinking(std::chrono::steady_clock::now()))
+        return 125;
+      return 1000;
+    }();
+    const auto ready = terminal_native_poll(&terminal_context, inputs, poll_timeout_ms);
     if (ready < 0) {
       if (errno == EINTR)
         continue;
@@ -4558,6 +4583,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       flightdeck_open = false;
       flightdeck_escape.clear();
       flightdeck_control = {};
+      flightdeck_prev_hb_rows.clear();
       if (flightdeck_kitty_emitted) {
         flightdeck_pending_erase = true;
         flightdeck_kitty_emitted = false;
@@ -4571,6 +4597,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       flightdeck_first_frame = true;
       flightdeck_escape.clear();
       flightdeck_control = {};
+      flightdeck_prev_hb_rows.clear();
       flightdeck_last_step = std::chrono::steady_clock::now();
       flightdeck_next_frame = std::chrono::steady_clock::time_point::min();
       viewport_invalidated = true;
@@ -4753,10 +4780,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         const char byte = bytes[i];
         const auto u = static_cast<unsigned char>(byte);
         const auto input_now = std::chrono::steady_clock::now();
-        redraw = true;
         auto steer = [&](HeroControlInput ctl) {
           flightdeck_control = ctl;
           flightdeck_steer_until = input_now + std::chrono::milliseconds{220};
+          if (input_now >= flightdeck_next_frame)
+            redraw = true;
         };
         if (!flightdeck_escape.empty()) {
           if (u == 27U) {
@@ -4820,6 +4848,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (!flightdeck_engine)
             flightdeck_engine.emplace(HeroCanvasConfig{});
           flightdeck_engine->cycle_theme();
+          redraw = true;
         } else if (byte == 'g' || byte == 'G') {
           if (!flightdeck_engine)
             flightdeck_engine.emplace(HeroCanvasConfig{});
@@ -4836,6 +4865,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               flightdeck_engine->set_question(std::move(demo));
               flightdeck_demo_gate_active = true;
             }
+            redraw = true;
           }
         } else if (byte == '1' || byte == '2' || byte == '3') {
           if (flightdeck_engine &&
@@ -4849,6 +4879,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                            keyboard_read);
               }
             }
+            redraw = true;
           }
         }
         keyboard_process.progress(static_cast<std::size_t>(i) + 1);

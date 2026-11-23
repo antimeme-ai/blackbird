@@ -1083,23 +1083,33 @@ std::string_view env_view(const char *name) noexcept {
   return val ? std::string_view{val} : std::string_view{};
 }
 
-// Fast 1D separable 3-tap blur on a low-res RGB float buffer.
+// Fast 1D separable 3-tap blur on a low-res RGB float buffer using caller scratch.
 struct LowResBuf {
   std::vector<float> *rgb = nullptr;
+  std::vector<float> *tmp = nullptr;
   int width = 0;
   int height = 0;
 };
 
-void blur_lowres_rgb(LowResBuf buf) {
-  if (buf.width < 3 || buf.height < 3 || buf.rgb == nullptr) {
+bool has_lowres_energy(const std::vector<float> &buf) noexcept {
+  for (const float v : buf) {
+    if (v > 0.05F) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void blur_lowres_rgb(LowResBuf buf) noexcept {
+  if (buf.width < 3 || buf.height < 3 || buf.rgb == nullptr || buf.tmp == nullptr) {
     return;
   }
   const auto count =
       static_cast<std::size_t>(buf.width) * static_cast<std::size_t>(buf.height) * 3U;
-  if (buf.rgb->size() < count) {
+  if (buf.rgb->size() < count || buf.tmp->size() < count) {
     return;
   }
-  std::vector<float> tmp(count, 0.0F);
+  float *tmp = buf.tmp->data();
   const float *src = buf.rgb->data();
   // Horizontal pass [0.25, 0.5, 0.25]
   for (int y = 0; y < buf.height; ++y) {
@@ -1219,16 +1229,35 @@ constexpr std::array<std::uint8_t, 6> kClassFlow = {2, 1, 1, 0, 0, 1};
 constexpr std::size_t kMaxParticles = 4096;
 
 void append_base64(std::string &out, std::span<const std::uint8_t> bytes) {
+  if (bytes.empty()) {
+    return;
+  }
   constexpr std::string_view kAlpha =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+  const std::size_t groups = (bytes.size() - 1U) / 3U + 1U;
+  const std::size_t old_size = out.size();
+  out.resize(old_size + groups * 4U);
+  char *dst = out.data() + old_size;
+  const std::size_t full_end = (bytes.size() / 3U) * 3U;
+  std::size_t i = 0;
+  for (; i < full_end; i += 3) {
     const auto a = static_cast<unsigned>(bytes[i]);
-    const auto b = i + 1 < bytes.size() ? static_cast<unsigned>(bytes[i + 1]) : 0U;
-    const auto c = i + 2 < bytes.size() ? static_cast<unsigned>(bytes[i + 2]) : 0U;
-    out += kAlpha[a >> 2U];
-    out += kAlpha[((a & 3U) << 4U) | (b >> 4U)];
-    out += (i + 1 < bytes.size()) ? kAlpha[((b & 15U) << 2U) | (c >> 6U)] : '=';
-    out += (i + 2 < bytes.size()) ? kAlpha[c & 63U] : '=';
+    const auto b = static_cast<unsigned>(bytes[i + 1]);
+    const auto c = static_cast<unsigned>(bytes[i + 2]);
+    dst[0] = kAlpha[a >> 2U];
+    dst[1] = kAlpha[((a & 3U) << 4U) | (b >> 4U)];
+    dst[2] = kAlpha[((b & 15U) << 2U) | (c >> 6U)];
+    dst[3] = kAlpha[c & 63U];
+    dst += 4;
+  }
+  if (i < bytes.size()) {
+    const auto a = static_cast<unsigned>(bytes[i]);
+    const bool has_b = (i + 1 < bytes.size());
+    const auto b = has_b ? static_cast<unsigned>(bytes[i + 1]) : 0U;
+    dst[0] = kAlpha[a >> 2U];
+    dst[1] = kAlpha[((a & 3U) << 4U) | (b >> 4U)];
+    dst[2] = has_b ? kAlpha[(b & 15U) << 2U] : '=';
+    dst[3] = '=';
   }
 }
 
@@ -1443,8 +1472,9 @@ bool HeroParticleSystem::buffers_valid() const noexcept {
   const std::size_t expected_mat =
       static_cast<std::size_t>(matrix_cols_) * static_cast<std::size_t>(matrix_rows_);
   return acc_.size() == expected_acc && glow_buf_.size() == expected_low &&
-         fog_buf_.size() == expected_low && matrix_bright_.size() == expected_mat &&
-         matrix_glyph_.size() == expected_mat;
+         fog_buf_.size() == expected_low && fog_blur_.size() == expected_low &&
+         glow_blur_.size() == expected_low && blur_tmp_.size() == expected_low &&
+         matrix_bright_.size() == expected_mat && matrix_glyph_.size() == expected_mat;
 }
 
 void HeroParticleSystem::reset(HeroSize size, std::uint32_t seed) {
@@ -1466,10 +1496,13 @@ void HeroParticleSystem::reset(HeroSize size, std::uint32_t seed) {
   particles_.reserve(1024);
   acc_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 3U,
               0.0F);
-  glow_buf_.assign(
-      static_cast<std::size_t>(glow_w_) * static_cast<std::size_t>(glow_h_) * 3U, 0.0F);
-  fog_buf_.assign(
-      static_cast<std::size_t>(glow_w_) * static_cast<std::size_t>(glow_h_) * 3U, 0.0F);
+  const auto low_count =
+      static_cast<std::size_t>(glow_w_) * static_cast<std::size_t>(glow_h_) * 3U;
+  glow_buf_.assign(low_count, 0.0F);
+  fog_buf_.assign(low_count, 0.0F);
+  fog_blur_.assign(low_count, 0.0F);
+  glow_blur_.assign(low_count, 0.0F);
+  blur_tmp_.assign(low_count, 0.0F);
   matrix_cols_ = std::max<std::uint32_t>(8, (width_ + 8) / 9);
   matrix_rows_ = std::max<std::uint32_t>(8, (height_ + 10) / 11);
   matrix_bright_.assign(static_cast<std::size_t>(matrix_cols_) *
@@ -1886,27 +1919,28 @@ void HeroParticleSystem::composite(std::vector<std::uint8_t> &rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
-  // Blurred additive fog + team glow upsampled from W/4 x H/4.
-  std::vector<float> fog_blur = fog_buf_;
-  std::vector<float> glow_blur = glow_buf_;
-  blur_lowres_rgb(LowResBuf{.rgb = &fog_blur,
-                            .width = static_cast<int>(glow_w_),
-                            .height = static_cast<int>(glow_h_)});
-  blur_lowres_rgb(LowResBuf{.rgb = &glow_blur,
-                            .width = static_cast<int>(glow_w_),
-                            .height = static_cast<int>(glow_h_)});
-  blur_lowres_rgb(LowResBuf{.rgb = &glow_blur,
-                            .width = static_cast<int>(glow_w_),
-                            .height = static_cast<int>(glow_h_)});
-
-  upsample_additive(cv, UpsampleSpec{.src = &fog_blur,
-                                     .src_w = static_cast<int>(glow_w_),
-                                     .src_h = static_cast<int>(glow_h_),
-                                     .gain = 0.90F});
-  upsample_additive(cv, UpsampleSpec{.src = &glow_blur,
-                                     .src_w = static_cast<int>(glow_w_),
-                                     .src_h = static_cast<int>(glow_h_),
-                                     .gain = 0.65F + theme.bloom * 0.55F});
+  // Blurred additive fog + team glow upsampled from W/4 x H/4 using preallocated
+  // scratch buffers; skip empty low-res buffers completely.
+  const int gw = static_cast<int>(glow_w_);
+  const int gh = static_cast<int>(glow_h_);
+  if (has_lowres_energy(fog_buf_)) {
+    std::copy(fog_buf_.begin(), fog_buf_.end(), fog_blur_.begin());
+    blur_lowres_rgb(
+        LowResBuf{.rgb = &fog_blur_, .tmp = &blur_tmp_, .width = gw, .height = gh});
+    upsample_additive(
+        cv, UpsampleSpec{.src = &fog_blur_, .src_w = gw, .src_h = gh, .gain = 0.90F});
+  }
+  if (has_lowres_energy(glow_buf_)) {
+    std::copy(glow_buf_.begin(), glow_buf_.end(), glow_blur_.begin());
+    blur_lowres_rgb(
+        LowResBuf{.rgb = &glow_blur_, .tmp = &blur_tmp_, .width = gw, .height = gh});
+    blur_lowres_rgb(
+        LowResBuf{.rgb = &glow_blur_, .tmp = &blur_tmp_, .width = gw, .height = gh});
+    upsample_additive(cv, UpsampleSpec{.src = &glow_blur_,
+                                       .src_w = gw,
+                                       .src_h = gh,
+                                       .gain = 0.65F + theme.bloom * 0.55F});
+  }
 
   // Hackerman matrix glyph overlay.
   if (theme.cr_style == HeroCacheReadStyle::code && matrix_cols_ > 0 &&
@@ -3519,13 +3553,17 @@ void HeroFlightDeckEngine::draw_scanlines(const HeroTheme &spec) {
     return;
   }
   const float keep = std::clamp(1.0F - spec.scan, 0.0F, 1.0F);
+  const auto keep_u16 = static_cast<std::uint16_t>(std::lround(keep * 256.0F));
   for (std::uint32_t y = 0; y < height_; y += 3) {
     std::uint8_t *row = frame_.rgba.data() + static_cast<std::size_t>(y) *
                                                  static_cast<std::size_t>(width_) * 4U;
     for (std::uint32_t x = 0; x < width_; ++x) {
-      row[0] = clamp_u8(static_cast<float>(row[0]) * keep);
-      row[1] = clamp_u8(static_cast<float>(row[1]) * keep);
-      row[2] = clamp_u8(static_cast<float>(row[2]) * keep);
+      row[0] = static_cast<std::uint8_t>(
+          (static_cast<std::uint32_t>(row[0]) * keep_u16) >> 8U);
+      row[1] = static_cast<std::uint8_t>(
+          (static_cast<std::uint32_t>(row[1]) * keep_u16) >> 8U);
+      row[2] = static_cast<std::uint8_t>(
+          (static_cast<std::uint32_t>(row[2]) * keep_u16) >> 8U);
       row += 4;
     }
   }
@@ -3746,6 +3784,83 @@ std::string encode_kitty_rgba_frame(const HeroFrame &frame,
   return out;
 }
 
+std::string encode_kitty_rgb_frame(const HeroFrame &frame,
+                                   const HeroKittyPlacement &placement) {
+  const auto expected_opt =
+      checked_rgba_bytes(HeroSize{.width = frame.width, .height = frame.height});
+  constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
+  if (!expected_opt.has_value() || frame.rgba.size() != *expected_opt ||
+      placement.columns == 0 || placement.rows == 0 || placement.row == kMaxSize ||
+      placement.column == kMaxSize) {
+    return {};
+  }
+  const std::size_t pixels = *expected_opt / 4U;
+  const std::size_t rgb_bytes = pixels * 3U;
+
+  // 1024 pixels = 3072 RGB bytes -> exactly 4096 base64 characters per Kitty chunk.
+  constexpr std::size_t kChunkPixels = 1024;
+  constexpr std::size_t kRawChunkBytes = kChunkPixels * 3U;
+  const std::size_t b64_groups = (rgb_bytes - 1U) / 3U + 1U;
+  const std::size_t num_chunks = (rgb_bytes - 1U) / kRawChunkBytes + 1U;
+  std::string out;
+  if (b64_groups <= (kMaxSize - 96U) / 4U &&
+      num_chunks <= (kMaxSize - b64_groups * 4U - 96U) / 24U) {
+    out.reserve(b64_groups * 4U + num_chunks * 24U + 96U);
+  }
+
+  // Anchor at (row, column) with DECSC/DECRC cursor save/restore.
+  out += "\x1b"
+         "7\x1b[";
+  out += std::to_string(placement.row + 1);
+  out += ';';
+  out += std::to_string(placement.column + 1);
+  out += 'H';
+
+  std::array<std::uint8_t, kRawChunkBytes> chunk_rgb{};
+  std::size_t pixel_offset = 0;
+  std::size_t chunk_idx = 0;
+  while (pixel_offset < pixels) {
+    const std::size_t take_pixels = std::min(kChunkPixels, pixels - pixel_offset);
+    const bool is_first = (chunk_idx == 0);
+    const bool is_last = (pixel_offset + take_pixels >= pixels);
+    if (is_first) {
+      out += "\x1b_Ga=T,f=24,s=";
+      out += std::to_string(frame.width);
+      out += ",v=";
+      out += std::to_string(frame.height);
+      out += ",i=";
+      out += std::to_string(placement.image_id);
+      out += ",p=";
+      out += std::to_string(placement.placement_id);
+      out += ",q=2,C=1,c=";
+      out += std::to_string(placement.columns);
+      out += ",r=";
+      out += std::to_string(placement.rows);
+      out += is_last ? ",m=0;" : ",m=1;";
+    } else {
+      out += is_last ? "\x1b_Gm=0;" : "\x1b_Gm=1;";
+    }
+    const std::uint8_t *src = frame.rgba.data() + pixel_offset * 4U;
+    std::uint8_t *dst = chunk_rgb.data();
+    for (std::size_t p = 0; p < take_pixels; ++p) {
+      dst[0] = src[0];
+      dst[1] = src[1];
+      dst[2] = src[2];
+      src += 4;
+      dst += 3;
+    }
+    append_base64(out,
+                  std::span<const std::uint8_t>{chunk_rgb.data(), take_pixels * 3U});
+    out += "\x1b\\";
+    pixel_offset += take_pixels;
+    ++chunk_idx;
+  }
+
+  out += "\x1b"
+         "8";
+  return out;
+}
+
 std::string encode_kitty_erase(std::uint32_t image_id) {
   return "\x1b_Ga=d,d=I,i=" + std::to_string(image_id) + ",q=2;\x1b\\";
 }
@@ -3762,8 +3877,20 @@ encode_truecolor_halfblock_frame(const HeroFrame &frame,
   const bool valid_frame =
       expected_opt.has_value() && frame.rgba.size() == *expected_opt;
 
+  std::vector<std::string> lines;
+  lines.reserve(options.rows);
+  if (!valid_frame) {
+    std::string blank_row;
+    blank_row.reserve(options.columns + 20U);
+    blank_row += "\x1b[48;2;0;0;0m";
+    blank_row.append(options.columns, ' ');
+    blank_row += "\x1b[0m";
+    lines.assign(options.rows, blank_row);
+    return lines;
+  }
+
   const auto scale_index = [](std::size_t idx, std::size_t num,
-                              std::size_t den) -> std::size_t {
+                              std::size_t den) noexcept -> std::size_t {
     if (idx >= den) {
       return num;
     }
@@ -3776,35 +3903,58 @@ encode_truecolor_halfblock_frame(const HeroFrame &frame,
     return std::min(num, idx * q + scaled_rem);
   };
 
-  const auto sample_box = [&](std::size_t cx, std::size_t cy_sub) -> HeroRgb {
-    if (!valid_frame) {
-      return HeroRgb{0, 0, 0};
-    }
-    const std::size_t fw = frame.width;
-    const std::size_t fh = frame.height;
-    const std::size_t target_h = options.rows * 2U;
-    const std::size_t x0 = std::min(fw - 1U, scale_index(cx, fw, options.columns));
+  struct SpanRange {
+    std::size_t start = 0;
+    std::size_t end = 0;
+  };
+  struct BoxSpan {
+    SpanRange x{};
+    SpanRange y{};
+  };
+
+  const std::size_t fw = frame.width;
+  const std::size_t fh = frame.height;
+  const std::size_t target_h = options.rows * 2U;
+
+  // Precompute integer source spans once per frame (zero double math in inner loop).
+  std::vector<SpanRange> x_spans(options.columns);
+  for (std::size_t c = 0; c < options.columns; ++c) {
+    const std::size_t x0 = std::min(fw - 1U, scale_index(c, fw, options.columns));
     const std::size_t xe =
-        std::min(fw, std::max(x0 + 1U, scale_index(cx + 1U, fw, options.columns)));
-    const std::size_t y0 = std::min(fh - 1U, scale_index(cy_sub, fh, target_h));
+        std::min(fw, std::max(x0 + 1U, scale_index(c + 1U, fw, options.columns)));
+    x_spans[c] = SpanRange{.start = x0, .end = xe};
+  }
+  std::vector<SpanRange> y_spans(target_h);
+  for (std::size_t ys = 0; ys < target_h; ++ys) {
+    const std::size_t y0 = std::min(fh - 1U, scale_index(ys, fh, target_h));
     const std::size_t ye =
-        std::min(fh, std::max(y0 + 1U, scale_index(cy_sub + 1U, fh, target_h)));
-    std::uint32_t sr = 0;
-    std::uint32_t sg = 0;
-    std::uint32_t sb = 0;
-    std::uint32_t count = 0;
-    for (std::size_t y = y0; y < ye; ++y) {
-      const std::size_t row = y * fw;
-      for (std::size_t x = x0; x < xe; ++x) {
-        const std::size_t off = (row + x) * 4U;
-        sr += frame.rgba[off];
-        sg += frame.rgba[off + 1];
-        sb += frame.rgba[off + 2];
-        ++count;
-      }
+        std::min(fh, std::max(y0 + 1U, scale_index(ys + 1U, fh, target_h)));
+    y_spans[ys] = SpanRange{.start = y0, .end = ye};
+  }
+
+  const std::uint8_t *rgba_ptr = frame.rgba.data();
+  const auto sample_span = [rgba_ptr, fw](BoxSpan box) noexcept -> HeroRgb {
+    if (box.x.end - box.x.start == 1U && box.y.end - box.y.start == 1U) {
+      const std::size_t off = (box.y.start * fw + box.x.start) * 4U;
+      return HeroRgb{
+          .r = rgba_ptr[off],
+          .g = rgba_ptr[off + 1U],
+          .b = rgba_ptr[off + 2U],
+      };
     }
-    if (count == 0) {
-      return HeroRgb{0, 0, 0};
+    std::uint64_t sr = 0;
+    std::uint64_t sg = 0;
+    std::uint64_t sb = 0;
+    const std::uint64_t count =
+        static_cast<std::uint64_t>(box.y.end - box.y.start) * (box.x.end - box.x.start);
+    for (std::size_t y = box.y.start; y < box.y.end; ++y) {
+      const std::uint8_t *px = rgba_ptr + (y * fw + box.x.start) * 4U;
+      for (std::size_t x = box.x.start; x < box.x.end; ++x) {
+        sr += px[0];
+        sg += px[1];
+        sb += px[2];
+        px += 4;
+      }
     }
     return HeroRgb{
         .r = static_cast<std::uint8_t>(sr / count),
@@ -3813,16 +3963,33 @@ encode_truecolor_halfblock_frame(const HeroFrame &frame,
     };
   };
 
-  std::vector<std::string> lines;
-  lines.reserve(options.rows);
   for (std::size_t r = 0; r < options.rows; ++r) {
     std::string line;
     line.reserve(options.columns * 24U);
     std::optional<HeroRgb> prev_fg;
     std::optional<HeroRgb> prev_bg;
+    const SpanRange y_top = y_spans[r * 2U];
+    const SpanRange y_bot = y_spans[r * 2U + 1U];
     for (std::size_t c = 0; c < options.columns; ++c) {
-      const HeroRgb top = sample_box(c, r * 2U);
-      const HeroRgb bot = sample_box(c, r * 2U + 1U);
+      const SpanRange xs = x_spans[c];
+      const HeroRgb top = sample_span(BoxSpan{.x = xs, .y = y_top});
+      const HeroRgb bot = sample_span(BoxSpan{.x = xs, .y = y_bot});
+      if (top == bot) {
+        // Coalesce identical top/bottom pixels into a single ASCII space using
+        // only background SGR, preserving prev_fg for subsequent half-block cells.
+        if (!prev_bg.has_value() || *prev_bg != bot) {
+          line += "\x1b[48;2;";
+          append_u8_dec(line, bot.r);
+          line += ';';
+          append_u8_dec(line, bot.g);
+          line += ';';
+          append_u8_dec(line, bot.b);
+          line += 'm';
+          prev_bg = bot;
+        }
+        line += ' ';
+        continue;
+      }
       if (!prev_fg.has_value() || *prev_fg != top) {
         line += "\x1b[38;2;";
         append_u8_dec(line, top.r);
@@ -3850,6 +4017,31 @@ encode_truecolor_halfblock_frame(const HeroFrame &frame,
     lines.push_back(std::move(line));
   }
   return lines;
+}
+
+std::string encode_halfblock_diff(const HeroHalfBlockDiff &diff) {
+  const bool emit_all =
+      diff.full_redraw || diff.prev_rows.size() != diff.curr_rows.size();
+  std::size_t bytes = 0;
+  for (std::size_t r = 0; r < diff.curr_rows.size(); ++r) {
+    if (emit_all || diff.curr_rows[r] != diff.prev_rows[r]) {
+      bytes += diff.curr_rows[r].size() + 16U;
+    }
+  }
+  if (bytes == 0U) {
+    return {};
+  }
+  std::string out;
+  out.reserve(bytes);
+  for (std::size_t r = 0; r < diff.curr_rows.size(); ++r) {
+    if (emit_all || diff.curr_rows[r] != diff.prev_rows[r]) {
+      out += "\x1b[";
+      out += std::to_string(r + 1U);
+      out += ";1H";
+      out += diff.curr_rows[r];
+    }
+  }
+  return out;
 }
 
 } // namespace blackbird

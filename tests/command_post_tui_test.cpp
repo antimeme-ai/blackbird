@@ -2250,6 +2250,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             PARTY_STATE["epoch"] = 4
             self._send_json(200, {"party_epoch": 4})
             return
+        if parsed.path == "/v1/web-sessions/approve":
+            code = body.get("user_code", "")
+            if code == "EXPD-0000":
+                self._send_json(410, {"error": "session_expired"})
+                return
+            if code != "ABCD-2345":
+                self._send_json(404, {"error": "not_found"})
+                return
+            self._send_json(200, {
+                "approved": True,
+                "user_code": code,
+                "scope": "read_only_web_portal",
+                "expires_at_ms": 1795500000000,
+            })
+            return
         self._send_json(404, {"error": "unknown_route"})
     def do_DELETE(self):
         if not self._require_sig():
@@ -2461,6 +2476,40 @@ srv.serve_forever()
   require(pdisband_out.find("Disbanded online party 5001") != std::string::npos &&
               pdisband_out.find("party_epoch=4") != std::string::npos,
           "/online party disband fetches current epoch and disbands cleanly");
+
+  // /online web-approve (valid normalization, alias, invalid code, expired 410)
+  const auto web_ok_res =
+      handle_command_post_slash("/online web-approve abcd2345", ctx);
+  const std::string &web_ok_out =
+      check_safe(web_ok_res, "/online web-approve abcd2345");
+  require(web_ok_out.find("Approved web session:") != std::string::npos &&
+              web_ok_out.find("user_code:     ABCD-2345") != std::string::npos &&
+              web_ok_out.find("approved:      true") != std::string::npos &&
+              web_ok_out.find("scope:         read_only_web_portal") !=
+                  std::string::npos,
+          "/online web-approve normalizes Crockford code and approves cleanly");
+
+  const auto web_alias_res =
+      handle_command_post_slash("/party online web-approve ABCD-2345", ctx);
+  const std::string &web_alias_out =
+      check_safe(web_alias_res, "/party online web-approve");
+  require(web_alias_out.find("user_code:     ABCD-2345") != std::string::npos,
+          "/party online web-approve routes cleanly");
+
+  const auto web_bad_res =
+      handle_command_post_slash("/online web-approve OILU-1234", ctx);
+  const std::string &web_bad_out =
+      check_safe(web_bad_res, "/online web-approve invalid");
+  require(web_bad_out.find("Invalid web-approve code") != std::string::npos,
+          "/online web-approve rejects forbidden Crockford chars before network");
+
+  const auto web_exp_res =
+      handle_command_post_slash("/online web-approve expd-0000", ctx);
+  const std::string &web_exp_out =
+      check_safe(web_exp_res, "/online web-approve expired");
+  require(web_exp_out.find("Online web-approve failed:") != std::string::npos &&
+              web_exp_out.find("http_gone") != std::string::npos,
+          "/online web-approve surfaces HTTP 410 expired session cleanly");
 
   // 5. Device-only store (root_seed absent), expired CWT, and XDG_CONFIG_HOME fallback.
   {
