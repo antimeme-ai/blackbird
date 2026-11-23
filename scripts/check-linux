@@ -50,7 +50,7 @@ def main():
     paths.append("scripts/check-tui-instrument")
     paths += ["scripts/check-terminal-edge", "scripts/check-tui-viewport", "scripts/check-main-input"]
 
-    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime"]
+    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime", "papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md"]
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
         for name in paths:

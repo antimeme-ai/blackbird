@@ -1,4 +1,5 @@
 #include "blackbird/tools.hpp"
+#include "blackbird/command_post_tools.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/raw_file.hpp"
 #include "native_process.hpp"
@@ -1667,6 +1668,9 @@ Value tool_definitions() {
                   Value::object(
                       {{"code", Value::object({{"type", Value{"string"}}})}})},
                  {"required", Value{Value::Array{Value{"code"}}}}})}})}};
+  auto command_post = command_post_tool_definitions();
+  for (auto &tool : command_post.array())
+    tools.array().push_back(std::move(tool));
   // Budget properties only where a long answer is expected (T1, measured bytes in
   // the journal); every generic tool honours the keys when they are supplied.
   for (auto &tool : tools.array()) {

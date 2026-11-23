@@ -1,3 +1,4 @@
+#include "blackbird/command_post_tools.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/raw_command.hpp"
@@ -1576,6 +1577,12 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           return context_read(arguments);
         if (name == "hooks")
           return hooks_tool(arguments);
+        if (auto cp = try_dispatch_command_post_tool(
+                name, arguments,
+                CommandPostToolContext{.decision_models = &decision_models_,
+                                       .cancelled = cancelled})) {
+          return std::move(*cp);
+        }
         if (name == "rageshake") {
           const RawAdapterContext origin{
               nullptr,

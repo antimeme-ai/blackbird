@@ -13999,3 +13999,30 @@ Blackbird must not present itself as another product.
     reuse in `send_envelope()` with `ErrorCode::conflict`.
   - **L7 (`src/command_post_tui.cpp`):** mask raw `std::exception::what()` in `/companion`
     and outer Command Post slash-command dispatch.
+
+## 2026-11-23 — Wave 5: Swarmboard TUI, Model Command-Post Tools, Stage 1->2 Relay Substrate, & SR-71 Flight-Deck Visualizer
+
+- **Track 3A — Live Swarmboard TUI (`include/blackbird/swarmboard_view.hpp`,
+  `src/swarmboard_view.cpp`, `tests/swarmboard_view_test.cpp`):** passive read-only split
+  dashboard over `.blackbird/platoon`, `.blackbird/worktrees/.leases`, and `.blackbird/bridge`
+  (peer roster strip + scrollable filterable `@mention` board + watcher presence & unread-guard
+  header + strict C0/DEL/C1/bidi escaping; directly asserts zero disk/receipt mutations on render).
+- **Track 3B — Model-Callable Command Post Tools (`include/blackbird/command_post_tools.hpp`,
+  `src/command_post_tools.cpp`, `tests/command_post_tools_test.cpp`, `src/tools.cpp`,
+  `src/coding_dispatch.cpp`):** registered `platoon_board`, `bridge_guard`, `project_issues`,
+  `project_memory`, and silence-by-default `companion_timing` arbitrator with strict schema
+  validation, quoted untrusted peer framing, and zero directory creation on read-only queries.
+- **Track 4 — Stage 1->2 Multiplexing, Checkpoints & Blind Relay (`include/blackbird/bridge_relay.hpp`,
+  `src/bridge_relay.cpp`, `tests/bridge_relay_test.cpp`):** 3-lane priority multiplexer
+  (`BridgeMux` Lane 0 preemptive control > Lane 1 causal > Lane 2 latest-wins MRS presence),
+  signed late-join `BridgeCheckpoint` + O(delta) catch-up, `bbjoin1:...` room invite URIs,
+  content-blind `BlindRelayRouter` with sender-scoped dedupe, token-bucket isolation, and
+  roaming session resumption, plus monotonic transitive `TaintedProvenance`.
+- **SR-71 Flight-Deck & Token-Shower Visualizer (`include/blackbird/flight_deck_view.hpp`,
+  `src/flight_deck_view.cpp`, `tests/flight_deck_view_test.cpp`):** deterministic read-only
+  terminal canvas combining `blackbird_sprite()` contrail flight deck, 4-lane proportional
+  `INPUT`/`CACHED`/`REASONING`/`OUTPUT` token shower fountain, Unicode sparklines, and Unit 6
+  tri-state `UNKNOWN`/`STALE` honesty.
+- **Linux check bundle (`scripts/check-linux`):** bundled cited profile doc
+  `papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md` so `provider_profile_shipped`
+  passes cleanly on remote Linux hosts.
