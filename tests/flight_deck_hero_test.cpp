@@ -1,15 +1,20 @@
 #include "blackbird/flight_deck_hero.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fcntl.h>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -22,6 +27,8 @@ void check(bool cond, std::string_view msg) {
     ++g_failures;
   }
 }
+
+void require(bool cond, std::string_view msg) { check(cond, msg); }
 
 std::vector<std::uint8_t> decode_base64(std::string_view b64) {
   std::array<int, 256> lut{};
@@ -557,9 +564,26 @@ void test_determinism_and_performance() {
   });
   const auto &fk = e_kitty.step_and_render(1.0F / 30.0F);
   const std::string kitty_384_rgb = encode_kitty_rgb_frame(fk, kitty_place);
+  const std::string kitty_480_shm = encode_kitty_shm_rgb_frame(e1.frame(), kitty_place);
+  const std::size_t shm_apc = kitty_480_shm.find("\x1b_G");
+  const std::size_t shm_semi = (shm_apc != std::string::npos)
+                                   ? kitty_480_shm.find(';', shm_apc)
+                                   : std::string::npos;
+  const std::size_t shm_st = (shm_semi != std::string::npos)
+                                 ? kitty_480_shm.find("\x1b\\", shm_semi)
+                                 : std::string::npos;
+  if (shm_semi != std::string::npos && shm_st != std::string::npos &&
+      shm_st > shm_semi + 1U) {
+    const auto name_bytes = decode_base64(std::string_view(
+        kitty_480_shm.data() + shm_semi + 1U, shm_st - (shm_semi + 1U)));
+    const std::string shm_name(reinterpret_cast<const char *>(name_bytes.data()),
+                               name_bytes.size());
+    (void)::shm_unlink(shm_name.c_str());
+  }
   std::cout << "hero_kitty_480x300_rgba_bytes=" << kitty_480_rgba.size() << "\n";
   std::cout << "hero_kitty_480x300_rgb_bytes=" << kitty_480_rgb.size() << "\n";
   std::cout << "hero_kitty_384x240_rgb_bytes=" << kitty_384_rgb.size() << "\n";
+  std::cout << "hero_kitty_480x300_shm_bytes=" << kitty_480_shm.size() << "\n";
 
   HeroFlightDeckEngine e_hb(HeroCanvasConfig{
       .size = HeroSize{.width = 180, .height = 100},
@@ -735,6 +759,361 @@ void test_safety_hardening_regressions() {
   check(!parse_hero_theme(huge).has_value(), "parse_hero_theme rejects overlong input");
 }
 
+void test_stale_idle_burst_and_rate_limiting() {
+  using namespace blackbird;
+
+  const auto &synth = hero_theme_spec(HeroThemeId::synthwave);
+
+  // 1) Stale high rate while !busy and counters stationary must decay after > 1.5s.
+  HeroParticleSystem ps;
+  ps.reset(HeroSize{.width = 480, .height = 300}, 42);
+  HeroTelemetryInput stale_tel{};
+  stale_tel.total_tok_per_sec = 50000.0;
+  stale_tel.out_rsn_tok_per_sec = 12000.0;
+  stale_tel.cached_tokens = 10000;
+  stale_tel.input_tokens = 2000;
+  stale_tel.output_tokens = 500;
+  stale_tel.busy = false;
+
+  // First 0.5s: still fresh -> responsive emission.
+  for (int i = 0; i < 15; ++i) {
+    ps.emit_from_telemetry(stale_tel, synth, 1.0F / 30.0F);
+    ps.step(synth, 1.0F / 30.0F);
+  }
+  require(ps.effective_total_rate() > 10000.0F,
+          "fresh telemetry responds immediately before 1.5s staleness window");
+
+  // Advance another 8.0s with !busy and stationary counters so stale rate decays
+  // after 1.5s and previously spawned slow fog particles finish drifting out.
+  for (int i = 0; i < 240; ++i) {
+    ps.emit_from_telemetry(stale_tel, synth, 1.0F / 30.0F);
+    ps.step(synth, 1.0F / 30.0F);
+  }
+  require(ps.effective_total_rate() < 55.0F,
+          "stale idle total rate decays smoothly toward 45 tok/s ambient cruise");
+  require(ps.live_count() <= 40U,
+          "stale idle telemetry settles to light ambient cruise without flooding");
+
+  // 2) Single huge counter jump must be rate-limited (<= 8 per class = <= 48 per frame)
+  //    and spread smoothly over ~0.5s, never exceeding kMaxParticles (600).
+  HeroParticleSystem burst_ps;
+  burst_ps.reset(HeroSize{.width = 480, .height = 300}, 7);
+  HeroTelemetryInput jump_tel{};
+  jump_tel.busy = true;
+  jump_tel.total_tok_per_sec = 100.0;
+  jump_tel.out_rsn_tok_per_sec = 50.0;
+  burst_ps.emit_from_telemetry(jump_tel, synth, 1.0F / 30.0F);
+  const std::size_t before_jump = burst_ps.live_count();
+
+  jump_tel.cached_tokens += 50000;
+  jump_tel.input_tokens += 50000;
+  jump_tel.reasoning_tokens += 20000;
+  jump_tel.output_tokens += 20000;
+  jump_tel.jev_calls += 20;
+  burst_ps.emit_from_telemetry(jump_tel, synth, 1.0F / 30.0F);
+  const std::size_t spawned_in_one_frame = burst_ps.live_count() - before_jump;
+  require(spawned_in_one_frame > 0U && spawned_in_one_frame <= 48U,
+          "huge counter jump caps single-frame spawns to <= 8 per class (<= 48 total)");
+
+  // Keep stepping with massive repeated jumps -> never exceeds kMaxParticles (600).
+  for (int i = 0; i < 40; ++i) {
+    jump_tel.cached_tokens += 50000;
+    jump_tel.input_tokens += 50000;
+    jump_tel.output_tokens += 20000;
+    burst_ps.emit_from_telemetry(jump_tel, synth, 1.0F / 30.0F);
+    burst_ps.step(synth, 1.0F / 30.0F);
+    require(burst_ps.live_count() <= 600U, "live particle count capped at 600");
+  }
+
+  // 3) Live busy streaming remains responsive even when counters pause briefly.
+  HeroTelemetryInput busy_tel{};
+  busy_tel.busy = true;
+  busy_tel.total_tok_per_sec = 8000.0;
+  busy_tel.out_rsn_tok_per_sec = 1500.0;
+  for (int i = 0; i < 90; ++i) {
+    ps.emit_from_telemetry(busy_tel, synth, 1.0F / 30.0F);
+    ps.step(synth, 1.0F / 30.0F);
+  }
+  require(ps.effective_total_rate() >= 8000.0F,
+          "busy telemetry stays responsive without staleness decay");
+
+  // 4) Energy-gated composite skips empty buffers completely (no pixel mutations).
+  HeroParticleSystem empty_ps;
+  empty_ps.reset(HeroSize{.width = 160, .height = 100}, 1);
+  empty_ps.step(synth, 1.0F / 30.0F);
+  require(empty_ps.acc_energy() < 0.005F && empty_ps.glow_energy() < 0.005F &&
+              empty_ps.fog_energy() < 0.005F,
+          "empty particle system has sub-threshold energies");
+  std::vector<std::uint8_t> canvas(160U * 100U * 4U, 42U);
+  const auto snapshot = canvas;
+  empty_ps.composite(canvas, synth);
+  require(canvas == snapshot,
+          "energy-gated composite leaves canvas untouched when empty");
+}
+
+void test_forward_ground_scroll() {
+  using namespace blackbird;
+
+  // Verify ALL 3 ground renderers (grid via synthwave/tokyonight, ocean via retro82,
+  // glyph via dyingearth) scroll strictly DOWNWARD toward the camera as time advances.
+  const std::array<HeroThemeId, 4> ground_themes = {
+      HeroThemeId::synthwave,
+      HeroThemeId::tokyonight,
+      HeroThemeId::retro82,
+      HeroThemeId::dyingearth,
+  };
+  for (const HeroThemeId tid : ground_themes) {
+    HeroFlightDeckEngine engine(HeroCanvasConfig{
+        .size = HeroSize{.width = 480, .height = 300},
+        .theme = tid,
+        .seed = 11,
+    });
+    HeroTelemetryInput tel{};
+    tel.busy = true;
+    tel.total_tok_per_sec = 9000.0;
+    engine.set_telemetry(tel);
+
+    const std::vector<std::uint8_t> snap1 = engine.step_and_render(0.05F).rgba;
+    const std::vector<std::uint8_t> snap2 = engine.step_and_render(0.30F).rgba;
+
+    const auto &spec = hero_theme_spec(tid);
+    const int horizon_y = static_cast<int>(std::lround(300.0F * spec.horizon));
+    const int x0 = (tid == HeroThemeId::retro82) ? 295 : 160;
+    const int x1 = 320;
+    auto row_luma = [&](const std::vector<std::uint8_t> &rgba, int y) -> double {
+      double sum = 0.0;
+      for (int x = x0; x < x1; ++x) {
+        const std::size_t off =
+            (static_cast<std::size_t>(y) * 480U + static_cast<std::size_t>(x)) * 4U;
+        sum += static_cast<double>(rgba[off]) + static_cast<double>(rgba[off + 1]) +
+               static_cast<double>(rgba[off + 2]);
+      }
+      return sum;
+    };
+
+    // High-pass vertical cross-correlation over [-6, +6] excluding dy=0 finds the exact
+    // pixel displacement of horizontal ground lines, ocean bars, and glyph rows.
+    int best_dy = 0;
+    double best_score = -1e18;
+    for (int dy = -6; dy <= 6; ++dy) {
+      if (dy == 0) {
+        continue;
+      }
+      double score = 0.0;
+      for (int y = horizon_y + 14; y < 270; ++y) {
+        const double v1 = row_luma(snap1, y) -
+                          0.5 * (row_luma(snap1, y - 1) + row_luma(snap1, y + 1));
+        const double v2 = row_luma(snap2, y + dy) - 0.5 * (row_luma(snap2, y + dy - 1) +
+                                                           row_luma(snap2, y + dy + 1));
+        score += v1 * v2;
+      }
+      if (score > best_score) {
+        best_score = score;
+        best_dy = dy;
+      }
+    }
+    require(best_dy > 0, "ground renderer scrolls strictly downward toward camera");
+  }
+}
+
+void test_static_bg_cache_equivalence_and_invalidation() {
+  using namespace blackbird;
+
+  HeroTelemetryInput tel{};
+  tel.total_tok_per_sec = 2400.0;
+  tel.out_rsn_tok_per_sec = 600.0;
+  tel.active_agents = 3;
+  tel.total_agents = 5;
+  tel.busy = true;
+  tel.main_context_fill = 0.64;
+
+  HeroThemeId cur = HeroThemeId::synthwave;
+  for (std::size_t i = 0; i < hero_theme_count; ++i) {
+    const HeroCanvasConfig cfg{
+        .size = HeroSize{.width = 320, .height = 200},
+        .theme = cur,
+        .seed = 99,
+    };
+    HeroFlightDeckEngine cached_eng(cfg);
+    HeroFlightDeckEngine fresh_eng(cfg);
+    cached_eng.set_telemetry(tel);
+    fresh_eng.set_telemetry(tel);
+
+    // Frame 1 populates the static background cache in both engines.
+    (void)cached_eng.step_and_render(1.0F / 30.0F);
+    (void)fresh_eng.step_and_render(1.0F / 30.0F);
+
+    // Invalidate fresh_eng's static background cache by toggling theme away and back
+    // without touching particles or visual_rng_.
+    fresh_eng.set_theme(next_hero_theme(cur));
+    fresh_eng.set_theme(cur);
+
+    // Frame 2: cached_eng reuses static_bg_rgba_ via memcpy; fresh_eng rebuilds it.
+    const auto &f_cached = cached_eng.step_and_render(1.0F / 30.0F);
+    const auto &f_fresh = fresh_eng.step_and_render(1.0F / 30.0F);
+    require(f_cached.rgba == f_fresh.rgba,
+            "cached static background render matches fresh render bit-for-bit");
+
+    cur = next_hero_theme(cur);
+  }
+
+  // Verify theme change invalidation and resize invalidation produce valid distinct
+  // frames.
+  HeroFlightDeckEngine eng(HeroCanvasConfig{
+      .size = HeroSize{.width = 320, .height = 200},
+      .theme = HeroThemeId::synthwave,
+      .seed = 21,
+  });
+  const std::vector<std::uint8_t> synth_px = eng.render().rgba;
+  eng.cycle_theme();
+  const std::vector<std::uint8_t> tokyo_px = eng.render().rgba;
+  require(synth_px != tokyo_px, "cycle_theme invalidates static background cache");
+
+  eng.resize(HeroSize{.width = 240, .height = 160});
+  const auto &resized_frame = eng.render();
+  require(resized_frame.width == 240U && resized_frame.height == 160U &&
+              resized_frame.rgba.size() == 240U * 160U * 4U,
+          "resize invalidates and rebuilds static background cache at new dimensions");
+}
+
+void test_kitty_shm_encoder_and_capability() {
+  using namespace blackbird;
+
+  // 1) Capability gating for kitty_shm_capable().
+  ::unsetenv("BLACKBIRD_GRAPHICS");
+  ::unsetenv("SSH_CONNECTION");
+  ::unsetenv("SSH_TTY");
+  ::unsetenv("SSH_CLIENT");
+  ::unsetenv("TMUX");
+  ::unsetenv("STY");
+  ::setenv("TERM_PROGRAM", "ghostty", 1);
+  ::setenv("TERM", "xterm-256color", 1);
+  require(kitty_shm_capable(), "local Ghostty enables kitty_shm_capable");
+
+  ::setenv("TERM_PROGRAM", "WezTerm", 1);
+  require(kitty_shm_capable(), "local WezTerm enables kitty_shm_capable");
+
+  ::setenv("SSH_CONNECTION", "1.2.3.4 1234 5.6.7.8 22", 1);
+  require(!kitty_shm_capable(), "SSH_CONNECTION disables kitty_shm_capable");
+  ::unsetenv("SSH_CONNECTION");
+
+  ::setenv("SSH_TTY", "/dev/pts/1", 1);
+  require(!kitty_shm_capable(), "SSH_TTY disables kitty_shm_capable");
+  ::unsetenv("SSH_TTY");
+
+  ::setenv("SSH_CLIENT", "1.2.3.4 1234 22", 1);
+  require(!kitty_shm_capable(), "SSH_CLIENT disables kitty_shm_capable");
+  ::unsetenv("SSH_CLIENT");
+
+  ::setenv("TMUX", "/tmp/tmux-1000/default,123,0", 1);
+  require(!kitty_shm_capable(), "TMUX disables kitty_shm_capable");
+  ::unsetenv("TMUX");
+
+  ::setenv("STY", "12345.pts-0.host", 1);
+  require(!kitty_shm_capable(), "STY disables kitty_shm_capable");
+  ::unsetenv("STY");
+
+  ::setenv("BLACKBIRD_GRAPHICS", "kitty", 1);
+  ::setenv("SSH_TTY", "/dev/pts/1", 1);
+  require(
+      !kitty_shm_capable(),
+      "SSH_TTY still disables kitty_shm_capable even with BLACKBIRD_GRAPHICS=kitty");
+  ::unsetenv("SSH_TTY");
+  require(kitty_shm_capable(),
+          "local BLACKBIRD_GRAPHICS=kitty enables kitty_shm_capable");
+  ::setenv("BLACKBIRD_GRAPHICS", "off", 1);
+  require(!kitty_shm_capable(), "BLACKBIRD_GRAPHICS=off disables kitty_shm_capable");
+  ::unsetenv("BLACKBIRD_GRAPHICS");
+
+  // 2) Full t=s shared-memory round-trip + exact RGB24 byte check + zero-leak cleanup.
+  HeroFlightDeckEngine engine(HeroCanvasConfig{
+      .size = HeroSize{.width = 160, .height = 100},
+      .theme = HeroThemeId::synthwave,
+      .seed = 77,
+  });
+  const auto &frame = engine.step_and_render(0.05F);
+  const HeroKittyPlacement placement{.row = 2,
+                                     .column = 4,
+                                     .columns = 60,
+                                     .rows = 20,
+                                     .image_id = 72172,
+                                     .placement_id = 1};
+  const std::string shm_enc = encode_kitty_shm_rgb_frame(frame, placement);
+  require(
+      shm_enc.starts_with(
+          "\x1b"
+          "7\x1b[3;5H\x1b_Ga=T,f=24,t=s,s=160,v=100,i=72172,p=1,q=2,C=1,c=60,r=20;"),
+      "kitty shm prefix header matches exact t=s spec");
+  require(shm_enc.ends_with("\x1b\\"
+                            "\x1b"
+                            "8"),
+          "kitty shm trailer ends with ST + DECRC");
+  require(shm_enc.size() < 120U,
+          "kitty shm encoded frame is compact (~85 bytes, not hundreds of KB)");
+
+  const std::size_t apc = shm_enc.find("\x1b_G");
+  const std::size_t semi =
+      (apc != std::string::npos) ? shm_enc.find(';', apc) : std::string::npos;
+  const std::size_t st =
+      (semi != std::string::npos) ? shm_enc.find("\x1b\\", semi) : std::string::npos;
+  require(semi != std::string::npos && st != std::string::npos && st > semi + 1U,
+          "kitty shm sequence contains base64 shm_name payload");
+  if (semi != std::string::npos && st != std::string::npos && st > semi + 1U) {
+    const std::string_view b64_name(shm_enc.data() + semi + 1U, st - (semi + 1U));
+    const auto name_bytes = decode_base64(b64_name);
+    const std::string shm_name(reinterpret_cast<const char *>(name_bytes.data()),
+                               name_bytes.size());
+    require(shm_name.starts_with("/bb-fd-"), "shm_name uses /bb-fd- prefix");
+    require(shm_name.size() <= 30U, "shm_name fits within macOS PSHMNAMLEN=31 limit");
+
+    const int fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
+    require(fd >= 0, "shm_open opens created shared memory object");
+    if (fd >= 0) {
+      struct stat sb{};
+      const int stat_rc = ::fstat(fd, &sb);
+      const std::size_t expected_rgb_bytes = 160U * 100U * 3U;
+      // macOS rounds POSIX shm ftruncate size up to the VM page size; Linux is exact.
+      require(stat_rc == 0 &&
+                  static_cast<std::size_t>(sb.st_size) >= expected_rgb_bytes,
+              "shm object size covers width * height * 3");
+      void *mapped = ::mmap(nullptr, expected_rgb_bytes, PROT_READ, MAP_SHARED, fd, 0);
+      require(mapped != MAP_FAILED, "mmap maps shared memory object for verification");
+      if (mapped != MAP_FAILED) {
+        const auto *rgb = static_cast<const std::uint8_t *>(mapped);
+        bool all_match = true;
+        for (std::size_t p = 0; p < 160U * 100U; ++p) {
+          if (rgb[p * 3U] != frame.rgba[p * 4U] ||
+              rgb[p * 3U + 1U] != frame.rgba[p * 4U + 1U] ||
+              rgb[p * 3U + 2U] != frame.rgba[p * 4U + 2U]) {
+            all_match = false;
+            break;
+          }
+        }
+        require(all_match, "shm RGB24 bytes match rendered frame RGBA bit-for-bit");
+        ::munmap(mapped, expected_rgb_bytes);
+      }
+      ::close(fd);
+    }
+    // Always unlink so tests NEVER leak shared memory entries.
+    const int unlink_rc = ::shm_unlink(shm_name.c_str());
+    require(unlink_rc == 0, "shm_unlink cleanly removes test shared memory object");
+    const int after_fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
+    require(after_fd < 0, "unlinked shm object is no longer openable (zero leak)");
+    if (after_fd >= 0) {
+      ::close(after_fd);
+    }
+  }
+
+  // 3) Invalid/overflow frames rejected cleanly without creating shm objects.
+  HeroFrame wrap_frame{
+      .width = 0x80000000U,
+      .height = 0x80000000U,
+      .rgba = {},
+  };
+  require(encode_kitty_shm_rgb_frame(wrap_frame).empty(),
+          "kitty shm encoder rejects 64-bit overflow dimensions");
+}
+
 } // namespace
 
 int main() {
@@ -749,6 +1128,10 @@ int main() {
   test_kitty_capability_env();
   test_size_clamping();
   test_safety_hardening_regressions();
+  test_stale_idle_burst_and_rate_limiting();
+  test_forward_ground_scroll();
+  test_static_bg_cache_equivalence_and_invalidation();
+  test_kitty_shm_encoder_and_capability();
 
   if (g_failures != 0) {
     std::cerr << "TOTAL FAILURES: " << g_failures << "\n";

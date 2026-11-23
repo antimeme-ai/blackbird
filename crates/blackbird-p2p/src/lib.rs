@@ -22,7 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ pub const BB_P2P_MAX_EPHEMERAL_FRAME_BYTES: usize = 1200;
 pub const BB_P2P_MAX_RELAY_URL_BYTES: usize = 100;
 pub const BB_P2P_MAX_DIRECT_ADDRS: usize = 8;
 pub const BB_P2P_MAX_ALLOWED_PEERS: usize = 1024;
+pub const BB_P2P_MAX_PENDING_LAN_PEERS: usize = 16;
 
 const BB_P2P_ALPN: &[u8] = b"blackbird-mp/1";
 const STREAM_ID_CONTROL: u64 = 0;
@@ -400,6 +401,7 @@ struct ActivePeer {
     conn: Connection,
     control_tx: mpsc::Sender<Bytes>,
     causal_tx: mpsc::Sender<Bytes>,
+    is_pending: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -411,9 +413,23 @@ impl ActivePeer {
     }
 }
 
+struct InFlightPendingGuard {
+    shared: Arc<SharedState>,
+}
+
+impl Drop for InFlightPendingGuard {
+    fn drop(&mut self) {
+        self.shared
+            .in_flight_pending_lan
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct SharedState {
     relay_policy: BbP2pRelayPolicy,
     pinned_relay_url: Option<RelayUrl>,
+    lan_open_admission: AtomicBool,
+    in_flight_pending_lan: AtomicUsize,
     allowed_peers: RwLock<HashSet<EndpointId>>,
     peers: RwLock<HashMap<EndpointId, ActivePeer>>,
     next_conn_id: AtomicU64,
@@ -425,6 +441,62 @@ impl SharedState {
     fn is_allowed(&self, peer_id: &EndpointId) -> bool {
         let guard = self.allowed_peers.read().unwrap_or_else(|e| e.into_inner());
         guard.contains(peer_id)
+    }
+
+    fn is_lan_open_admission(&self) -> bool {
+        self.relay_policy == BbP2pRelayPolicy::NoRelays
+            && self.lan_open_admission.load(Ordering::Acquire)
+    }
+
+    fn pending_lan_slots_full(&self, candidate: &EndpointId) -> bool {
+        let active_pending = {
+            let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = peers.get(candidate)
+                && existing.is_pending.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            peers
+                .values()
+                .filter(|p| p.is_pending.load(Ordering::Acquire))
+                .count()
+        };
+        let in_flight = self.in_flight_pending_lan.load(Ordering::Acquire);
+        active_pending.saturating_add(in_flight) >= BB_P2P_MAX_PENDING_LAN_PEERS
+    }
+
+    fn try_reserve_in_flight_pending(
+        self: &Arc<Self>,
+        candidate: &EndpointId,
+    ) -> Option<InFlightPendingGuard> {
+        let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
+        let already_pending_self = peers
+            .get(candidate)
+            .is_some_and(|p| p.is_pending.load(Ordering::Acquire));
+        let active_pending = peers
+            .values()
+            .filter(|p| p.is_pending.load(Ordering::Acquire))
+            .count();
+        let effective_active = if already_pending_self {
+            active_pending.saturating_sub(1)
+        } else {
+            active_pending
+        };
+        loop {
+            let current = self.in_flight_pending_lan.load(Ordering::Acquire);
+            if effective_active.saturating_add(current) >= BB_P2P_MAX_PENDING_LAN_PEERS {
+                return None;
+            }
+            if self
+                .in_flight_pending_lan
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(InFlightPendingGuard {
+                    shared: Arc::clone(self),
+                });
+            }
+        }
     }
 
     fn close_and_remove_peer(
@@ -516,10 +588,18 @@ impl EndpointHooks for AllowlistHooks {
         }
         let remote_id = conn.remote_id();
         if !self.shared.is_allowed(&remote_id) {
-            return AfterHandshakeOutcome::Reject {
-                error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
-                reason: b"peer_not_allowed".to_vec(),
-            };
+            if !self.shared.is_lan_open_admission() {
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    reason: b"peer_not_allowed".to_vec(),
+                };
+            }
+            if self.shared.pending_lan_slots_full(&remote_id) {
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    reason: b"pending_lan_cap_reached".to_vec(),
+                };
+            }
         }
         AfterHandshakeOutcome::Accept
     }
@@ -683,10 +763,33 @@ async fn write_framed_stream(
     let _ = send.finish();
 }
 
+fn check_inbound_lane_allowed(
+    shared: &SharedState,
+    peer_id: &EndpointId,
+    lane: BbP2pLane,
+    is_pending: &AtomicBool,
+) -> Result<(), (u32, &'static [u8])> {
+    if shared.is_allowed(peer_id) {
+        return Ok(());
+    }
+    if is_pending.load(Ordering::Acquire) {
+        if lane == BbP2pLane::Control {
+            if shared.is_lan_open_admission() {
+                return Ok(());
+            }
+            return Err((CLOSE_UNAUTHORIZED, b"lan_admission_closed"));
+        }
+        return Err((CLOSE_PROTOCOL_VIOLATION, b"pending_peer_lane_violation"));
+    }
+    Err((CLOSE_PEER_REVOKED, b"peer_revoked"))
+}
+
 async fn read_framed_stream(
     mut recv: RecvStream,
     lane: BbP2pLane,
     peer_id: EndpointId,
+    conn_id: u64,
+    is_pending: Arc<AtomicBool>,
     conn: Connection,
     shared: Arc<SharedState>,
 ) {
@@ -695,30 +798,50 @@ async fn read_framed_stream(
     loop {
         if recv.read_exact(&mut len_buf).await.is_err() {
             if !shared.closed.load(Ordering::Acquire) && conn.close_reason().is_none() {
-                conn.close(
-                    VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION),
+                shared.close_and_remove_peer(
+                    &peer_id,
+                    Some(conn_id),
+                    CLOSE_PROTOCOL_VIOLATION,
                     b"stream_closed_unexpectedly",
+                    true,
                 );
             }
             return;
         }
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, lane, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
+            return;
+        }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > max_bytes {
-            conn.close(VarInt::from_u32(CLOSE_FRAME_TOO_LARGE), b"frame_too_large");
+            shared.close_and_remove_peer(
+                &peer_id,
+                Some(conn_id),
+                CLOSE_FRAME_TOO_LARGE,
+                b"frame_too_large",
+                true,
+            );
             return;
         }
         let mut payload = vec![0u8; len];
         if len > 0 && recv.read_exact(&mut payload).await.is_err() {
             if !shared.closed.load(Ordering::Acquire) && conn.close_reason().is_none() {
-                conn.close(
-                    VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION),
+                shared.close_and_remove_peer(
+                    &peer_id,
+                    Some(conn_id),
+                    CLOSE_PROTOCOL_VIOLATION,
                     b"stream_truncated_unexpectedly",
+                    true,
                 );
             }
             return;
         }
-        if !shared.is_allowed(&peer_id) {
-            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, lane, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
             return;
         }
         let ev = QueuedEvent {
@@ -736,18 +859,26 @@ async fn read_framed_stream(
     }
 }
 
-async fn read_datagram_loop(peer_id: EndpointId, conn: Connection, shared: Arc<SharedState>) {
+async fn read_datagram_loop(
+    peer_id: EndpointId,
+    conn_id: u64,
+    is_pending: Arc<AtomicBool>,
+    conn: Connection,
+    shared: Arc<SharedState>,
+) {
     loop {
         let Ok(dgram) = conn.read_datagram().await else {
             return;
         };
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, BbP2pLane::Ephemeral, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
+            return;
+        }
         if dgram.len() > BB_P2P_MAX_EPHEMERAL_FRAME_BYTES {
             // Drop oversized unreliable datagram safely.
             continue;
-        }
-        if !shared.is_allowed(&peer_id) {
-            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
-            return;
         }
         shared.events.push_ephemeral(QueuedEvent {
             kind: BbP2pEventKind::FrameReceived,
@@ -759,6 +890,7 @@ async fn read_datagram_loop(peer_id: EndpointId, conn: Connection, shared: Arc<S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_active_peer(
     shared: &Arc<SharedState>,
     peer_id: EndpointId,
@@ -767,17 +899,20 @@ fn register_active_peer(
     control_recv: RecvStream,
     causal_send: SendStream,
     causal_recv: RecvStream,
+    is_pending_lan: bool,
+    pending_guard: Option<InFlightPendingGuard>,
 ) -> Result<(), BbP2pStatus> {
     if shared.closed.load(Ordering::Acquire) {
         conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_closed");
         return Err(BbP2pStatus::ErrClosed);
     }
-    if !shared.is_allowed(&peer_id) {
+    if !shared.is_allowed(&peer_id) && (!is_pending_lan || !shared.is_lan_open_admission()) {
         conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
         return Err(BbP2pStatus::ErrNotAllowed);
     }
 
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let is_pending = Arc::new(AtomicBool::new(is_pending_lan));
     let (control_tx, control_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
     let (causal_tx, causal_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
 
@@ -797,6 +932,8 @@ fn register_active_peer(
         control_recv,
         BbP2pLane::Control,
         peer_id,
+        conn_id,
+        Arc::clone(&is_pending),
         conn.clone(),
         Arc::clone(shared),
     ));
@@ -804,11 +941,15 @@ fn register_active_peer(
         causal_recv,
         BbP2pLane::Causal,
         peer_id,
+        conn_id,
+        Arc::clone(&is_pending),
         conn.clone(),
         Arc::clone(shared),
     ));
     let t_dgram_r = tokio::spawn(read_datagram_loop(
         peer_id,
+        conn_id,
+        Arc::clone(&is_pending),
         conn.clone(),
         Arc::clone(shared),
     ));
@@ -832,19 +973,50 @@ fn register_active_peer(
         conn,
         control_tx,
         causal_tx,
+        is_pending,
         tasks: vec![t_ctrl_w, t_caus_w, t_ctrl_r, t_caus_r, t_dgram_r, t_watcher],
     };
 
     let old = {
         let mut peers = shared.peers.write().unwrap_or_else(|e| e.into_inner());
-        // Final recheck under lock in case revoke happened concurrently.
-        if !shared.is_allowed(&peer_id) || shared.closed.load(Ordering::Acquire) {
+        if shared.closed.load(Ordering::Acquire) {
             let mut dropped = active;
-            dropped.conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
+            dropped.conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_closed");
             dropped.abort_tasks();
-            return Err(BbP2pStatus::ErrNotAllowed);
+            return Err(BbP2pStatus::ErrClosed);
         }
-        peers.insert(peer_id, active)
+        let is_allowed_now = shared.is_allowed(&peer_id);
+        if is_allowed_now {
+            active.is_pending.store(false, Ordering::Release);
+        } else {
+            if !is_pending_lan || !shared.is_lan_open_admission() {
+                let mut dropped = active;
+                let (code, reason): (u32, &[u8]) = if is_pending_lan {
+                    (CLOSE_UNAUTHORIZED, b"lan_admission_closed")
+                } else {
+                    (CLOSE_PEER_REVOKED, b"peer_revoked")
+                };
+                dropped.conn.close(VarInt::from_u32(code), reason);
+                dropped.abort_tasks();
+                return Err(BbP2pStatus::ErrNotAllowed);
+            }
+            let other_pending = peers
+                .iter()
+                .filter(|(id, p)| **id != peer_id && p.is_pending.load(Ordering::Acquire))
+                .count();
+            if other_pending >= BB_P2P_MAX_PENDING_LAN_PEERS {
+                let mut dropped = active;
+                dropped
+                    .conn
+                    .close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"pending_lan_cap_reached");
+                dropped.abort_tasks();
+                return Err(BbP2pStatus::ErrNotAllowed);
+            }
+        }
+        let previous = peers.insert(peer_id, active);
+        // Transfer slot accounting from in-flight to active map under the write lock.
+        drop(pending_guard);
+        previous
     };
 
     if let Some(mut previous) = old {
@@ -881,9 +1053,26 @@ async fn handle_incoming_connection(
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION), b"wrong_alpn");
         return;
     }
+    let mut is_pending_lan = false;
+    let mut pending_guard: Option<InFlightPendingGuard> = None;
     if !shared.is_allowed(&remote_id) {
-        conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
-        return;
+        if !shared.is_lan_open_admission() {
+            conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
+            return;
+        }
+        match shared.try_reserve_in_flight_pending(&remote_id) {
+            Some(guard) => {
+                is_pending_lan = true;
+                pending_guard = Some(guard);
+            }
+            None => {
+                conn.close(
+                    VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    b"pending_lan_cap_reached",
+                );
+                return;
+            }
+        }
     }
 
     // Accept bidirectional Stream 0 (Control) and Stream 4 (Causal) in any arrival order.
@@ -921,7 +1110,7 @@ async fn handle_incoming_connection(
             return Err(CLOSE_PROTOCOL_VIOLATION);
         };
 
-        if !shared.is_allowed(&remote_id) {
+        if !shared.is_allowed(&remote_id) && (!is_pending_lan || !shared.is_lan_open_admission()) {
             return Err(CLOSE_UNAUTHORIZED);
         }
 
@@ -946,6 +1135,8 @@ async fn handle_incoming_connection(
                 control_recv,
                 causal_send,
                 causal_recv,
+                is_pending_lan,
+                pending_guard,
             );
         }
         Ok(Err(code)) => {
@@ -1091,6 +1282,8 @@ pub unsafe extern "C" fn bb_p2p_create(
         let shared = Arc::new(SharedState {
             relay_policy,
             pinned_relay_url: pinned_relay_url.clone(),
+            lan_open_admission: AtomicBool::new(false),
+            in_flight_pending_lan: AtomicUsize::new(0),
             allowed_peers: RwLock::new(HashSet::new()),
             peers: RwLock::new(HashMap::new()),
             next_conn_id: AtomicU64::new(0),
@@ -1339,14 +1532,18 @@ pub unsafe extern "C" fn bb_p2p_set_allowed_peers(
             *guard = next_allowed.clone();
         }
 
-        // Immediately sever any active peer connections removed from the allowlist.
+        // Promote any pending peers now in the allowlist and sever any removed active peers.
         let to_revoke: Vec<EndpointId> = {
             let peers = ep.shared.peers.read().unwrap_or_else(|e| e.into_inner());
-            peers
-                .keys()
-                .filter(|id| !next_allowed.contains(*id))
-                .copied()
-                .collect()
+            let mut revoke = Vec::new();
+            for (id, peer) in peers.iter() {
+                if next_allowed.contains(id) {
+                    peer.is_pending.store(false, Ordering::Release);
+                } else {
+                    revoke.push(*id);
+                }
+            }
+            revoke
         };
         for peer_id in to_revoke {
             ep.shared.close_and_remove_peer(
@@ -1356,6 +1553,121 @@ pub unsafe extern "C" fn bb_p2p_set_allowed_peers(
                 b"peer_removed_from_allowlist",
                 true,
             );
+        }
+        Ok(())
+    })
+}
+
+/// Additively inserts a single Ed25519 peer public key into the allowlist while respecting
+/// `BB_P2P_MAX_ALLOWED_PEERS`. If the peer is currently connected as a pending LAN peer,
+/// promotes the live connection to full Lanes 0/1/2 access without dropping it.
+///
+/// # Safety
+/// `handle` must be a valid endpoint pointer and `peer_pubkey` must point to 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bb_p2p_allow_peer(
+    handle: *mut BbP2pEndpoint,
+    peer_pubkey: *const u8,
+) -> BbP2pStatus {
+    catch_ffi_status(|| {
+        if handle.is_null() || peer_pubkey.is_null() {
+            return Err(BbP2pStatus::ErrNullPointer);
+        }
+        let ep = unsafe { &*handle };
+        if ep.shared.closed.load(Ordering::Acquire) {
+            return Err(BbP2pStatus::ErrClosed);
+        }
+        let raw = unsafe { slice::from_raw_parts(peer_pubkey, BB_P2P_PUBKEY_LEN) };
+        let mut key_bytes = [0u8; BB_P2P_PUBKEY_LEN];
+        key_bytes.copy_from_slice(raw);
+        let peer_id = PublicKey::from_bytes(&key_bytes).map_err(|_| BbP2pStatus::ErrInvalidArg)?;
+
+        {
+            let mut guard = ep
+                .shared
+                .allowed_peers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if !guard.contains(&peer_id) {
+                if guard.len() >= BB_P2P_MAX_ALLOWED_PEERS {
+                    return Err(BbP2pStatus::ErrCapacity);
+                }
+                guard.insert(peer_id);
+            }
+        }
+
+        // Promote any existing pending LAN connection cleanly without dropping it.
+        {
+            let peers = ep.shared.peers.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(peer) = peers.get(&peer_id) {
+                peer.is_pending.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Enables or disables opt-in open LAN admission on `BB_P2P_NO_RELAYS` endpoints.
+///
+/// Fails closed with `BB_P2P_ERR_POLICY_VIOLATION` on `AllowRelays` or `ForceRelays` endpoints.
+/// When disabled (`enabled == 0`), immediately closes all still-pending un-allowlisted peers
+/// while preserving all already-allowlisted peers.
+///
+/// # Safety
+/// `handle` must be a valid endpoint pointer created by `bb_p2p_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bb_p2p_set_lan_open_admission(
+    handle: *mut BbP2pEndpoint,
+    enabled: u8,
+) -> BbP2pStatus {
+    catch_ffi_status(|| {
+        if handle.is_null() {
+            return Err(BbP2pStatus::ErrNullPointer);
+        }
+        if enabled > 1 {
+            return Err(BbP2pStatus::ErrInvalidArg);
+        }
+        let ep = unsafe { &*handle };
+        if ep.shared.closed.load(Ordering::Acquire) {
+            return Err(BbP2pStatus::ErrClosed);
+        }
+        if ep.shared.relay_policy != BbP2pRelayPolicy::NoRelays {
+            return Err(BbP2pStatus::ErrPolicyViolation);
+        }
+
+        let enable = enabled == 1;
+        ep.shared.lan_open_admission.store(enable, Ordering::Release);
+
+        if !enable {
+            let drained_pending: Vec<(EndpointId, ActivePeer)> = {
+                let mut peers = ep.shared.peers.write().unwrap_or_else(|e| e.into_inner());
+                let pending_ids: Vec<EndpointId> = peers
+                    .iter()
+                    .filter(|(id, p)| {
+                        p.is_pending.load(Ordering::Acquire) && !ep.shared.is_allowed(id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                let mut removed = Vec::with_capacity(pending_ids.len());
+                for id in pending_ids {
+                    if let Some(peer) = peers.remove(&id) {
+                        removed.push((id, peer));
+                    }
+                }
+                removed
+            };
+            for (peer_id, mut peer) in drained_pending {
+                peer.conn
+                    .close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"lan_admission_closed");
+                peer.abort_tasks();
+                ep.shared.events.push_lifecycle(QueuedEvent {
+                    kind: BbP2pEventKind::PeerDisconnected,
+                    lane: BbP2pLane::Control,
+                    peer_pubkey: *peer_id.as_bytes(),
+                    data: Vec::new(),
+                    reason_code: CLOSE_UNAUTHORIZED,
+                });
+            }
         }
         Ok(())
     })
@@ -1604,6 +1916,8 @@ pub unsafe extern "C" fn bb_p2p_connect_peer(
                 control_recv,
                 causal_send,
                 causal_recv,
+                false,
+                None,
             )
         })
     })
@@ -1643,9 +1957,7 @@ pub unsafe extern "C" fn bb_p2p_send_frame(
         key_bytes.copy_from_slice(raw_pk);
         let peer_id = PublicKey::from_bytes(&key_bytes).map_err(|_| BbP2pStatus::ErrInvalidArg)?;
 
-        if !ep.shared.is_allowed(&peer_id) {
-            return Err(BbP2pStatus::ErrNotAllowed);
-        }
+        let allowed = ep.shared.is_allowed(&peer_id);
 
         let payload = if len == 0 {
             Bytes::new()
@@ -1657,8 +1969,20 @@ pub unsafe extern "C" fn bb_p2p_send_frame(
         let (conn, sender_opt) = {
             let peers = ep.shared.peers.read().unwrap_or_else(|e| e.into_inner());
             let Some(peer) = peers.get(&peer_id) else {
-                return Err(BbP2pStatus::ErrNotConnected);
+                return Err(if allowed {
+                    BbP2pStatus::ErrNotConnected
+                } else {
+                    BbP2pStatus::ErrNotAllowed
+                });
             };
+            if !allowed {
+                let can_send_pending_control = lane == BbP2pLane::Control
+                    && peer.is_pending.load(Ordering::Acquire)
+                    && ep.shared.is_lan_open_admission();
+                if !can_send_pending_control {
+                    return Err(BbP2pStatus::ErrNotAllowed);
+                }
+            }
             if peer.conn.close_reason().is_some() {
                 return Err(BbP2pStatus::ErrNotConnected);
             }
@@ -2521,5 +2845,498 @@ mod tests {
 
         rt.block_on(raw_ep.close());
         unsafe { bb_p2p_destroy(alice) };
+    }
+
+    fn wait_for_peer_event(
+        handle: *mut BbP2pEndpoint,
+        expected_kind: BbP2pEventKind,
+        expected_peer: [u8; 32],
+    ) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut ev = BbP2pEvent {
+                kind: 0,
+                lane: 0,
+                peer_pubkey: [0u8; 32],
+                data: ptr::null_mut(),
+                data_len: 0,
+                reason_code: 0,
+            };
+            let st = unsafe { bb_p2p_poll_event(handle, 200, &mut ev) };
+            if st == BbP2pStatus::ErrTimeout {
+                continue;
+            }
+            assert_eq!(st, BbP2pStatus::Ok);
+            if !ev.data.is_null() {
+                unsafe { bb_p2p_free_bytes(ev.data, ev.data_len) };
+            }
+            if ev.kind == expected_kind as u32 && ev.peer_pubkey == expected_peer {
+                return ev.reason_code;
+            }
+        }
+        panic!("timed out waiting for {expected_kind:?} for peer");
+    }
+
+    fn target_for(host_pk: [u8; 32], host_addrs: &[BbP2pDirectAddr]) -> BbP2pPeerTarget {
+        BbP2pPeerTarget {
+            pubkey: host_pk,
+            remote_relay_policy: BbP2pRelayPolicy::NoRelays as u32,
+            relay_url: ptr::null(),
+            relay_url_len: 0,
+            direct_addrs: host_addrs.as_ptr(),
+            direct_addrs_count: host_addrs.len(),
+            connect_timeout_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn lan_open_admission_fails_closed_on_online_relay_policies() {
+        // Null & invalid flag guards.
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(ptr::null_mut(), 1) },
+            BbP2pStatus::ErrNullPointer
+        );
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(ptr::null_mut(), ptr::null()) },
+            BbP2pStatus::ErrNullPointer
+        );
+
+        // AllowRelays endpoint must fail closed with ErrPolicyViolation.
+        let relay = "https://relay.multiplayer.tech";
+        let allow_cfg = BbP2pCreateConfig {
+            abi_version: BB_P2P_ABI_VERSION,
+            relay_policy: BbP2pRelayPolicy::AllowRelays as u32,
+            secret_key: ptr::null(),
+            relay_url: relay.as_ptr().cast(),
+            relay_url_len: relay.len(),
+        };
+        let mut allow_ep: *mut BbP2pEndpoint = ptr::null_mut();
+        assert_eq!(
+            unsafe { bb_p2p_create(&allow_cfg, &mut allow_ep) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(allow_ep, 1) },
+            BbP2pStatus::ErrPolicyViolation
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(allow_ep, 0) },
+            BbP2pStatus::ErrPolicyViolation
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(allow_ep, 2) },
+            BbP2pStatus::ErrInvalidArg
+        );
+        unsafe { bb_p2p_destroy(allow_ep) };
+
+        // ForceRelays endpoint must fail closed with ErrPolicyViolation.
+        let force_cfg = BbP2pCreateConfig {
+            abi_version: BB_P2P_ABI_VERSION,
+            relay_policy: BbP2pRelayPolicy::ForceRelays as u32,
+            secret_key: ptr::null(),
+            relay_url: relay.as_ptr().cast(),
+            relay_url_len: relay.len(),
+        };
+        let mut force_ep: *mut BbP2pEndpoint = ptr::null_mut();
+        assert_eq!(
+            unsafe { bb_p2p_create(&force_cfg, &mut force_ep) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(force_ep, 1) },
+            BbP2pStatus::ErrPolicyViolation
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(force_ep, 0) },
+            BbP2pStatus::ErrPolicyViolation
+        );
+        unsafe { bb_p2p_destroy(force_ep) };
+    }
+
+    #[test]
+    fn lan_open_admission_pending_lane_enforcement_promotion_and_lock() {
+        let (host, host_pk, host_addrs) = create_no_relays_endpoint();
+        let (peer_a, pk_a, _) = create_no_relays_endpoint();
+        let (peer_b, pk_b, _) = create_no_relays_endpoint();
+        let (peer_c, pk_c, _) = create_no_relays_endpoint();
+        let (peer_d, pk_d, _) = create_no_relays_endpoint();
+        let (peer_e, pk_e, _) = create_no_relays_endpoint();
+        let (peer_f, _pk_f, _) = create_no_relays_endpoint();
+
+        let host_target = target_for(host_pk, &host_addrs);
+        for p in [peer_a, peer_b, peer_c, peer_d, peer_e, peer_f] {
+            assert_eq!(
+                unsafe { bb_p2p_set_allowed_peers(p, host_pk.as_ptr(), 1) },
+                BbP2pStatus::Ok
+            );
+        }
+
+        // Default on NoRelays is strict allowlist (closed).
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_a, &host_target) },
+            BbP2pStatus::ErrNotAllowed
+        );
+
+        // Enable open LAN admission on host.
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(host, 2) },
+            BbP2pStatus::ErrInvalidArg
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(host, 1) },
+            BbP2pStatus::Ok
+        );
+
+        // 1. Un-allowlisted peer A connects as pending and exchanges Lane 0 Control frames.
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_a, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk_a);
+
+        // Host cannot send Lane 1 or Lane 2 to pending peer A before promotion.
+        let blocked = b"not-yet-promoted";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    host,
+                    pk_a.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    blocked.as_ptr(),
+                    blocked.len(),
+                )
+            },
+            BbP2pStatus::ErrNotAllowed
+        );
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    host,
+                    pk_a.as_ptr(),
+                    BbP2pLane::Ephemeral as u32,
+                    blocked.as_ptr(),
+                    blocked.len(),
+                )
+            },
+            BbP2pStatus::ErrNotAllowed
+        );
+
+        // Host <-> pending peer A exchange Lane 0 handshake frames.
+        let lan_hello = b"LAN_HELLO:nonce=0123456789abcdef";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    host,
+                    pk_a.as_ptr(),
+                    BbP2pLane::Control as u32,
+                    lan_hello.as_ptr(),
+                    lan_hello.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(peer_a, BbP2pLane::Control);
+        assert_eq!(from, host_pk);
+        assert_eq!(got, lan_hello);
+
+        let lan_join = b"LAN_JOIN:pin_proof=ok";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    peer_a,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Control as u32,
+                    lan_join.as_ptr(),
+                    lan_join.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(host, BbP2pLane::Control);
+        assert_eq!(from, pk_a);
+        assert_eq!(got, lan_join);
+
+        // 2. Pending peer B sending Lane 1 (Causal) is dropped & closed with CLOSE_PROTOCOL_VIOLATION.
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_b, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk_b);
+
+        let rogue_causal = b"rogue-causal-before-pin";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    peer_b,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    rogue_causal.as_ptr(),
+                    rogue_causal.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let host_b_disc = wait_for_peer_event(host, BbP2pEventKind::PeerDisconnected, pk_b);
+        assert_eq!(host_b_disc, CLOSE_PROTOCOL_VIOLATION);
+        let b_disc = wait_for_peer_event(peer_b, BbP2pEventKind::PeerDisconnected, host_pk);
+        assert_eq!(b_disc, CLOSE_PROTOCOL_VIOLATION);
+
+        // 3. Pending peer C sending Lane 2 (Ephemeral) is dropped & closed with CLOSE_PROTOCOL_VIOLATION.
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_c, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk_c);
+
+        let rogue_dgram = b"rogue-dgram-before-pin";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    peer_c,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Ephemeral as u32,
+                    rogue_dgram.as_ptr(),
+                    rogue_dgram.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let host_c_disc = wait_for_peer_event(host, BbP2pEventKind::PeerDisconnected, pk_c);
+        assert_eq!(host_c_disc, CLOSE_PROTOCOL_VIOLATION);
+        let c_disc = wait_for_peer_event(peer_c, BbP2pEventKind::PeerDisconnected, host_pk);
+        assert_eq!(c_disc, CLOSE_PROTOCOL_VIOLATION);
+
+        // 4. Pending peer D rejected via bb_p2p_revoke_peer closes immediately with CLOSE_PEER_REVOKED.
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_d, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk_d);
+        assert_eq!(
+            unsafe { bb_p2p_revoke_peer(host, pk_d.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+        let d_disc = wait_for_peer_event(peer_d, BbP2pEventKind::PeerDisconnected, host_pk);
+        assert_eq!(d_disc, CLOSE_PEER_REVOKED);
+
+        // 5. Host promotes pending peer A via bb_p2p_allow_peer (idempotent) without dropping conn.
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, pk_a.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, pk_a.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+
+        let causal_a2h = b"promoted-causal-from-a";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    peer_a,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    causal_a2h.as_ptr(),
+                    causal_a2h.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(host, BbP2pLane::Causal);
+        assert_eq!(from, pk_a);
+        assert_eq!(got, causal_a2h);
+
+        let causal_h2a = b"promoted-causal-from-host";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    host,
+                    pk_a.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    causal_h2a.as_ptr(),
+                    causal_h2a.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(peer_a, BbP2pLane::Causal);
+        assert_eq!(from, host_pk);
+        assert_eq!(got, causal_h2a);
+
+        // 6. Connect pending peer E, then lock lobby via set_lan_open_admission(0):
+        //    E must be immediately closed while promoted peer A stays connected!
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_e, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk_e);
+
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(host, 0) },
+            BbP2pStatus::Ok
+        );
+        let host_e_disc = wait_for_peer_event(host, BbP2pEventKind::PeerDisconnected, pk_e);
+        assert_eq!(host_e_disc, CLOSE_UNAUTHORIZED);
+        let e_disc = wait_for_peer_event(peer_e, BbP2pEventKind::PeerDisconnected, host_pk);
+        assert_eq!(e_disc, CLOSE_UNAUTHORIZED);
+
+        // New un-allowlisted peer F is rejected after lock.
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(peer_f, &host_target) },
+            BbP2pStatus::ErrNotAllowed
+        );
+
+        // Promoted peer A still exchanges Causal frames cleanly!
+        let post_lock = b"causal-after-lobby-lock";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    peer_a,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    post_lock.as_ptr(),
+                    post_lock.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(host, BbP2pLane::Causal);
+        assert_eq!(from, pk_a);
+        assert_eq!(got, post_lock);
+
+        for p in [peer_f, peer_e, peer_d, peer_c, peer_b, peer_a, host] {
+            unsafe { bb_p2p_destroy(p) };
+        }
+    }
+
+    #[test]
+    fn lan_open_admission_enforces_16_pending_peer_cap() {
+        let (host, host_pk, host_addrs) = create_no_relays_endpoint();
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(host, 1) },
+            BbP2pStatus::Ok
+        );
+        let host_target = target_for(host_pk, &host_addrs);
+
+        let mut pending_peers = Vec::with_capacity(BB_P2P_MAX_PENDING_LAN_PEERS);
+        for _ in 0..BB_P2P_MAX_PENDING_LAN_PEERS {
+            let (ep, pk, _) = create_no_relays_endpoint();
+            assert_eq!(
+                unsafe { bb_p2p_set_allowed_peers(ep, host_pk.as_ptr(), 1) },
+                BbP2pStatus::Ok
+            );
+            assert_eq!(
+                unsafe { bb_p2p_connect_peer(ep, &host_target) },
+                BbP2pStatus::Ok
+            );
+            wait_for_peer_event(host, BbP2pEventKind::PeerConnected, pk);
+            pending_peers.push((ep, pk));
+        }
+
+        // 17th un-allowlisted peer MUST be rejected with CLOSE_UNAUTHORIZED -> ErrNotAllowed.
+        let (overflow_ep, overflow_pk, _) = create_no_relays_endpoint();
+        assert_eq!(
+            unsafe { bb_p2p_set_allowed_peers(overflow_ep, host_pk.as_ptr(), 1) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(overflow_ep, &host_target) },
+            BbP2pStatus::ErrNotAllowed
+        );
+
+        // Already-allowlisted peer MUST still connect even while 16 pending slots are full.
+        let (vip_ep, vip_pk, _) = create_no_relays_endpoint();
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, vip_pk.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_set_allowed_peers(vip_ep, host_pk.as_ptr(), 1) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(vip_ep, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, vip_pk);
+
+        // Promoting 1 pending peer frees 1 pending slot so overflow_ep can now connect!
+        let promoted_pk = pending_peers[0].1;
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, promoted_pk.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+        assert_eq!(
+            unsafe { bb_p2p_connect_peer(overflow_ep, &host_target) },
+            BbP2pStatus::Ok
+        );
+        wait_for_peer_event(host, BbP2pEventKind::PeerConnected, overflow_pk);
+
+        // Closing open admission closes all remaining pending peers while keeping vip_ep alive.
+        assert_eq!(
+            unsafe { bb_p2p_set_lan_open_admission(host, 0) },
+            BbP2pStatus::Ok
+        );
+        let overflow_disc =
+            wait_for_peer_event(overflow_ep, BbP2pEventKind::PeerDisconnected, host_pk);
+        assert_eq!(overflow_disc, CLOSE_UNAUTHORIZED);
+
+        let vip_msg = b"vip-still-alive";
+        assert_eq!(
+            unsafe {
+                bb_p2p_send_frame(
+                    vip_ep,
+                    host_pk.as_ptr(),
+                    BbP2pLane::Causal as u32,
+                    vip_msg.as_ptr(),
+                    vip_msg.len(),
+                )
+            },
+            BbP2pStatus::Ok
+        );
+        let (from, got) = poll_next_frame(host, BbP2pLane::Causal);
+        assert_eq!(from, vip_pk);
+        assert_eq!(got, vip_msg);
+
+        unsafe {
+            bb_p2p_destroy(overflow_ep);
+            bb_p2p_destroy(vip_ep);
+            for (ep, _) in pending_peers {
+                bb_p2p_destroy(ep);
+            }
+            bb_p2p_destroy(host);
+        }
+    }
+
+    #[test]
+    fn allow_peer_respects_max_allowed_peers_capacity() {
+        let (host, _, _) = create_no_relays_endpoint();
+        let mut keys = Vec::with_capacity(BB_P2P_MAX_ALLOWED_PEERS * BB_P2P_PUBKEY_LEN);
+        let mut first_pk = [0u8; 32];
+        for i in 0..BB_P2P_MAX_ALLOWED_PEERS {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            let pk = *SecretKey::from_bytes(&seed).public().as_bytes();
+            if i == 0 {
+                first_pk = pk;
+            }
+            keys.extend_from_slice(&pk);
+        }
+        assert_eq!(
+            unsafe { bb_p2p_set_allowed_peers(host, keys.as_ptr(), BB_P2P_MAX_ALLOWED_PEERS) },
+            BbP2pStatus::Ok
+        );
+        // Re-allowing an already-present peer succeeds (idempotent).
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, first_pk.as_ptr()) },
+            BbP2pStatus::Ok
+        );
+        // Adding a 1025th distinct peer fails closed with ErrCapacity.
+        let extra_pk = *SecretKey::generate().public().as_bytes();
+        assert_eq!(
+            unsafe { bb_p2p_allow_peer(host, extra_pk.as_ptr()) },
+            BbP2pStatus::ErrCapacity
+        );
+        unsafe { bb_p2p_destroy(host) };
     }
 }

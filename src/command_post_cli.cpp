@@ -7,6 +7,7 @@
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/lan_party_runtime.hpp"
 #include "blackbird/mcp_server.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
@@ -6112,6 +6113,7 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
   engine.set_telemetry(observe_flightdeck_telemetry(observed_session, rate_tracker));
 
   const bool use_kitty = !halfblock && kitty_graphics_capable();
+  const bool use_kitty_shm = use_kitty && kitty_shm_capable();
   const float nominal_dt = 1.0F / static_cast<float>(fps);
 
   const bool interactive_tty =
@@ -6200,13 +6202,15 @@ int run_flightdeck_cli(std::span<char *> args, CliIo io) {
     prev_cells = cells;
 
     if (use_kitty) {
-      const std::string encoded = encode_kitty_rgb_frame(
-          frame, HeroKittyPlacement{.row = 0,
-                                    .column = 0,
-                                    .columns = cells.columns,
-                                    .rows = cells.rows,
-                                    .image_id = hero_default_kitty_image_id,
-                                    .placement_id = 1});
+      const HeroKittyPlacement placement{.row = 0,
+                                         .column = 0,
+                                         .columns = cells.columns,
+                                         .rows = cells.rows,
+                                         .image_id = hero_default_kitty_image_id,
+                                         .placement_id = 1};
+      const std::string encoded = use_kitty_shm
+                                      ? encode_kitty_shm_rgb_frame(frame, placement)
+                                      : encode_kitty_rgb_frame(frame, placement);
       std::string out;
       out.reserve(encoded.size() + 64U);
       out += "\x1b[?2026h";
@@ -10446,13 +10450,630 @@ int run_doctor_cli(std::span<char *> args, CliIo io) {
   return report.healthy ? 0 : 1;
 }
 
+std::filesystem::path default_lan_state_dir() {
+  if (const char *xdg = std::getenv("XDG_CONFIG_HOME");
+      xdg != nullptr && xdg[0] != '\0') {
+    return fs::path{xdg} / "blackbird" / "lan";
+  }
+  if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+    return fs::path{home} / ".config" / "blackbird" / "lan";
+  }
+  return fs::path{".blackbird"} / "lan";
+}
+
+std::filesystem::path default_lan_known_peers_path() {
+  if (const char *xdg = std::getenv("XDG_CONFIG_HOME");
+      xdg != nullptr && xdg[0] != '\0') {
+    return fs::path{xdg} / "blackbird" / "known_peers.json";
+  }
+  if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+    return fs::path{home} / ".config" / "blackbird" / "known_peers.json";
+  }
+  return fs::path{".blackbird"} / "known_peers.json";
+}
+
+std::optional<fs::path> default_lan_online_state_dir_passive() {
+  if (const char *env_dir = std::getenv("BLACKBIRD_ONLINE_DIR");
+      env_dir != nullptr && env_dir[0] != '\0') {
+    return fs::path{env_dir};
+  }
+  if (const char *xdg = std::getenv("XDG_CONFIG_HOME");
+      xdg != nullptr && xdg[0] != '\0') {
+    return fs::path{xdg} / "blackbird" / "online";
+  }
+  if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+    return fs::path{home} / ".config" / "blackbird" / "online";
+  }
+  return std::nullopt;
+}
+
+bool confirm_lan_peer_trust_cli(const lan::LanPeerTrustPrompt &prompt, CliIo io) {
+  io.err << "\nUnpinned LAN " << (prompt.is_host ? "host" : "peer") << ":\n"
+         << "  Name:          " << party_chat_sanitize(prompt.display_name, 48) << "\n"
+         << "  Safety Number: " << prompt.safety_number << "\n";
+  if (!prompt.source_addr.empty()) {
+    io.err << "  Address:       " << party_chat_sanitize(prompt.source_addr, 64)
+           << "\n";
+  }
+  io.err << "Verify this Safety Number out-of-band and trust/pin this peer? [y/N]: "
+         << std::flush;
+  std::string reply;
+  if (!std::getline(io.in, reply))
+    return false;
+  while (!reply.empty() &&
+         (reply.back() == '\r' || reply.back() == ' ' || reply.back() == '\t')) {
+    reply.pop_back();
+  }
+  std::size_t s = 0U;
+  while (s < reply.size() && (reply[s] == ' ' || reply[s] == '\t'))
+    ++s;
+  std::string norm;
+  for (std::size_t i = s; i < reply.size(); ++i) {
+    norm.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(reply[i]))));
+  }
+  return norm == "y" || norm == "yes";
+}
+
+int run_lan_cli(std::span<char *> args, CliIo io) {
+  if (args.size() < 2U) {
+    io.err << "usage: blackbird lan {status|scan|host|join} [options]\n";
+    return 2;
+  }
+  const std::string_view sub{args[1]};
+  if (sub == "--help" || sub == "-h" || sub == "help") {
+    io.err
+        << "usage: blackbird lan {status|scan|host|join} [options]\n"
+           "  status [--json] [--lan-dir DIR]\n"
+           "  scan   [--timeout 1..60] [--json]\n"
+           "  host   [--name NAME] [--require-pin] [--pin-stdin] [--timeout 1..1800] "
+           "[--no-mdns] [--lan-dir DIR] [--display-name NAME]\n"
+           "  join   <lobby_id|ip:port> [--host-pk B64URL] [--pin-stdin] "
+           "[--scan-timeout 1..60] [--lan-dir DIR] [--display-name NAME]\n"
+           "Note: PINs are read via hidden TTY prompt or --pin-stdin (never --pin on "
+           "argv).\n";
+    return 0;
+  }
+
+  if (sub == "status") {
+    bool json_out = false;
+    fs::path lan_dir = default_lan_state_dir();
+    for (std::size_t i = 2U; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--help" || arg == "-h") {
+        io.err << "usage: blackbird lan status [--json] [--lan-dir DIR]\n";
+        return 0;
+      }
+      if (arg == "--json") {
+        json_out = true;
+      } else if (arg == "--lan-dir") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        lan_dir = fs::path{std::move(*v)};
+      } else {
+        return fail_usage(io, "lan status: unknown option: " + std::string{arg});
+      }
+    }
+    const auto policy_res = lan::load_effective_lan_policy();
+    if (!policy_res.has_value()) {
+      return fail_error(io, "lan status", policy_res.error());
+    }
+    const lan::LanPolicyConfig &pol = policy_res.value();
+    std::error_code ec;
+    const bool has_lan_id = fs::exists(lan_dir / "identity.json", ec);
+    if (json_out) {
+      return emit_json(
+          io, Value::object({
+                  {"disabled", Value{pol.disabled}},
+                  {"require_pin", Value{pol.require_pin}},
+                  {"require_local_auth", Value{pol.require_local_auth}},
+                  {"idle_timeout_sec",
+                   Value{Number{static_cast<std::uint64_t>(pol.idle_timeout_sec)}}},
+                  {"scan_timeout_sec",
+                   Value{Number{static_cast<std::uint64_t>(pol.scan_timeout_sec)}}},
+                  {"lan_state_dir", Value{lan_dir.string()}},
+                  {"local_lan_identity_present", Value{has_lan_id}},
+              }));
+    }
+    io.out << "LAN Party (mp1-lan/1) — strictly opt-in (zero sockets open):\n"
+           << "  Status:            "
+           << (pol.disabled ? "DISABLED (policy/env kill-switch)"
+                            : "available (opt-in)")
+           << "\n"
+           << "  Require PIN:       " << (pol.require_pin ? "yes" : "no") << "\n"
+           << "  Require OS Auth:   " << (pol.require_local_auth ? "yes" : "no") << "\n"
+           << "  Host Idle Timeout: " << pol.idle_timeout_sec << "s (cap 1800s)\n"
+           << "  Scan Timeout:      " << pol.scan_timeout_sec << "s (cap 60s)\n"
+           << "  Local Identity:    "
+           << (has_lan_id ? "present" : "created on first use") << " ("
+           << lan_dir.string() << ")\n";
+    return 0;
+  }
+
+  if (sub == "scan") {
+    lan::LanScanConfig scfg{};
+    bool json_out = false;
+    for (std::size_t i = 2U; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--help" || arg == "-h") {
+        io.err << "usage: blackbird lan scan [--timeout 1..60] [--json]\n";
+        return 0;
+      }
+      if (arg == "--json") {
+        json_out = true;
+      } else if (arg == "--timeout") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        const auto parsed = parse_u64(*v);
+        if (!parsed.has_value() || *parsed < 1U ||
+            *parsed > lan::kMaxLanScanTimeoutSec) {
+          return fail_usage(io, "lan scan: --timeout must be between 1 and 60");
+        }
+        scfg.scan_timeout_sec = static_cast<std::uint32_t>(*parsed);
+      } else {
+        return fail_usage(io, "lan scan: unknown option: " + std::string{arg});
+      }
+    }
+    if (!json_out) {
+      io.err << "Scanning local network for _mp1-lan._udp.local. lobbies (up to "
+             << scfg.scan_timeout_sec << "s)...\n"
+             << std::flush;
+    }
+    const auto found = lan::scan_lan_lobbies(scfg);
+    if (!found.has_value()) {
+      return fail_error(io, "lan scan", found.error());
+    }
+    if (json_out) {
+      Value::Array arr;
+      for (const auto &item : found.value()) {
+        Value::Array targets;
+        for (const auto &t : item.direct_targets)
+          targets.push_back(Value{t});
+        arr.push_back(Value::object({
+            {"lan_party_id", Value{item.lobby.beacon.lan_party_id}},
+            {"name", Value{item.lobby.beacon.lobby_name}},
+            {"host", Value{item.lobby.beacon.host_name}},
+            {"host_pubkey_b64url",
+             Value{encode_lan_pubkey_base64url(item.lobby.beacon.host_pubkey)}},
+            {"safety_number", Value{item.safety_number}},
+            {"pin_required", Value{item.lobby.beacon.require_pin}},
+            {"direct_targets", Value{std::move(targets)}},
+        }));
+      }
+      return emit_json(
+          io, Value::object({
+                  {"lobbies", Value{std::move(arr)}},
+                  {"count",
+                   Value{Number{static_cast<std::uint64_t>(found.value().size())}}},
+              }));
+    }
+    if (found.value().empty()) {
+      io.out << "No LAN Party lobbies found.\n";
+      return 0;
+    }
+    io.out << "Discovered LAN Party lobbies (" << found.value().size() << "):\n";
+    for (const auto &item : found.value()) {
+      io.out << "  id=" << item.lobby.beacon.lan_party_id << "  name=\""
+             << party_chat_sanitize(item.lobby.beacon.lobby_name, 32)
+             << "\"  host=" << party_chat_sanitize(item.lobby.beacon.host_name, 32)
+             << (item.lobby.beacon.require_pin ? "  [PIN]" : "  [open]") << "\n"
+             << "    safety: " << item.safety_number << "\n";
+      if (!item.direct_targets.empty()) {
+        io.out << "    direct: " << item.direct_targets.front() << "\n";
+      }
+    }
+    return 0;
+  }
+
+  if (sub == "host") {
+    std::string lobby_name = "blackbird-lan";
+    std::string display_name;
+    fs::path lan_dir = default_lan_state_dir();
+    bool require_pin = false;
+    bool pin_stdin = false;
+    bool enable_mdns = true;
+    std::uint32_t idle_timeout_sec = lan::kDefaultLanIdleTimeoutSec;
+    for (std::size_t i = 2U; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--help" || arg == "-h") {
+        io.err
+            << "usage: blackbird lan host [--name NAME] [--require-pin] [--pin-stdin] "
+               "[--timeout 1..1800] [--no-mdns] [--lan-dir DIR] "
+               "[--display-name NAME]\n";
+        return 0;
+      }
+      if (arg == "--pin" || arg.starts_with("--pin=")) {
+        return fail_usage(io, "lan host: refusing --pin on argv (secrets must never be "
+                              "passed via CLI args; use --require-pin or --pin-stdin)");
+      }
+      if (arg == "--name") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        lobby_name = std::move(*v);
+      } else if (arg == "--display-name") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        display_name = std::move(*v);
+      } else if (arg == "--lan-dir") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        lan_dir = fs::path{std::move(*v)};
+      } else if (arg == "--require-pin") {
+        require_pin = true;
+      } else if (arg == "--pin-stdin") {
+        require_pin = true;
+        pin_stdin = true;
+      } else if (arg == "--no-mdns") {
+        enable_mdns = false;
+      } else if (arg == "--timeout") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        const auto parsed = parse_u64(*v);
+        if (!parsed.has_value() || *parsed < 1U ||
+            *parsed > lan::kMaxLanIdleTimeoutSec) {
+          return fail_usage(io, "lan host: --timeout must be between 1 and 1800");
+        }
+        idle_timeout_sec = static_cast<std::uint32_t>(*parsed);
+      } else {
+        return fail_usage(io, "lan host: unknown option: " + std::string{arg});
+      }
+    }
+
+    const auto policy_res = lan::load_effective_lan_policy();
+    if (!policy_res.has_value())
+      return fail_error(io, "lan host", policy_res.error());
+    if (policy_res.value().disabled)
+      return fail_message(io,
+                          "lan host: LAN mode is disabled by policy or environment");
+    const bool need_pin = require_pin || policy_res.value().require_pin;
+
+    std::string pin_buf;
+    struct CleanseStr {
+      std::string &s;
+      ~CleanseStr() {
+        if (!s.empty()) {
+          OPENSSL_cleanse(s.data(), s.size());
+          s.clear();
+        }
+      }
+    } pin_guard{pin_buf};
+    if (need_pin) {
+      if (!read_secret_line_bounded(
+              io,
+              ReadSecretLineOpts{.prompt = "Enter LAN Party room PIN: ",
+                                 .max_bytes = lan::kLanPinMaxBytes,
+                                 .force_stdin = pin_stdin},
+              pin_buf) ||
+          pin_buf.empty()) {
+        return fail_message(io, "lan host: room PIN is required");
+      }
+    }
+
+    auto id_res = lan::load_or_create_lan_identity(lan::LanIdentityRequest{
+        .online_state_dir = default_lan_online_state_dir_passive(),
+        .lan_state_dir = lan_dir,
+        .preferred_display_name = display_name,
+    });
+    if (!id_res.has_value())
+      return fail_error(io, "lan host", id_res.error());
+
+    lan::LanHostConfig hcfg{};
+    hcfg.identity = std::move(id_res).value();
+    hcfg.lobby_name = lobby_name;
+    hcfg.pin = pin_buf;
+    hcfg.require_pin = need_pin;
+    hcfg.idle_timeout_sec = idle_timeout_sec;
+    hcfg.enable_mdns = enable_mdns;
+    hcfg.known_peers_path = default_lan_known_peers_path();
+    hcfg.trust_callback = [io](const lan::LanPeerTrustPrompt &prompt) {
+      return confirm_lan_peer_trust_cli(prompt, io);
+    };
+
+    auto host_res = lan::LanPartyHost::start(std::move(hcfg));
+    if (!host_res.has_value())
+      return fail_error(io, "lan host", host_res.error());
+    lan::LanPartyHost host = std::move(host_res).value();
+
+    io.out << "Hosting LAN Party \"" << party_chat_sanitize(host.lobby_name(), 32)
+           << "\" (id=" << host.lan_party_id() << ")\n"
+           << "  Safety Number: " << host.safety_number() << "\n"
+           << "  PIN Required:  " << (host.pin_required() ? "yes" : "no") << "\n"
+           << "  Idle Timeout:  " << host.effective_idle_timeout_sec() << "s\n";
+    const std::string pk_b64u = encode_lan_pubkey_base64url(host.host_pubkey());
+    for (const auto &dt : host.direct_targets()) {
+      io.out << "  Direct Join:   blackbird lan join " << dt << " --host-pk " << pk_b64u
+             << "\n";
+    }
+    io.out << "Type chat lines (or /lock, /members, /quit; Ctrl+C stops hosting).\n"
+           << std::flush;
+
+    FlightDeckSignalGuard sig_guard{};
+    const bool stdin_tty = (&io.in == &std::cin) && (::isatty(STDIN_FILENO) != 0);
+    std::string input_buf;
+    while (host.active() && g_flightdeck_stop == 0) {
+      (void)host.pump_once(50U);
+      for (const auto &ev : host.drain_events()) {
+        if (ev.kind == lan::LanEventKind::member_joined) {
+          io.out << "[join] " << party_chat_sanitize(ev.sender_name, 32) << " ("
+                 << ev.safety_number << ")\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::member_left) {
+          io.out << "[left] " << party_chat_sanitize(ev.sender_name, 32) << "\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::chat_received && ev.chat.has_value()) {
+          io.out << "[" << party_chat_sanitize(ev.sender_name, 32) << "] "
+                 << party_chat_sanitize(ev.chat->body, 1024) << "\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::lobby_timed_out) {
+          io.out << "[lan] Host idle timeout reached with no peers; stopped.\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::lobby_pin_locked_out) {
+          io.out << "[lan] Lobby locked out due to repeated invalid PIN attempts.\n"
+                 << std::flush;
+        }
+      }
+      if (stdin_tty) {
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        if (::poll(&pfd, 1U, 0) > 0 && (pfd.revents & POLLIN) != 0) {
+          char chunk[512];
+          const ssize_t n = ::read(STDIN_FILENO, chunk, sizeof(chunk));
+          if (n <= 0)
+            break;
+          input_buf.append(chunk, static_cast<std::size_t>(n));
+          std::size_t nl = 0;
+          while ((nl = input_buf.find('\n')) != std::string::npos) {
+            std::string line = input_buf.substr(0, nl);
+            input_buf.erase(0, nl + 1U);
+            if (!line.empty() && line.back() == '\r')
+              line.pop_back();
+            if (line == "/quit" || line == "/exit") {
+              host.stop();
+              break;
+            }
+            if (line == "/lock") {
+              (void)host.lock_lobby();
+              io.out << "[lan] Lobby locked (mDNS stopped; current members kept).\n"
+                     << std::flush;
+            } else if (line == "/members") {
+              io.out << "[lan] Members (" << host.members().size() << "):\n";
+              for (const auto &m : host.members()) {
+                io.out << "  - " << party_chat_sanitize(m.display_name, 32)
+                       << (m.is_host ? " [host]" : " [member]") << "\n";
+              }
+              io.out << std::flush;
+            } else if (!line.empty()) {
+              (void)host.send_chat(line);
+            }
+          }
+        }
+      }
+    }
+    host.stop();
+    return 0;
+  }
+
+  if (sub == "join") {
+    std::string target;
+    std::string host_pk_b64u;
+    std::string display_name;
+    fs::path lan_dir = default_lan_state_dir();
+    bool pin_stdin = false;
+    std::uint32_t scan_timeout_sec = lan::kDefaultLanScanTimeoutSec;
+    for (std::size_t i = 2U; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--help" || arg == "-h") {
+        io.err << "usage: blackbird lan join <lobby_id|ip:port> [--host-pk B64URL] "
+                  "[--pin-stdin] [--scan-timeout 1..60] [--lan-dir DIR] "
+                  "[--display-name NAME]\n";
+        return 0;
+      }
+      if (arg == "--pin" || arg.starts_with("--pin=")) {
+        return fail_usage(io,
+                          "lan join: refusing --pin on argv (use interactive prompt "
+                          "or --pin-stdin)");
+      }
+      if (arg == "--host-pk") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        host_pk_b64u = std::move(*v);
+      } else if (arg == "--display-name") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        display_name = std::move(*v);
+      } else if (arg == "--lan-dir") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        lan_dir = fs::path{std::move(*v)};
+      } else if (arg == "--pin-stdin") {
+        pin_stdin = true;
+      } else if (arg == "--scan-timeout") {
+        auto v = take_flag_value(args, i, arg, io);
+        if (!v.has_value())
+          return 2;
+        const auto parsed = parse_u64(*v);
+        if (!parsed.has_value() || *parsed < 1U ||
+            *parsed > lan::kMaxLanScanTimeoutSec) {
+          return fail_usage(io, "lan join: --scan-timeout must be between 1 and 60");
+        }
+        scan_timeout_sec = static_cast<std::uint32_t>(*parsed);
+      } else if (arg.starts_with('-')) {
+        return fail_usage(io, "lan join: unknown option: " + std::string{arg});
+      } else if (target.empty()) {
+        target = std::string{arg};
+      } else {
+        return fail_usage(io, "lan join: unexpected extra argument");
+      }
+    }
+    if (target.empty())
+      return fail_usage(io, "lan join: <lobby_id|ip:port> is required");
+
+    const auto policy_res = lan::load_effective_lan_policy();
+    if (!policy_res.has_value())
+      return fail_error(io, "lan join", policy_res.error());
+    if (policy_res.value().disabled)
+      return fail_message(io,
+                          "lan join: LAN mode is disabled by policy or environment");
+
+    lan::LanClientConfig ccfg{};
+    bool need_pin = policy_res.value().require_pin || pin_stdin;
+
+    if (const auto direct = parse_lan_direct_target(target); direct.has_value()) {
+      if (host_pk_b64u.empty()) {
+        return fail_usage(io, "lan join: direct ip:port requires --host-pk <b64url>");
+      }
+      const auto decoded_pk = decode_lan_pubkey_base64url(host_pk_b64u);
+      if (!decoded_pk.has_value())
+        return fail_usage(io, "lan join: invalid --host-pk base64url");
+      ccfg.host_pubkey = decoded_pk.value();
+      ccfg.host_addrs.push_back(direct.value());
+    } else {
+      lan::LanScanConfig scfg{};
+      scfg.scan_timeout_sec = scan_timeout_sec;
+      scfg.stop_when = [&](const std::vector<lan::DiscoveredLanLobbyInfo> &list) {
+        for (const auto &it : list) {
+          if (it.lobby.beacon.lan_party_id == target)
+            return true;
+        }
+        return false;
+      };
+      const auto scanned = lan::scan_lan_lobbies(scfg);
+      if (!scanned.has_value())
+        return fail_error(io, "lan join", scanned.error());
+      const lan::DiscoveredLanLobbyInfo *match = nullptr;
+      for (const auto &it : scanned.value()) {
+        if (it.lobby.beacon.lan_party_id == target) {
+          match = &it;
+          break;
+        }
+      }
+      if (match == nullptr) {
+        return fail_message(io, "lan join: lobby '" + party_chat_sanitize(target, 32) +
+                                    "' not found on LAN");
+      }
+      ccfg.host_pubkey = match->lobby.beacon.host_pubkey;
+      ccfg.host_addrs = match->lobby.addrs;
+      ccfg.expected_lan_party_id = match->lobby.beacon.lan_party_id;
+      ccfg.expected_host_name = match->lobby.beacon.host_name;
+      need_pin = need_pin || match->lobby.beacon.require_pin;
+    }
+
+    std::string pin_buf;
+    struct CleanseStr {
+      std::string &s;
+      ~CleanseStr() {
+        if (!s.empty()) {
+          OPENSSL_cleanse(s.data(), s.size());
+          s.clear();
+        }
+      }
+    } pin_guard{pin_buf};
+    if (need_pin) {
+      if (!read_secret_line_bounded(
+              io,
+              ReadSecretLineOpts{.prompt = "Enter LAN Party room PIN: ",
+                                 .max_bytes = lan::kLanPinMaxBytes,
+                                 .force_stdin = pin_stdin},
+              pin_buf) ||
+          pin_buf.empty()) {
+        return fail_message(io, "lan join: room PIN is required");
+      }
+    }
+
+    auto id_res = lan::load_or_create_lan_identity(lan::LanIdentityRequest{
+        .online_state_dir = default_lan_online_state_dir_passive(),
+        .lan_state_dir = lan_dir,
+        .preferred_display_name = display_name,
+    });
+    if (!id_res.has_value())
+      return fail_error(io, "lan join", id_res.error());
+
+    ccfg.identity = std::move(id_res).value();
+    ccfg.pin = pin_buf;
+    ccfg.known_peers_path = default_lan_known_peers_path();
+    ccfg.trust_callback = [io](const lan::LanPeerTrustPrompt &prompt) {
+      return confirm_lan_peer_trust_cli(prompt, io);
+    };
+
+    auto client_res = lan::LanPartyClient::join(std::move(ccfg));
+    if (!client_res.has_value())
+      return fail_error(io, "lan join", client_res.error());
+    lan::LanPartyClient client = std::move(client_res).value();
+
+    FlightDeckSignalGuard sig_guard{};
+    const bool stdin_tty = (&io.in == &std::cin) && (::isatty(STDIN_FILENO) != 0);
+    std::string input_buf;
+    while (client.state() != lan::LanSessionState::stopped &&
+           client.state() != lan::LanSessionState::rejected &&
+           client.state() != lan::LanSessionState::disconnected &&
+           g_flightdeck_stop == 0) {
+      (void)client.pump_once(50U);
+      for (const auto &ev : client.drain_events()) {
+        if (ev.kind == lan::LanEventKind::connected) {
+          io.out << "[lan] Connected to \""
+                 << party_chat_sanitize(client.lobby_name(), 32)
+                 << "\" (members=" << client.members().size() << "). Type chat lines "
+                 << "(or /quit).\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::welcome_rejected) {
+          io.err << "[lan] Join rejected: " << party_chat_sanitize(ev.reason, 64)
+                 << "\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::chat_received && ev.chat.has_value()) {
+          io.out << "[" << party_chat_sanitize(ev.sender_name, 32) << "] "
+                 << party_chat_sanitize(ev.chat->body, 1024) << "\n"
+                 << std::flush;
+        } else if (ev.kind == lan::LanEventKind::disconnected) {
+          io.out << "[lan] Disconnected.\n" << std::flush;
+        }
+      }
+      if (stdin_tty && client.connected()) {
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        if (::poll(&pfd, 1U, 0) > 0 && (pfd.revents & POLLIN) != 0) {
+          char chunk[512];
+          const ssize_t n = ::read(STDIN_FILENO, chunk, sizeof(chunk));
+          if (n <= 0)
+            break;
+          input_buf.append(chunk, static_cast<std::size_t>(n));
+          std::size_t nl = 0;
+          while ((nl = input_buf.find('\n')) != std::string::npos) {
+            std::string line = input_buf.substr(0, nl);
+            input_buf.erase(0, nl + 1U);
+            if (!line.empty() && line.back() == '\r')
+              line.pop_back();
+            if (line == "/quit" || line == "/exit") {
+              client.stop();
+              break;
+            }
+            if (!line.empty())
+              (void)client.send_chat(line);
+          }
+        }
+      }
+    }
+    const bool rejected = (client.state() == lan::LanSessionState::rejected);
+    client.stop();
+    return rejected ? 1 : 0;
+  }
+
+  return fail_usage(io, "lan: unknown subcommand: " + std::string{sub});
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
-         arg == "online" || arg == "upgrade" || arg == "doctor";
+         arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -10493,6 +11114,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_upgrade_cli(args, io);
     if (subcommand == "doctor")
       return run_doctor_cli(args, io);
+    if (subcommand == "lan")
+      return run_lan_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

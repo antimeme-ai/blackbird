@@ -2,15 +2,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <limits>
 #include <numbers>
 #include <span>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -479,6 +486,53 @@ void blend_pixel(CanvasView cv, PixelPos pos, ColorA col, bool additive) noexcep
   dst[3] = 255;
 }
 
+void blend_span(std::uint8_t *dst, int count, ColorA col, bool additive) noexcept {
+  if (count <= 0 || col.alpha <= 0.001F) {
+    return;
+  }
+  const float a = std::clamp(col.alpha, 0.0F, 1.0F);
+  if (additive) {
+    const int dr = static_cast<int>(static_cast<float>(col.rgb.r) * a + 0.5F);
+    const int dg = static_cast<int>(static_cast<float>(col.rgb.g) * a + 0.5F);
+    const int db = static_cast<int>(static_cast<float>(col.rgb.b) * a + 0.5F);
+    if (dr == 0 && dg == 0 && db == 0) {
+      return;
+    }
+    for (int i = 0; i < count; ++i) {
+      dst[0] = static_cast<std::uint8_t>(std::min(255, static_cast<int>(dst[0]) + dr));
+      dst[1] = static_cast<std::uint8_t>(std::min(255, static_cast<int>(dst[1]) + dg));
+      dst[2] = static_cast<std::uint8_t>(std::min(255, static_cast<int>(dst[2]) + db));
+      dst[3] = 255;
+      dst += 4;
+    }
+    return;
+  }
+  if (a >= 0.999F) {
+    const std::uint8_t r = col.rgb.r;
+    const std::uint8_t g = col.rgb.g;
+    const std::uint8_t b = col.rgb.b;
+    for (int i = 0; i < count; ++i) {
+      dst[0] = r;
+      dst[1] = g;
+      dst[2] = b;
+      dst[3] = 255;
+      dst += 4;
+    }
+    return;
+  }
+  const float inv = 1.0F - a;
+  const float sr = static_cast<float>(col.rgb.r) * a;
+  const float sg = static_cast<float>(col.rgb.g) * a;
+  const float sb = static_cast<float>(col.rgb.b) * a;
+  for (int i = 0; i < count; ++i) {
+    dst[0] = clamp_u8(static_cast<float>(dst[0]) * inv + sr);
+    dst[1] = clamp_u8(static_cast<float>(dst[1]) * inv + sg);
+    dst[2] = clamp_u8(static_cast<float>(dst[2]) * inv + sb);
+    dst[3] = 255;
+    dst += 4;
+  }
+}
+
 void fill_rect(CanvasView cv, RectF rect, ColorA col, bool additive = false) noexcept {
   if (col.alpha <= 0.001F || rect.w <= 0.0F || rect.h <= 0.0F) {
     return;
@@ -490,26 +544,13 @@ void fill_rect(CanvasView cv, RectF rect, ColorA col, bool additive = false) noe
   if (x0 >= x1 || y0 >= y1) {
     return;
   }
-  if (!additive && col.alpha >= 0.999F) {
-    for (int y = y0; y < y1; ++y) {
-      std::uint8_t *row =
-          cv.rgba + (static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) +
-                     static_cast<std::size_t>(x0)) *
-                        4U;
-      for (int x = x0; x < x1; ++x) {
-        row[0] = col.rgb.r;
-        row[1] = col.rgb.g;
-        row[2] = col.rgb.b;
-        row[3] = 255;
-        row += 4;
-      }
-    }
-    return;
-  }
+  const int span = x1 - x0;
   for (int y = y0; y < y1; ++y) {
-    for (int x = x0; x < x1; ++x) {
-      blend_pixel(cv, PixelPos{.x = x, .y = y}, col, additive);
-    }
+    std::uint8_t *row =
+        cv.rgba + (static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) +
+                   static_cast<std::size_t>(x0)) *
+                      4U;
+    blend_span(row, span, col, additive);
   }
 }
 
@@ -524,6 +565,7 @@ void fill_vgrad_rect(CanvasView cv, RectF rect, VGrad grad) noexcept {
   if (x0 >= x1 || y0 >= y1) {
     return;
   }
+  const int span = x1 - x0;
   const float inv_h = 1.0F / std::max(1.0F, rect.h);
   for (int y = y0; y < y1; ++y) {
     const float t = std::clamp((static_cast<float>(y) - rect.y) * inv_h, 0.0F, 1.0F);
@@ -534,9 +576,11 @@ void fill_vgrad_rect(CanvasView cv, RectF rect, VGrad grad) noexcept {
     if (col.alpha <= 0.001F) {
       continue;
     }
-    for (int x = x0; x < x1; ++x) {
-      blend_pixel(cv, PixelPos{.x = x, .y = y}, col, grad.additive);
-    }
+    std::uint8_t *row =
+        cv.rgba + (static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) +
+                   static_cast<std::size_t>(x0)) *
+                      4U;
+    blend_span(row, span, col, grad.additive);
   }
 }
 
@@ -557,8 +601,8 @@ void draw_aa_line(CanvasView cv, LineSeg seg, ColorA col, float thickness = 1.0F
   }
   const float dx = seg.b.x - seg.a.x;
   const float dy = seg.b.y - seg.a.y;
-  const float len = std::hypot(dx, dy);
-  if (len < 0.001F) {
+  const float len2 = dx * dx + dy * dy;
+  if (len2 < 1e-6F) {
     blend_pixel(cv,
                 PixelPos{.x = static_cast<int>(std::lround(seg.a.x)),
                          .y = static_cast<int>(std::lround(seg.a.y))},
@@ -601,8 +645,10 @@ void draw_aa_line(CanvasView cv, LineSeg seg, ColorA col, float thickness = 1.0F
     }
     return;
   }
-  // Smooth SDF capsule for thick / glowing strokes.
+  // Smooth SDF capsule for thick / glowing strokes with squared-distance reject.
   const float half_w = thickness * 0.5F;
+  const float reach = half_w + 0.75F;
+  const float reach2 = reach * reach;
   const int min_x = std::max(
       0, static_cast<int>(std::floor(std::min(seg.a.x, seg.b.x) - half_w - 1)));
   const int max_x =
@@ -613,14 +659,20 @@ void draw_aa_line(CanvasView cv, LineSeg seg, ColorA col, float thickness = 1.0F
   const int max_y =
       std::min(cv.height - 1,
                static_cast<int>(std::ceil(std::max(seg.a.y, seg.b.y) + half_w + 1)));
-  const float inv_len2 = 1.0F / (dx * dx + dy * dy);
+  const float inv_len2 = 1.0F / len2;
   for (int y = min_y; y <= max_y; ++y) {
+    const float py = static_cast<float>(y) - seg.a.y;
     for (int x = min_x; x <= max_x; ++x) {
       const float px = static_cast<float>(x) - seg.a.x;
-      const float py = static_cast<float>(y) - seg.a.y;
       const float proj = std::clamp((px * dx + py * dy) * inv_len2, 0.0F, 1.0F);
-      const float dist = std::hypot(px - proj * dx, py - proj * dy);
-      const float cov = std::clamp(half_w + 0.75F - dist, 0.0F, 1.0F);
+      const float rx = px - proj * dx;
+      const float ry = py - proj * dy;
+      const float dist2 = rx * rx + ry * ry;
+      if (dist2 >= reach2) {
+        continue;
+      }
+      const float dist = std::sqrt(dist2);
+      const float cov = std::clamp(reach - dist, 0.0F, 1.0F);
       if (cov > 0.01F) {
         blend_pixel(cv, PixelPos{.x = x, .y = y},
                     ColorA{.rgb = col.rgb, .alpha = col.alpha * cov}, additive);
@@ -641,6 +693,10 @@ void fill_circle(CanvasView cv, CircleSpec spec, ColorA col,
   if (spec.radius <= 0.0F || col.alpha <= 0.001F) {
     return;
   }
+  const float outer = spec.radius + 0.5F;
+  const float outer2 = outer * outer;
+  const float inner = std::max(0.0F, spec.radius - 0.5F);
+  const float inner2 = inner * inner;
   const int min_x =
       std::max(0, static_cast<int>(std::floor(spec.center.x - spec.radius - 1.0F)));
   const int max_x = std::min(
@@ -651,10 +707,18 @@ void fill_circle(CanvasView cv, CircleSpec spec, ColorA col,
       cv.height - 1, static_cast<int>(std::ceil(spec.center.y + spec.radius + 1.0F)));
   for (int y = min_y; y <= max_y; ++y) {
     const float dy = static_cast<float>(y) - spec.center.y;
+    const float dy2 = dy * dy;
+    if (dy2 >= outer2) {
+      continue;
+    }
     for (int x = min_x; x <= max_x; ++x) {
       const float dx = static_cast<float>(x) - spec.center.x;
-      const float dist = std::hypot(dx, dy);
-      const float cov = std::clamp(spec.radius + 0.5F - dist, 0.0F, 1.0F);
+      const float d2 = dx * dx + dy2;
+      if (d2 >= outer2) {
+        continue;
+      }
+      const float cov =
+          (d2 <= inner2) ? 1.0F : std::clamp(outer - std::sqrt(d2), 0.0F, 1.0F);
       if (cov > 0.01F) {
         blend_pixel(cv, PixelPos{.x = x, .y = y},
                     ColorA{.rgb = col.rgb, .alpha = col.alpha * cov}, additive);
@@ -669,19 +733,33 @@ void stroke_circle(CanvasView cv, CircleSpec spec, ColorA col, float thickness =
     return;
   }
   const float half_w = thickness * 0.5F;
-  const float outer = spec.radius + half_w + 1.0F;
-  const int min_x = std::max(0, static_cast<int>(std::floor(spec.center.x - outer)));
+  const float band = half_w + 0.6F;
+  const float outer = spec.radius + band;
+  const float outer2 = outer * outer;
+  const float inner = std::max(0.0F, spec.radius - band);
+  const float inner2 = inner * inner;
+  const int min_x =
+      std::max(0, static_cast<int>(std::floor(spec.center.x - outer - 1.0F)));
   const int max_x =
-      std::min(cv.width - 1, static_cast<int>(std::ceil(spec.center.x + outer)));
-  const int min_y = std::max(0, static_cast<int>(std::floor(spec.center.y - outer)));
-  const int max_y =
-      std::min(cv.height - 1, static_cast<int>(std::ceil(spec.center.y + outer)));
+      std::min(cv.width - 1, static_cast<int>(std::ceil(spec.center.x + outer + 1.0F)));
+  const int min_y =
+      std::max(0, static_cast<int>(std::floor(spec.center.y - outer - 1.0F)));
+  const int max_y = std::min(cv.height - 1,
+                             static_cast<int>(std::ceil(spec.center.y + outer + 1.0F)));
   for (int y = min_y; y <= max_y; ++y) {
     const float dy = static_cast<float>(y) - spec.center.y;
+    const float dy2 = dy * dy;
+    if (dy2 >= outer2) {
+      continue;
+    }
     for (int x = min_x; x <= max_x; ++x) {
       const float dx = static_cast<float>(x) - spec.center.x;
-      const float dist = std::abs(std::hypot(dx, dy) - spec.radius);
-      const float cov = std::clamp(half_w + 0.6F - dist, 0.0F, 1.0F);
+      const float d2 = dx * dx + dy2;
+      if (d2 >= outer2 || d2 <= inner2) {
+        continue;
+      }
+      const float dist = std::abs(std::sqrt(d2) - spec.radius);
+      const float cov = std::clamp(band - dist, 0.0F, 1.0F);
       if (cov > 0.01F) {
         blend_pixel(cv, PixelPos{.x = x, .y = y},
                     ColorA{.rgb = col.rgb, .alpha = col.alpha * cov}, additive);
@@ -784,11 +862,16 @@ void fill_polygon(CanvasView cv, std::span<const Vec2> pts, ColorA col,
   if (y0 > y1) {
     return;
   }
-  std::vector<float> nodes;
-  nodes.reserve(pts.size());
+  std::array<float, 64> stack_nodes{};
+  std::vector<float> heap_nodes;
+  float *nodes = stack_nodes.data();
+  if (pts.size() > stack_nodes.size()) {
+    heap_nodes.resize(pts.size());
+    nodes = heap_nodes.data();
+  }
   for (int y = y0; y <= y1; ++y) {
     const float scan_y = static_cast<float>(y) + 0.5F;
-    nodes.clear();
+    std::size_t node_count = 0;
     std::size_t j = pts.size() - 1;
     for (std::size_t i = 0; i < pts.size(); ++i) {
       const float yi = pts[i].y;
@@ -796,16 +879,22 @@ void fill_polygon(CanvasView cv, std::span<const Vec2> pts, ColorA col,
       if ((yi < scan_y && yj >= scan_y) || (yj < scan_y && yi >= scan_y)) {
         const float xi = pts[i].x;
         const float xj = pts[j].x;
-        nodes.push_back(xi + (scan_y - yi) / (yj - yi) * (xj - xi));
+        nodes[node_count++] = xi + (scan_y - yi) / (yj - yi) * (xj - xi);
       }
       j = i;
     }
-    std::sort(nodes.begin(), nodes.end());
-    for (std::size_t i = 0; i + 1 < nodes.size(); i += 2) {
+    if (node_count < 2U) {
+      continue;
+    }
+    std::sort(nodes, nodes + node_count);
+    std::uint8_t *row_base =
+        cv.rgba + static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) * 4U;
+    for (std::size_t i = 0; i + 1 < node_count; i += 2) {
       const int x0 = std::max(0, static_cast<int>(std::floor(nodes[i])));
       const int x1 = std::min(cv.width - 1, static_cast<int>(std::ceil(nodes[i + 1])));
-      for (int x = x0; x <= x1; ++x) {
-        blend_pixel(cv, PixelPos{.x = x, .y = y}, col, additive);
+      if (x0 <= x1) {
+        blend_span(row_base + static_cast<std::size_t>(x0) * 4U, x1 - x0 + 1, col,
+                   additive);
       }
     }
   }
@@ -827,23 +916,15 @@ void fill_polygon_vgrad(CanvasView cv, std::span<const Vec2> pts, VGrad grad) {
     return;
   }
   const float inv_span = 1.0F / std::max(1.0F, max_yf - min_yf);
-  std::vector<float> nodes;
-  nodes.reserve(pts.size());
+  std::array<float, 64> stack_nodes{};
+  std::vector<float> heap_nodes;
+  float *nodes = stack_nodes.data();
+  if (pts.size() > stack_nodes.size()) {
+    heap_nodes.resize(pts.size());
+    nodes = heap_nodes.data();
+  }
   for (int y = y0; y <= y1; ++y) {
     const float scan_y = static_cast<float>(y) + 0.5F;
-    nodes.clear();
-    std::size_t j = pts.size() - 1;
-    for (std::size_t i = 0; i < pts.size(); ++i) {
-      const float yi = pts[i].y;
-      const float yj = pts[j].y;
-      if ((yi < scan_y && yj >= scan_y) || (yj < scan_y && yi >= scan_y)) {
-        const float xi = pts[i].x;
-        const float xj = pts[j].x;
-        nodes.push_back(xi + (scan_y - yi) / (yj - yi) * (xj - xi));
-      }
-      j = i;
-    }
-    std::sort(nodes.begin(), nodes.end());
     const float t = std::clamp((scan_y - min_yf) * inv_span, 0.0F, 1.0F);
     const ColorA col{
         .rgb = lerp_rgb(grad.top, grad.bottom, t),
@@ -852,11 +933,30 @@ void fill_polygon_vgrad(CanvasView cv, std::span<const Vec2> pts, VGrad grad) {
     if (col.alpha <= 0.001F) {
       continue;
     }
-    for (std::size_t i = 0; i + 1 < nodes.size(); i += 2) {
+    std::size_t node_count = 0;
+    std::size_t j = pts.size() - 1;
+    for (std::size_t i = 0; i < pts.size(); ++i) {
+      const float yi = pts[i].y;
+      const float yj = pts[j].y;
+      if ((yi < scan_y && yj >= scan_y) || (yj < scan_y && yi >= scan_y)) {
+        const float xi = pts[i].x;
+        const float xj = pts[j].x;
+        nodes[node_count++] = xi + (scan_y - yi) / (yj - yi) * (xj - xi);
+      }
+      j = i;
+    }
+    if (node_count < 2U) {
+      continue;
+    }
+    std::sort(nodes, nodes + node_count);
+    std::uint8_t *row_base =
+        cv.rgba + static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) * 4U;
+    for (std::size_t i = 0; i + 1 < node_count; i += 2) {
       const int x0 = std::max(0, static_cast<int>(std::floor(nodes[i])));
       const int x1 = std::min(cv.width - 1, static_cast<int>(std::ceil(nodes[i + 1])));
-      for (int x = x0; x <= x1; ++x) {
-        blend_pixel(cv, PixelPos{.x = x, .y = y}, col, grad.additive);
+      if (x0 <= x1) {
+        blend_span(row_base + static_cast<std::size_t>(x0) * 4U, x1 - x0 + 1, col,
+                   grad.additive);
       }
     }
   }
@@ -1091,15 +1191,6 @@ struct LowResBuf {
   int height = 0;
 };
 
-bool has_lowres_energy(const std::vector<float> &buf) noexcept {
-  for (const float v : buf) {
-    if (v > 0.05F) {
-      return true;
-    }
-  }
-  return false;
-}
-
 void blur_lowres_rgb(LowResBuf buf) noexcept {
   if (buf.width < 3 || buf.height < 3 || buf.rgb == nullptr || buf.tmp == nullptr) {
     return;
@@ -1111,18 +1202,26 @@ void blur_lowres_rgb(LowResBuf buf) noexcept {
   }
   float *tmp = buf.tmp->data();
   const float *src = buf.rgb->data();
+  const auto stride = static_cast<std::size_t>(buf.width) * 3U;
   // Horizontal pass [0.25, 0.5, 0.25]
   for (int y = 0; y < buf.height; ++y) {
-    const auto row = static_cast<std::size_t>(y) * static_cast<std::size_t>(buf.width);
-    for (int x = 0; x < buf.width; ++x) {
-      const int xl = std::max(0, x - 1);
-      const int xr = std::min(buf.width - 1, x + 1);
-      const auto o = (row + static_cast<std::size_t>(x)) * 3U;
-      const auto ol = (row + static_cast<std::size_t>(xl)) * 3U;
-      const auto orr = (row + static_cast<std::size_t>(xr)) * 3U;
-      for (std::size_t c = 0; c < 3; ++c) {
-        tmp[o + c] = src[ol + c] * 0.25F + src[o + c] * 0.50F + src[orr + c] * 0.25F;
-      }
+    const float *srow = src + static_cast<std::size_t>(y) * stride;
+    float *trow = tmp + static_cast<std::size_t>(y) * stride;
+    // Left edge (x = 0)
+    for (std::size_t c = 0; c < 3; ++c) {
+      trow[c] = srow[c] * 0.75F + srow[3U + c] * 0.25F;
+    }
+    // Interior
+    for (int x = 1; x < buf.width - 1; ++x) {
+      const auto o = static_cast<std::size_t>(x) * 3U;
+      trow[o] = srow[o - 3U] * 0.25F + srow[o] * 0.50F + srow[o + 3U] * 0.25F;
+      trow[o + 1U] = srow[o - 2U] * 0.25F + srow[o + 1U] * 0.50F + srow[o + 4U] * 0.25F;
+      trow[o + 2U] = srow[o - 1U] * 0.25F + srow[o + 2U] * 0.50F + srow[o + 5U] * 0.25F;
+    }
+    // Right edge (x = width - 1)
+    const auto last = static_cast<std::size_t>(buf.width - 1) * 3U;
+    for (std::size_t c = 0; c < 3; ++c) {
+      trow[last + c] = srow[last - 3U + c] * 0.25F + srow[last + c] * 0.75F;
     }
   }
   // Vertical pass [0.25, 0.5, 0.25]
@@ -1130,17 +1229,12 @@ void blur_lowres_rgb(LowResBuf buf) noexcept {
   for (int y = 0; y < buf.height; ++y) {
     const int yu = std::max(0, y - 1);
     const int yd = std::min(buf.height - 1, y + 1);
-    const auto row = static_cast<std::size_t>(y) * static_cast<std::size_t>(buf.width);
-    const auto ru = static_cast<std::size_t>(yu) * static_cast<std::size_t>(buf.width);
-    const auto rd = static_cast<std::size_t>(yd) * static_cast<std::size_t>(buf.width);
-    for (int x = 0; x < buf.width; ++x) {
-      const auto ux = static_cast<std::size_t>(x);
-      const auto o = (row + ux) * 3U;
-      const auto ou = (ru + ux) * 3U;
-      const auto od = (rd + ux) * 3U;
-      for (std::size_t c = 0; c < 3; ++c) {
-        dst[o + c] = tmp[ou + c] * 0.25F + tmp[o + c] * 0.50F + tmp[od + c] * 0.25F;
-      }
+    float *drow = dst + static_cast<std::size_t>(y) * stride;
+    const float *tu = tmp + static_cast<std::size_t>(yu) * stride;
+    const float *tc = tmp + static_cast<std::size_t>(y) * stride;
+    const float *td = tmp + static_cast<std::size_t>(yd) * stride;
+    for (std::size_t k = 0; k < stride; ++k) {
+      drow[k] = tu[k] * 0.25F + tc[k] * 0.50F + td[k] * 0.25F;
     }
   }
 }
@@ -1153,43 +1247,84 @@ struct UpsampleSpec {
 };
 
 void upsample_additive(CanvasView cv, UpsampleSpec spec) noexcept {
-  if (spec.src == nullptr || spec.src_w < 2 || spec.src_h < 2 || spec.gain <= 0.001F) {
+  if (spec.src == nullptr || spec.src_w < 2 || spec.src_h < 2 || spec.gain <= 0.001F ||
+      cv.width <= 0 || cv.height <= 0 || cv.width > static_cast<int>(hero_max_width) ||
+      spec.src_h > 256) {
     return;
   }
   const float *s = spec.src->data();
+  const auto src_stride = static_cast<std::size_t>(spec.src_w) * 3U;
+
+  // Compute compact per-source-row activity mask so empty rows skip 100% of output
+  // work.
+  std::array<bool, 256> row_active{};
+  bool any_active = false;
+  for (int sy = 0; sy < spec.src_h; ++sy) {
+    const float *row = s + static_cast<std::size_t>(sy) * src_stride;
+    bool active = false;
+    for (std::size_t k = 0; k < src_stride; ++k) {
+      if (row[k] > 0.05F) {
+        active = true;
+        break;
+      }
+    }
+    row_active[static_cast<std::size_t>(sy)] = active;
+    any_active = any_active || active;
+  }
+  if (!any_active) {
+    return;
+  }
+
+  // Precompute horizontal sample offsets and interpolation weights once per call.
   const float sx_scale = static_cast<float>(spec.src_w - 1) /
                          static_cast<float>(std::max(1, cv.width - 1));
   const float sy_scale = static_cast<float>(spec.src_h - 1) /
                          static_cast<float>(std::max(1, cv.height - 1));
+  std::array<std::uint16_t, hero_max_width> x0_off{};
+  std::array<std::uint16_t, hero_max_width> x1_off{};
+  std::array<float, hero_max_width> wx_arr{};
+  for (int x = 0; x < cv.width; ++x) {
+    const float fx = static_cast<float>(x) * sx_scale;
+    const int x0 = static_cast<int>(fx);
+    const int x1 = std::min(spec.src_w - 1, x0 + 1);
+    const auto ux = static_cast<std::size_t>(x);
+    x0_off[ux] = static_cast<std::uint16_t>(x0 * 3);
+    x1_off[ux] = static_cast<std::uint16_t>(x1 * 3);
+    wx_arr[ux] = fx - static_cast<float>(x0);
+  }
+
   for (int y = 0; y < cv.height; ++y) {
     const float fy = static_cast<float>(y) * sy_scale;
     const int y0 = static_cast<int>(fy);
     const int y1 = std::min(spec.src_h - 1, y0 + 1);
+    if (!row_active[static_cast<std::size_t>(y0)] &&
+        !row_active[static_cast<std::size_t>(y1)]) {
+      continue;
+    }
     const float wy = fy - static_cast<float>(y0);
-    const auto r0 = static_cast<std::size_t>(y0) * static_cast<std::size_t>(spec.src_w);
-    const auto r1 = static_cast<std::size_t>(y1) * static_cast<std::size_t>(spec.src_w);
+    const float wy0 = (1.0F - wy) * spec.gain;
+    const float wy1 = wy * spec.gain;
+    const float *s0 = s + static_cast<std::size_t>(y0) * src_stride;
+    const float *s1 = s + static_cast<std::size_t>(y1) * src_stride;
     std::uint8_t *dst_row =
         cv.rgba + static_cast<std::size_t>(y) * static_cast<std::size_t>(cv.width) * 4U;
     for (int x = 0; x < cv.width; ++x) {
-      const float fx = static_cast<float>(x) * sx_scale;
-      const int x0 = static_cast<int>(fx);
-      const int x1 = std::min(spec.src_w - 1, x0 + 1);
-      const float wx = fx - static_cast<float>(x0);
-      const auto i00 = (r0 + static_cast<std::size_t>(x0)) * 3U;
-      const auto i10 = (r0 + static_cast<std::size_t>(x1)) * 3U;
-      const auto i01 = (r1 + static_cast<std::size_t>(x0)) * 3U;
-      const auto i11 = (r1 + static_cast<std::size_t>(x1)) * 3U;
-      const float w00 = (1.0F - wx) * (1.0F - wy) * spec.gain;
-      const float w10 = wx * (1.0F - wy) * spec.gain;
-      const float w01 = (1.0F - wx) * wy * spec.gain;
-      const float w11 = wx * wy * spec.gain;
-      const float r = s[i00] * w00 + s[i10] * w10 + s[i01] * w01 + s[i11] * w11;
+      const auto ux = static_cast<std::size_t>(x);
+      const std::size_t o0 = x0_off[ux];
+      const std::size_t o1 = x1_off[ux];
+      const float wx = wx_arr[ux];
+      const float w1m = 1.0F - wx;
+      const float w00 = w1m * wy0;
+      const float w10 = wx * wy0;
+      const float w01 = w1m * wy1;
+      const float w11 = wx * wy1;
+      const float r = s0[o0] * w00 + s0[o1] * w10 + s1[o0] * w01 + s1[o1] * w11;
       const float g =
-          s[i00 + 1] * w00 + s[i10 + 1] * w10 + s[i01 + 1] * w01 + s[i11 + 1] * w11;
+          s0[o0 + 1U] * w00 + s0[o1 + 1U] * w10 + s1[o0 + 1U] * w01 + s1[o1 + 1U] * w11;
       const float b =
-          s[i00 + 2] * w00 + s[i10 + 2] * w10 + s[i01 + 2] * w01 + s[i11 + 2] * w11;
+          s0[o0 + 2U] * w00 + s0[o1 + 2U] * w10 + s1[o0 + 2U] * w01 + s1[o1 + 2U] * w11;
       if (r > 0.25F || g > 0.25F || b > 0.25F) {
-        std::uint8_t *px = dst_row + static_cast<std::size_t>(x) * 4U;
+        std::uint8_t *px = dst_row + ux * 4U;
         px[0] = clamp_u8(static_cast<float>(px[0]) + r);
         px[1] = clamp_u8(static_cast<float>(px[1]) + g);
         px[2] = clamp_u8(static_cast<float>(px[2]) + b);
@@ -1226,7 +1361,13 @@ constexpr std::array<Vec2, 14> kSrHalf = {{
 // Per token class flow index: 0 cascade, 1 sweep, 2 fog/atmosphere.
 constexpr std::array<std::uint8_t, 6> kClassFlow = {2, 1, 1, 0, 0, 1};
 
-constexpr std::size_t kMaxParticles = 4096;
+constexpr std::size_t kMaxParticles = 600;
+constexpr float kEnergyThreshold = 0.005F;
+constexpr float kStaleIdleSeconds = 1.5F;
+constexpr float kIdleAmbientTotalRate = 45.0F;
+constexpr float kBusyAmbientTotalRate = 320.0F;
+constexpr float kIdleAmbientOutRate = 12.0F;
+constexpr float kBusyAmbientOutRate = 120.0F;
 
 void append_base64(std::string &out, std::span<const std::uint8_t> bytes) {
   if (bytes.empty()) {
@@ -1485,15 +1626,19 @@ void HeroParticleSystem::reset(HeroSize size, std::uint32_t seed) {
   glow_h_ = std::max<std::uint32_t>(16, height_ / 4);
   rng_state_ = seed == 0 ? 11U : seed;
   sim_t_ = 0.0F;
+  idle_stale_seconds_ = 0.0F;
+  eff_total_rate_ = kIdleAmbientTotalRate;
+  eff_out_rate_ = kIdleAmbientOutRate;
   has_prev_counters_ = false;
   prev_input_ = 0;
   prev_cached_ = 0;
   prev_reasoning_ = 0;
   prev_output_ = 0;
   prev_jev_ = 0;
+  burst_backlog_.fill(0.0F);
   owe_.fill(0.0F);
   particles_.clear();
-  particles_.reserve(1024);
+  particles_.reserve(kMaxParticles);
   acc_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 3U,
               0.0F);
   const auto low_count =
@@ -1503,6 +1648,10 @@ void HeroParticleSystem::reset(HeroSize size, std::uint32_t seed) {
   fog_blur_.assign(low_count, 0.0F);
   glow_blur_.assign(low_count, 0.0F);
   blur_tmp_.assign(low_count, 0.0F);
+  acc_energy_ = 0.0F;
+  glow_energy_ = 0.0F;
+  fog_energy_ = 0.0F;
+  matrix_energy_ = 0.0F;
   matrix_cols_ = std::max<std::uint32_t>(8, (width_ + 8) / 9);
   matrix_rows_ = std::max<std::uint32_t>(8, (height_ + 10) / 11);
   matrix_bright_.assign(static_cast<std::size_t>(matrix_cols_) *
@@ -1539,6 +1688,7 @@ void HeroParticleSystem::write_matrix_cell(CellPoint point) {
         next_random() * static_cast<float>(kCodeGlyphs.size()));
   }
   matrix_bright_[k] = 1.25F;
+  matrix_energy_ = std::max(matrix_energy_, 1.25F);
 }
 
 void HeroParticleSystem::spawn_particle(SpawnSpec spec, const HeroTheme &theme) {
@@ -1636,47 +1786,43 @@ void HeroParticleSystem::emit_from_telemetry(const HeroTelemetryInput &telemetry
   const float hit = static_cast<float>(sanitize_cache_hit(telemetry.cache_hit_ratio));
   const float miss = 1.0F - hit;
 
-  // Always maintain a tasteful ambient cruise baseline so idle flight deck is alive,
-  // scaling dramatically when live tokens flow.
-  const float live_rate =
-      static_cast<float>(sanitize_rate(telemetry.total_tok_per_sec));
-  const float live_out =
-      static_cast<float>(sanitize_rate(telemetry.out_rsn_tok_per_sec));
-  const float ambient_base = telemetry.busy ? 650.0F : 240.0F;
-  const float eff_total = std::max(ambient_base, live_rate);
-  const float eff_out = std::max(telemetry.busy ? 180.0F : 70.0F, live_out);
+  // Token quanta per particle (cache read uses coarser quantum so sky stays balanced).
+  constexpr std::array<float, 6> kQuanta = {110.0F, 28.0F, 28.0F, 22.0F, 22.0F, 45.0F};
 
-  std::array<float, 6> class_tokens{};
-  class_tokens[0] = eff_total * hit * dt;
-  class_tokens[1] = eff_total * miss * 0.25F * dt;
-  class_tokens[2] = eff_total * miss * 0.75F * dt;
-  class_tokens[3] = eff_out * 0.35F * dt;
-  class_tokens[4] = eff_out * 0.65F * dt;
-  class_tokens[5] = telemetry.busy ? 28.0F * dt : 8.0F * dt;
-
-  // Also inject bursts directly from monotonic counter deltas.
+  // Detect monotonic counter movement and stage bounded bursts into a smooth ~0.5s
+  // backlog so large counter jumps never dump 288 particles in a single frame spike.
+  bool counters_advanced = false;
   if (has_prev_counters_) {
     if (telemetry.cached_tokens > prev_cached_) {
-      class_tokens[0] += static_cast<float>(
+      counters_advanced = true;
+      const float d = static_cast<float>(
           std::min<std::uint64_t>(telemetry.cached_tokens - prev_cached_, 50000));
+      burst_backlog_[0] = std::min(burst_backlog_[0] + d, kQuanta[0] * 48.0F);
     }
     if (telemetry.input_tokens > prev_input_) {
+      counters_advanced = true;
       const float d_in = static_cast<float>(
           std::min<std::uint64_t>(telemetry.input_tokens - prev_input_, 50000));
-      class_tokens[1] += d_in * 0.2F;
-      class_tokens[2] += d_in * 0.8F;
+      burst_backlog_[1] = std::min(burst_backlog_[1] + d_in * 0.2F, kQuanta[1] * 48.0F);
+      burst_backlog_[2] = std::min(burst_backlog_[2] + d_in * 0.8F, kQuanta[2] * 48.0F);
     }
     if (telemetry.reasoning_tokens > prev_reasoning_) {
-      class_tokens[3] += static_cast<float>(
+      counters_advanced = true;
+      const float d = static_cast<float>(
           std::min<std::uint64_t>(telemetry.reasoning_tokens - prev_reasoning_, 20000));
+      burst_backlog_[3] = std::min(burst_backlog_[3] + d, kQuanta[3] * 48.0F);
     }
     if (telemetry.output_tokens > prev_output_) {
-      class_tokens[4] += static_cast<float>(
+      counters_advanced = true;
+      const float d = static_cast<float>(
           std::min<std::uint64_t>(telemetry.output_tokens - prev_output_, 20000));
+      burst_backlog_[4] = std::min(burst_backlog_[4] + d, kQuanta[4] * 48.0F);
     }
     if (telemetry.jev_calls > prev_jev_) {
-      class_tokens[5] += static_cast<float>(
+      counters_advanced = true;
+      const float d = static_cast<float>(
           std::min<std::uint64_t>(telemetry.jev_calls - prev_jev_, 20) * 600ULL);
+      burst_backlog_[5] = std::min(burst_backlog_[5] + d, kQuanta[5] * 48.0F);
     }
   }
   has_prev_counters_ = true;
@@ -1686,8 +1832,60 @@ void HeroParticleSystem::emit_from_telemetry(const HeroTelemetryInput &telemetry
   prev_output_ = telemetry.output_tokens;
   prev_jev_ = telemetry.jev_calls;
 
-  // Token quanta per particle (cache read uses coarser quantum so sky stays balanced).
-  constexpr std::array<float, 6> kQuanta = {110.0F, 28.0F, 28.0F, 22.0F, 22.0F, 45.0F};
+  // Track staleness when !busy and counters are stationary for > 1.5s: treat stale
+  // non-zero incoming rates as zero and smoothly decay down to a crisp ambient cruise.
+  if (telemetry.busy || counters_advanced) {
+    idle_stale_seconds_ = 0.0F;
+  } else {
+    idle_stale_seconds_ = std::min(idle_stale_seconds_ + dt, 60.0F);
+  }
+  const bool stale_idle =
+      (!telemetry.busy) && (idle_stale_seconds_ > kStaleIdleSeconds);
+  const float live_rate =
+      stale_idle ? 0.0F
+                 : static_cast<float>(sanitize_rate(telemetry.total_tok_per_sec));
+  const float live_out =
+      stale_idle ? 0.0F
+                 : static_cast<float>(sanitize_rate(telemetry.out_rsn_tok_per_sec));
+  const float ambient_base =
+      telemetry.busy ? kBusyAmbientTotalRate : kIdleAmbientTotalRate;
+  const float out_base = telemetry.busy ? kBusyAmbientOutRate : kIdleAmbientOutRate;
+  const float target_total = std::max(ambient_base, live_rate);
+  const float target_out = std::max(out_base, live_out);
+
+  // Ramp up immediately for responsive live streaming; decay smoothly when going idle.
+  const float decay_alpha = 1.0F - std::exp(-dt * 3.0F);
+  if (target_total >= eff_total_rate_) {
+    eff_total_rate_ = target_total;
+  } else {
+    eff_total_rate_ += (target_total - eff_total_rate_) * decay_alpha;
+  }
+  if (target_out >= eff_out_rate_) {
+    eff_out_rate_ = target_out;
+  } else {
+    eff_out_rate_ += (target_out - eff_out_rate_) * decay_alpha;
+  }
+
+  std::array<float, 6> class_tokens{};
+  class_tokens[0] = eff_total_rate_ * hit * dt;
+  class_tokens[1] = eff_total_rate_ * miss * 0.25F * dt;
+  class_tokens[2] = eff_total_rate_ * miss * 0.75F * dt;
+  class_tokens[3] = eff_out_rate_ * 0.35F * dt;
+  class_tokens[4] = eff_out_rate_ * 0.65F * dt;
+  class_tokens[5] = telemetry.busy ? 18.0F * dt : 2.5F * dt;
+
+  // Spread any counter-delta backlog smoothly over ~0.5s.
+  const float burst_drain_frac = std::min(1.0F, dt * 2.0F);
+  for (std::size_t c = 0; c < 6; ++c) {
+    if (burst_backlog_[c] > 0.0F) {
+      const float take = (burst_backlog_[c] < 1.0F)
+                             ? burst_backlog_[c]
+                             : (burst_backlog_[c] * burst_drain_frac);
+      burst_backlog_[c] = std::max(0.0F, burst_backlog_[c] - take);
+      class_tokens[c] += take;
+    }
+  }
+
   const std::size_t active_sources =
       std::clamp<std::size_t>(std::max<std::size_t>(1, telemetry.total_agents), 1, 6);
 
@@ -1696,9 +1894,9 @@ void HeroParticleSystem::emit_from_telemetry(const HeroTelemetryInput &telemetry
     const float add = (std::isfinite(class_tokens[c]) && class_tokens[c] > 0.0F)
                           ? class_tokens[c]
                           : 0.0F;
-    owe_[c] = std::min(next_owe + add, kQuanta[c] * 64.0F);
+    owe_[c] = std::min(next_owe + add, kQuanta[c] * 16.0F);
     const int spawn_count =
-        std::min(48, static_cast<int>(std::floor(owe_[c] / kQuanta[c])));
+        std::min(8, static_cast<int>(std::floor(owe_[c] / kQuanta[c])));
     if (spawn_count <= 0) {
       continue;
     }
@@ -1722,33 +1920,68 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
   const float dt = std::min(dt_seconds, 0.1F);
   sim_t_ += dt;
 
-  // Exponential decay scaled to frame dt (30 fps reference).
+  // Exponential decay scaled to frame dt (30 fps reference), energy-gated so empty
+  // buffers cost zero memory bandwidth.
   const float ticks = dt * 30.0F;
-  const float acc_decay = std::pow(0.84F, ticks);
-  const float glow_decay = std::pow(0.945F, ticks);
-  const float fog_decay = std::pow(0.925F, ticks);
-  for (float &v : acc_) {
-    v *= acc_decay;
+  if (acc_energy_ >= kEnergyThreshold) {
+    const float acc_decay = std::pow(0.84F, ticks);
+    acc_energy_ *= acc_decay;
+    if (acc_energy_ < kEnergyThreshold) {
+      std::fill(acc_.begin(), acc_.end(), 0.0F);
+      acc_energy_ = 0.0F;
+    } else {
+      float *p = acc_.data();
+      const std::size_t n = acc_.size();
+      for (std::size_t idx = 0; idx < n; ++idx) {
+        p[idx] *= acc_decay;
+      }
+    }
   }
-  for (float &v : glow_buf_) {
-    v *= glow_decay;
+  if (glow_energy_ >= kEnergyThreshold) {
+    const float glow_decay = std::pow(0.945F, ticks);
+    glow_energy_ *= glow_decay;
+    if (glow_energy_ < kEnergyThreshold) {
+      std::fill(glow_buf_.begin(), glow_buf_.end(), 0.0F);
+      glow_energy_ = 0.0F;
+    } else {
+      float *p = glow_buf_.data();
+      const std::size_t n = glow_buf_.size();
+      for (std::size_t idx = 0; idx < n; ++idx) {
+        p[idx] *= glow_decay;
+      }
+    }
   }
-  for (float &v : fog_buf_) {
-    v *= fog_decay;
+  if (fog_energy_ >= kEnergyThreshold) {
+    const float fog_decay = std::pow(0.925F, ticks);
+    fog_energy_ *= fog_decay;
+    if (fog_energy_ < kEnergyThreshold) {
+      std::fill(fog_buf_.begin(), fog_buf_.end(), 0.0F);
+      fog_energy_ = 0.0F;
+    } else {
+      float *p = fog_buf_.data();
+      const std::size_t n = fog_buf_.size();
+      for (std::size_t idx = 0; idx < n; ++idx) {
+        p[idx] *= fog_decay;
+      }
+    }
   }
-  if (theme.cr_style == HeroCacheReadStyle::code) {
+  if (theme.cr_style == HeroCacheReadStyle::code &&
+      matrix_energy_ >= kEnergyThreshold) {
     const float mat_decay = std::pow(0.935F, ticks);
+    float peak_mat = 0.0F;
     for (std::size_t k = 0; k < matrix_bright_.size(); ++k) {
       if (matrix_bright_[k] < 0.03F) {
         matrix_bright_[k] = 0.0F;
         continue;
       }
       matrix_bright_[k] *= mat_decay;
+      peak_mat = std::max(peak_mat, matrix_bright_[k]);
       if (next_random() < 0.004F) {
         matrix_glyph_[k] = static_cast<std::uint8_t>(
             next_random() * static_cast<float>(kCodeGlyphs.size()));
       }
     }
+    matrix_energy_ = peak_mat;
   }
 
   const auto w = static_cast<int>(width_);
@@ -1757,6 +1990,9 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
       static_cast<float>(h) * theme.horizon + static_cast<float>(h) * 0.04F;
   const float gravity = 18.0F * (static_cast<float>(h) / 300.0F);
   const float drag = std::max(0.0F, 1.0F - 0.02F * dt);
+  float *acc_data = acc_.data();
+  float *glow_data = glow_buf_.data();
+  float *fog_data = fog_buf_.data();
 
   std::size_t i = particles_.size();
   while (i > 0) {
@@ -1800,9 +2036,9 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
 
     const HeroRgb col = theme.cls[p.token_class];
     const auto gx =
-        std::min<std::uint32_t>(glow_w_ - 1, static_cast<std::uint32_t>(xi) / 4U);
+        std::min<std::uint32_t>(glow_w_ - 1, static_cast<std::uint32_t>(xi) >> 2U);
     const auto gy =
-        std::min<std::uint32_t>(glow_h_ - 1, static_cast<std::uint32_t>(yi) / 4U);
+        std::min<std::uint32_t>(glow_h_ - 1, static_cast<std::uint32_t>(yi) >> 2U);
     const auto go = (static_cast<std::size_t>(gy) * static_cast<std::size_t>(glow_w_) +
                      static_cast<std::size_t>(gx)) *
                     3U;
@@ -1810,21 +2046,29 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
     if (p.flow == 2) {
       switch (theme.cr_style) {
       case HeroCacheReadStyle::snow: {
+        const float dr = static_cast<float>(col.r) * 0.42F;
+        const float dg = static_cast<float>(col.g) * 0.42F;
+        const float db = static_cast<float>(col.b) * 0.42F;
         for (int dy = 0; dy < 3; ++dy) {
+          const int yy = yi + dy;
+          if (yy >= h) {
+            break;
+          }
           for (int dx = 0; dx < 3; ++dx) {
             if ((dx == 0 || dx == 2) && (dy == 0 || dy == 2)) {
               continue;
             }
             const int xx = xi + dx;
-            const int yy = yi + dy;
-            if (xx < w && yy < h) {
+            if (xx < w) {
               const auto o =
                   (static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) +
                    static_cast<std::size_t>(xx)) *
                   3U;
-              acc_[o] += static_cast<float>(col.r) * 0.42F;
-              acc_[o + 1] += static_cast<float>(col.g) * 0.42F;
-              acc_[o + 2] += static_cast<float>(col.b) * 0.42F;
+              acc_data[o] += dr;
+              acc_data[o + 1] += dg;
+              acc_data[o + 2] += db;
+              acc_energy_ = std::max(
+                  {acc_energy_, acc_data[o], acc_data[o + 1], acc_data[o + 2]});
             }
           }
         }
@@ -1835,18 +2079,26 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
             ((static_cast<int>(p.y * 0.08F) + static_cast<int>(i)) & 1) != 0;
         const int pw = flip ? 4 : 2;
         const int ph = flip ? 2 : 4;
+        const float dr = static_cast<float>(col.r) * 0.48F;
+        const float dg = static_cast<float>(col.g) * 0.48F;
+        const float db = static_cast<float>(col.b) * 0.48F;
         for (int dy = 0; dy < ph; ++dy) {
+          const int yy = yi + dy;
+          if (yy >= h) {
+            break;
+          }
           for (int dx = 0; dx < pw; ++dx) {
             const int xx = xi + dx;
-            const int yy = yi + dy;
-            if (xx < w && yy < h) {
+            if (xx < w) {
               const auto o =
                   (static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) +
                    static_cast<std::size_t>(xx)) *
                   3U;
-              acc_[o] += static_cast<float>(col.r) * 0.48F;
-              acc_[o + 1] += static_cast<float>(col.g) * 0.48F;
-              acc_[o + 2] += static_cast<float>(col.b) * 0.48F;
+              acc_data[o] += dr;
+              acc_data[o + 1] += dg;
+              acc_data[o + 2] += db;
+              acc_energy_ = std::max(
+                  {acc_energy_, acc_data[o], acc_data[o + 1], acc_data[o + 2]});
             }
           }
         }
@@ -1857,6 +2109,9 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
         break;
       }
       case HeroCacheReadStyle::rain: {
+        const float dr = static_cast<float>(col.r) * 0.22F;
+        const float dg = static_cast<float>(col.g) * 0.22F;
+        const float db = static_cast<float>(col.b) * 0.22F;
         for (int k = 0; k < 10; ++k) {
           const int xx = xi + static_cast<int>(static_cast<float>(k) * 0.14F);
           const int yy = yi - k;
@@ -1866,41 +2121,55 @@ void HeroParticleSystem::step(const HeroTheme &theme, float dt_seconds) {
           const auto o = (static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) +
                           static_cast<std::size_t>(xx)) *
                          3U;
-          acc_[o] += static_cast<float>(col.r) * 0.22F;
-          acc_[o + 1] += static_cast<float>(col.g) * 0.22F;
-          acc_[o + 2] += static_cast<float>(col.b) * 0.22F;
+          acc_data[o] += dr;
+          acc_data[o + 1] += dg;
+          acc_data[o + 2] += db;
+          acc_energy_ =
+              std::max({acc_energy_, acc_data[o], acc_data[o + 1], acc_data[o + 2]});
         }
         break;
       }
       case HeroCacheReadStyle::fog: {
-        const float fa = 0.09F;
-        fog_buf_[go] += static_cast<float>(col.r) * fa;
-        fog_buf_[go + 1] += static_cast<float>(col.g) * fa;
-        fog_buf_[go + 2] += static_cast<float>(col.b) * fa;
+        constexpr float kFogAlpha = 0.09F;
+        fog_data[go] += static_cast<float>(col.r) * kFogAlpha;
+        fog_data[go + 1] += static_cast<float>(col.g) * kFogAlpha;
+        fog_data[go + 2] += static_cast<float>(col.b) * kFogAlpha;
+        fog_energy_ =
+            std::max({fog_energy_, fog_data[go], fog_data[go + 1], fog_data[go + 2]});
         break;
       }
       }
       continue;
     }
 
-    // Flow 0 & 1: team-colored low-res additive glow + crisp 2x2/3x3 token core.
+    // Flow 0 & 1: team-colored low-res additive glow + crisp 2x2 token core.
     const HeroRgb tm = theme.team[p.source];
-    glow_buf_[go] += static_cast<float>(tm.r) * 0.11F;
-    glow_buf_[go + 1] += static_cast<float>(tm.g) * 0.11F;
-    glow_buf_[go + 2] += static_cast<float>(tm.b) * 0.11F;
+    glow_data[go] += static_cast<float>(tm.r) * 0.11F;
+    glow_data[go + 1] += static_cast<float>(tm.g) * 0.11F;
+    glow_data[go + 2] += static_cast<float>(tm.b) * 0.11F;
+    glow_energy_ =
+        std::max({glow_energy_, glow_data[go], glow_data[go + 1], glow_data[go + 2]});
 
     constexpr float kCoreAlpha = 0.52F;
+    const float cr = static_cast<float>(col.r) * kCoreAlpha;
+    const float cg = static_cast<float>(col.g) * kCoreAlpha;
+    const float cb = static_cast<float>(col.b) * kCoreAlpha;
     for (int dy = 0; dy < 2; ++dy) {
+      const int yy = yi + dy;
+      if (yy >= h) {
+        break;
+      }
       for (int dx = 0; dx < 2; ++dx) {
         const int xx = xi + dx;
-        const int yy = yi + dy;
-        if (xx < w && yy < h) {
+        if (xx < w) {
           const auto o = (static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) +
                           static_cast<std::size_t>(xx)) *
                          3U;
-          acc_[o] += static_cast<float>(col.r) * kCoreAlpha;
-          acc_[o + 1] += static_cast<float>(col.g) * kCoreAlpha;
-          acc_[o + 2] += static_cast<float>(col.b) * kCoreAlpha;
+          acc_data[o] += cr;
+          acc_data[o + 1] += cg;
+          acc_data[o + 2] += cb;
+          acc_energy_ =
+              std::max({acc_energy_, acc_data[o], acc_data[o + 1], acc_data[o + 2]});
         }
       }
     }
@@ -1919,19 +2188,19 @@ void HeroParticleSystem::composite(std::vector<std::uint8_t> &rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
-  // Blurred additive fog + team glow upsampled from W/4 x H/4 using preallocated
-  // scratch buffers; skip empty low-res buffers completely.
+  // Energy-gated blurred additive fog + team glow upsampled from W/4 x H/4 using
+  // preallocated scratch buffers; skip completely when peak energy < 0.005F.
   const int gw = static_cast<int>(glow_w_);
   const int gh = static_cast<int>(glow_h_);
-  if (has_lowres_energy(fog_buf_)) {
-    std::copy(fog_buf_.begin(), fog_buf_.end(), fog_blur_.begin());
+  if (fog_energy_ >= kEnergyThreshold) {
+    std::memcpy(fog_blur_.data(), fog_buf_.data(), fog_buf_.size() * sizeof(float));
     blur_lowres_rgb(
         LowResBuf{.rgb = &fog_blur_, .tmp = &blur_tmp_, .width = gw, .height = gh});
     upsample_additive(
         cv, UpsampleSpec{.src = &fog_blur_, .src_w = gw, .src_h = gh, .gain = 0.90F});
   }
-  if (has_lowres_energy(glow_buf_)) {
-    std::copy(glow_buf_.begin(), glow_buf_.end(), glow_blur_.begin());
+  if (glow_energy_ >= kEnergyThreshold) {
+    std::memcpy(glow_blur_.data(), glow_buf_.data(), glow_buf_.size() * sizeof(float));
     blur_lowres_rgb(
         LowResBuf{.rgb = &glow_blur_, .tmp = &blur_tmp_, .width = gw, .height = gh});
     blur_lowres_rgb(
@@ -1942,9 +2211,9 @@ void HeroParticleSystem::composite(std::vector<std::uint8_t> &rgba,
                                        .gain = 0.65F + theme.bloom * 0.55F});
   }
 
-  // Hackerman matrix glyph overlay.
-  if (theme.cr_style == HeroCacheReadStyle::code && matrix_cols_ > 0 &&
-      matrix_rows_ > 0) {
+  // Hackerman matrix glyph overlay (energy-gated).
+  if (theme.cr_style == HeroCacheReadStyle::code &&
+      matrix_energy_ >= kEnergyThreshold && matrix_cols_ > 0 && matrix_rows_ > 0) {
     const HeroRgb head_col = rgb_hex(0xe8fff0);
     const HeroRgb tail_col = theme.cls[0];
     for (std::uint32_t r = 0; r < matrix_rows_; ++r) {
@@ -1979,29 +2248,33 @@ void HeroParticleSystem::composite(std::vector<std::uint8_t> &rgba,
     }
   }
 
-  // Composite full-resolution particle trail buffer with peak-preserving tone curve.
+  // Composite full-resolution particle trail buffer (energy-gated).
+  if (acc_energy_ < 1.0F) {
+    return;
+  }
   const std::size_t total_px =
       static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
   const float bloom_boost = 1.0F + theme.bloom * 0.45F;
+  constexpr float kInv255 = 1.0F / 255.0F;
+  const float *acc_ptr = acc_.data();
+  std::uint8_t *dst = rgba.data();
   for (std::size_t p = 0; p < total_px; ++p) {
-    const std::size_t o = p * 3U;
-    const float r = acc_[o];
-    const float g = acc_[o + 1];
-    const float b = acc_[o + 2];
+    const float r = acc_ptr[0];
+    const float g = acc_ptr[1];
+    const float b = acc_ptr[2];
+    acc_ptr += 3;
     const float m = std::max({r, g, b});
-    if (m < 1.0F) {
-      continue;
+    if (m >= 1.0F) {
+      const float k = 255.0F / std::max(m, 255.0F);
+      const float a = std::min(235.0F, m * 1.1F) * kInv255;
+      const float inv = 1.0F - a * 0.55F;
+      const float scale = k * a * bloom_boost;
+      dst[0] = clamp_u8(static_cast<float>(dst[0]) * inv + r * scale);
+      dst[1] = clamp_u8(static_cast<float>(dst[1]) * inv + g * scale);
+      dst[2] = clamp_u8(static_cast<float>(dst[2]) * inv + b * scale);
+      dst[3] = 255;
     }
-    const float k = 255.0F / std::max(m, 255.0F);
-    const float a = std::min(235.0F, m * 1.1F) / 255.0F;
-    const float inv = 1.0F - a * 0.55F;
-    const std::size_t j = p * 4U;
-    rgba[j] = clamp_u8(static_cast<float>(rgba[j]) * inv + r * k * a * bloom_boost);
-    rgba[j + 1] =
-        clamp_u8(static_cast<float>(rgba[j + 1]) * inv + g * k * a * bloom_boost);
-    rgba[j + 2] =
-        clamp_u8(static_cast<float>(rgba[j + 2]) * inv + b * k * a * bloom_boost);
-    rgba[j + 3] = 255;
+    dst += 4;
   }
 }
 
@@ -2023,12 +2296,20 @@ HeroFlightDeckEngine::HeroFlightDeckEngine(HeroCanvasConfig config)
 void HeroFlightDeckEngine::reset(std::uint32_t seed) {
   seed_ = seed == 0 ? 11U : seed;
   visual_rng_ = seed_;
+  static_bg_valid_ = false;
   sim_t_ = 0.0F;
   grid_off_ = 0.0F;
   grid_n_ = 0;
-  smooth_rate_ = 1200.0F;
-  prev_rate_ = 1200.0F;
-  smooth_out_rate_ = 280.0F;
+  has_prev_engine_counters_ = false;
+  prev_eng_input_ = 0;
+  prev_eng_cached_ = 0;
+  prev_eng_reasoning_ = 0;
+  prev_eng_output_ = 0;
+  prev_eng_jev_ = 0;
+  engine_idle_stale_seconds_ = 0.0F;
+  smooth_rate_ = kIdleAmbientTotalRate;
+  prev_rate_ = kIdleAmbientTotalRate;
+  smooth_out_rate_ = kIdleAmbientOutRate;
   smooth_miss_ = 0.15F;
   stx_ = 0.0F;
   sty_ = 0.0F;
@@ -2054,6 +2335,7 @@ void HeroFlightDeckEngine::resize(HeroSize size) {
   }
   width_ = clamped.width;
   height_ = clamped.height;
+  static_bg_valid_ = false;
   frame_.width = width_;
   frame_.height = height_;
   frame_.rgba.assign(
@@ -2062,9 +2344,17 @@ void HeroFlightDeckEngine::resize(HeroSize size) {
   rebuild_gate_layout();
 }
 
-void HeroFlightDeckEngine::set_theme(HeroThemeId theme) { theme_ = theme; }
+void HeroFlightDeckEngine::set_theme(HeroThemeId theme) {
+  if (theme_ != theme) {
+    theme_ = theme;
+    static_bg_valid_ = false;
+  }
+}
 
-void HeroFlightDeckEngine::cycle_theme() { theme_ = next_hero_theme(theme_); }
+void HeroFlightDeckEngine::cycle_theme() {
+  theme_ = next_hero_theme(theme_);
+  static_bg_valid_ = false;
+}
 
 void HeroFlightDeckEngine::set_telemetry(const HeroTelemetryInput &telemetry) {
   telemetry_ = telemetry;
@@ -2202,13 +2492,44 @@ void HeroFlightDeckEngine::step_substep(float dt_seconds) {
   }
   sim_t_ += dt_seconds;
 
+  // Track counter staleness when idle so stale non-zero rates smoothly decay down
+  // to a crisp ambient cruise instead of driving maxed ground speed and afterburners.
+  bool eng_counters_advanced = false;
+  if (has_prev_engine_counters_) {
+    eng_counters_advanced = (telemetry_.input_tokens > prev_eng_input_) ||
+                            (telemetry_.cached_tokens > prev_eng_cached_) ||
+                            (telemetry_.reasoning_tokens > prev_eng_reasoning_) ||
+                            (telemetry_.output_tokens > prev_eng_output_) ||
+                            (telemetry_.jev_calls > prev_eng_jev_);
+  }
+  has_prev_engine_counters_ = true;
+  prev_eng_input_ = telemetry_.input_tokens;
+  prev_eng_cached_ = telemetry_.cached_tokens;
+  prev_eng_reasoning_ = telemetry_.reasoning_tokens;
+  prev_eng_output_ = telemetry_.output_tokens;
+  prev_eng_jev_ = telemetry_.jev_calls;
+
+  if (telemetry_.busy || eng_counters_advanced) {
+    engine_idle_stale_seconds_ = 0.0F;
+  } else {
+    engine_idle_stale_seconds_ =
+        std::min(engine_idle_stale_seconds_ + dt_seconds, 60.0F);
+  }
+  const bool eng_stale_idle =
+      (!telemetry_.busy) && (engine_idle_stale_seconds_ > kStaleIdleSeconds);
+
   // Smooth telemetry signals.
   const float raw_rate =
-      static_cast<float>(sanitize_rate(telemetry_.total_tok_per_sec));
+      eng_stale_idle ? 0.0F
+                     : static_cast<float>(sanitize_rate(telemetry_.total_tok_per_sec));
   const float raw_out =
-      static_cast<float>(sanitize_rate(telemetry_.out_rsn_tok_per_sec));
-  const float target_rate = std::max(telemetry_.busy ? 900.0F : 350.0F, raw_rate);
-  const float target_out = std::max(telemetry_.busy ? 320.0F : 120.0F, raw_out);
+      eng_stale_idle
+          ? 0.0F
+          : static_cast<float>(sanitize_rate(telemetry_.out_rsn_tok_per_sec));
+  const float target_rate = std::max(
+      telemetry_.busy ? kBusyAmbientTotalRate : kIdleAmbientTotalRate, raw_rate);
+  const float target_out =
+      std::max(telemetry_.busy ? kBusyAmbientOutRate : kIdleAmbientOutRate, raw_out);
   const float target_miss =
       1.0F - static_cast<float>(sanitize_cache_hit(telemetry_.cache_hit_ratio));
   const float rate_alpha = std::min(1.0F, dt_seconds * 4.0F);
@@ -2322,7 +2643,69 @@ void HeroFlightDeckEngine::step_substep(float dt_seconds) {
   particles_.step(spec, dt_seconds);
 }
 
-void HeroFlightDeckEngine::draw_sun(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_sun_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                           int horizon_y) const {
+  CanvasView cv{
+      .rgba = rgba,
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float w = static_cast<float>(width_);
+  const float h = static_cast<float>(height_);
+  const float cx = w * 0.64F;
+  const float cy = static_cast<float>(horizon_y) - 3.0F;
+  const float r = std::min(w, h) * 0.24F;
+
+  // Additive radial halo behind sun (100% static).
+  fill_radial_halo(cv, RadialGrad{.center = Vec2{.x = cx, .y = cy},
+                                  .inner_r = r * 0.55F,
+                                  .outer_r = r * 2.1F,
+                                  .inner = ColorA{.rgb = spec.sun_halo, .alpha = 0.28F},
+                                  .outer = ColorA{.rgb = spec.sun_halo, .alpha = 0.0F},
+                                  .clip_y_max = horizon_y,
+                                  .additive = true});
+
+  // Upper unstriped semicircle band (above cy - r * 0.52F, never touched by stripes).
+  const float stripe_band = r * 0.52F;
+  const int min_y = std::max(0, static_cast<int>(std::floor(cy - r - 1.0F)));
+  const int stripe_top_y = std::min(
+      horizon_y + 1, std::max(min_y, static_cast<int>(std::floor(cy - stripe_band))));
+  const float r_outer = r + 0.5F;
+  const float r_outer2 = r_outer * r_outer;
+  const float r_inner = std::max(0.0F, r - 0.5F);
+  const float r_inner2 = r_inner * r_inner;
+
+  for (int y = min_y; y < stripe_top_y; ++y) {
+    const float fy = static_cast<float>(y);
+    const float dy = fy - cy;
+    const float dy2 = dy * dy;
+    if (dy2 >= r_outer2) {
+      continue;
+    }
+    const float half_x = std::sqrt(r_outer2 - dy2);
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx - half_x)));
+    const int x1 = std::min(cv.width - 1, static_cast<int>(std::ceil(cx + half_x)));
+    const float t = std::clamp((fy - (cy - r)) / std::max(1.0F, r), 0.0F, 1.0F);
+    const HeroRgb sun_rgb =
+        (t < 0.55F) ? lerp_rgb(spec.sun_cols[0], spec.sun_cols[1], t / 0.55F)
+                    : lerp_rgb(spec.sun_cols[1], spec.sun_cols[2], (t - 0.55F) / 0.45F);
+    for (int x = x0; x <= x1; ++x) {
+      const float dx = static_cast<float>(x) - cx;
+      const float d2 = dx * dx + dy2;
+      if (d2 >= r_outer2) {
+        continue;
+      }
+      const float cov =
+          (d2 <= r_inner2) ? 1.0F : std::clamp(r_outer - std::sqrt(d2), 0.0F, 1.0F);
+      if (cov > 0.01F) {
+        blend_pixel(cv, PixelPos{.x = x, .y = y}, ColorA{.rgb = sun_rgb, .alpha = cov},
+                    false);
+      }
+    }
+  }
+}
+
+void HeroFlightDeckEngine::draw_sun_dynamic(const HeroTheme &spec, int horizon_y) {
   CanvasView cv{
       .rgba = frame_.rgba.data(),
       .width = static_cast<int>(width_),
@@ -2334,31 +2717,29 @@ void HeroFlightDeckEngine::draw_sun(const HeroTheme &spec, int horizon_y) {
   const float cy = static_cast<float>(horizon_y) - 3.0F;
   const float r = std::min(w, h) * 0.24F;
 
-  // Additive radial halo behind sun.
-  fill_radial_halo(cv, RadialGrad{.center = Vec2{.x = cx, .y = cy},
-                                  .inner_r = r * 0.55F,
-                                  .outer_r = r * 2.1F,
-                                  .inner = ColorA{.rgb = spec.sun_halo, .alpha = 0.28F},
-                                  .outer = ColorA{.rgb = spec.sun_halo, .alpha = 0.0F},
-                                  .clip_y_max = horizon_y,
-                                  .additive = true});
-
-  // Upper semicircle with 3-stop gradient + animated cache-miss stripe cutouts.
+  // Lower semicircle with animated cache-miss stripe cutouts.
   const float stripe_band = r * 0.52F;
   const float stripe_step = stripe_band / 7.0F;
   const float stripe_shift = std::fmod(sim_t_ * 3.0F, stripe_step);
   const float gap_max =
       std::max(1.2F, r * 0.115F * std::min(1.0F, smooth_miss_ * 4.0F));
 
-  const int min_x = std::max(0, static_cast<int>(std::floor(cx - r - 1.0F)));
-  const int max_x = std::min(cv.width - 1, static_cast<int>(std::ceil(cx + r + 1.0F)));
   const int min_y = std::max(0, static_cast<int>(std::floor(cy - r - 1.0F)));
+  const int stripe_top_y =
+      std::max(min_y, static_cast<int>(std::floor(cy - stripe_band)));
   const int max_y = std::min(horizon_y, static_cast<int>(std::ceil(cy)));
+  const float r_outer = r + 0.5F;
+  const float r_outer2 = r_outer * r_outer;
+  const float r_inner = std::max(0.0F, r - 0.5F);
+  const float r_inner2 = r_inner * r_inner;
 
-  for (int y = min_y; y <= max_y; ++y) {
+  for (int y = stripe_top_y; y <= max_y; ++y) {
     const float fy = static_cast<float>(y);
     const float dy = fy - cy;
-    // Check whether this scanline falls inside one of the 7 horizontal gaps.
+    const float dy2 = dy * dy;
+    if (dy2 >= r_outer2) {
+      continue;
+    }
     bool in_stripe = false;
     for (int k = 0; k < 7; ++k) {
       const float sy =
@@ -2370,44 +2751,79 @@ void HeroFlightDeckEngine::draw_sun(const HeroTheme &spec, int horizon_y) {
         break;
       }
     }
+    const float half_x = std::sqrt(r_outer2 - dy2);
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx - half_x)));
+    const int x1 = std::min(cv.width - 1, static_cast<int>(std::ceil(cx + half_x)));
     const float t = std::clamp((fy - (cy - r)) / std::max(1.0F, r), 0.0F, 1.0F);
     const HeroRgb sun_rgb =
         (t < 0.55F) ? lerp_rgb(spec.sun_cols[0], spec.sun_cols[1], t / 0.55F)
                     : lerp_rgb(spec.sun_cols[1], spec.sun_cols[2], (t - 0.55F) / 0.45F);
-    for (int x = min_x; x <= max_x; ++x) {
-      const float dx = static_cast<float>(x) - cx;
-      const float dist = std::hypot(dx, dy);
-      const float cov = std::clamp(r + 0.5F - dist, 0.0F, 1.0F);
-      if (cov <= 0.01F) {
-        continue;
+    const HeroRgb row_rgb = in_stripe ? spec.sky[3] : sun_rgb;
+    const float row_alpha_scale = in_stripe ? 0.85F : 1.0F;
+
+    if (dy2 < r_inner2) {
+      const float inner_half = std::sqrt(r_inner2 - dy2);
+      const int ix0 = std::max(x0, static_cast<int>(std::ceil(cx - inner_half)));
+      const int ix1 = std::min(x1, static_cast<int>(std::floor(cx + inner_half)));
+      // Left AA edge
+      for (int x = x0; x < ix0; ++x) {
+        const float dx = static_cast<float>(x) - cx;
+        const float d2 = dx * dx + dy2;
+        if (d2 < r_outer2) {
+          const float cov = std::clamp(r_outer - std::sqrt(d2), 0.0F, 1.0F);
+          if (cov > 0.01F) {
+            blend_pixel(cv, PixelPos{.x = x, .y = y},
+                        ColorA{.rgb = row_rgb, .alpha = cov * row_alpha_scale}, false);
+          }
+        }
       }
-      if (in_stripe) {
-        blend_pixel(cv, PixelPos{.x = x, .y = y},
-                    ColorA{.rgb = spec.sky[3], .alpha = cov * 0.85F}, false);
-      } else {
-        blend_pixel(cv, PixelPos{.x = x, .y = y}, ColorA{.rgb = sun_rgb, .alpha = cov},
-                    false);
+      // Fast interior span (cov == 1.0F)
+      if (ix0 <= ix1) {
+        std::uint8_t *row_ptr = cv.rgba + (static_cast<std::size_t>(y) *
+                                               static_cast<std::size_t>(cv.width) +
+                                           static_cast<std::size_t>(ix0)) *
+                                              4U;
+        blend_span(row_ptr, ix1 - ix0 + 1,
+                   ColorA{.rgb = row_rgb, .alpha = row_alpha_scale}, false);
+      }
+      // Right AA edge
+      for (int x = ix1 + 1; x <= x1; ++x) {
+        const float dx = static_cast<float>(x) - cx;
+        const float d2 = dx * dx + dy2;
+        if (d2 < r_outer2) {
+          const float cov = std::clamp(r_outer - std::sqrt(d2), 0.0F, 1.0F);
+          if (cov > 0.01F) {
+            blend_pixel(cv, PixelPos{.x = x, .y = y},
+                        ColorA{.rgb = row_rgb, .alpha = cov * row_alpha_scale}, false);
+          }
+        }
+      }
+    } else {
+      for (int x = x0; x <= x1; ++x) {
+        const float dx = static_cast<float>(x) - cx;
+        const float d2 = dx * dx + dy2;
+        if (d2 < r_outer2) {
+          const float cov = std::clamp(r_outer - std::sqrt(d2), 0.0F, 1.0F);
+          if (cov > 0.01F) {
+            blend_pixel(cv, PixelPos{.x = x, .y = y},
+                        ColorA{.rgb = row_rgb, .alpha = cov * row_alpha_scale}, false);
+          }
+        }
       }
     }
   }
 }
 
-void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_skyline_static(std::uint8_t *rgba,
+                                               const HeroTheme &spec, int horizon_y) {
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
   const float w = static_cast<float>(width_);
   const float fh = static_cast<float>(horizon_y);
   const float sy = fh / 320.0F;
-  const float busy_ratio =
-      telemetry_.total_agents > 0
-          ? std::clamp(static_cast<float>(telemetry_.active_agents) /
-                           static_cast<float>(telemetry_.total_agents),
-                       0.0F, 1.0F)
-          : (telemetry_.busy ? 0.8F : 0.25F);
-  const float lit_thresh = 0.08F + 0.80F * busy_ratio;
 
   // Horizon city glow.
   fill_vgrad_rect(cv, RectF{.x = 0.0F, .y = fh - 110.0F * sy, .w = w, .h = 110.0F * sy},
@@ -2427,8 +2843,7 @@ void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
     x += bw + rng.next() * 3.0F;
   }
 
-  // Front dark stepped buildings + lit windows + beacons.
-  std::vector<Vec2> beacons;
+  // Front dark stepped buildings + record window slots and beacon positions.
   std::size_t bldg_idx = 0;
   for (float x = -4.0F; x < w;) {
     const float bw = rng_range(rng, RangeF{.lo = 16.0F, .hi = 40.0F});
@@ -2448,7 +2863,8 @@ void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
       fill_rect(
           cv, RectF{.x = x + bw * 0.5F, .y = fh - bh - mast_h, .w = 1.5F, .h = mast_h},
           ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-      beacons.push_back(Vec2{.x = x + bw * 0.5F, .y = fh - bh - mast_h - 1.0F});
+      cached_beacons_.push_back(
+          CachedBeacon{.x = x + bw * 0.5F, .y = fh - bh - mast_h - 1.0F});
     }
     if (rng.next() < 0.28F && bh > 40.0F * sy) {
       fill_rect(cv, RectF{.x = x, .y = fh - bh, .w = bw, .h = 1.5F},
@@ -2463,11 +2879,14 @@ void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
       for (int c = 0; c < w_cols; ++c) {
         const float wx = x + 3.0F + static_cast<float>(c) * 4.5F;
         const float th = rng.next();
-        if (th < lit_thresh) {
-          fill_rect(cv, RectF{.x = wx, .y = wy, .w = 2.0F, .h = 2.5F},
-                    ColorA{.rgb = spec.window,
-                           .alpha = 0.35F + 0.50F * std::fmod(th * 97.0F, 1.0F)});
-        }
+        cached_windows_.push_back(CachedWindow{
+            .x = wx,
+            .y = wy,
+            .w = 2.0F,
+            .h = 2.5F,
+            .thresh = th,
+            .alpha = 0.35F + 0.50F * std::fmod(th * 97.0F, 1.0F),
+        });
       }
     }
     // Vertical neon accent bar on select buildings.
@@ -2495,7 +2914,7 @@ void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
   fill_rect(
       cv, RectF{.x = ax - 0.5F, .y = fh - ah - 24.0F * sy, .w = 1.5F, .h = 24.0F * sy},
       ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-  beacons.push_back(Vec2{.x = ax, .y = fh - ah - 25.0F * sy});
+  cached_beacons_.push_back(CachedBeacon{.x = ax, .y = fh - ah - 25.0F * sy});
 
   // Tokyo lattice tower at W * 0.62.
   const float tx = w * 0.62F;
@@ -2542,26 +2961,48 @@ void HeroFlightDeckEngine::draw_skyline(const HeroTheme &spec, int horizon_y) {
       RectF{
           .x = tx - 0.5F, .y = fh - th_tower - 16.0F * sy, .w = 1.5F, .h = 16.0F * sy},
       ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-  beacons.push_back(Vec2{.x = tx, .y = fh - th_tower - 17.0F * sy});
+  cached_beacons_.push_back(CachedBeacon{.x = tx, .y = fh - th_tower - 17.0F * sy});
+}
 
+void HeroFlightDeckEngine::draw_skyline_dynamic(const HeroTheme &spec) {
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float busy_ratio =
+      telemetry_.total_agents > 0
+          ? std::clamp(static_cast<float>(telemetry_.active_agents) /
+                           static_cast<float>(telemetry_.total_agents),
+                       0.0F, 1.0F)
+          : (telemetry_.busy ? 0.8F : 0.25F);
+  const float lit_thresh = 0.08F + 0.80F * busy_ratio;
+  for (const auto &win : cached_windows_) {
+    if (win.thresh < lit_thresh) {
+      fill_rect(cv, RectF{.x = win.x, .y = win.y, .w = win.w, .h = win.h},
+                ColorA{.rgb = spec.window, .alpha = win.alpha});
+    }
+  }
   // Flashing red Jev beacons.
   const float ba = 0.30F + 0.70F * beacon_flash_;
   const HeroRgb red = rgb_hex(0xff3c50);
-  for (const auto &b : beacons) {
-    fill_radial_halo(cv, RadialGrad{.center = b,
+  for (const auto &b : cached_beacons_) {
+    const Vec2 pt{.x = b.x, .y = b.y};
+    fill_radial_halo(cv, RadialGrad{.center = pt,
                                     .inner_r = 0.0F,
                                     .outer_r = 4.0F + beacon_flash_ * 6.0F,
                                     .inner = ColorA{.rgb = red, .alpha = ba * 0.8F},
                                     .outer = ColorA{.rgb = red, .alpha = 0.0F},
                                     .additive = true});
-    fill_circle(cv, CircleSpec{.center = b, .radius = 1.3F + beacon_flash_ * 0.9F},
+    fill_circle(cv, CircleSpec{.center = pt, .radius = 1.3F + beacon_flash_ * 0.9F},
                 ColorA{.rgb = red, .alpha = ba}, true);
   }
 }
 
-void HeroFlightDeckEngine::draw_gotham(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_gotham_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                              int horizon_y) {
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
@@ -2576,6 +3017,108 @@ void HeroFlightDeckEngine::draw_gotham(const HeroTheme &spec, int horizon_y) {
                         .top_alpha = 0.0F,
                         .bottom_alpha = 0.14F,
                         .additive = true});
+
+  // Art-deco towers + Empire State + Chrysler silhouettes (cached static geometry).
+  SeededRng rng{.state = 31};
+  for (float x = -6.0F; x < w;) {
+    const float bw = rng_range(rng, RangeF{.lo = 14.0F, .hi = 30.0F});
+    const float bh = rng_range(rng, RangeF{.lo = 26.0F, .hi = 70.0F}) * sy;
+    fill_rect(cv, RectF{.x = x, .y = fh - bh, .w = bw, .h = bh},
+              ColorA{.rgb = spec.sky_back, .alpha = 1.0F});
+    x += bw + 2.0F;
+  }
+
+  for (float x = -4.0F; x < w;) {
+    const float bw = rng_range(rng, RangeF{.lo = 18.0F, .hi = 36.0F});
+    const float bh = (32.0F + std::pow(rng.next(), 1.5F) * 100.0F) * sy;
+    fill_rect(cv, RectF{.x = x, .y = fh - bh, .w = bw, .h = bh},
+              ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+    const float wy0 = fh - bh + 5.0F;
+    const int w_rows =
+        std::max(0, static_cast<int>(std::ceil((fh - 4.0F - wy0) / 5.0F)));
+    const int w_cols = std::max(0, static_cast<int>(std::ceil((bw - 6.0F) / 4.0F)));
+    for (int r = 0; r < w_rows; ++r) {
+      const float wy = wy0 + static_cast<float>(r) * 5.0F;
+      for (int c = 0; c < w_cols; ++c) {
+        const float wx = x + 3.0F + static_cast<float>(c) * 4.0F;
+        const float th = rng.next();
+        cached_windows_.push_back(CachedWindow{
+            .x = wx,
+            .y = wy,
+            .w = 1.5F,
+            .h = 2.0F,
+            .thresh = th,
+            .alpha = 0.28F + 0.42F * std::fmod(th * 97.0F, 1.0F),
+        });
+      }
+    }
+    x += bw + 2.0F;
+  }
+
+  // Empire State setbacks at W * 0.64.
+  const float ex = w * 0.64F;
+  float ey = fh;
+  constexpr std::array<Vec2, 4> kEmpTiers = {
+      {{54.0F, 92.0F}, {38.0F, 36.0F}, {24.0F, 22.0F}, {12.0F, 14.0F}}};
+  for (const auto &tier : kEmpTiers) {
+    const float tw = tier.x * (w / 480.0F);
+    const float th_t = tier.y * sy;
+    fill_rect(cv, RectF{.x = ex - tw * 0.5F, .y = ey - th_t, .w = tw, .h = th_t},
+              ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+    ey -= th_t;
+  }
+  fill_rect(cv, RectF{.x = ex - 1.0F, .y = ey - 28.0F * sy, .w = 2.0F, .h = 28.0F * sy},
+            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+  cached_beacons_.push_back(CachedBeacon{.x = ex, .y = ey - 29.0F * sy});
+
+  // Chrysler crown at W * 0.88.
+  const float kx = w * 0.88F;
+  const float kh = 128.0F * sy;
+  fill_rect(cv, RectF{.x = kx - 18.0F, .y = fh - kh, .w = 36.0F, .h = kh},
+            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+  float ky = fh - kh;
+  for (int k = 0; k < 4; ++k) {
+    const float rr = 16.0F - static_cast<float>(k) * 3.2F;
+    fill_circle(cv, CircleSpec{.center = Vec2{.x = kx, .y = ky}, .radius = rr},
+                ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+    stroke_ellipse_arc(cv,
+                       ArcSpec{.center = Vec2{.x = kx, .y = ky},
+                               .radii = Vec2{.x = rr * 0.72F, .y = rr * 0.72F},
+                               .start_rad = std::numbers::pi_v<float>,
+                               .end_rad = std::numbers::pi_v<float> * 2.0F,
+                               .thickness = 1.2F},
+                       ColorA{.rgb = rgb_hex(0xffaa5a), .alpha = 0.65F}, true);
+    ky -= rr * 0.72F;
+  }
+  fill_rect(cv, RectF{.x = kx - 1.0F, .y = ky - 26.0F * sy, .w = 2.0F, .h = 26.0F * sy},
+            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
+  cached_beacons_.push_back(CachedBeacon{.x = kx, .y = ky - 27.0F * sy});
+}
+
+void HeroFlightDeckEngine::draw_gotham_dynamic(const HeroTheme &spec, int horizon_y) {
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float w = static_cast<float>(width_);
+  const float fh = static_cast<float>(horizon_y);
+  const float sy = fh / 320.0F;
+
+  // Dynamic lit windows on cached buildings.
+  const float busy_ratio =
+      telemetry_.total_agents > 0
+          ? std::clamp(static_cast<float>(telemetry_.active_agents) /
+                           static_cast<float>(telemetry_.total_agents),
+                       0.0F, 1.0F)
+          : (telemetry_.busy ? 0.8F : 0.25F);
+  const float lit_thresh = 0.08F + 0.78F * busy_ratio;
+  for (const auto &win : cached_windows_) {
+    if (win.thresh < lit_thresh) {
+      fill_rect(cv, RectF{.x = win.x, .y = win.y, .w = win.w, .h = win.h},
+                ColorA{.rgb = spec.window, .alpha = win.alpha});
+    }
+  }
 
   // Sweeping searchlight cones (one per active agent, up to 6).
   const std::size_t lights_n =
@@ -2615,114 +3158,36 @@ void HeroFlightDeckEngine::draw_gotham(const HeroTheme &spec, int horizon_y) {
                      .inner = ColorA{.rgb = rgb_hex(0xffe1b4), .alpha = 0.55F * sgl},
                      .outer = ColorA{.rgb = rgb_hex(0xffc88c), .alpha = 0.0F},
                      .additive = true});
-  // Dark SR-71 top silhouette inside signal.
-  std::vector<Vec2> sig_plane;
-  sig_plane.reserve(kSrHalf.size() * 2);
+  // Dark SR-71 top silhouette inside signal (stack array, zero heap alloc).
+  std::array<Vec2, kSrHalf.size() * 2U> sig_plane{};
+  std::size_t sp_idx = 0;
   for (const auto &pt : kSrHalf) {
-    sig_plane.push_back(
-        Vec2{.x = sig.x + pt.x * 0.42F, .y = sig.y - (pt.y - 52.0F) * 0.18F});
+    sig_plane[sp_idx++] =
+        Vec2{.x = sig.x + pt.x * 0.42F, .y = sig.y - (pt.y - 52.0F) * 0.18F};
   }
   for (std::size_t idx = kSrHalf.size(); idx > 0; --idx) {
     const auto &pt = kSrHalf[idx - 1];
-    sig_plane.push_back(
-        Vec2{.x = sig.x - pt.x * 0.42F, .y = sig.y - (pt.y - 52.0F) * 0.18F});
+    sig_plane[sp_idx++] =
+        Vec2{.x = sig.x - pt.x * 0.42F, .y = sig.y - (pt.y - 52.0F) * 0.18F};
   }
   fill_polygon(cv, sig_plane,
                ColorA{.rgb = rgb_hex(0x0c0c0c), .alpha = 0.55F + 0.35F * sgl}, false);
 
-  // Art-deco towers + Empire State + Chrysler silhouettes.
-  SeededRng rng{.state = 31};
-  for (float x = -6.0F; x < w;) {
-    const float bw = rng_range(rng, RangeF{.lo = 14.0F, .hi = 30.0F});
-    const float bh = rng_range(rng, RangeF{.lo = 26.0F, .hi = 70.0F}) * sy;
-    fill_rect(cv, RectF{.x = x, .y = fh - bh, .w = bw, .h = bh},
-              ColorA{.rgb = spec.sky_back, .alpha = 1.0F});
-    x += bw + 2.0F;
-  }
-
-  const float busy_ratio =
-      telemetry_.total_agents > 0
-          ? std::clamp(static_cast<float>(telemetry_.active_agents) /
-                           static_cast<float>(telemetry_.total_agents),
-                       0.0F, 1.0F)
-          : (telemetry_.busy ? 0.8F : 0.25F);
-  const float lit_thresh = 0.08F + 0.78F * busy_ratio;
-  std::vector<Vec2> beacons;
-  for (float x = -4.0F; x < w;) {
-    const float bw = rng_range(rng, RangeF{.lo = 18.0F, .hi = 36.0F});
-    const float bh = (32.0F + std::pow(rng.next(), 1.5F) * 100.0F) * sy;
-    fill_rect(cv, RectF{.x = x, .y = fh - bh, .w = bw, .h = bh},
-              ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-    const float wy0 = fh - bh + 5.0F;
-    const int w_rows =
-        std::max(0, static_cast<int>(std::ceil((fh - 4.0F - wy0) / 5.0F)));
-    const int w_cols = std::max(0, static_cast<int>(std::ceil((bw - 6.0F) / 4.0F)));
-    for (int r = 0; r < w_rows; ++r) {
-      const float wy = wy0 + static_cast<float>(r) * 5.0F;
-      for (int c = 0; c < w_cols; ++c) {
-        const float wx = x + 3.0F + static_cast<float>(c) * 4.0F;
-        const float th = rng.next();
-        if (th < lit_thresh) {
-          fill_rect(cv, RectF{.x = wx, .y = wy, .w = 1.5F, .h = 2.0F},
-                    ColorA{.rgb = spec.window,
-                           .alpha = 0.28F + 0.42F * std::fmod(th * 97.0F, 1.0F)});
-        }
-      }
-    }
-    x += bw + 2.0F;
-  }
-
-  // Empire State setbacks at W * 0.64.
-  const float ex = w * 0.64F;
-  float ey = fh;
-  constexpr std::array<Vec2, 4> kEmpTiers = {
-      {{54.0F, 92.0F}, {38.0F, 36.0F}, {24.0F, 22.0F}, {12.0F, 14.0F}}};
-  for (const auto &tier : kEmpTiers) {
-    const float tw = tier.x * (w / 480.0F);
-    const float th_t = tier.y * sy;
-    fill_rect(cv, RectF{.x = ex - tw * 0.5F, .y = ey - th_t, .w = tw, .h = th_t},
-              ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-    ey -= th_t;
-  }
-  fill_rect(cv, RectF{.x = ex - 1.0F, .y = ey - 28.0F * sy, .w = 2.0F, .h = 28.0F * sy},
-            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-  beacons.push_back(Vec2{.x = ex, .y = ey - 29.0F * sy});
-
-  // Chrysler crown at W * 0.88.
-  const float kx = w * 0.88F;
-  const float kh = 128.0F * sy;
-  fill_rect(cv, RectF{.x = kx - 18.0F, .y = fh - kh, .w = 36.0F, .h = kh},
-            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-  float ky = fh - kh;
-  for (int k = 0; k < 4; ++k) {
-    const float rr = 16.0F - static_cast<float>(k) * 3.2F;
-    fill_circle(cv, CircleSpec{.center = Vec2{.x = kx, .y = ky}, .radius = rr},
-                ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-    stroke_ellipse_arc(cv,
-                       ArcSpec{.center = Vec2{.x = kx, .y = ky},
-                               .radii = Vec2{.x = rr * 0.72F, .y = rr * 0.72F},
-                               .start_rad = std::numbers::pi_v<float>,
-                               .end_rad = std::numbers::pi_v<float> * 2.0F,
-                               .thickness = 1.2F},
-                       ColorA{.rgb = rgb_hex(0xffaa5a), .alpha = 0.65F}, true);
-    ky -= rr * 0.72F;
-  }
-  fill_rect(cv, RectF{.x = kx - 1.0F, .y = ky - 26.0F * sy, .w = 2.0F, .h = 26.0F * sy},
-            ColorA{.rgb = spec.sky_front, .alpha = 1.0F});
-  beacons.push_back(Vec2{.x = kx, .y = ky - 27.0F * sy});
-
   const float ba = 0.28F + 0.72F * beacon_flash_;
   const HeroRgb red = rgb_hex(0xff3c3c);
-  for (const auto &b : beacons) {
-    fill_circle(cv, CircleSpec{.center = b, .radius = 1.4F + beacon_flash_ * 1.1F},
+  for (const auto &b : cached_beacons_) {
+    fill_circle(cv,
+                CircleSpec{.center = Vec2{.x = b.x, .y = b.y},
+                           .radius = 1.4F + beacon_flash_ * 1.1F},
                 ColorA{.rgb = red, .alpha = ba}, true);
   }
 }
 
-void HeroFlightDeckEngine::draw_fuji(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_fuji_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                            int horizon_y) const {
   (void)spec;
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
@@ -2781,6 +3246,18 @@ void HeroFlightDeckEngine::draw_fuji(const HeroTheme &spec, int horizon_y) {
       Vec2{.x = px - 32.0F, .y = top + 33.0F * sy},
   }};
   fill_polygon(cv, snow, ColorA{.rgb = rgb_hex(0xdcd7ba), .alpha = 1.0F});
+}
+
+void HeroFlightDeckEngine::draw_fuji_dynamic(const HeroTheme &spec, int horizon_y) {
+  (void)spec;
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float w = static_cast<float>(width_);
+  const float fh = static_cast<float>(horizon_y);
+  const float sy = fh / 240.0F;
 
   // Hokusai curling wave on the right (crest height = output + reasoning rate).
   const float thr = std::min(1.6F, smooth_out_rate_ / 2500.0F);
@@ -2800,41 +3277,21 @@ void HeroFlightDeckEngine::draw_fuji(const HeroTheme &spec, int horizon_y) {
   stroke_polygon(cv, wave, ColorA{.rgb = rgb_hex(0xdcd7ba), .alpha = 0.85F}, false);
 }
 
-void HeroFlightDeckEngine::draw_aurora(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_aurora_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                              int horizon_y) {
   (void)spec;
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
   const float w = static_cast<float>(width_);
   const float fh = static_cast<float>(horizon_y);
   const float sy = fh / 240.0F;
-  const float hit = 1.0F - smooth_miss_;
-  const float k = std::clamp((hit - 0.35F) / 0.60F, 0.18F, 1.0F);
 
-  // Rippling additive aurora curtains.
-  for (int x = 0; x < cv.width; x += 3) {
-    const float fx = static_cast<float>(x);
-    const float y0 = (36.0F + 22.0F * std::sin(fx * 0.015F + sim_t_ * 0.28F) +
-                      10.0F * std::sin(fx * 0.040F - sim_t_ * 0.42F)) *
-                     sy;
-    const float ah = (54.0F + 26.0F * std::sin(fx * 0.025F + sim_t_ * 0.32F)) * sy;
-    fill_vgrad_rect(cv, RectF{.x = fx, .y = y0, .w = 3.0F, .h = ah * 0.5F},
-                    VGrad{.top = rgb_hex(0xb48ead),
-                          .bottom = rgb_hex(0x88c0d0),
-                          .top_alpha = 0.0F,
-                          .bottom_alpha = 0.16F * k,
-                          .additive = true});
-    fill_vgrad_rect(cv, RectF{.x = fx, .y = y0 + ah * 0.5F, .w = 3.0F, .h = ah * 0.5F},
-                    VGrad{.top = rgb_hex(0x88c0d0),
-                          .bottom = rgb_hex(0xa3be8c),
-                          .top_alpha = 0.24F * k,
-                          .bottom_alpha = 0.0F,
-                          .additive = true});
-  }
+  cached_aurora_clip_y_.assign(static_cast<std::size_t>(width_), horizon_y);
 
-  // Two snow-capped Nordic mountain ridges.
+  // Two snow-capped Nordic mountain ridges (100% static).
   struct Layer {
     float base;
     float amp;
@@ -2861,6 +3318,24 @@ void HeroFlightDeckEngine::draw_aurora(const HeroTheme &spec, int horizon_y) {
                                      .step = l.step,
                                      .seed = l.seed,
                                      .width = cv.width});
+    // Record upper ridge silhouette per column so dynamic aurora clips cleanly behind
+    // it.
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+      const Vec2 a = pts[i];
+      const Vec2 b = pts[i + 1];
+      const int x0 = std::max(0, static_cast<int>(std::floor(std::min(a.x, b.x))));
+      const int x1 =
+          std::min(cv.width - 1, static_cast<int>(std::ceil(std::max(a.x, b.x))));
+      const float dx = b.x - a.x;
+      for (int x = x0; x <= x1; ++x) {
+        const float t = (std::abs(dx) > 0.001F)
+                            ? std::clamp((static_cast<float>(x) - a.x) / dx, 0.0F, 1.0F)
+                            : 0.0F;
+        const int ridge_y = static_cast<int>(std::floor(a.y + (b.y - a.y) * t));
+        const auto ux = static_cast<std::size_t>(x);
+        cached_aurora_clip_y_[ux] = std::min(cached_aurora_clip_y_[ux], ridge_y);
+      }
+    }
     std::vector<Vec2> poly;
     poly.reserve(pts.size() + 2);
     poly.push_back(Vec2{.x = -16.0F, .y = fh});
@@ -2880,18 +3355,80 @@ void HeroFlightDeckEngine::draw_aurora(const HeroTheme &spec, int horizon_y) {
   }
 }
 
-void HeroFlightDeckEngine::draw_wire(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_aurora_dynamic(const HeroTheme &spec, int horizon_y) {
   (void)spec;
   CanvasView cv{
       .rgba = frame_.rgba.data(),
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
+  const float fh = static_cast<float>(horizon_y);
+  const float sy = fh / 240.0F;
+  const float hit = 1.0F - smooth_miss_;
+  const float k = std::clamp((hit - 0.35F) / 0.60F, 0.18F, 1.0F);
+  const HeroRgb top_col = rgb_hex(0xb48ead);
+  const HeroRgb mid_col = rgb_hex(0x88c0d0);
+  const HeroRgb bot_col = rgb_hex(0xa3be8c);
+
+  // Rippling additive aurora curtains clipped cleanly behind cached Nordic peaks.
+  for (int x = 0; x < cv.width; x += 3) {
+    const float fx = static_cast<float>(x);
+    const float y0 = (36.0F + 22.0F * std::sin(fx * 0.015F + sim_t_ * 0.28F) +
+                      10.0F * std::sin(fx * 0.040F - sim_t_ * 0.42F)) *
+                     sy;
+    const float ah = (54.0F + 26.0F * std::sin(fx * 0.025F + sim_t_ * 0.32F)) * sy;
+    const float half_h = ah * 0.5F;
+    const int span_w = std::min(3, cv.width - x);
+    int clip_y = horizon_y;
+    for (int dx = 0; dx < span_w; ++dx) {
+      const auto ux = static_cast<std::size_t>(x + dx);
+      if (ux < cached_aurora_clip_y_.size()) {
+        clip_y = std::min(clip_y, cached_aurora_clip_y_[ux]);
+      }
+    }
+    const float max_h1 = static_cast<float>(clip_y) - y0;
+    if (max_h1 > 0.0F) {
+      fill_vgrad_rect(cv,
+                      RectF{.x = fx,
+                            .y = y0,
+                            .w = static_cast<float>(span_w),
+                            .h = std::min(half_h, max_h1)},
+                      VGrad{.top = top_col,
+                            .bottom = mid_col,
+                            .top_alpha = 0.0F,
+                            .bottom_alpha = 0.16F * k,
+                            .additive = true});
+    }
+    const float y_mid = y0 + half_h;
+    const float max_h2 = static_cast<float>(clip_y) - y_mid;
+    if (max_h2 > 0.0F) {
+      fill_vgrad_rect(cv,
+                      RectF{.x = fx,
+                            .y = y_mid,
+                            .w = static_cast<float>(span_w),
+                            .h = std::min(half_h, max_h2)},
+                      VGrad{.top = mid_col,
+                            .bottom = bot_col,
+                            .top_alpha = 0.24F * k,
+                            .bottom_alpha = 0.0F,
+                            .additive = true});
+    }
+  }
+}
+
+void HeroFlightDeckEngine::draw_wire_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                            int horizon_y) const {
+  (void)spec;
+  CanvasView cv{
+      .rgba = rgba,
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
   const float w = static_cast<float>(width_);
   const float fh = static_cast<float>(horizon_y);
   const float sy = fh / 240.0F;
-  const float alpha = 0.55F + 0.45F * beacon_flash_;
-  const ColorA col{.rgb = rgb_hex(0x4fe88f), .alpha = alpha};
+  constexpr float kBaseAlpha = 0.55F;
+  const ColorA col{.rgb = rgb_hex(0x4fe88f), .alpha = kBaseAlpha};
   auto pts = build_ridge(RidgeSpec{.horizon_y = horizon_y,
                                    .base = 4.0F * sy,
                                    .amp = 78.0F * sy,
@@ -2899,14 +3436,13 @@ void HeroFlightDeckEngine::draw_wire(const HeroTheme &spec, int horizon_y) {
                                    .seed = 41,
                                    .width = cv.width});
   for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
-    draw_glow_line(cv, LineSeg{.a = pts[i], .b = pts[i + 1]}, col,
-                   2.8F + beacon_flash_ * 2.0F);
+    draw_glow_line(cv, LineSeg{.a = pts[i], .b = pts[i + 1]}, col, 2.8F);
     if ((i & 1U) != 0U) {
       draw_aa_line(
           cv,
           LineSeg{.a = pts[i],
                   .b = Vec2{.x = pts[i].x + (pts[i].x - w * 0.64F) * 0.08F, .y = fh}},
-          ColorA{.rgb = col.rgb, .alpha = alpha * 0.65F}, 1.0F, true);
+          ColorA{.rgb = col.rgb, .alpha = kBaseAlpha * 0.65F}, 1.0F, true);
     }
   }
   // Wireframe crescent moon.
@@ -2927,11 +3463,37 @@ void HeroFlightDeckEngine::draw_wire(const HeroTheme &spec, int horizon_y) {
                      ColorA{.rgb = rgb_hex(0x4fe88f), .alpha = 0.55F}, true);
 }
 
-void HeroFlightDeckEngine::draw_palms(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_wire_dynamic(const HeroTheme &spec, int horizon_y) {
+  (void)spec;
+  if (beacon_flash_ <= 0.01F) {
+    return;
+  }
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float fh = static_cast<float>(horizon_y);
+  const float sy = fh / 240.0F;
+  const ColorA pulse_col{.rgb = rgb_hex(0x4fe88f), .alpha = 0.45F * beacon_flash_};
+  auto pts = build_ridge(RidgeSpec{.horizon_y = horizon_y,
+                                   .base = 4.0F * sy,
+                                   .amp = 78.0F * sy,
+                                   .step = 32.0F,
+                                   .seed = 41,
+                                   .width = cv.width});
+  for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+    draw_aa_line(cv, LineSeg{.a = pts[i], .b = pts[i + 1]}, pulse_col,
+                 2.8F + beacon_flash_ * 2.0F, true);
+  }
+}
+
+void HeroFlightDeckEngine::draw_palms_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                             int horizon_y) const {
   (void)spec;
   (void)horizon_y;
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
@@ -2957,6 +3519,34 @@ void HeroFlightDeckEngine::draw_palms(const HeroTheme &spec, int horizon_y) {
     draw_aa_line(cv, LineSeg{.a = base, .b = mid}, dark, std::max(2.5F, pl.sz * 0.10F));
     draw_aa_line(cv, LineSeg{.a = mid, .b = top}, dark, std::max(2.0F, pl.sz * 0.075F));
     fill_circle(cv, CircleSpec{.center = top, .radius = pl.sz * 0.08F}, dark);
+  }
+}
+
+void HeroFlightDeckEngine::draw_palms_dynamic(const HeroTheme &spec, int horizon_y) {
+  (void)spec;
+  (void)horizon_y;
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float w = static_cast<float>(width_);
+  const float h = static_cast<float>(height_);
+  const ColorA dark{.rgb = rgb_hex(0x020c17), .alpha = 1.0F};
+
+  struct PalmSpec {
+    float bx;
+    float hgt;
+    float lean;
+    float sz;
+  };
+  const std::array<PalmSpec, 3> palms = {{
+      {.bx = w * 0.03F, .hgt = h * 0.42F, .lean = w * 0.06F, .sz = h * 0.16F},
+      {.bx = w * 0.12F, .hgt = h * 0.30F, .lean = w * 0.04F, .sz = h * 0.12F},
+      {.bx = w * 0.97F, .hgt = h * 0.38F, .lean = -w * 0.06F, .sz = h * 0.14F},
+  }};
+  for (const auto &pl : palms) {
+    const Vec2 top{.x = pl.bx + pl.lean, .y = h - pl.hgt};
     for (int k = 0; k < 9; ++k) {
       const float a = std::numbers::pi_v<float> +
                       static_cast<float>(k) * (std::numbers::pi_v<float> / 8.0F) +
@@ -2976,9 +3566,11 @@ void HeroFlightDeckEngine::draw_palms(const HeroTheme &spec, int horizon_y) {
   }
 }
 
-void HeroFlightDeckEngine::draw_qud(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_qud_static(std::uint8_t *rgba, const HeroTheme &spec,
+                                           int horizon_y) const {
+  (void)spec;
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = rgba,
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
@@ -3033,7 +3625,7 @@ void HeroFlightDeckEngine::draw_qud(const HeroTheme &spec, int horizon_y) {
               ColorA{.rgb = rgb_hex(0x0a2726), .alpha = 1.0F});
   }
 
-  // The Spindle at W * 0.74: lit height = main context fill.
+  // The Spindle body & outline at W * 0.74.
   const float sx = w * 0.74F;
   const std::array<Vec2, 4> spindle = {{
       Vec2{.x = sx - 6.0F, .y = fh},
@@ -3043,6 +3635,19 @@ void HeroFlightDeckEngine::draw_qud(const HeroTheme &spec, int horizon_y) {
   }};
   fill_polygon(cv, spindle, ColorA{.rgb = rgb_hex(0x155352), .alpha = 1.0F});
   stroke_polygon(cv, spindle, ColorA{.rgb = rgb_hex(0x40a4b9), .alpha = 0.65F}, false);
+}
+
+void HeroFlightDeckEngine::draw_qud_dynamic(const HeroTheme &spec, int horizon_y) {
+  (void)spec;
+  CanvasView cv{
+      .rgba = frame_.rgba.data(),
+      .width = static_cast<int>(width_),
+      .height = static_cast<int>(height_),
+  };
+  const float w = static_cast<float>(width_);
+  const float fh = static_cast<float>(horizon_y);
+  const float sy = fh / 240.0F;
+  const float sx = w * 0.74F;
 
   const float fill =
       static_cast<float>(sanitize_context_fill(telemetry_.main_context_fill));
@@ -3064,10 +3669,9 @@ void HeroFlightDeckEngine::draw_qud(const HeroTheme &spec, int horizon_y) {
     fill_rect(cv, RectF{.x = sx - 3.5F, .y = y, .w = 7.0F, .h = 1.5F},
               ColorA{.rgb = rgb_hex(0xcfc041), .alpha = 0.75F}, true);
   }
-  (void)spec;
 }
 
-void HeroFlightDeckEngine::draw_ocean(const HeroTheme &spec, int horizon_y) {
+void HeroFlightDeckEngine::draw_ocean_dynamic(const HeroTheme &spec, int horizon_y) {
   CanvasView cv{
       .rgba = frame_.rgba.data(),
       .width = static_cast<int>(width_),
@@ -3077,13 +3681,11 @@ void HeroFlightDeckEngine::draw_ocean(const HeroTheme &spec, int horizon_y) {
   const float h = static_cast<float>(height_);
   const float fh = static_cast<float>(horizon_y);
   const float depth = std::max(1.0F, h - fh);
-  fill_vgrad_rect(cv, RectF{.x = 0.0F, .y = fh, .w = w, .h = depth},
-                  VGrad{.top = rgb_hex(0x0a2540), .bottom = rgb_hex(0x020c17)});
   const float cx = w * 0.64F;
-  for (int k = 0; k < 22; ++k) {
-    const float raw_z =
-        std::fmod(static_cast<float>(k + 1) - grid_off_ * 2.0F + 22.0F, 22.0F);
-    const float z = raw_z / 22.0F;
+  constexpr int kLines = 22;
+  for (int k = 0; k < kLines; ++k) {
+    // Scroll smoothly DOWN toward the camera as grid_off_ increases.
+    const float z = (static_cast<float>(k) + grid_off_) / static_cast<float>(kLines);
     const float y = fh + depth * z * z;
     const float rw = (w * 0.19F - z * w * 0.08F) *
                      (0.60F + 0.40F * std::sin(static_cast<float>(k) * 2.3F + sim_t_));
@@ -3122,7 +3724,8 @@ void HeroFlightDeckEngine::draw_glyph_ground(const HeroTheme &spec, int horizon_
   }};
   constexpr int kRows = 12;
   for (int k = 0; k < kRows; ++k) {
-    const float z = (static_cast<float>(k + 1) - grid_off_) / static_cast<float>(kRows);
+    // Scroll smoothly DOWN toward the camera as grid_off_ increases.
+    const float z = (static_cast<float>(k) + grid_off_) / static_cast<float>(kRows);
     const float y = fh + depth * z * z;
     const float alpha = 0.25F + 0.70F * z;
     const std::uint32_t row_id =
@@ -3159,9 +3762,26 @@ void HeroFlightDeckEngine::draw_grid(const HeroTheme &spec, int horizon_y) {
   const float depth = std::max(1.0F, h - fh);
   const float dim = (spec.ground == HeroGroundKind::ocean) ? 0.35F : 1.0F;
 
-  // Glowing horizon line.
-  draw_glow_line(cv, LineSeg{.a = Vec2{.x = 0.0F, .y = fh}, .b = Vec2{.x = w, .y = fh}},
-                 ColorA{.rgb = spec.grid, .alpha = 0.90F * dim}, 2.6F);
+  // Fast direct horizontal glowing horizon line (exact SDF equivalence, zero hypot).
+  const float horiz_alpha = 0.90F * dim;
+  const float glow_reach = 2.6F * 0.5F + 0.75F;
+  const int hy0 = std::max(0, horizon_y - 2);
+  const int hy1 = std::min(cv.height - 1, horizon_y + 2);
+  for (int y = hy0; y <= hy1; ++y) {
+    const float dist = std::abs(static_cast<float>(y) - fh);
+    const float cov = std::clamp(glow_reach - dist, 0.0F, 1.0F);
+    if (cov > 0.01F) {
+      std::uint8_t *row = cv.rgba + static_cast<std::size_t>(y) *
+                                        static_cast<std::size_t>(cv.width) * 4U;
+      blend_span(row, cv.width,
+                 ColorA{.rgb = spec.grid, .alpha = horiz_alpha * 0.24F * cov}, true);
+    }
+  }
+  if (horizon_y >= 0 && horizon_y < cv.height) {
+    std::uint8_t *row = cv.rgba + static_cast<std::size_t>(horizon_y) *
+                                      static_cast<std::size_t>(cv.width) * 4U;
+    blend_span(row, cv.width, ColorA{.rgb = spec.grid, .alpha = horiz_alpha}, false);
+  }
 
   // Diverging rays from vanishing point (W * 0.64, horizon_y).
   const float vpx = w * 0.64F;
@@ -3173,27 +3793,47 @@ void HeroFlightDeckEngine::draw_grid(const HeroTheme &spec, int horizon_y) {
                  ColorA{.rgb = spec.grid, .alpha = 0.55F * dim}, 1.0F, true);
   }
 
-  // Depth-squared scrolling horizontal lines.
+  // Depth-squared forward-scrolling horizontal lines moving DOWN toward the camera.
   constexpr int kLines = 14;
   for (int k = 0; k < kLines; ++k) {
-    const float z =
-        (static_cast<float>(k + 1) - grid_off_) / static_cast<float>(kLines);
+    const float z = (static_cast<float>(k) + grid_off_) / static_cast<float>(kLines);
     const float y = fh + depth * z * z;
     const float alpha = (0.25F + 0.60F * z) * dim;
-    draw_aa_line(cv, LineSeg{.a = Vec2{.x = 0.0F, .y = y}, .b = Vec2{.x = w, .y = y}},
-                 ColorA{.rgb = spec.grid, .alpha = alpha}, 1.0F, true);
+    const int iy = static_cast<int>(std::floor(y));
+    const float frac = y - static_cast<float>(iy);
+    if (iy >= 0 && iy < cv.height) {
+      std::uint8_t *row0 = cv.rgba + static_cast<std::size_t>(iy) *
+                                         static_cast<std::size_t>(cv.width) * 4U;
+      blend_span(row0, cv.width,
+                 ColorA{.rgb = spec.grid, .alpha = alpha * (1.0F - frac)}, true);
+    }
+    if (iy + 1 >= 0 && iy + 1 < cv.height) {
+      std::uint8_t *row1 = cv.rgba + static_cast<std::size_t>(iy + 1) *
+                                         static_cast<std::size_t>(cv.width) * 4U;
+      blend_span(row1, cv.width, ColorA{.rgb = spec.grid, .alpha = alpha * frac}, true);
+    }
   }
 }
 
-void HeroFlightDeckEngine::draw_background(const HeroTheme &spec) {
+void HeroFlightDeckEngine::ensure_static_background(const HeroTheme &spec,
+                                                    int horizon_y) {
+  const std::size_t expected_bytes =
+      static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4U;
+  if (static_bg_valid_ && static_bg_width_ == width_ && static_bg_height_ == height_ &&
+      static_bg_theme_ == theme_ && static_bg_rgba_.size() == expected_bytes) {
+    return;
+  }
+
+  static_bg_rgba_.assign(expected_bytes, 255);
+  cached_windows_.clear();
+  cached_beacons_.clear();
+  cached_aurora_clip_y_.clear();
+
   CanvasView cv{
-      .rgba = frame_.rgba.data(),
+      .rgba = static_bg_rgba_.data(),
       .width = static_cast<int>(width_),
       .height = static_cast<int>(height_),
   };
-  const int horizon_y = std::clamp(
-      static_cast<int>(std::lround(static_cast<float>(height_) * spec.horizon)), 16,
-      static_cast<int>(height_) - 8);
 
   // Multi-stop sky gradient.
   const float inv_sky = 1.0F / static_cast<float>(std::max(1, horizon_y - 1));
@@ -3220,29 +3860,83 @@ void HeroFlightDeckEngine::draw_background(const HeroTheme &spec) {
       ColorA{.rgb = spec.sky[0], .alpha = 1.0F});
 
   if (spec.sun) {
-    draw_sun(spec, horizon_y);
+    draw_sun_static(static_bg_rgba_.data(), spec, horizon_y);
   }
   switch (spec.scene) {
   case HeroSceneKind::skyline:
-    draw_skyline(spec, horizon_y);
+    draw_skyline_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::gotham:
-    draw_gotham(spec, horizon_y);
+    draw_gotham_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::fuji:
-    draw_fuji(spec, horizon_y);
+    draw_fuji_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::aurora:
-    draw_aurora(spec, horizon_y);
+    draw_aurora_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::wire:
-    draw_wire(spec, horizon_y);
+    draw_wire_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::palms:
-    draw_palms(spec, horizon_y);
+    draw_palms_static(static_bg_rgba_.data(), spec, horizon_y);
     break;
   case HeroSceneKind::qud:
-    draw_qud(spec, horizon_y);
+    draw_qud_static(static_bg_rgba_.data(), spec, horizon_y);
+    break;
+  case HeroSceneKind::none:
+    break;
+  }
+
+  // Static ocean gradient base (drawn after palms so trunks clip cleanly at horizon).
+  if (spec.ground == HeroGroundKind::ocean) {
+    const float fh = static_cast<float>(horizon_y);
+    const float depth = std::max(1.0F, static_cast<float>(height_) - fh);
+    fill_vgrad_rect(
+        cv, RectF{.x = 0.0F, .y = fh, .w = static_cast<float>(width_), .h = depth},
+        VGrad{.top = rgb_hex(0x0a2540), .bottom = rgb_hex(0x020c17)});
+  }
+
+  static_bg_width_ = width_;
+  static_bg_height_ = height_;
+  static_bg_theme_ = theme_;
+  static_bg_valid_ = true;
+}
+
+void HeroFlightDeckEngine::draw_background(const HeroTheme &spec) {
+  const int horizon_y = std::clamp(
+      static_cast<int>(std::lround(static_cast<float>(height_) * spec.horizon)), 16,
+      static_cast<int>(height_) - 8);
+
+  // Steady-state frame: single memcpy of cached static sky + sun + scene geometry.
+  ensure_static_background(spec, horizon_y);
+  std::memcpy(frame_.rgba.data(), static_bg_rgba_.data(), frame_.rgba.size());
+
+  // Dynamic overlays on top of static background cache.
+  if (spec.sun) {
+    draw_sun_dynamic(spec, horizon_y);
+  }
+  switch (spec.scene) {
+  case HeroSceneKind::skyline:
+    draw_skyline_dynamic(spec);
+    break;
+  case HeroSceneKind::gotham:
+    draw_gotham_dynamic(spec, horizon_y);
+    break;
+  case HeroSceneKind::fuji:
+    draw_fuji_dynamic(spec, horizon_y);
+    break;
+  case HeroSceneKind::aurora:
+    draw_aurora_dynamic(spec, horizon_y);
+    break;
+  case HeroSceneKind::wire:
+    draw_wire_dynamic(spec, horizon_y);
+    break;
+  case HeroSceneKind::palms:
+    draw_palms_dynamic(spec, horizon_y);
+    break;
+  case HeroSceneKind::qud:
+    draw_qud_dynamic(spec, horizon_y);
     break;
   case HeroSceneKind::none:
     break;
@@ -3252,7 +3946,7 @@ void HeroFlightDeckEngine::draw_background(const HeroTheme &spec) {
     draw_glyph_ground(spec, horizon_y);
   } else {
     if (spec.ground == HeroGroundKind::ocean) {
-      draw_ocean(spec, horizon_y);
+      draw_ocean_dynamic(spec, horizon_y);
     }
     draw_grid(spec, horizon_y);
   }
@@ -3379,15 +4073,15 @@ void HeroFlightDeckEngine::draw_sr71(const HeroTheme &spec) {
     };
   };
 
-  // Full 26-vertex planform outline.
-  std::vector<Vec2> outline;
-  outline.reserve(kSrHalf.size() * 2 - 2);
+  // Full 26-vertex planform outline (stack array, zero heap alloc).
+  std::array<Vec2, kSrHalf.size() * 2U - 2U> outline{};
+  std::size_t out_idx = 0;
   for (const auto &pt : kSrHalf) {
-    outline.push_back(project(Vec3{.x = pt.x, .y = 0.0F, .z = pt.y}).pt);
+    outline[out_idx++] = project(Vec3{.x = pt.x, .y = 0.0F, .z = pt.y}).pt;
   }
   for (std::size_t i = kSrHalf.size() - 2; i >= 1; --i) {
     const auto &pt = kSrHalf[i];
-    outline.push_back(project(Vec3{.x = -pt.x, .y = 0.0F, .z = pt.y}).pt);
+    outline[out_idx++] = project(Vec3{.x = -pt.x, .y = 0.0F, .z = pt.y}).pt;
   }
   fill_polygon_vgrad(cv, outline,
                      VGrad{.top = rgb_hex(0x1a1430), .bottom = rgb_hex(0x07050d)});
@@ -3423,14 +4117,17 @@ void HeroFlightDeckEngine::draw_sr71(const HeroTheme &spec) {
   // Fuselage spine, dorsal ridge, and canopy hump (rim2 cyan glint).
   const auto draw_poly3 = [&](std::initializer_list<Vec3> pts3, HeroRgb fill_rgb,
                               std::optional<HeroRgb> stroke_rgb, bool glow) {
-    std::vector<Vec2> pts2;
-    pts2.reserve(pts3.size());
+    std::array<Vec2, 8> pts2{};
+    std::size_t count = 0;
     for (const auto &p : pts3) {
-      pts2.push_back(project(p).pt);
+      if (count < pts2.size()) {
+        pts2[count++] = project(p).pt;
+      }
     }
-    fill_polygon(cv, pts2, ColorA{.rgb = fill_rgb, .alpha = 1.0F});
+    const std::span<const Vec2> poly_span{pts2.data(), count};
+    fill_polygon(cv, poly_span, ColorA{.rgb = fill_rgb, .alpha = 1.0F});
     if (stroke_rgb.has_value()) {
-      stroke_polygon(cv, pts2, ColorA{.rgb = *stroke_rgb, .alpha = 0.90F}, glow);
+      stroke_polygon(cv, poly_span, ColorA{.rgb = *stroke_rgb, .alpha = 0.90F}, glow);
     }
   };
   draw_poly3({{-3.2F, 0.0F, 30.0F},
@@ -3580,34 +4277,37 @@ void HeroFlightDeckEngine::draw_hud(const HeroTheme &spec) {
 
   // Top-right translucent roster pill (when canvas wide enough).
   if (width_ >= 240) {
-    std::vector<HeroPeerEntry> roster = telemetry_.peers;
+    std::array<HeroPeerEntry, 3> fallback_roster{};
+    std::size_t fallback_count = 0;
+    std::span<const HeroPeerEntry> roster = telemetry_.peers;
     if (roster.empty()) {
       const std::uint64_t total_tok =
           telemetry_.input_tokens + telemetry_.cached_tokens +
           telemetry_.reasoning_tokens + telemetry_.output_tokens;
-      roster.push_back(HeroPeerEntry{
+      fallback_roster[fallback_count++] = HeroPeerEntry{
           .name = telemetry_.room_label.empty()
                       ? "main"
                       : sanitize_hero_text(telemetry_.room_label, 12),
           .tokens = total_tok,
           .active = telemetry_.busy,
-      });
+      };
       if (telemetry_.total_agents > 1) {
-        roster.push_back(HeroPeerEntry{
+        fallback_roster[fallback_count++] = HeroPeerEntry{
             .name = "agents " + format_u64(telemetry_.active_agents) + "/" +
                     format_u64(telemetry_.total_agents),
             .tokens = telemetry_.output_tokens + telemetry_.reasoning_tokens,
             .active = telemetry_.active_agents > 0,
-        });
+        };
       }
       if (telemetry_.jev_calls > 0) {
-        roster.push_back(HeroPeerEntry{
+        fallback_roster[fallback_count++] = HeroPeerEntry{
             .name = "jev",
             .jev_calls = telemetry_.jev_calls,
             .active = true,
             .is_jev = true,
-        });
+        };
       }
+      roster = std::span<const HeroPeerEntry>{fallback_roster.data(), fallback_count};
     }
     const std::size_t rows = std::min<std::size_t>(7, roster.size());
     const float pill_w = std::min(156.0F, w * 0.36F);
@@ -3703,7 +4403,9 @@ const HeroFrame &HeroFlightDeckEngine::step_and_render(float dt_seconds) {
 
 // ---- Terminal Graphics Encoders ----
 
-bool kitty_graphics_capable() {
+namespace {
+
+bool kitty_graphics_capable_impl() noexcept {
   const auto mode = env_view("BLACKBIRD_GRAPHICS");
   if (mode == "off") {
     return false;
@@ -3717,7 +4419,21 @@ bool kitty_graphics_capable() {
   }
   const auto term_program = env_view("TERM_PROGRAM");
   const auto term = env_view("TERM");
-  return term_program == "ghostty" || term == "xterm-ghostty" || term == "xterm-kitty";
+  return term_program == "ghostty" || term_program == "WezTerm" ||
+         term == "xterm-ghostty" || term == "xterm-kitty";
+}
+
+} // namespace
+
+bool kitty_graphics_capable() { return kitty_graphics_capable_impl(); }
+
+bool kitty_shm_capable() noexcept {
+  if (!kitty_graphics_capable_impl()) {
+    return false;
+  }
+  return env_view("SSH_CONNECTION").empty() && env_view("SSH_TTY").empty() &&
+         env_view("SSH_CLIENT").empty() && env_view("TMUX").empty() &&
+         env_view("STY").empty();
 }
 
 std::string encode_kitty_rgba_frame(const HeroFrame &frame,
@@ -3857,6 +4573,110 @@ std::string encode_kitty_rgb_frame(const HeroFrame &frame,
   }
 
   out += "\x1b"
+         "8";
+  return out;
+}
+
+std::string encode_kitty_shm_rgb_frame(const HeroFrame &frame,
+                                       const HeroKittyPlacement &placement) {
+  const auto expected_opt =
+      checked_rgba_bytes(HeroSize{.width = frame.width, .height = frame.height});
+  constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
+  if (!expected_opt.has_value() || frame.rgba.size() != *expected_opt ||
+      placement.columns == 0 || placement.rows == 0 || placement.row == kMaxSize ||
+      placement.column == kMaxSize) {
+    return {};
+  }
+  const std::size_t pixels = *expected_opt / 4U;
+  const std::size_t rgb_bytes = pixels * 3U;
+  if (rgb_bytes == 0U ||
+      rgb_bytes > static_cast<std::size_t>(std::numeric_limits<off_t>::max())) {
+    return encode_kitty_rgb_frame(frame, placement);
+  }
+
+  // Unique POSIX shared memory name <= 30 chars (macOS PSHMNAMLEN = 31).
+  static std::atomic<std::uint64_t> g_shm_seq{1U};
+  const unsigned pid_part = static_cast<unsigned>(::getpid()) % 100000000U;
+  std::array<char, 31> shm_name{};
+  int fd = -1;
+  int name_len = 0;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    const unsigned seq_part =
+        static_cast<unsigned>(g_shm_seq.fetch_add(1U, std::memory_order_relaxed)) %
+        100000000U;
+    name_len = std::snprintf(shm_name.data(), shm_name.size(), "/bb-fd-%u-%u", pid_part,
+                             seq_part);
+    if (name_len <= 0 || static_cast<std::size_t>(name_len) >= shm_name.size()) {
+      return encode_kitty_rgb_frame(frame, placement);
+    }
+    fd = ::shm_open(shm_name.data(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+    if (fd >= 0) {
+      break;
+    }
+    if (errno != EEXIST) {
+      return encode_kitty_rgb_frame(frame, placement);
+    }
+  }
+  if (fd < 0) {
+    return encode_kitty_rgb_frame(frame, placement);
+  }
+
+  int trunc_rc = 0;
+  do {
+    trunc_rc = ::ftruncate(fd, static_cast<off_t>(rgb_bytes));
+  } while (trunc_rc != 0 && errno == EINTR);
+  if (trunc_rc != 0) {
+    ::close(fd);
+    ::shm_unlink(shm_name.data());
+    return encode_kitty_rgb_frame(frame, placement);
+  }
+
+  void *mapped = ::mmap(nullptr, rgb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED) {
+    ::close(fd);
+    ::shm_unlink(shm_name.data());
+    return encode_kitty_rgb_frame(frame, placement);
+  }
+
+  // Pack tight 24-bit RGB directly into shared memory (zero base64 on pixel bytes).
+  const std::uint8_t *src = frame.rgba.data();
+  auto *dst = static_cast<std::uint8_t *>(mapped);
+  for (std::size_t p = 0; p < pixels; ++p) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    src += 4;
+    dst += 3;
+  }
+
+  ::munmap(mapped, rgb_bytes);
+  ::close(fd);
+
+  // Per Kitty t=s spec, the terminal opens and unlinks shm_name after reading it.
+  std::string out;
+  out.reserve(128U);
+  out += "\x1b"
+         "7\x1b[";
+  out += std::to_string(placement.row + 1U);
+  out += ';';
+  out += std::to_string(placement.column + 1U);
+  out += "H\x1b_Ga=T,f=24,t=s,s=";
+  out += std::to_string(frame.width);
+  out += ",v=";
+  out += std::to_string(frame.height);
+  out += ",i=";
+  out += std::to_string(placement.image_id);
+  out += ",p=";
+  out += std::to_string(placement.placement_id);
+  out += ",q=2,C=1,c=";
+  out += std::to_string(placement.columns);
+  out += ",r=";
+  out += std::to_string(placement.rows);
+  out += ';';
+  append_base64(out, std::span<const std::uint8_t>{
+                         reinterpret_cast<const std::uint8_t *>(shm_name.data()),
+                         static_cast<std::size_t>(name_len)});
+  out += "\x1b\\\x1b"
          "8";
   return out;
 }

@@ -217,6 +217,10 @@ public:
   std::size_t live_count() const noexcept { return particles_.size(); }
   std::uint32_t width() const noexcept { return width_; }
   std::uint32_t height() const noexcept { return height_; }
+  float effective_total_rate() const noexcept { return eff_total_rate_; }
+  float acc_energy() const noexcept { return acc_energy_; }
+  float glow_energy() const noexcept { return glow_energy_; }
+  float fog_energy() const noexcept { return fog_energy_; }
 
 private:
   struct Particle {
@@ -250,12 +254,16 @@ private:
   std::uint32_t glow_h_ = hero_default_height / 4;
   std::uint32_t rng_state_ = 11;
   float sim_t_ = 0.0F;
+  float idle_stale_seconds_ = 0.0F;
+  float eff_total_rate_ = 45.0F;
+  float eff_out_rate_ = 12.0F;
   bool has_prev_counters_ = false;
   std::uint64_t prev_input_ = 0;
   std::uint64_t prev_cached_ = 0;
   std::uint64_t prev_reasoning_ = 0;
   std::uint64_t prev_output_ = 0;
   std::uint64_t prev_jev_ = 0;
+  std::array<float, 6> burst_backlog_{};
   std::array<float, 6> owe_{};
   std::vector<Particle> particles_;
   std::vector<float> acc_;
@@ -264,6 +272,10 @@ private:
   mutable std::vector<float> fog_blur_;
   mutable std::vector<float> glow_blur_;
   mutable std::vector<float> blur_tmp_;
+  float acc_energy_ = 0.0F;
+  float glow_energy_ = 0.0F;
+  float fog_energy_ = 0.0F;
+  float matrix_energy_ = 0.0F;
   std::uint32_t matrix_cols_ = 0;
   std::uint32_t matrix_rows_ = 0;
   std::vector<float> matrix_bright_;
@@ -316,19 +328,43 @@ private:
     float flash = 0.0F;
   };
 
+  struct CachedWindow {
+    float x = 0.0F;
+    float y = 0.0F;
+    float w = 0.0F;
+    float h = 0.0F;
+    float thresh = 0.0F;
+    float alpha = 0.0F;
+  };
+
+  struct CachedBeacon {
+    float x = 0.0F;
+    float y = 0.0F;
+  };
+
   void step_substep(float dt_seconds);
   void rebuild_gate_layout();
   void finish_question(std::size_t option_index, std::string_view how);
+  void ensure_static_background(const HeroTheme &spec, int horizon_y);
   void draw_background(const HeroTheme &spec);
-  void draw_sun(const HeroTheme &spec, int horizon_y);
-  void draw_skyline(const HeroTheme &spec, int horizon_y);
-  void draw_gotham(const HeroTheme &spec, int horizon_y);
-  void draw_fuji(const HeroTheme &spec, int horizon_y);
-  void draw_aurora(const HeroTheme &spec, int horizon_y);
-  void draw_wire(const HeroTheme &spec, int horizon_y);
-  void draw_palms(const HeroTheme &spec, int horizon_y);
-  void draw_qud(const HeroTheme &spec, int horizon_y);
-  void draw_ocean(const HeroTheme &spec, int horizon_y);
+  void draw_sun_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y) const;
+  void draw_sun_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_skyline_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y);
+  void draw_skyline_dynamic(const HeroTheme &spec);
+  void draw_gotham_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y);
+  void draw_gotham_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_fuji_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y) const;
+  void draw_fuji_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_aurora_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y);
+  void draw_aurora_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_wire_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y) const;
+  void draw_wire_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_palms_static(std::uint8_t *rgba, const HeroTheme &spec,
+                         int horizon_y) const;
+  void draw_palms_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_qud_static(std::uint8_t *rgba, const HeroTheme &spec, int horizon_y) const;
+  void draw_qud_dynamic(const HeroTheme &spec, int horizon_y);
+  void draw_ocean_dynamic(const HeroTheme &spec, int horizon_y);
   void draw_glyph_ground(const HeroTheme &spec, int horizon_y);
   void draw_grid(const HeroTheme &spec, int horizon_y);
   void draw_question_overlay(const HeroTheme &spec);
@@ -347,13 +383,30 @@ private:
   HeroParticleSystem particles_{};
   HeroFrame frame_{};
 
+  std::vector<std::uint8_t> static_bg_rgba_;
+  std::uint32_t static_bg_width_ = 0;
+  std::uint32_t static_bg_height_ = 0;
+  HeroThemeId static_bg_theme_ = HeroThemeId::synthwave;
+  bool static_bg_valid_ = false;
+  std::vector<CachedWindow> cached_windows_;
+  std::vector<CachedBeacon> cached_beacons_;
+  std::vector<int> cached_aurora_clip_y_;
+
   float sim_t_ = 0.0F;
   float grid_off_ = 0.0F;
   std::uint32_t grid_n_ = 0;
 
-  float smooth_rate_ = 1200.0F;
-  float prev_rate_ = 1200.0F;
-  float smooth_out_rate_ = 280.0F;
+  bool has_prev_engine_counters_ = false;
+  std::uint64_t prev_eng_input_ = 0;
+  std::uint64_t prev_eng_cached_ = 0;
+  std::uint64_t prev_eng_reasoning_ = 0;
+  std::uint64_t prev_eng_output_ = 0;
+  std::uint64_t prev_eng_jev_ = 0;
+  float engine_idle_stale_seconds_ = 0.0F;
+
+  float smooth_rate_ = 45.0F;
+  float prev_rate_ = 45.0F;
+  float smooth_out_rate_ = 12.0F;
   float smooth_miss_ = 0.15F;
 
   float stx_ = 0.0F;
@@ -373,8 +426,12 @@ private:
 };
 
 // Returns true when the terminal supports in-memory Kitty Graphics Protocol
-// transmission (Ghostty, Kitty, or BLACKBIRD_GRAPHICS=kitty override).
+// transmission (Ghostty, Kitty, WezTerm, or BLACKBIRD_GRAPHICS=kitty override).
 bool kitty_graphics_capable();
+
+// Returns true when local POSIX shared-memory Kitty graphics (t=s) is safe
+// to use: kitty_graphics_capable() is true and no SSH/tmux/screen session is active.
+bool kitty_shm_capable() noexcept;
 
 // Encodes an RGBA8888 HeroFrame into standard 4096-byte base64-chunked Kitty
 // APC sequences anchored at (placement.row, placement.column).
@@ -386,6 +443,13 @@ std::string encode_kitty_rgba_frame(const HeroFrame &frame,
 // (placement.row, placement.column).
 std::string encode_kitty_rgb_frame(const HeroFrame &frame,
                                    const HeroKittyPlacement &placement = {});
+
+// Encodes an RGBA8888 HeroFrame as 24-bit RGB (f=24) using local POSIX shared
+// memory (t=s), emitting a compact ~85-byte Kitty APC sequence carrying only
+// the base64-encoded shm object name. Falls back transparently to
+// encode_kitty_rgb_frame() if POSIX shm creation or mapping fails.
+std::string encode_kitty_shm_rgb_frame(const HeroFrame &frame,
+                                       const HeroKittyPlacement &placement = {});
 
 // Deletes the uploaded Kitty graphics image and its placements.
 std::string encode_kitty_erase(std::uint32_t image_id = hero_default_kitty_image_id);

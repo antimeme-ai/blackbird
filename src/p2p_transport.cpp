@@ -6,6 +6,12 @@
 
 #if defined(BLACKBIRD_HAS_IROH) && BLACKBIRD_HAS_IROH
 #include "blackbird_p2p_abi.h"
+
+extern "C" {
+BbP2pStatus bb_p2p_set_lan_open_admission(BbP2pEndpoint *handle, uint8_t enabled);
+BbP2pStatus bb_p2p_allow_peer(BbP2pEndpoint *handle,
+                              const uint8_t pubkey_32b[BB_P2P_PUBKEY_LEN]);
+}
 #endif
 
 namespace blackbird {
@@ -216,6 +222,28 @@ Result<void> P2pEndpoint::set_allowed_peers(std::span<const P2pPubkey> peers) {
   return Result<void>::success();
 }
 
+Result<void> P2pEndpoint::allow_peer(const P2pPubkey &peer_pubkey) {
+  if (handle_ == nullptr) {
+    return Result<void>::failure({ErrorCode::stale_handle});
+  }
+  const BbP2pStatus status = bb_p2p_allow_peer(handle_, peer_pubkey.data());
+  if (status != BB_P2P_OK) {
+    return Result<void>::failure(map_status(status));
+  }
+  return Result<void>::success();
+}
+
+Result<void> P2pEndpoint::set_lan_open_admission(bool enabled) {
+  if (handle_ == nullptr) {
+    return Result<void>::failure({ErrorCode::stale_handle});
+  }
+  const BbP2pStatus status = bb_p2p_set_lan_open_admission(handle_, enabled ? 1U : 0U);
+  if (status != BB_P2P_OK) {
+    return Result<void>::failure(map_status(status));
+  }
+  return Result<void>::success();
+}
+
 Result<void> P2pEndpoint::revoke_peer(const P2pPubkey &peer_pubkey) {
   if (handle_ == nullptr) {
     return Result<void>::failure({ErrorCode::stale_handle});
@@ -386,6 +414,14 @@ Result<std::vector<P2pDirectAddr>> P2pEndpoint::local_direct_addrs() const {
 }
 
 Result<void> P2pEndpoint::set_allowed_peers(std::span<const P2pPubkey> /*peers*/) {
+  return Result<void>::failure({ErrorCode::unsupported});
+}
+
+Result<void> P2pEndpoint::allow_peer(const P2pPubkey & /*peer_pubkey*/) {
+  return Result<void>::failure({ErrorCode::unsupported});
+}
+
+Result<void> P2pEndpoint::set_lan_open_admission(bool /*enabled*/) {
   return Result<void>::failure({ErrorCode::unsupported});
 }
 

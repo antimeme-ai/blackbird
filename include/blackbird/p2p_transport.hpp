@@ -23,6 +23,7 @@ inline constexpr std::size_t kP2pMaxEphemeralFrameBytes = 1200U;
 inline constexpr std::size_t kP2pMaxRelayUrlBytes = 100U;
 inline constexpr std::size_t kP2pMaxDirectAddrs = 8U;
 inline constexpr std::size_t kP2pMaxAllowedPeers = 1024U;
+inline constexpr std::size_t kP2pMaxPendingLanPeers = 16U;
 inline constexpr std::string_view kP2pAlpn = "blackbird-mp/1";
 
 using P2pPubkey = std::array<std::uint8_t, kP2pPubkeySize>;
@@ -171,6 +172,8 @@ public:
   Result<std::vector<P2pDirectAddr>> local_direct_addrs() const;
 
   Result<void> set_allowed_peers(std::span<const P2pPubkey> peers);
+  Result<void> allow_peer(const P2pPubkey &peer_pubkey);
+  Result<void> set_lan_open_admission(bool enabled);
   Result<void> revoke_peer(const P2pPubkey &peer_pubkey);
   Result<void> connect_peer(const P2pPeerTarget &target);
 

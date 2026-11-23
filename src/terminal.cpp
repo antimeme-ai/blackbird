@@ -203,6 +203,9 @@ const std::array builtin_commands{
                 "Command Post"},
     ChatCommand{"/doctor", "[--offline] [--no-update-check]",
                 "Run zero-secret local & online diagnostics (binary, auth, API, relay)",
+                "Command Post"},
+    ChatCommand{"/lan", "[status|scan|help]",
+                "Inspect opt-in LAN Party! (mp1-lan/1) policy or scan local lobbies",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>
@@ -2819,6 +2822,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   };
   refresh_party_passive();
   const bool flightdeck_kitty_capable = kitty_graphics_capable();
+  const bool flightdeck_kitty_shm_capable = kitty_shm_capable();
   bool flightdeck_open = false;
   bool flightdeck_first_frame = true;
   bool flightdeck_kitty_emitted = false;
@@ -3838,7 +3842,16 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                static_cast<double>(live_telemetry.last_input),
                            0.0, 1.0);
           }
-          if (live_telemetry.last_duration_ms >= 50ULL) {
+          if (busy && stream_bytes > 0) {
+            const auto elapsed_ms = std::max<std::int64_t>(
+                100,
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - started)
+                    .count());
+            const double approx_tok_s = (static_cast<double>(stream_bytes) / 4.0) /
+                                        (static_cast<double>(elapsed_ms) / 1000.0);
+            ht.out_rsn_tok_per_sec = approx_tok_s;
+            ht.total_tok_per_sec = std::max(approx_tok_s * 3.0, 200.0);
+          } else if (busy && live_telemetry.last_duration_ms >= 50ULL) {
             const double sec =
                 static_cast<double>(live_telemetry.last_duration_ms) / 1000.0;
             ht.total_tok_per_sec = static_cast<double>(live_telemetry.last_input +
@@ -3848,15 +3861,6 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 static_cast<double>(live_telemetry.last_output +
                                     live_telemetry.last_reasoning) /
                 sec;
-          } else if (busy && stream_bytes > 0) {
-            const auto elapsed_ms = std::max<std::int64_t>(
-                100,
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - started)
-                    .count());
-            const double approx_tok_s = (static_cast<double>(stream_bytes) / 4.0) /
-                                        (static_cast<double>(elapsed_ms) / 1000.0);
-            ht.out_rsn_tok_per_sec = approx_tok_s;
-            ht.total_tok_per_sec = std::max(approx_tok_s * 3.0, 200.0);
           }
           if (live_telemetry.context_window && *live_telemetry.context_window > 0 &&
               live_telemetry.last_input > 0) {
@@ -3953,13 +3957,15 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             pending_image_loaded = false;
           }
           if (flightdeck_kitty_capable) {
-            payload += encode_kitty_rgb_frame(
-                hero_frame, HeroKittyPlacement{.row = 0,
+            const HeroKittyPlacement placement{.row = 0,
                                                .column = 0,
                                                .columns = width,
                                                .rows = rows,
                                                .image_id = hero_default_kitty_image_id,
-                                               .placement_id = 1});
+                                               .placement_id = 1};
+            payload += flightdeck_kitty_shm_capable
+                           ? encode_kitty_shm_rgb_frame(hero_frame, placement)
+                           : encode_kitty_rgb_frame(hero_frame, placement);
             flightdeck_kitty_emitted = true;
           } else {
             auto hb_rows = encode_truecolor_halfblock_frame(

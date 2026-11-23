@@ -364,6 +364,172 @@ void test_live_loopback_quic_tls13_rpk_end_to_end() {
           "revoked bob re-dialing alice must be immediately rejected");
 }
 
+void test_lan_open_admission_fail_closed_on_online_policies() {
+  g_stage = "lan_open_admission_fail_closed_on_online_policies";
+
+  // allow_relays endpoint MUST fail closed with ErrorCode::conflict.
+  P2pEndpointConfig allow_cfg{};
+  allow_cfg.relay_policy = P2pRelayPolicy::allow_relays;
+  allow_cfg.relay_url = "https://relay.multiplayer.tech";
+  auto allow_ep = must(P2pEndpoint::create(allow_cfg), "create allow_relays");
+  auto allow_on = allow_ep.set_lan_open_admission(true);
+  require(!allow_on.has_value() && allow_on.error().code == ErrorCode::conflict,
+          "allow_relays must reject set_lan_open_admission(true) with conflict");
+  auto allow_off = allow_ep.set_lan_open_admission(false);
+  require(!allow_off.has_value() && allow_off.error().code == ErrorCode::conflict,
+          "allow_relays must reject set_lan_open_admission(false) with conflict");
+
+  // force_relays endpoint MUST fail closed with ErrorCode::conflict.
+  P2pEndpointConfig force_cfg{};
+  force_cfg.relay_policy = P2pRelayPolicy::force_relays;
+  force_cfg.relay_url = "https://relay.multiplayer.tech";
+  auto force_ep = must(P2pEndpoint::create(force_cfg), "create force_relays");
+  auto force_on = force_ep.set_lan_open_admission(true);
+  require(!force_on.has_value() && force_on.error().code == ErrorCode::conflict,
+          "force_relays must reject set_lan_open_admission(true) with conflict");
+  auto force_off = force_ep.set_lan_open_admission(false);
+  require(!force_off.has_value() && force_off.error().code == ErrorCode::conflict,
+          "force_relays must reject set_lan_open_admission(false) with conflict");
+
+  // Default-constructed / closed endpoints fail with stale_handle.
+  P2pEndpoint empty{};
+  auto empty_open = empty.set_lan_open_admission(true);
+  require(!empty_open.has_value() && empty_open.error().code == ErrorCode::stale_handle,
+          "invalid endpoint set_lan_open_admission must fail with stale_handle");
+  const P2pPubkey dummy_pk{};
+  auto empty_allow = empty.allow_peer(dummy_pk);
+  require(!empty_allow.has_value() &&
+              empty_allow.error().code == ErrorCode::stale_handle,
+          "invalid endpoint allow_peer must fail with stale_handle");
+}
+
+void test_lan_open_admission_live_handshake_promotion_and_lock() {
+  g_stage = "lan_open_admission_live_handshake_promotion_and_lock";
+
+  P2pEndpointConfig lan_cfg{};
+  lan_cfg.relay_policy = P2pRelayPolicy::no_relays;
+
+  auto host = must(P2pEndpoint::create(lan_cfg), "create lan host");
+  auto joiner = must(P2pEndpoint::create(lan_cfg), "create lan joiner");
+  auto rogue = must(P2pEndpoint::create(lan_cfg), "create lan rogue");
+  auto latecomer = must(P2pEndpoint::create(lan_cfg), "create lan latecomer");
+
+  const auto host_pk = must(host.local_pubkey(), "host pubkey");
+  const auto joiner_pk = must(joiner.local_pubkey(), "joiner pubkey");
+  const auto rogue_pk = must(rogue.local_pubkey(), "rogue pubkey");
+  const auto host_addrs = must(host.local_direct_addrs(), "host direct addrs");
+  require(!host_addrs.empty(), "lan host must bind loopback direct addr");
+
+  const std::array<P2pPubkey, 1> allow_host = {host_pk};
+  must_void(joiner.set_allowed_peers(allow_host), "joiner allow host");
+  must_void(rogue.set_allowed_peers(allow_host), "rogue allow host");
+  must_void(latecomer.set_allowed_peers(allow_host), "latecomer allow host");
+
+  P2pPeerTarget host_target{};
+  host_target.pubkey = host_pk;
+  host_target.remote_relay_policy = P2pRelayPolicy::no_relays;
+  host_target.direct_addrs = host_addrs;
+  host_target.connect_timeout_ms = 5000;
+
+  // 1. Default no_relays host rejects un-allowlisted joiner.
+  auto before_open = joiner.connect_peer(host_target);
+  require(!before_open.has_value() &&
+              before_open.error().code == ErrorCode::invalid_identity,
+          "no_relays default must reject un-allowlisted joiner");
+
+  // 2. Host enables opt-in open LAN admission -> un-allowlisted joiner connects.
+  must_void(host.set_lan_open_admission(true), "host enable lan open admission");
+  must_void(joiner.connect_peer(host_target), "un-allowlisted joiner dials lan host");
+
+  const auto host_saw_joiner = wait_for_event(host, P2pEventKind::peer_connected);
+  require(host_saw_joiner.peer_pubkey == joiner_pk,
+          "host must observe pending joiner peer_connected");
+
+  // Host cannot send Lane 1 (causal) to un-allowlisted pending joiner before promotion.
+  auto pre_promote_causal =
+      host.send_frame(joiner_pk, P2pLane::causal, "blocked-causal-before-allow");
+  require(!pre_promote_causal.has_value() &&
+              pre_promote_causal.error().code == ErrorCode::invalid_identity,
+          "host must not send causal frames to pending un-allowlisted peer");
+
+  // Exchange Lane 0 (control) LAN handshake frames while joiner is pending.
+  const std::string lan_hello = "LAN_HELLO:nonce=feedface";
+  must_void(host.send_frame(joiner_pk, P2pLane::control, lan_hello),
+            "host send LAN_HELLO");
+  const auto got_hello = wait_for_event(joiner, P2pEventKind::frame_received);
+  require(got_hello.peer_pubkey == host_pk && got_hello.lane == P2pLane::control &&
+              bytes_to_string(got_hello.payload) == lan_hello,
+          "joiner LAN_HELLO control recv mismatch");
+
+  const std::string lan_join = "LAN_JOIN:pin_proof=verified";
+  must_void(joiner.send_frame(host_pk, P2pLane::control, lan_join),
+            "joiner send LAN_JOIN");
+  const auto got_join = wait_for_event(host, P2pEventKind::frame_received);
+  require(got_join.peer_pubkey == joiner_pk && got_join.lane == P2pLane::control &&
+              bytes_to_string(got_join.payload) == lan_join,
+          "host LAN_JOIN control recv mismatch");
+
+  // 3. Rogue pending peer sending Lane 1 (causal) before promotion is closed with 4400.
+  must_void(rogue.connect_peer(host_target), "rogue connects pending");
+  const auto host_saw_rogue = wait_for_event(host, P2pEventKind::peer_connected);
+  require(host_saw_rogue.peer_pubkey == rogue_pk,
+          "host must observe pending rogue peer_connected");
+  must_void(rogue.send_frame(host_pk, P2pLane::causal, "rogue-causal-violation"),
+            "rogue sends forbidden causal frame");
+
+  const auto rogue_host_disc = wait_for_event(host, P2pEventKind::peer_disconnected);
+  require(
+      rogue_host_disc.peer_pubkey == rogue_pk && rogue_host_disc.reason_code == 4400U,
+      "host must disconnect rogue pending peer with CLOSE_PROTOCOL_VIOLATION (4400)");
+  const auto rogue_disc = wait_for_event(rogue, P2pEventKind::peer_disconnected);
+  require(rogue_disc.peer_pubkey == host_pk && rogue_disc.reason_code == 4400U,
+          "rogue must observe CLOSE_PROTOCOL_VIOLATION (4400)");
+
+  // 4. Host promotes joiner via allow_peer -> both exchange Lane 1 (causal) cleanly.
+  must_void(host.allow_peer(joiner_pk), "host promote joiner");
+  const std::string lan_welcome = "LAN_WELCOME:admitted=1";
+  must_void(host.send_frame(joiner_pk, P2pLane::control, lan_welcome),
+            "host send LAN_WELCOME");
+  const auto got_welcome = wait_for_event(joiner, P2pEventKind::frame_received);
+  require(got_welcome.peer_pubkey == host_pk && got_welcome.lane == P2pLane::control &&
+              bytes_to_string(got_welcome.payload) == lan_welcome,
+          "joiner LAN_WELCOME recv mismatch");
+
+  const std::string causal_j2h = "lan-causal:joiner-to-host";
+  must_void(joiner.send_frame(host_pk, P2pLane::causal, causal_j2h),
+            "promoted joiner send causal");
+  const auto got_causal_h = wait_for_event(host, P2pEventKind::frame_received);
+  require(got_causal_h.peer_pubkey == joiner_pk &&
+              got_causal_h.lane == P2pLane::causal &&
+              bytes_to_string(got_causal_h.payload) == causal_j2h,
+          "host causal recv from promoted joiner mismatch");
+
+  const std::string causal_h2j = "lan-causal:host-to-joiner";
+  must_void(host.send_frame(joiner_pk, P2pLane::causal, causal_h2j),
+            "host send causal to promoted joiner");
+  const auto got_causal_j = wait_for_event(joiner, P2pEventKind::frame_received);
+  require(got_causal_j.peer_pubkey == host_pk && got_causal_j.lane == P2pLane::causal &&
+              bytes_to_string(got_causal_j.payload) == causal_h2j,
+          "joiner causal recv from host mismatch");
+
+  // 5. Locking lobby (set_lan_open_admission(false)) blocks third un-allowlisted peer
+  //    while keeping admitted joiner connected!
+  must_void(host.set_lan_open_admission(false), "host lock lan lobby");
+
+  auto late_res = latecomer.connect_peer(host_target);
+  require(!late_res.has_value() && late_res.error().code == ErrorCode::invalid_identity,
+          "locked lan lobby must reject un-allowlisted third peer");
+
+  const std::string post_lock_causal = "lan-causal:after-lobby-lock";
+  must_void(joiner.send_frame(host_pk, P2pLane::causal, post_lock_causal),
+            "admitted joiner send causal after lobby lock");
+  const auto got_post_lock = wait_for_event(host, P2pEventKind::frame_received);
+  require(got_post_lock.peer_pubkey == joiner_pk &&
+              got_post_lock.lane == P2pLane::causal &&
+              bytes_to_string(got_post_lock.payload) == post_lock_causal,
+          "admitted joiner must remain connected after lobby lock");
+}
+
 #else
 
 void test_without_iroh_returns_unsupported() {
@@ -372,6 +538,14 @@ void test_without_iroh_returns_unsupported() {
   auto res = P2pEndpoint::create();
   require(!res.has_value() && res.error().code == ErrorCode::unsupported,
           "P2pEndpoint::create without iroh must return ErrorCode::unsupported");
+  P2pEndpoint ep{};
+  auto open_res = ep.set_lan_open_admission(true);
+  require(!open_res.has_value() && open_res.error().code == ErrorCode::unsupported,
+          "set_lan_open_admission without iroh must return ErrorCode::unsupported");
+  const P2pPubkey pk{};
+  auto allow_res = ep.allow_peer(pk);
+  require(!allow_res.has_value() && allow_res.error().code == ErrorCode::unsupported,
+          "allow_peer without iroh must return ErrorCode::unsupported");
 }
 
 #endif
@@ -385,6 +559,8 @@ int main() {
     require(p2p_iroh_compiled_in(), "p2p_iroh_compiled_in must be true with flag");
     test_force_relays_policy_and_zero_direct_sockets();
     test_live_loopback_quic_tls13_rpk_end_to_end();
+    test_lan_open_admission_fail_closed_on_online_policies();
+    test_lan_open_admission_live_handshake_promotion_and_lock();
 #else
     test_without_iroh_returns_unsupported();
 #endif

@@ -3917,6 +3917,29 @@ int main(int argc, char **argv) {
                 doc_val.value().find("healthy") != nullptr &&
                 doc_val.value().find("checks") != nullptr,
             "doctor --offline --json must emit valid report JSON");
+
+      check(is_command_post_subcommand("lan"),
+            "lan must be registered as a command_post subcommand");
+      const auto lan_help = run_cli({"lan", "--help"});
+      check(lan_help.exit_code == 0 &&
+                lan_help.err.find("blackbird lan") != std::string::npos &&
+                lan_help.err.find("--pin-stdin") != std::string::npos,
+            "lan --help must exit 0 with --pin-stdin guidance");
+      const auto lan_pin_argv = run_cli({"lan", "host", "--pin", "1234"});
+      check(lan_pin_argv.exit_code == 2 &&
+                lan_pin_argv.err.find("refusing --pin on argv") != std::string::npos,
+            "lan host must refuse --pin secret on argv");
+      const fs::path lan_absent_dir = temp.path() / "lan_absent_state";
+      const auto lan_status =
+          run_cli({"lan", "status", "--json", "--lan-dir", lan_absent_dir.string()});
+      check(lan_status.exit_code == 0 && !fs::exists(lan_absent_dir),
+            "lan status --json must be passive and exit 0");
+      const auto lan_val = parse_json(lan_status.out);
+      check(lan_val.has_value() &&
+                std::holds_alternative<Value::Object>(lan_val.value().value()) &&
+                lan_val.value().find("disabled") != nullptr &&
+                lan_val.value().find("idle_timeout_sec") != nullptr,
+            "lan status --json must emit valid policy JSON");
     }
 
     std::cout << "PASS command_post_cli\n";

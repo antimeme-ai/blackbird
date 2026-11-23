@@ -4,6 +4,7 @@
 #include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/lan_party_runtime.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
@@ -4113,6 +4114,76 @@ std::string handle_doctor(std::string_view args) {
   return format_doctor_report_human(run_blackbird_doctor(cfg));
 }
 
+std::string handle_lan(std::string_view args) {
+  const auto [sub, rest] = split_first_token(trim_view(args));
+  if (sub == "help" || sub == "--help" || sub == "-h") {
+    return "LAN Party (mp1-lan/1, strictly opt-in):\n"
+           "  /lan [status]           Show effective LAN policy & kill-switch status\n"
+           "  /lan scan [1..60]       Scan local network for _mp1-lan._udp.local. "
+           "lobbies\n"
+           "  CLI host/join:          blackbird lan host [--name ...] [--require-pin]\n"
+           "                          blackbird lan join <lobby_id|ip:port>\n";
+  }
+  if (sub.empty() || sub == "status") {
+    if (!rest.empty())
+      return "Usage: /lan [status|scan [1..60]|help]\n";
+    const auto pol = lan::load_effective_lan_policy();
+    if (!pol.has_value()) {
+      return "LAN policy check failed: " +
+             std::string{lan::lan_error_name(lan::lan_error_of(pol.error()))} + "\n";
+    }
+    std::string out = "LAN Party (mp1-lan/1) — strictly opt-in (zero sockets open):\n";
+    out += "  Status:            " +
+           std::string{pol.value().disabled ? "DISABLED (policy/env kill-switch)"
+                                            : "available (opt-in)"} +
+           "\n";
+    out +=
+        "  Require PIN:       " + std::string{pol.value().require_pin ? "yes" : "no"} +
+        "\n";
+    out += "  Require OS Auth:   " +
+           std::string{pol.value().require_local_auth ? "yes" : "no"} + "\n";
+    out += "  Host Idle Timeout: " + std::to_string(pol.value().idle_timeout_sec) +
+           "s (cap 1800s)\n";
+    out += "  Scan Timeout:      " + std::to_string(pol.value().scan_timeout_sec) +
+           "s (cap 60s)\n";
+    return out;
+  }
+  if (sub == "scan") {
+    lan::LanScanConfig scfg{};
+    scfg.scan_timeout_sec = 3U;
+    if (!rest.empty()) {
+      const auto [tok, extra] = split_first_token(rest);
+      if (!extra.empty())
+        return "Usage: /lan scan [1..60]\n";
+      std::uint32_t sec = 0;
+      const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), sec);
+      if (ec != std::errc{} || ptr != tok.data() + tok.size() || sec < 1U ||
+          sec > lan::kMaxLanScanTimeoutSec) {
+        return "Usage: /lan scan [1..60]\n";
+      }
+      scfg.scan_timeout_sec = sec;
+    }
+    const auto found = lan::scan_lan_lobbies(scfg);
+    if (!found.has_value()) {
+      return "LAN scan failed: " +
+             std::string{lan::lan_error_name(lan::lan_error_of(found.error()))} + "\n";
+    }
+    if (found.value().empty())
+      return "No LAN Party lobbies found.\n";
+    std::string out = "Discovered LAN Party lobbies (" +
+                      std::to_string(found.value().size()) + "):\n";
+    for (const auto &it : found.value()) {
+      out += "  id=" + it.lobby.beacon.lan_party_id + " name=\"" +
+             sanitize_inline(it.lobby.beacon.lobby_name, 32) +
+             "\" host=" + sanitize_inline(it.lobby.beacon.host_name, 32) +
+             (it.lobby.beacon.require_pin ? " [PIN]" : " [open]") + "\n";
+      out += "    safety: " + it.safety_number + "\n";
+    }
+    return out;
+  }
+  return "Usage: /lan [status|scan [1..60]|help]\n";
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -4144,6 +4215,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_online(args));
     if (cmd == "/doctor")
       return bound_output(handle_doctor(args));
+    if (cmd == "/lan")
+      return bound_output(handle_lan(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {
