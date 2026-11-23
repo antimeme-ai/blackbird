@@ -13712,3 +13712,12 @@ Addressed six operator field notes from live TUI use:
   model's `decision_model` tool, Lua `blackbird.decide`, and `/decision`.
 - Added bare `/decision` status/usage notice and `/provider jev` guidance notice while
   keeping non-conversational `decision` providers out of the primary `/provider` picker.
+
+## 2026-11-23 — Rock 1.1: Durable Zero-Daemon `PlatoonBoard`
+
+- Added `include/blackbird/platoon_board.hpp`, `src/platoon_board.cpp`, and
+  `tests/platoon_board_test.cpp` (registered as `platoon_board` in `CMakeLists.txt`).
+- File-backed `0700` shared board (`board.jsonl` + `roster.json`) pinned with
+  `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, `flock`-serialized single-buffer `O_APPEND`
+  writes + `fsync`, crash-resilient trailing-fragment invalidation, monotonic `seq`
+  cursors, recipient filtering, and multi-thread / `fork()` multi-process verification.
