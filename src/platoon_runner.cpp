@@ -841,7 +841,8 @@ Result<SpawnedProcess> spawn_peer_process(SpawnInput input) {
     rc = ::posix_spawn_file_actions_adddup2(&actions, err_target, STDERR_FILENO);
   }
   if (rc == 0) {
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) &&    \
+    __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 260000
     rc = ::posix_spawn_file_actions_addchdir(&actions,
                                              input.validated.working_dir.c_str());
 #else

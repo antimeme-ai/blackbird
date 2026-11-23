@@ -230,7 +230,8 @@ public:
           }
           if (rc == 0 && !cwd.empty()) {
             native_stage = 9;
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) &&    \
+    __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 260000
             rc = ::posix_spawn_file_actions_addchdir(&actions, cwd.c_str());
 #else
             rc = ::posix_spawn_file_actions_addchdir_np(&actions, cwd.c_str());

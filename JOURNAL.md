@@ -14154,3 +14154,11 @@ Blackbird must not present itself as another product.
 - **Wave 13B — Prebuilt Release Packaging & Verified Installer (`scripts/package-release`, `scripts/install-release.sh`, `scripts/check-release-packaging`, `.github/workflows/release.yml`):**
   added self-contained tarball packager (macOS 15.0+ Apple system dylib allowlist + static Lua/OpenSSL/`iroh`; Linux `$ORIGIN/../lib` RPATH bundler + post-bundle containment check; mandatory relocated offline smoke check; `SHA256SUMS.txt` + `release-manifest.json`), strict POSIX `sh` one-line installer (`https://`-only, mandatory SHA-256 + `tar -tvzf` symlink/hardlink inspection before extract, atomic `install.lock` rollback-compatible generations), offline tamper/escape regression suite (`scripts/check-release-packaging`), and tag-driven GitHub Actions workflow.
 - **Review Trail:** archived `@dentist-2`'s Wave 13B verification report in `papers/2026-11-23-wave13b-release-packaging-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #28 (Wave 13A & macOS 15.0+ Portability): Live `MpPartyRuntime` Event Loop & `posix_spawn_file_actions_addchdir_np` Fix
+
+- **macOS 15.0+ Binary Portability Fix (`src/native_process.hpp`, `src/platoon_runner.cpp`):**
+  switched macOS `posix_spawn_file_actions_addchdir` (macOS 26.0+ only, caught immediately by `scripts/package-release --macos-deployment-target 15.0`) to `posix_spawn_file_actions_addchdir_np` (macOS 10.15–26 & glibc Linux) so prebuilt Apple Silicon releases run on macOS 15 Sequoia and macOS 26 Tahoe alike.
+- **Wave 13A — Live Control-Plane WS ↔ `iroh` P2P Party Runtime (`include/blackbird/mp_party_runtime.hpp`, `src/mp_party_runtime.cpp`, `tests/mp_party_runtime_test.cpp`, `CMakeLists.txt`):**
+  wired `MpControlSocket` (`/v1/parties/<id>/ws`) directly into `P2pPartySession` (`iroh` v1.5.0) with `HELLO_ACK` clock-skew sync, `"MP1:PING"`/`"MP1:PONG"` heartbeat + lease refresh, automatic `PARTY_ENDPOINT_UPDATE`, live endpoint roaming re-dial, `<= 60s` offline TTL eviction, immediate `4403` QUIC hard-teardown on `4401`/`4403`/reconnect-401/disband, and full 2-peer Alice+Bob live TLS 1.3 + `iroh` QUIC Mutual RPK E2E tests (323 total ctests; 5/5 Guard Malloc + ASan/UBSan + `-O2 -DNDEBUG` clean).
+- **Review Trail:** archived `@dentist-2`'s Wave 13A verification report in `papers/2026-11-23-wave13a-mp-party-runtime-dentist-review.md`.
