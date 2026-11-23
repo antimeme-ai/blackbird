@@ -13765,3 +13765,12 @@ Addressed six operator field notes from live TUI use:
 - Added FIPS 180-4 SHA-256 `decision_blind_seal` / `decision_blind_verify` helpers for
   tamper-evident blind decision trials and generalized `decision_model.provider` schema
   in `src/tools.cpp`.
+
+## 2026-11-23 — Rock 5.1: TUI Unit 5 Qualified `CapabilityCatalog`
+
+- Added `include/blackbird/capabilities.hpp`, `src/capabilities.cpp`, and
+  `tests/capabilities_test.cpp` (registered as `capabilities` in `CMakeLists.txt`).
+- Manages typed skills, prompt templates, Lua recipes, and API recipes across
+  `project > user > builtin` precedence with atomic `O_NOFOLLOW | O_CLOEXEC` storage,
+  single-pass non-recursive `{{param}}` expansion, strict `executed == false` separation,
+  canonical SHA-256 stale-form protection (`ErrorCode::conflict`), and bounded paging.
