@@ -1364,12 +1364,12 @@ Result<Ed25519PubKey> parse_cnf_ed25519(StrictCborReader &reader) {
   return Result<Ed25519PubKey>::success(*x);
 }
 
-inline constexpr std::array<std::string_view, 27> kReservedHandles = {
-    "admin",    "administrator", "antimeme", "api",       "auth",        "blackbird",
-    "help",     "lobby",         "mod",      "moderator", "multiplayer", "neon",
-    "official", "operator",      "party",    "privacy",   "relay",       "root",
-    "security", "staff",         "status",   "support",   "sys",         "system",
-    "team",     "waitlist",      "www",
+inline constexpr std::array<std::string_view, 26> kReservedHandles = {
+    "admin",    "administrator", "api",       "auth",        "blackbird", "help",
+    "lobby",    "mod",           "moderator", "multiplayer", "neon",      "official",
+    "operator", "party",         "privacy",   "relay",       "root",      "security",
+    "staff",    "status",        "support",   "sys",         "system",    "team",
+    "waitlist", "www",
 };
 
 } // namespace

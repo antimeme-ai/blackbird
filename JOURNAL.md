@@ -14144,3 +14144,13 @@ Blackbird must not present itself as another product.
 - **Wave 12C — Canonical Cross-Company Safety Number (`include/blackbird/mp_protocol.hpp`, `src/mp_protocol.cpp`, `tests/mp_protocol_test.cpp`):**
   implemented `mp::compute_safety_number(AccountId, Ed25519PubKey)` matching Platoon 3 (`../multiplayer_outpost`, `xplat-board` `seq #15`/`#17`): `"mp-safety-v1:" || u64_le(account_id) || root_pubkey[32]` -> SHA-256[:20] -> 32 uppercase Crockford Base32 chars (`XXXX-XXXX-...`, 39 chars, golden vector `SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV`).
 - **Review Trail:** archived `@dentist-2`'s Wave 12 verification report in `papers/2026-11-23-wave12-online-cli-tui-safety-number-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #27 (Wave 13B & `v0.1.0` Release Prep): Unblock `@antimeme` Handle, Self-Contained Release Packager, SHA-256 Verified Installer & GitHub Release Pipeline
+
+- **Linux Wave 12 Verification (`context/linux/run-65f9hdbc`) & Fleet Rollout:**
+  verified 100% Linux `debug`/`release`/`asan` pass on `wintermute` (`command_post_cli`, `command_post_tui`, `terminal`) and deployed `7e347c1` across all 3 physical hosts (`laptop`, `wintermute`, `neuromancer`), each verified live against `https://api.multiplayer.tech/v1/health`.
+- **Cross-Company Handle Unblock (`src/mp_protocol.cpp`, `tests/mp_protocol_test.cpp`):**
+  removed `"antimeme"` from client-side `kReservedHandles` (27 -> 26) per `xplat-board` `seq #21` so the operator can register and resolve `@antimeme` on `api.multiplayer.tech`.
+- **Wave 13B — Prebuilt Release Packaging & Verified Installer (`scripts/package-release`, `scripts/install-release.sh`, `scripts/check-release-packaging`, `.github/workflows/release.yml`):**
+  added self-contained tarball packager (macOS 15.0+ Apple system dylib allowlist + static Lua/OpenSSL/`iroh`; Linux `$ORIGIN/../lib` RPATH bundler + post-bundle containment check; mandatory relocated offline smoke check; `SHA256SUMS.txt` + `release-manifest.json`), strict POSIX `sh` one-line installer (`https://`-only, mandatory SHA-256 + `tar -tvzf` symlink/hardlink inspection before extract, atomic `install.lock` rollback-compatible generations), offline tamper/escape regression suite (`scripts/check-release-packaging`), and tag-driven GitHub Actions workflow.
+- **Review Trail:** archived `@dentist-2`'s Wave 13B verification report in `papers/2026-11-23-wave13b-release-packaging-dentist-review.md`.

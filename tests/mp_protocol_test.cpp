@@ -186,6 +186,8 @@ void test_safe_ids_and_handles() {
   const auto handle = must(AccountHandle::parse("Patrick_1"), "valid handle");
   require(handle.display() == "Patrick_1", "handle display");
   require(handle.normalized() == "patrick_1", "handle normalized");
+  const auto antimeme = must(AccountHandle::parse("antimeme"), "antimeme allowed");
+  require(antimeme.normalized() == "antimeme", "antimeme normalized");
   expect_err(AccountHandle::parse("admin"), MpError::reserved_handle, "reserved admin");
   expect_err(AccountHandle::parse("Blackbird"), MpError::reserved_handle,
              "reserved blackbird");

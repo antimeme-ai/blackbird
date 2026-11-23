@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""Build, verify, and package a self-contained Blackbird release tarball."""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from datetime import datetime, timezone
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+PRODUCTION_BINARIES = (
+    "blackbird",
+    "blackbird-candidate",
+    "blackbird-auth",
+    "blackbird-workflow",
+    "blackbird-colleague",
+    "blackbird-job-runner",
+    "blackbird-archive",
+    "blackbird-resource-sampler",
+    "blackbird-raw-reader",
+    "blackbird-token-usage",
+)
+
+REQUIRED_SOURCE_FILES = (
+    "CMakeLists.txt",
+    "CMakePresets.json",
+    "scripts/blackbird",
+    "programs/turn.lua",
+    "programs/instruments/results.lua",
+    "assets/sr71.png",
+    "profiles/providers/conservative.lua",
+)
+
+# Core glibc/kernel libraries that MUST come from the target Linux host.
+LINUX_CORE_LIB_PATTERNS = (
+    "linux-vdso*",
+    "linux-gate*",
+    "ld-linux*",
+    "libc.so*",
+    "libm.so*",
+    "libdl.so*",
+    "libpthread.so*",
+    "librt.so*",
+    "libgcc_s.so*",
+    "libresolv.so*",
+    "libutil.so*",
+    "libanl.so*",
+    "libnss_*",
+    "libnsl.so*",
+    "libcrypt.so*",
+)
+
+VERSION_RE = re.compile(r"^v[0-9A-Za-z._-]+$")
+MACOS_TARGET_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}$")
+HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"package-release: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_version(version: str) -> str:
+    if not VERSION_RE.match(version) or ".." in version:
+        die(
+            f"invalid --version {version!r}: must match v[0-9A-Za-z._-]+ without '..'",
+            code=2,
+        )
+    return version
+
+
+def validate_macos_target(value: str) -> str:
+    if not MACOS_TARGET_RE.match(value):
+        die(
+            f"invalid --macos-deployment-target {value!r}: expected version like 15.0",
+            code=2,
+        )
+    return value
+
+
+def detect_target() -> tuple[str, str, str]:
+    sysname = platform.system()
+    machine = platform.machine()
+
+    if sysname == "Darwin":
+        os_name = "darwin"
+    elif sysname == "Linux":
+        os_name = "linux"
+    else:
+        die(f"unsupported operating system: {sysname}")
+
+    if machine in ("arm64", "aarch64"):
+        arch_name = "arm64"
+    elif machine in ("x86_64", "amd64"):
+        arch_name = "x86_64"
+    else:
+        die(f"unsupported CPU architecture: {machine}")
+
+    return os_name, arch_name, f"{os_name}-{arch_name}"
+
+
+def git_short_commit(source: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "--short=12", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and sha:
+            return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_linux_core_lib(soname: str) -> bool:
+    return any(fnmatch.fnmatch(soname, pat) for pat in LINUX_CORE_LIB_PATTERNS)
+
+
+def verify_macos_binaries(bin_dir: Path) -> None:
+    otool = shutil.which("otool")
+    if not otool:
+        die("otool not found on macOS; refusing to publish unverified binaries")
+    for tool in PRODUCTION_BINARIES:
+        binary = bin_dir / tool
+        proc = subprocess.run(
+            [otool, "-L", str(binary)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            die(
+                f"otool -L failed for {tool} (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        if (
+            "is not an object file" in proc.stdout
+            and os.environ.get("BLACKBIRD_PACKAGE_ALLOW_SCRIPT_FIXTURES") != "1"
+        ):
+            die(f"refusing non-Mach-O binary on macOS: {tool}")
+        bad_lines: list[str] = []
+        for line in proc.stdout.splitlines()[1:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            dylib_path = stripped.split(" ", 1)[0]
+            if not (
+                dylib_path.startswith("/usr/lib/")
+                or dylib_path.startswith("/System/Library/")
+            ):
+                bad_lines.append(stripped)
+        if bad_lines:
+            joined = "\n  ".join(bad_lines)
+            die(
+                f"refusing non-self-contained macOS binary '{tool}' with non-system "
+                f"dylib dependencies (only /usr/lib/ and /System/Library/ are allowed):\n  {joined}"
+            )
+
+
+def is_elf_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def parse_ldd_output(output: str) -> tuple[list[tuple[str, str]], list[str]]:
+    resolved: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=>" in line:
+            left, right = line.split("=>", 1)
+            soname = left.strip()
+            rhs = right.strip()
+            if rhs.startswith("not found"):
+                missing.append(soname)
+                continue
+            lib_path = re.sub(r"\s+\(0x[0-9a-fA-F]+\)$", "", rhs).strip()
+            if lib_path.startswith("/"):
+                resolved.append((soname, lib_path))
+        elif line.startswith("/"):
+            # Dynamic loader or absolute-path dependency (e.g. /lib64/ld-linux-x86-64.so.2).
+            lib_path = re.sub(r"\s+\(0x[0-9a-fA-F]+\)$", "", line).strip()
+            resolved.append((os.path.basename(lib_path), lib_path))
+    return resolved, missing
+
+
+def bundle_linux_shared_libs(bin_dir: Path, lib_dir: Path, build_env: dict[str, str]) -> int:
+    elf_binaries = [bin_dir / tool for tool in PRODUCTION_BINARIES if is_elf_file(bin_dir / tool)]
+    if not elf_binaries:
+        # Synthetic non-ELF fixture scripts (e.g., offline packaging tests).
+        if os.environ.get("BLACKBIRD_PACKAGE_ALLOW_SCRIPT_FIXTURES") == "1":
+            return 0
+        die("no ELF executables produced on Linux; refusing to package")
+
+    ldd = shutil.which("ldd")
+    if not ldd:
+        die("ldd not found on Linux; cannot inspect or bundle shared libraries")
+
+    queue: deque[Path] = deque(elf_binaries)
+    scanned: set[Path] = set()
+    bundled_sonames: dict[str, Path] = {}
+    bundled_reals: dict[Path, str] = {}
+
+    while queue:
+        current = queue.popleft()
+        real_current = current.resolve()
+        if real_current in scanned:
+            continue
+        scanned.add(real_current)
+
+        proc = subprocess.run(
+            [ldd, str(current)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=build_env,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            die(
+                f"ldd failed for {current.name} (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        deps, missing = parse_ldd_output(proc.stdout)
+        if missing:
+            die(f"unresolved shared library dependencies for {current.name}: {', '.join(missing)}")
+
+        for soname, lib_path_str in deps:
+            if is_linux_core_lib(soname):
+                continue
+            if soname in bundled_sonames:
+                continue
+            lib_path = Path(lib_path_str)
+            if not lib_path.is_file():
+                die(f"resolved shared library missing on disk: {soname} -> {lib_path}")
+            real_lib = lib_path.resolve(strict=True)
+            lib_dir.mkdir(parents=True, exist_ok=True)
+            real_name = real_lib.name
+            if real_lib not in bundled_reals:
+                dest_real = lib_dir / real_name
+                shutil.copy2(real_lib, dest_real)
+                dest_real.chmod(0o755)
+                bundled_reals[real_lib] = real_name
+                queue.append(dest_real)
+            else:
+                real_name = bundled_reals[real_lib]
+
+            dest_soname = lib_dir / soname
+            if soname != real_name and not dest_soname.exists() and not dest_soname.is_symlink():
+                dest_soname.symlink_to(real_name)
+            bundled_sonames[soname] = dest_soname
+
+    # Verify with empty LD_LIBRARY_PATH that $ORIGIN/../lib resolves EVERY non-core .so inside lib_dir.
+    verify_env = {
+        "PATH": build_env.get("PATH", "/usr/bin:/bin"),
+        "HOME": build_env.get("HOME", "/tmp"),
+    }
+    resolved_lib_dir = lib_dir.resolve() if lib_dir.is_dir() else None
+    for binary in elf_binaries:
+        proc = subprocess.run(
+            [ldd, str(binary)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=verify_env,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            die(
+                f"post-bundle ldd failed for {binary.name}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        resolved_deps, missing = parse_ldd_output(proc.stdout)
+        if missing:
+            die(
+                f"post-bundle unresolved dependencies for {binary.name} "
+                f"(check RPATH=$ORIGIN/../lib): {', '.join(missing)}"
+            )
+        host_leaks: list[str] = []
+        for soname, lib_path_str in resolved_deps:
+            if is_linux_core_lib(soname):
+                continue
+            actual_parent = Path(lib_path_str).resolve().parent
+            if resolved_lib_dir is None or actual_parent != resolved_lib_dir:
+                host_leaks.append(f"{soname} => {lib_path_str}")
+        if host_leaks:
+            joined = "\n  ".join(host_leaks)
+            die(
+                f"post-bundle RPATH verification failed for {binary.name}: "
+                f"non-core libraries resolved outside {lib_dir}:\n  {joined}"
+            )
+
+    return len(bundled_sonames)
+
+
+def create_tarball(stage_root: Path, top_name: str, tarball_path: Path) -> None:
+    def reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        return info
+
+    top_dir = stage_root / top_name
+    entries: list[Path] = [top_dir]
+    for root, dirs, files in os.walk(top_dir, followlinks=False):
+        dirs.sort()
+        files.sort()
+        root_path = Path(root)
+        for name in dirs:
+            entries.append(root_path / name)
+        for name in files:
+            entries.append(root_path / name)
+
+    with tarfile.open(tarball_path, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        for entry in entries:
+            arcname = entry.relative_to(stage_root).as_posix()
+            archive.add(entry, arcname=arcname, recursive=False, filter=reset_tarinfo)
+
+
+def safe_extract_tarball(tarball_path: Path, expected_top: str, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tarball_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        if not members:
+            die("generated tarball is empty")
+        for member in members:
+            name = member.name
+            if name.startswith("/") or ".." in Path(name).parts:
+                die(f"unsafe tarball member path: {name!r}")
+            if name != expected_top and not name.startswith(expected_top + "/"):
+                die(f"unexpected tarball member outside {expected_top}/: {name!r}")
+            if member.issym():
+                # Only allow intra-directory relative symlinks directly inside <top>/lib/.
+                member_path = Path(name)
+                if (
+                    member_path.parent != Path(expected_top) / "lib"
+                    or "/" in member.linkname
+                    or member.linkname in ("", ".", "..")
+                    or ".." in member.linkname
+                ):
+                    die(f"unsafe symlink target in tarball: {name} -> {member.linkname}")
+            elif member.islnk():
+                die(f"unexpected hardlink in tarball: {name}")
+        if sys.version_info >= (3, 12):
+            archive.extractall(dest_dir, filter="tar")
+        else:
+            archive.extractall(dest_dir)
+    extracted = dest_dir / expected_top
+    if not extracted.is_dir():
+        die(f"extracted tarball missing top-level directory {expected_top}")
+    return extracted
+
+
+def run_smoke_cmd(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    label: str,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        argv,
+        env=env,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        die(
+            f"relocated smoke check failed ({label}, exit {proc.returncode}):\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def run_relocated_smoke(tarball_path: Path, top_name: str, scratch: Path) -> str:
+    extract_dir = scratch / "smoke-extract"
+    extracted = safe_extract_tarball(tarball_path, top_name, extract_dir)
+
+    smoke_home = scratch / "smoke-home"
+    smoke_home.mkdir(mode=0o700)
+    (smoke_home / "auth").mkdir(mode=0o700)
+    (smoke_home / "config").mkdir(mode=0o700)
+    (smoke_home / "state").mkdir(mode=0o700)
+    (smoke_home / "cache").mkdir(mode=0o700)
+
+    # Clean isolated environment: empty HOME, no credentials, no LD_LIBRARY_PATH/DYLD_LIBRARY_PATH.
+    smoke_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(smoke_home),
+        "TMPDIR": str(smoke_home),
+        "BLACKBIRD_AUTH_HOME": str(smoke_home / "auth"),
+        "XDG_CONFIG_HOME": str(smoke_home / "config"),
+        "XDG_STATE_HOME": str(smoke_home / "state"),
+        "XDG_CACHE_HOME": str(smoke_home / "cache"),
+        "TERM": os.environ.get("TERM", "xterm-256color"),
+    }
+    if "FAIL_SMOKE" in os.environ:
+        smoke_env["FAIL_SMOKE"] = os.environ["FAIL_SMOKE"]
+
+    blackbird_bin = extracted / "bin/blackbird"
+    version_proc = run_smoke_cmd(
+        [str(blackbird_bin), "--version"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="bin/blackbird --version",
+    )
+    version_out = version_proc.stdout.strip()
+    if not version_out.startswith("blackbird "):
+        die(f"unexpected bin/blackbird --version output: {version_out!r}")
+
+    help_proc = run_smoke_cmd(
+        [str(blackbird_bin), "--help"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="bin/blackbird --help",
+    )
+    if not help_proc.stdout.strip():
+        die("bin/blackbird --help produced empty output")
+
+    run_smoke_cmd(
+        [str(blackbird_bin), "auth", "providers"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="bin/blackbird auth providers",
+    )
+
+    run_smoke_cmd(
+        [str(blackbird_bin), "online", "--help"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="bin/blackbird online --help",
+    )
+
+    lua_smoke = smoke_home / "local.lua"
+    lua_smoke.write_text(
+        "local result = blackbird.call('exec', {argv={'/bin/sh', '-c', 'exit 0'}, pty=true})\n"
+        "assert(result.exit_code == 0, 'Installed PTY helper failed')\n"
+        "print('BLACKBIRD_INSTALL_SMOKE')\n",
+        encoding="utf-8",
+    )
+    pty_proc = run_smoke_cmd(
+        [
+            str(blackbird_bin),
+            "--plain",
+            "--session",
+            str(smoke_home / "session"),
+            "--workflow",
+            str(lua_smoke),
+            "--once",
+            "offline-install-smoke",
+        ],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="offline PTY Lua smoke workflow",
+    )
+    if "BLACKBIRD_INSTALL_SMOKE" not in pty_proc.stdout:
+        die(
+            "offline PTY Lua smoke workflow did not print BLACKBIRD_INSTALL_SMOKE:\n"
+            f"stdout:\n{pty_proc.stdout}\nstderr:\n{pty_proc.stderr}"
+        )
+
+    wrapper_proc = run_smoke_cmd(
+        [str(extracted / "scripts/blackbird"), "--version"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="scripts/blackbird --version",
+    )
+    if wrapper_proc.stdout.strip() != version_out:
+        die(
+            f"scripts/blackbird --version mismatch: {wrapper_proc.stdout.strip()!r} != {version_out!r}"
+        )
+
+    return version_out
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def update_sha256sums(sums_path: Path, filename: str, digest: str) -> None:
+    entries: dict[str, str] = {}
+    if sums_path.is_file():
+        for raw_line in sums_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2 or not HEX64_RE.match(parts[0]):
+                continue
+            existing_hash = parts[0].lower()
+            existing_name = parts[1].lstrip("*").strip()
+            if existing_name:
+                entries[existing_name] = existing_hash
+    entries[filename] = digest.lower()
+    lines = [f"{entries[name]}  {name}\n" for name in sorted(entries)]
+    atomic_write_text(sums_path, "".join(lines))
+
+
+def update_release_manifest(
+    manifest_path: Path,
+    *,
+    version: str,
+    commit: str,
+    target: str,
+    filename: str,
+    digest: str,
+    size_bytes: int,
+) -> None:
+    assets_by_target: dict[str, dict[str, object]] = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and existing.get("version") == version:
+                for item in existing.get("assets", []):
+                    if isinstance(item, dict) and isinstance(item.get("target"), str):
+                        assets_by_target[item["target"]] = item
+        except (ValueError, OSError):
+            pass
+
+    assets_by_target[target] = {
+        "target": target,
+        "filename": filename,
+        "sha256": digest.lower(),
+        "size_bytes": size_bytes,
+    }
+    manifest = {
+        "version": version,
+        "commit": commit,
+        "assets": [assets_by_target[key] for key in sorted(assets_by_target)],
+    }
+    atomic_write_text(manifest_path, json.dumps(manifest, indent=2) + "\n")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    default_source = Path(__file__).resolve().parent.parent
+    default_jobs = max(1, min(os.cpu_count() or 4, 8))
+    parser = argparse.ArgumentParser(
+        prog="package-release",
+        description=(
+            "Build, verify, and package a self-contained Blackbird release tarball, "
+            "SHA256SUMS.txt, and release-manifest.json without dirtying the checkout."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        required=True,
+        help="Release version tag (e.g. v0.1.0); must match v[0-9A-Za-z._-]+",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path.cwd() / "dist",
+        help="Output directory for tarball, SHA256SUMS.txt, and release-manifest.json (default: ./dist)",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=default_jobs,
+        help=f"Parallel build jobs (default: {default_jobs})",
+    )
+    parser.add_argument(
+        "--macos-deployment-target",
+        default="15.0",
+        help="macOS deployment target for Darwin builds (default: 15.0)",
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=default_source,
+        help="Blackbird source checkout directory (default: repository root)",
+    )
+    args = parser.parse_args(argv)
+    if args.jobs < 1:
+        die("--jobs must be a positive integer", code=2)
+    validate_version(args.version)
+    validate_macos_target(args.macos_deployment_target)
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    source = args.source.resolve()
+    for rel in REQUIRED_SOURCE_FILES:
+        if not (source / rel).is_file():
+            die(f"incomplete source checkout ({source}): missing {rel}")
+
+    os_name, _arch_name, target = detect_target()
+    version = args.version
+    top_name = f"blackbird-{version}-{target}"
+    tarball_name = f"{top_name}.tar.gz"
+    out_dir = args.out_dir.resolve()
+    cmake = os.environ.get("CMAKE", "cmake")
+    commit = git_short_commit(source)
+    built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with tempfile.TemporaryDirectory(prefix="blackbird-release-pkg-") as tmp_str:
+        scratch = Path(tmp_str).resolve()
+        build_dir = scratch / "build"
+        cargo_target_dir = scratch / "cargo-target"
+        stage_root = scratch / "stage"
+        stage_dir = stage_root / top_name
+
+        build_env = dict(os.environ)
+        configure_cmd = [
+            cmake,
+            "--preset",
+            "release",
+            "-S",
+            str(source),
+            "-B",
+            str(build_dir),
+            f"-DBLACKBIRD_CARGO_TARGET_DIR={cargo_target_dir}",
+            "-DBLACKBIRD_RESOURCE_ROOT=/nonexistent/blackbird-packaged",
+        ]
+
+        if os_name == "darwin":
+            build_env["MACOSX_DEPLOYMENT_TARGET"] = args.macos_deployment_target
+            configure_cmd.extend(
+                [
+                    f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.macos_deployment_target}",
+                    "-DBLACKBIRD_STATIC_LUA=on",
+                    "-DBLACKBIRD_STATIC_OPENSSL=on",
+                ]
+            )
+        elif os_name == "linux":
+            configure_cmd.extend(
+                [
+                    "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib",
+                    "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib",
+                    "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+                    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--disable-new-dtags",
+                ]
+            )
+
+        print(f"Configuring Blackbird release {version} ({target}) in {build_dir}...", flush=True)
+        cfg = subprocess.run(configure_cmd, env=build_env, check=False)
+        if cfg.returncode != 0:
+            die(f"cmake configure failed (exit {cfg.returncode})")
+
+        build_cmd = [
+            cmake,
+            "--build",
+            str(build_dir),
+            "--parallel",
+            str(args.jobs),
+            "--target",
+            *PRODUCTION_BINARIES,
+        ]
+        print(f"Building {len(PRODUCTION_BINARIES)} release binaries (-j{args.jobs})...", flush=True)
+        bld = subprocess.run(build_cmd, env=build_env, check=False)
+        if bld.returncode != 0:
+            die(f"cmake build failed (exit {bld.returncode})")
+
+        bin_dir = stage_dir / "bin"
+        lib_dir = stage_dir / "lib"
+        share_dir = stage_dir / "share/blackbird"
+        scripts_dir = stage_dir / "scripts"
+        bin_dir.mkdir(parents=True)
+        share_dir.mkdir(parents=True)
+        scripts_dir.mkdir(parents=True)
+
+        for tool in PRODUCTION_BINARIES:
+            built_bin = build_dir / tool
+            if not built_bin.is_file() or not os.access(built_bin, os.X_OK):
+                die(f"missing built executable: {built_bin}")
+            dest_bin = bin_dir / tool
+            shutil.copy2(built_bin, dest_bin)
+            dest_bin.chmod(0o755)
+
+        if os_name == "darwin":
+            verify_macos_binaries(bin_dir)
+        elif os_name == "linux":
+            bundled_count = bundle_linux_shared_libs(bin_dir, lib_dir, build_env)
+            print(f"Bundled {bundled_count} Linux shared runtime libraries into lib/.", flush=True)
+
+        for resource_dir in ("programs", "assets", "profiles"):
+            shutil.copytree(source / resource_dir, share_dir / resource_dir)
+
+        wrapper_dest = scripts_dir / "blackbird"
+        shutil.copy2(source / "scripts/blackbird", wrapper_dest)
+        wrapper_dest.chmod(0o755)
+
+        # Query exact binary version string before writing MANIFEST.
+        probe_home = scratch / "probe-home"
+        probe_home.mkdir(mode=0o700)
+        probe_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(probe_home),
+        }
+        ver_proc = subprocess.run(
+            [str(bin_dir / "blackbird"), "--version"],
+            env=probe_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if ver_proc.returncode != 0 or not ver_proc.stdout.strip().startswith("blackbird "):
+            die(
+                f"staged bin/blackbird --version failed (exit {ver_proc.returncode}): "
+                f"{ver_proc.stdout.strip()} {ver_proc.stderr.strip()}"
+            )
+        binary_version = ver_proc.stdout.strip()
+
+        manifest_lines = [
+            f"version={binary_version}\n",
+            f"tag={version}\n",
+            f"target={target}\n",
+            f"commit={commit}\n",
+            f"built_at={built_at}\n",
+        ]
+        (stage_dir / "MANIFEST").write_text("".join(manifest_lines), encoding="utf-8")
+
+        staged_tarball = scratch / tarball_name
+        print(f"Packing {tarball_name}...", flush=True)
+        create_tarball(stage_root, top_name, staged_tarball)
+
+        print("Running mandatory relocated offline smoke check...", flush=True)
+        run_relocated_smoke(staged_tarball, top_name, scratch)
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final_tarball = out_dir / tarball_name
+        tmp_out_fd, tmp_out_name = tempfile.mkstemp(dir=str(out_dir), prefix=f".{tarball_name}.")
+        os.close(tmp_out_fd)
+        try:
+            shutil.copy2(staged_tarball, tmp_out_name)
+            os.chmod(tmp_out_name, 0o644)
+            os.replace(tmp_out_name, final_tarball)
+        except BaseException:
+            try:
+                os.unlink(tmp_out_name)
+            except OSError:
+                pass
+            raise
+
+        digest = sha256_file(final_tarball)
+        size_bytes = final_tarball.stat().st_size
+        update_sha256sums(out_dir / "SHA256SUMS.txt", tarball_name, digest)
+        update_release_manifest(
+            out_dir / "release-manifest.json",
+            version=version,
+            commit=commit,
+            target=target,
+            filename=tarball_name,
+            digest=digest,
+            size_bytes=size_bytes,
+        )
+
+    print(
+        f"Published release artifact:\n"
+        f"  Tarball:  {final_tarball}\n"
+        f"  Target:   {target}\n"
+        f"  Version:  {version} ({binary_version})\n"
+        f"  SHA-256:  {digest}\n"
+        f"  Size:     {size_bytes} bytes\n"
+        f"  Checksums:{out_dir / 'SHA256SUMS.txt'}\n"
+        f"  Manifest: {out_dir / 'release-manifest.json'}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

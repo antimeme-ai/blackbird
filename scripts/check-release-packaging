@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""Offline regression tests for release packaging, SHA-256 verified installer, and release workflow."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import platform
+import py_compile
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_RELEASE = ROOT / "scripts/package-release"
+INSTALL_RELEASE = ROOT / "scripts/install-release.sh"
+INSTALL_BLACKBIRD = ROOT / "scripts/install-blackbird"
+RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
+
+
+def detect_target() -> str:
+    sysname = platform.system()
+    machine = platform.machine()
+    os_slug = "darwin" if sysname == "Darwin" else "linux"
+    arch_slug = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+    return f"{os_slug}-{arch_slug}"
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_cmd(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    expect_ok: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        argv,
+        env=env,
+        cwd=str(cwd) if cwd is not None else None,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if (proc.returncode == 0) != expect_ok:
+        raise AssertionError(
+            f"command {argv!r} expected ok={expect_ok}, got exit {proc.returncode}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def check_syntax_and_help() -> None:
+    assert PACKAGE_RELEASE.is_file(), "scripts/package-release missing"
+    assert INSTALL_RELEASE.is_file(), "scripts/install-release.sh missing"
+    assert RELEASE_WORKFLOW.is_file(), ".github/workflows/release.yml missing"
+
+    # Executable bits on scripts.
+    assert os.access(PACKAGE_RELEASE, os.X_OK), "scripts/package-release is not executable"
+    assert os.access(INSTALL_RELEASE, os.X_OK), "scripts/install-release.sh is not executable"
+
+    # Strict POSIX syntax check on install-release.sh.
+    run_cmd(["sh", "-n", str(INSTALL_RELEASE)])
+
+    # Python bytecode syntax compile on package-release and this script.
+    py_compile.compile(str(PACKAGE_RELEASE), doraise=True)
+    py_compile.compile(str(Path(__file__).resolve()), doraise=True)
+
+    # YAML syntax and structure check on .github/workflows/release.yml.
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        yaml = None
+    if yaml is not None:
+        workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        assert isinstance(workflow, dict), "release.yml did not parse to a mapping"
+        # PyYAML parses bare `on:` as boolean True in YAML 1.1.
+        triggers = workflow.get("on", workflow.get(True))
+        assert isinstance(triggers, dict), f"release.yml missing triggers: {workflow.keys()}"
+        assert "push" in triggers and "workflow_dispatch" in triggers, triggers
+        assert "jobs" in workflow and "build" in workflow["jobs"], workflow
+        publish = workflow["jobs"].get("publish", {})
+        assert publish.get("permissions", {}).get("contents") == "write", publish
+        wf_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        assert (
+            "1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce" in wf_text
+        ), "release.yml missing pinned Lua 5.5.1 SHA-256 verification"
+        publish_steps_text = "\n".join(
+            step.get("run", "") for step in publish.get("steps", []) if isinstance(step, dict)
+        )
+        assert "Invalid release version" in publish_steps_text, (
+            "publish job missing strict version validation"
+        )
+        build_steps_text = "\n".join(
+            step.get("run", "")
+            for step in workflow["jobs"]["build"].get("steps", [])
+            if isinstance(step, dict)
+        )
+        assert "command -v cargo" in build_steps_text, "build job missing cargo/iroh guard"
+
+    # --help checks (including piped sh -s -- --help to simulate curl | sh).
+    pkg_help = run_cmd([str(PACKAGE_RELEASE), "--help"])
+    assert "--version" in pkg_help.stdout, pkg_help.stdout
+    inst_help = run_cmd([str(INSTALL_RELEASE), "--help"])
+    assert "--base-url" in inst_help.stdout, inst_help.stdout
+    piped_help = run_cmd(
+        ["sh", "-s", "--", "--help"],
+        input_text=INSTALL_RELEASE.read_text(encoding="utf-8"),
+    )
+    assert "--base-url" in piped_help.stdout, piped_help.stdout
+
+
+def make_synthetic_checkout(checkout: Path) -> None:
+    checkout.mkdir(parents=True)
+    for name in ("programs", "assets", "scripts"):
+        (checkout / name).mkdir()
+    (checkout / "programs/instruments").mkdir()
+    (checkout / "profiles/providers").mkdir(parents=True)
+    (checkout / "CMakeLists.txt").write_text("fixture\n", encoding="utf-8")
+    (checkout / "CMakePresets.json").write_text("fixture\n", encoding="utf-8")
+    (checkout / "programs/turn.lua").write_text("fixture workflow\n", encoding="utf-8")
+    (checkout / "programs/instruments/results.lua").write_text("fixture instrument\n", encoding="utf-8")
+    (checkout / "assets/sr71.png").write_bytes(b"fixture sprite")
+    (checkout / "profiles/providers/conservative.lua").write_text("fixture profile\n", encoding="utf-8")
+    shutil.copy2(ROOT / "scripts/blackbird", checkout / "scripts/blackbird")
+    (checkout / "scripts/blackbird").chmod(0o755)
+
+
+def make_fake_cmake(cmake_path: Path) -> None:
+    cmake_path.write_text(
+        """#!/bin/sh
+set -eu
+if [ "$1" = --build ]; then
+  build=$2
+  mkdir -p "$build"
+  ver=${FAKE_BLACKBIRD_VERSION:-blackbird fixture-v0.1.0}
+  cat > "$build/blackbird" <<EOF
+#!/bin/sh
+set -eu
+case "\\${1:-}" in
+  --version|-V) printf '%s\\n' "$ver"; exit 0 ;;
+  --help)
+    if [ "\\${FAIL_INSTALL_SMOKE:-}" = yes ]; then exit 37; fi
+    printf 'fixture help\\n'
+    exit 0 ;;
+  auth) printf 'fixture auth providers\\n'; exit 0 ;;
+  online)
+    if [ "\\${2:-}" = --help ]; then
+      printf 'fixture online help\\n'
+      exit 0
+    fi
+    exit 2 ;;
+esac
+if [ -n "\\${INSTALL_CAPTURE:-}" ]; then
+  printf '%s\\n' "\\$PWD" "\\$BLACKBIRD_SPRITE_ASSET" "\\$@" > "\\$INSTALL_CAPTURE"
+fi
+if [ "\\${FAIL_SMOKE:-}" = yes ]; then exit 31; fi
+printf 'BLACKBIRD_INSTALL_SMOKE\\n'
+EOF
+  chmod 755 "$build/blackbird"
+  for tool in blackbird-candidate blackbird-auth blackbird-workflow blackbird-colleague blackbird-job-runner blackbird-archive blackbird-resource-sampler blackbird-raw-reader blackbird-token-usage; do
+    cp -p "$build/blackbird" "$build/$tool"
+  done
+else
+  printf '%s\n' "$@" > "$CONFIG_CAPTURE"
+fi
+""",
+        encoding="utf-8",
+    )
+    cmake_path.chmod(0o755)
+
+
+def main() -> int:
+    check_syntax_and_help()
+    target = detect_target()
+
+    with tempfile.TemporaryDirectory(prefix="blackbird release test ") as tmp_str:
+        root = Path(tmp_str).resolve()
+        checkout = root / "source"
+        make_synthetic_checkout(checkout)
+        fake_cmake = root / "cmake"
+        make_fake_cmake(fake_cmake)
+
+        config_capture = root / "cmake-configure.txt"
+        pkg_env = dict(
+            os.environ,
+            CMAKE=str(fake_cmake),
+            CONFIG_CAPTURE=str(config_capture),
+            BLACKBIRD_PACKAGE_ALLOW_SCRIPT_FIXTURES="1",
+        )
+
+        # 1. package-release rejects unsafe version strings.
+        for bad_ver in ("../evil", "0.1.0", "v1..2", "v1/2"):
+            run_cmd(
+                [
+                    str(PACKAGE_RELEASE),
+                    "--version",
+                    bad_ver,
+                    "--source",
+                    str(checkout),
+                    "--out-dir",
+                    str(root / "bad-out"),
+                ],
+                env=pkg_env,
+                expect_ok=False,
+            )
+        assert not (root / "bad-out").exists(), "bad version created output directory"
+
+        # 2. package-release fails closed when relocated smoke check fails and publishes nothing.
+        smoke_fail_out = root / "smoke-fail-out"
+        run_cmd(
+            [
+                str(PACKAGE_RELEASE),
+                "--version",
+                "v0.1.0",
+                "--source",
+                str(checkout),
+                "--out-dir",
+                str(smoke_fail_out),
+                "--jobs",
+                "2",
+            ],
+            env=dict(pkg_env, FAIL_SMOKE="yes"),
+            expect_ok=False,
+        )
+        assert not smoke_fail_out.exists(), "failed smoke check published output artifacts"
+
+        # 3. Verify macOS otool -L strict Apple system allowlist (/usr/lib/ and /System/Library/ only)
+        #    AND Linux post-bundle RPATH lib_dir verification directly.
+        if platform.system() == "Darwin":
+            for label, bad_dep in (
+                ("homebrew", "/opt/homebrew/opt/lua/lib/liblua.5.5.dylib"),
+                ("macports", "/opt/local/lib/libssl.3.dylib"),
+                ("rpath", "@rpath/libcustom.dylib"),
+            ):
+                bad_otool_dir = root / f"bad-otool-{label}"
+                bad_otool_dir.mkdir()
+                (bad_otool_dir / "otool").write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s:\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\\n"
+                    f"\\t{bad_dep} (compatibility version 1.0.0)\\n' \"$2\"\n",
+                    encoding="utf-8",
+                )
+                (bad_otool_dir / "otool").chmod(0o755)
+                fail_out = root / f"otool-fail-{label}"
+                run_cmd(
+                    [
+                        str(PACKAGE_RELEASE),
+                        "--version",
+                        "v0.1.0",
+                        "--source",
+                        str(checkout),
+                        "--out-dir",
+                        str(fail_out),
+                    ],
+                    env=dict(pkg_env, PATH=f"{bad_otool_dir}:{pkg_env['PATH']}"),
+                    expect_ok=False,
+                )
+                assert not fail_out.exists(), f"{label} dylib dependency was not rejected"
+
+        # Direct unit check of Linux post-bundle RPATH verification (host leak rejected vs lib_dir accepted).
+        loader = importlib.machinery.SourceFileLoader("package_release_mod", str(PACKAGE_RELEASE))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None
+        pkg_mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(pkg_mod)
+        linux_sim = root / "linux-rpath-sim"
+        sim_bin = linux_sim / "bin"
+        sim_lib = linux_sim / "lib"
+        host_lib = linux_sim / "hostlib"
+        sim_bin.mkdir(parents=True)
+        host_lib.mkdir(parents=True)
+        fake_host_so = host_lib / "liblua.so.5.5.1"
+        fake_host_so.write_bytes(b"\x7fELFfake-lua")
+        for tool in pkg_mod.PRODUCTION_BINARIES:
+            p = sim_bin / tool
+            p.write_bytes(b"\x7fELFfake-bin")
+            p.chmod(0o755)
+        ldd_shim_dir = linux_sim / "ldd-shim"
+        ldd_shim_dir.mkdir()
+        host_leak_flag = linux_sim / "host_leak_mode"
+        (ldd_shim_dir / "ldd").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'target=$1\n'
+            'case "$target" in\n'
+            '  */lib/liblua.so.5.5.1)\n'
+            "    printf '\\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0)\\n'\n"
+            "    exit 0 ;;\n"
+            "esac\n"
+            'if [ -f "' + str(host_leak_flag) + '" ] && [ -z "${LD_LIBRARY_PATH:-}" ]; then\n'
+            f"  printf '\\tliblua.so.5.5 => {fake_host_so} (0x0)\\n'\n"
+            'elif [ -f "' + str(sim_lib / "liblua.so.5.5") + '" ] && [ -z "${LD_LIBRARY_PATH:-}" ]; then\n'
+            f"  printf '\\tliblua.so.5.5 => {sim_lib / 'liblua.so.5.5'} (0x0)\\n'\n"
+            "else\n"
+            f"  printf '\\tliblua.so.5.5 => {fake_host_so} (0x0)\\n'\n"
+            "fi\n"
+            "printf '\\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0)\\n'\n",
+            encoding="utf-8",
+        )
+        (ldd_shim_dir / "ldd").chmod(0o755)
+        sim_env = {"PATH": f"{ldd_shim_dir}:{os.environ['PATH']}", "HOME": str(root), "LD_LIBRARY_PATH": str(host_lib)}
+        orig_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = sim_env["PATH"]
+            bundled = pkg_mod.bundle_linux_shared_libs(sim_bin, sim_lib, sim_env)
+            assert bundled == 1 and (sim_lib / "liblua.so.5.5").is_symlink()
+            # Now simulate RPATH failure where post-bundle ldd still resolves to hostlib outside lib_dir.
+            shutil.rmtree(sim_lib)
+            host_leak_flag.write_text("1", encoding="utf-8")
+            try:
+                pkg_mod.bundle_linux_shared_libs(sim_bin, sim_lib, sim_env)
+                raise AssertionError("Linux host-path non-core library leak was not rejected")
+            except SystemExit as exc:
+                assert exc.code != 0
+        finally:
+            os.environ["PATH"] = orig_path
+
+        # 4. Package v0.1.0 cleanly into mirror_v1/.
+        mirror_v1 = root / "mirror v1"
+        run_cmd(
+            [
+                str(PACKAGE_RELEASE),
+                "--version",
+                "v0.1.0",
+                "--source",
+                str(checkout),
+                "--out-dir",
+                str(mirror_v1),
+                "--jobs",
+                "2",
+                "--macos-deployment-target",
+                "15.0",
+            ],
+            env=dict(pkg_env, FAKE_BLACKBIRD_VERSION="blackbird release-v0.1.0"),
+        )
+
+        # Verify platform-specific CMake flags were passed.
+        cfg_lines = config_capture.read_text(encoding="utf-8").splitlines()
+        if platform.system() == "Darwin":
+            assert "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0" in cfg_lines, cfg_lines
+            assert "-DBLACKBIRD_STATIC_LUA=on" in cfg_lines, cfg_lines
+            assert "-DBLACKBIRD_STATIC_OPENSSL=on" in cfg_lines, cfg_lines
+        else:
+            assert "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib" in cfg_lines, cfg_lines
+            assert "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib" in cfg_lines, cfg_lines
+            assert "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" in cfg_lines, cfg_lines
+            assert "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags" in cfg_lines, cfg_lines
+
+        tar_v1_name = f"blackbird-v0.1.0-{target}.tar.gz"
+        tar_v1 = mirror_v1 / tar_v1_name
+        assert tar_v1.is_file(), f"missing {tar_v1}"
+        sums_v1 = (mirror_v1 / "SHA256SUMS.txt").read_text(encoding="utf-8")
+        expected_sha_v1 = sha256_file(tar_v1)
+        assert f"{expected_sha_v1}  {tar_v1_name}" in sums_v1, sums_v1
+
+        manifest_v1 = json.loads((mirror_v1 / "release-manifest.json").read_text(encoding="utf-8"))
+        assert manifest_v1["version"] == "v0.1.0", manifest_v1
+        assert len(manifest_v1["assets"]) == 1, manifest_v1
+        asset_v1 = manifest_v1["assets"][0]
+        assert asset_v1 == {
+            "target": target,
+            "filename": tar_v1_name,
+            "sha256": expected_sha_v1,
+            "size_bytes": tar_v1.stat().st_size,
+        }, asset_v1
+
+        # Verify tarball internal layout.
+        with tarfile.open(tar_v1, mode="r:gz") as tf:
+            names = set(tf.getnames())
+            top = f"blackbird-v0.1.0-{target}"
+            for binary in (
+                "blackbird",
+                "blackbird-candidate",
+                "blackbird-auth",
+                "blackbird-workflow",
+                "blackbird-colleague",
+                "blackbird-job-runner",
+                "blackbird-archive",
+                "blackbird-resource-sampler",
+                "blackbird-raw-reader",
+                "blackbird-token-usage",
+            ):
+                assert f"{top}/bin/{binary}" in names, f"missing bin/{binary}"
+            assert f"{top}/scripts/blackbird" in names
+            assert f"{top}/share/blackbird/programs/turn.lua" in names
+            assert f"{top}/share/blackbird/assets/sr71.png" in names
+            assert f"{top}/share/blackbird/profiles/providers/conservative.lua" in names
+            assert f"{top}/MANIFEST" in names
+            manifest_txt = tf.extractfile(f"{top}/MANIFEST").read().decode("utf-8")
+            assert "version=blackbird release-v0.1.0\n" in manifest_txt, manifest_txt
+            assert "tag=v0.1.0\n" in manifest_txt, manifest_txt
+            assert f"target={target}\n" in manifest_txt, manifest_txt
+            assert "commit=" in manifest_txt and "built_at=" in manifest_txt, manifest_txt
+            if platform.system() == "Darwin":
+                assert f"{top}/lib" not in names, "macOS tarball should omit empty lib/"
+
+        # 5. Security rejections BEFORE any install (zero mutation to $prefix!).
+        prefix = root / "prefix with 'quote"
+        user_home = root / "user-home"
+        user_home.mkdir()
+        mv_shim = root / "mv-shim"
+        mv_shim.mkdir()
+        (mv_shim / "mv").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'for dest in "$@"; do :; done\n'
+            'case "$dest" in\n'
+            '  */lib/blackbird/current) if [ "${FAIL_SWITCH:-}" = yes ]; then exit 29; fi ;;\n'
+            "esac\n"
+            'exec /bin/mv "$@"\n',
+            encoding="utf-8",
+        )
+        (mv_shim / "mv").chmod(0o755)
+        inst_env = dict(
+            os.environ,
+            PATH=f"{mv_shim}:{os.environ['PATH']}",
+            HOME=str(user_home),
+        )
+        # Clear any ambient BLACKBIRD_* installer env vars.
+        for var in ("BLACKBIRD_VERSION", "BLACKBIRD_PREFIX", "BLACKBIRD_RELEASE_BASE_URL"):
+            inst_env.pop(var, None)
+
+        # 5a. Plain http:// URL rejection.
+        http_res = run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                "http://example.com/releases",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert "https://" in http_res.stderr, http_res.stderr
+        assert not prefix.exists(), "plain http:// rejection mutated prefix"
+
+        # 5b. Version traversal / invalid version rejection.
+        for bad_ver in ("../evil", "v1.0/../../etc", "v1..0", "latest/foo", "1.2.3", "v1 0"):
+            run_cmd(
+                [
+                    str(INSTALL_RELEASE),
+                    "--prefix",
+                    str(prefix),
+                    "--version",
+                    bad_ver,
+                    "--base-url",
+                    f"file://{mirror_v1}",
+                ],
+                env=inst_env,
+                expect_ok=False,
+            )
+        assert not prefix.exists(), "bad version rejection mutated prefix"
+
+        # 5b2. Newline / control character in --prefix / BLACKBIRD_PREFIX rejected with exit 2 and zero writes.
+        for bad_prefix in (f"{root}/bad\nprefix", f"{root}/bad\x1bprefix"):
+            bad_pref_res = run_cmd(
+                [
+                    str(INSTALL_RELEASE),
+                    "--prefix",
+                    bad_prefix,
+                    "--version",
+                    "v0.1.0",
+                    "--base-url",
+                    f"file://{mirror_v1}",
+                ],
+                env=inst_env,
+                expect_ok=False,
+            )
+            assert bad_pref_res.returncode == 2, (bad_pref_res.returncode, bad_pref_res.stderr)
+            assert not Path(bad_prefix.split("\n")[0]).exists(), "bad prefix created directory"
+
+        # 5c. SHA-256 1-byte tamper rejection (zero mutation to $prefix!).
+        tampered_mirror = root / "mirror-tampered"
+        shutil.copytree(mirror_v1, tampered_mirror)
+        tampered_tar = tampered_mirror / tar_v1_name
+        raw_bytes = bytearray(tampered_tar.read_bytes())
+        raw_bytes[-1] ^= 0x01
+        tampered_tar.write_bytes(bytes(raw_bytes))
+        tamper_res = run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--version",
+                "v0.1.0",
+                "--base-url",
+                f"file://{tampered_mirror}",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert "SHA-256 mismatch" in tamper_res.stderr, tamper_res.stderr
+        assert not prefix.exists(), "SHA-256 tamper mutated prefix"
+
+        # 5d. Missing checksum entry in SHA256SUMS.txt.
+        missing_sum_mirror = root / "mirror-missing-sum"
+        shutil.copytree(mirror_v1, missing_sum_mirror)
+        (missing_sum_mirror / "SHA256SUMS.txt").write_text("", encoding="utf-8")
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--version",
+                "v0.1.0",
+                "--base-url",
+                f"file://{missing_sum_mirror}",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert not prefix.exists(), "missing checksum mutated prefix"
+
+        # 5e. Path traversal entry inside tarball with valid SHA-256 fails closed.
+        evil_mirror = root / "mirror-evil-tar"
+        evil_mirror.mkdir()
+        evil_tar = evil_mirror / tar_v1_name
+        with tarfile.open(evil_tar, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name=f"blackbird-v0.1.0-{target}/../../escape.txt")
+            data = b"pwned"
+            info.size = len(data)
+            tf.addfile(info, fileobj=io.BytesIO(data))
+        (evil_mirror / "SHA256SUMS.txt").write_text(
+            f"{sha256_file(evil_tar)}  {tar_v1_name}\n", encoding="utf-8"
+        )
+        evil_res = run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--version",
+                "v0.1.0",
+                "--base-url",
+                f"file://{evil_mirror}",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert "unsafe tarball entry" in evil_res.stderr.lower(), evil_res.stderr
+        assert not prefix.exists(), "evil tar path traversal mutated prefix"
+
+        # 5f. Symlink-escape and hardlink entries inside tarball (with valid SHA-256) fail closed before tar -xzf!
+        for case_name, entry_name, entry_type, link_target in (
+            ("symlink-outside-lib", f"blackbird-v0.1.0-{target}/share", tarfile.SYMTYPE, "/tmp/outside"),
+            ("symlink-traversal-in-lib", f"blackbird-v0.1.0-{target}/lib/evil.so", tarfile.SYMTYPE, "../bin/blackbird"),
+            ("symlink-abs-in-lib", f"blackbird-v0.1.0-{target}/lib/evil.so", tarfile.SYMTYPE, "/etc/passwd"),
+            ("hardlink", f"blackbird-v0.1.0-{target}/bin/hl", tarfile.LNKTYPE, f"blackbird-v0.1.0-{target}/bin/blackbird"),
+        ):
+            link_mirror = root / f"mirror-{case_name}"
+            link_mirror.mkdir()
+            link_tar = link_mirror / tar_v1_name
+            with tarfile.open(link_tar, mode="w:gz") as tf:
+                reg = tarfile.TarInfo(name=f"blackbird-v0.1.0-{target}/bin/blackbird")
+                reg_data = b"#!/bin/sh\n"
+                reg.size = len(reg_data)
+                tf.addfile(reg, fileobj=io.BytesIO(reg_data))
+                bad_info = tarfile.TarInfo(name=entry_name)
+                bad_info.type = entry_type
+                bad_info.linkname = link_target
+                tf.addfile(bad_info)
+            (link_mirror / "SHA256SUMS.txt").write_text(
+                f"{sha256_file(link_tar)}  {tar_v1_name}\n", encoding="utf-8"
+            )
+            link_res = run_cmd(
+                [
+                    str(INSTALL_RELEASE),
+                    "--prefix",
+                    str(prefix),
+                    "--version",
+                    "v0.1.0",
+                    "--base-url",
+                    f"file://{link_mirror}",
+                ],
+                env=inst_env,
+                expect_ok=False,
+            )
+            assert "refusing" in link_res.stderr.lower(), (case_name, link_res.stderr)
+            assert not prefix.exists(), f"{case_name} mutated prefix"
+
+        # 5g. Verify a safe intra-lib relative symlink (e.g. lib/libfoo.so.1 -> libfoo.so.1.2) IS allowed!
+        lib_sym_mirror = root / "mirror-safe-lib-sym"
+        lib_sym_mirror.mkdir()
+        lib_sym_tar = lib_sym_mirror / tar_v1_name
+        with tarfile.open(tar_v1, mode="r:gz") as src_tf, tarfile.open(lib_sym_tar, mode="w:gz") as dst_tf:
+            for member in src_tf.getmembers():
+                extracted_f = src_tf.extractfile(member) if member.isfile() else None
+                dst_tf.addfile(member, extracted_f)
+            lib_dir_info = tarfile.TarInfo(name=f"blackbird-v0.1.0-{target}/lib")
+            lib_dir_info.type = tarfile.DIRTYPE
+            lib_dir_info.mode = 0o755
+            dst_tf.addfile(lib_dir_info)
+            so_real = tarfile.TarInfo(name=f"blackbird-v0.1.0-{target}/lib/libdemo.so.1.2")
+            so_data = b"demo-so"
+            so_real.size = len(so_data)
+            so_real.mode = 0o755
+            dst_tf.addfile(so_real, io.BytesIO(so_data))
+            so_sym = tarfile.TarInfo(name=f"blackbird-v0.1.0-{target}/lib/libdemo.so.1")
+            so_sym.type = tarfile.SYMTYPE
+            so_sym.linkname = "libdemo.so.1.2"
+            dst_tf.addfile(so_sym)
+        (lib_sym_mirror / "SHA256SUMS.txt").write_text(
+            f"{sha256_file(lib_sym_tar)}  {tar_v1_name}\n", encoding="utf-8"
+        )
+        safe_sym_prefix = root / "safe-sym-prefix"
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(safe_sym_prefix),
+                "--version",
+                "v0.1.0",
+                "--base-url",
+                f"file://{lib_sym_mirror}",
+            ],
+            env=inst_env,
+        )
+        safe_sym_gen = (safe_sym_prefix / "lib/blackbird/current").resolve(strict=True)
+        assert (safe_sym_gen / "lib/libdemo.so.1").is_symlink()
+        assert os.readlink(safe_sym_gen / "lib/libdemo.so.1") == "libdemo.so.1.2"
+
+        # 6. First valid install (explicit --version v0.1.0) into prefix with spaces & quote!
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--version",
+                "v0.1.0",
+                "--base-url",
+                f"file://{mirror_v1}",
+            ],
+            env=inst_env,
+        )
+        current = prefix / "lib/blackbird/current"
+        first_gen = current.resolve(strict=True)
+        assert first_gen.parent == prefix / "lib/blackbird/releases"
+        assert first_gen.name.startswith("generation-"), first_gen.name
+        assert not (prefix / "lib/blackbird/install.lock").exists()
+
+        # Verify --version via installed launcher.
+        ver_v1 = run_cmd([str(prefix / "bin/blackbird"), "--version"], env=inst_env, cwd=root)
+        assert ver_v1.stdout.strip() == "blackbird release-v0.1.0", ver_v1.stdout
+
+        # Verify launcher preserves spaces, quotes, shell metacharacters, PWD, and sprite asset.
+        capture = root / "arg-capture.txt"
+        run_cmd(
+            [
+                str(prefix / "bin/blackbird"),
+                "--session",
+                "named session",
+                "--once",
+                "hello '$() world",
+            ],
+            env=dict(inst_env, INSTALL_CAPTURE=str(capture)),
+            cwd=root,
+        )
+        assert capture.read_text(encoding="utf-8").splitlines() == [
+            str(root),
+            str(first_gen / "share/blackbird/assets/sr71.png"),
+            "--session",
+            "named session",
+            "--once",
+            "hello '$() world",
+        ], capture.read_text(encoding="utf-8")
+
+        # 7. Package v0.2.0 and upgrade via `--version latest` resolution!
+        mirror_v2 = root / "mirror-v2"
+        run_cmd(
+            [
+                str(PACKAGE_RELEASE),
+                "--version",
+                "v0.2.0",
+                "--source",
+                str(checkout),
+                "--out-dir",
+                str(mirror_v2),
+                "--jobs",
+                "2",
+            ],
+            env=dict(pkg_env, FAKE_BLACKBIRD_VERSION="blackbird release-v0.2.0"),
+        )
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                f"file://{mirror_v2}",
+            ],
+            env=inst_env,
+        )
+        second_gen = current.resolve(strict=True)
+        assert second_gen != first_gen and first_gen.is_dir(), "upgrade did not preserve first generation"
+        ver_v2 = run_cmd([str(prefix / "bin/blackbird"), "--version"], env=inst_env, cwd=root)
+        assert ver_v2.stdout.strip() == "blackbird release-v0.2.0", ver_v2.stdout
+
+        # Verify seamless interop with scripts/install-blackbird --list and --rollback!
+        listed = run_cmd([str(INSTALL_BLACKBIRD), "--list", "--prefix", str(prefix)], env=inst_env)
+        assert f"* {second_gen.name}" in listed.stdout, listed.stdout
+        assert f"  {first_gen.name}" in listed.stdout, listed.stdout
+        assert "blackbird release-v0.2.0" in listed.stdout, listed.stdout
+        assert "blackbird release-v0.1.0" in listed.stdout, listed.stdout
+        assert "unknown" not in listed.stdout, f"installed_at missing from MANIFEST:\n{listed.stdout}"
+
+        run_cmd([str(INSTALL_BLACKBIRD), "--rollback", "--prefix", str(prefix)], env=inst_env)
+        assert current.resolve(strict=True) == first_gen
+        run_cmd(
+            [str(INSTALL_BLACKBIRD), "--rollback", second_gen.name, "--prefix", str(prefix)],
+            env=inst_env,
+        )
+        assert current.resolve(strict=True) == second_gen
+
+        # 8. Rollback safety on corrupted second/third download (SHA-256 tamper).
+        prev_launcher_bytes = (prefix / "bin/blackbird").read_bytes()
+        tampered_v2 = root / "mirror-v2-corrupt"
+        shutil.copytree(mirror_v2, tampered_v2)
+        tar_v2 = tampered_v2 / f"blackbird-v0.2.0-{target}.tar.gz"
+        b2 = bytearray(tar_v2.read_bytes())
+        b2[len(b2) // 2] ^= 0xFF
+        tar_v2.write_bytes(bytes(b2))
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                f"file://{tampered_v2}",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert current.resolve(strict=True) == second_gen, "corrupted upgrade altered current"
+        assert (prefix / "bin/blackbird").read_bytes() == prev_launcher_bytes
+        assert sorted(p.name for p in (prefix / "lib/blackbird/releases").iterdir()) == sorted(
+            [first_gen.name, second_gen.name]
+        )
+
+        # 9. Rollback safety on failed pre-activation smoke check.
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                f"file://{mirror_v2}",
+            ],
+            env=dict(inst_env, FAIL_INSTALL_SMOKE="yes"),
+            expect_ok=False,
+        )
+        assert current.resolve(strict=True) == second_gen, "failed smoke altered current"
+        assert sorted(p.name for p in (prefix / "lib/blackbird/releases").iterdir()) == sorted(
+            [first_gen.name, second_gen.name]
+        )
+        assert not (prefix / "lib/blackbird/install.lock").exists()
+
+        # 10. Rollback safety on failed atomic symlink switch.
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                f"file://{mirror_v2}",
+            ],
+            env=dict(inst_env, FAIL_SWITCH="yes"),
+            expect_ok=False,
+        )
+        assert current.resolve(strict=True) == second_gen, "failed switch altered current"
+        assert (prefix / "bin/blackbird").read_bytes() == prev_launcher_bytes
+        assert sorted(p.name for p in (prefix / "lib/blackbird/releases").iterdir()) == sorted(
+            [first_gen.name, second_gen.name]
+        )
+        assert not (prefix / "lib/blackbird/install.lock").exists()
+
+        # 11. Unrelated launcher preservation.
+        (prefix / "bin/blackbird").write_text("#!/bin/sh\n# operator custom wrapper\n", encoding="utf-8")
+        run_cmd(
+            [
+                str(INSTALL_RELEASE),
+                "--prefix",
+                str(prefix),
+                "--base-url",
+                f"file://{mirror_v2}",
+            ],
+            env=inst_env,
+            expect_ok=False,
+        )
+        assert (prefix / "bin/blackbird").read_text(encoding="utf-8") == "#!/bin/sh\n# operator custom wrapper\n"
+        assert current.resolve(strict=True) == second_gen
+
+    print(
+        "Release packaging & verified installer checks passed: "
+        "syntax, YAML, tarball layout, manifest, SHA-256 tamper rejection, "
+        "http:// & traversal rejection, atomic install, latest resolution, "
+        "install-blackbird interop, and rollback safety."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
