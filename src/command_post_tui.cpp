@@ -2167,8 +2167,12 @@ constexpr std::string_view kOnlineHelpText =
     "blocked\n"
     "  /online friend add <handle|account_id>             Send or accept friend "
     "request\n"
-    "  /online friend remove <account_id>                 Remove friend\n"
-    "  /online friend block <account_id>                  Block account\n"
+    "  /online friend accept <handle|account_id>          Accept incoming friend "
+    "request\n"
+    "  /online friend deny <handle|account_id>            Deny incoming friend "
+    "request (alias: decline)\n"
+    "  /online friend remove <handle|account_id>          Remove friend\n"
+    "  /online friend block <handle|account_id>           Block account\n"
     "  /online party create [private|friends] [force|allow|no]\n"
     "                                                     Create online party\n"
     "  /online party info <party_id>                      Inspect party summary\n"
@@ -2547,89 +2551,161 @@ std::string handle_online_status(const OnlineEnvConfig &env) {
   return out;
 }
 
+struct ResolvedTuiFriendTarget {
+  std::optional<mp::AccountId> account_id;
+  std::string resolved_handle;
+  std::string error_output;
+};
+
+std::optional<std::string> validate_online_friend_target(std::string_view target) {
+  if (is_all_ascii_digits(target)) {
+    const auto parsed = mp::AccountId::parse_decimal(target);
+    if (!parsed.has_value()) {
+      return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
+    }
+    return std::nullopt;
+  }
+  const auto valid_handle = mp::AccountHandle::parse(target);
+  if (!valid_handle.has_value()) {
+    return "Invalid handle or account_id: '" + sanitize_inline(target, 64) + "'\n";
+  }
+  return std::nullopt;
+}
+
+ResolvedTuiFriendTarget resolve_online_friend_target(mp::MpControlClient &client,
+                                                     std::string_view target) {
+  ResolvedTuiFriendTarget out{};
+  if (is_all_ascii_digits(target)) {
+    const auto parsed = mp::AccountId::parse_decimal(target);
+    if (!parsed.has_value()) {
+      out.error_output = "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
+      return out;
+    }
+    out.account_id = parsed.value();
+    return out;
+  }
+  const auto resolved = client.resolve_handle(target);
+  if (!resolved.has_value()) {
+    out.error_output = "Online resolve failed (" + sanitize_inline(target, 64) +
+                       "): " + format_mp_error_detail(resolved.error()) + "\n";
+    return out;
+  }
+  out.account_id = resolved.value().account_id;
+  out.resolved_handle = resolved.value().handle;
+  return out;
+}
+
 std::string handle_online_friend(std::string_view rest, const OnlineEnvConfig &env) {
   const auto [action, tail] = split_first_token(rest);
-  if (action == "add") {
+  if (action == "add" || action == "accept") {
+    const bool is_accept = action == "accept";
     const auto [target, extra] = split_first_token(tail);
-    if (target.empty() || !extra.empty())
-      return "Usage: /online friend add <handle|account_id>\n";
+    if (target.empty() || !extra.empty()) {
+      return is_accept ? "Usage: /online friend accept <handle|account_id>\n"
+                       : "Usage: /online friend add <handle|account_id>\n";
+    }
+    if (const auto err = validate_online_friend_target(target); err.has_value())
+      return *err;
     auto opened = open_authenticated_online_client(env);
     if (!opened.client.has_value())
       return opened.error_output;
-    std::optional<mp::AccountId> target_id;
-    std::string resolved_handle;
-    if (is_all_ascii_digits(target)) {
-      const auto parsed = mp::AccountId::parse_decimal(target);
-      if (!parsed.has_value()) {
-        return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
-      }
-      target_id = parsed.value();
-    } else {
-      const auto valid_handle = mp::AccountHandle::parse(target);
-      if (!valid_handle.has_value()) {
-        return "Invalid handle or account_id: '" + sanitize_inline(target, 64) + "'\n";
-      }
-      const auto resolved = opened.client->resolve_handle(target);
-      if (!resolved.has_value()) {
-        return "Online resolve failed (" + sanitize_inline(target, 64) +
-               "): " + format_mp_error_detail(resolved.error()) + "\n";
-      }
-      target_id = resolved.value().account_id;
-      resolved_handle = resolved.value().handle;
-    }
-    const auto res = opened.client->send_or_accept_friend(*target_id);
+    const auto resolved = resolve_online_friend_target(*opened.client, target);
+    if (!resolved.account_id.has_value())
+      return resolved.error_output;
+    const auto res = opened.client->send_or_accept_friend(*resolved.account_id);
     if (!res.has_value()) {
-      return "Online friend add failed: " + format_mp_error_detail(res.error()) + "\n";
+      return std::string{is_accept ? "Online friend accept failed: "
+                                   : "Online friend add failed: "} +
+             format_mp_error_detail(res.error()) + "\n";
     }
-    std::string out = "Online friend updated: account_id=" +
-                      res.value().target_account_id.to_decimal();
-    if (!resolved_handle.empty())
-      out += " handle=" + sanitize_inline(resolved_handle, 64);
+    std::string out =
+        std::string{is_accept ? "Accepted online friend request: account_id="
+                              : "Online friend updated: account_id="} +
+        res.value().target_account_id.to_decimal();
+    if (!resolved.resolved_handle.empty())
+      out += " handle=" + sanitize_inline(resolved.resolved_handle, 64);
     out += " state=" + std::string{friend_edge_state_name(res.value().state)} + "\n";
+    return out;
+  }
+
+  if (action == "deny" || action == "decline") {
+    const auto [target, extra] = split_first_token(tail);
+    if (target.empty() || !extra.empty())
+      return "Usage: /online friend deny <handle|account_id>\n";
+    if (const auto err = validate_online_friend_target(target); err.has_value())
+      return *err;
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto resolved = resolve_online_friend_target(*opened.client, target);
+    if (!resolved.account_id.has_value())
+      return resolved.error_output;
+    const mp::AccountId target_id = *resolved.account_id;
+    const auto res = opened.client->remove_friend(target_id);
+    if (!res.has_value()) {
+      return "Online friend deny failed: " + format_mp_error_detail(res.error()) + "\n";
+    }
+    std::string out =
+        "Denied online friend request: account_id=" + target_id.to_decimal();
+    if (!resolved.resolved_handle.empty())
+      out += " handle=" + sanitize_inline(resolved.resolved_handle, 64);
+    out += "\n";
     return out;
   }
 
   if (action == "remove") {
     const auto [target, extra] = split_first_token(tail);
     if (target.empty() || !extra.empty())
-      return "Usage: /online friend remove <account_id>\n";
-    const auto target_id = mp::AccountId::parse_decimal(target);
-    if (!target_id.has_value()) {
-      return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
-    }
+      return "Usage: /online friend remove <handle|account_id>\n";
+    if (const auto err = validate_online_friend_target(target); err.has_value())
+      return *err;
     auto opened = open_authenticated_online_client(env);
     if (!opened.client.has_value())
       return opened.error_output;
-    const auto res = opened.client->remove_friend(target_id.value());
+    const auto resolved = resolve_online_friend_target(*opened.client, target);
+    if (!resolved.account_id.has_value())
+      return resolved.error_output;
+    const mp::AccountId target_id = *resolved.account_id;
+    const auto res = opened.client->remove_friend(target_id);
     if (!res.has_value()) {
       return "Online friend remove failed: " + format_mp_error_detail(res.error()) +
              "\n";
     }
-    return "Removed online friend: account_id=" + target_id.value().to_decimal() + "\n";
+    std::string out = "Removed online friend: account_id=" + target_id.to_decimal();
+    if (!resolved.resolved_handle.empty())
+      out += " handle=" + sanitize_inline(resolved.resolved_handle, 64);
+    out += "\n";
+    return out;
   }
 
   if (action == "block") {
     const auto [target, extra] = split_first_token(tail);
     if (target.empty() || !extra.empty())
-      return "Usage: /online friend block <account_id>\n";
-    const auto target_id = mp::AccountId::parse_decimal(target);
-    if (!target_id.has_value()) {
-      return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
-    }
+      return "Usage: /online friend block <handle|account_id>\n";
+    if (const auto err = validate_online_friend_target(target); err.has_value())
+      return *err;
     auto opened = open_authenticated_online_client(env);
     if (!opened.client.has_value())
       return opened.error_output;
-    const auto res = opened.client->block_account(target_id.value());
+    const auto resolved = resolve_online_friend_target(*opened.client, target);
+    if (!resolved.account_id.has_value())
+      return resolved.error_output;
+    const mp::AccountId target_id = *resolved.account_id;
+    const auto res = opened.client->block_account(target_id);
     if (!res.has_value()) {
       return "Online friend block failed: " + format_mp_error_detail(res.error()) +
              "\n";
     }
-    return "Blocked online account: account_id=" + target_id.value().to_decimal() +
-           "\n";
+    std::string out = "Blocked online account: account_id=" + target_id.to_decimal();
+    if (!resolved.resolved_handle.empty())
+      out += " handle=" + sanitize_inline(resolved.resolved_handle, 64);
+    out += "\n";
+    return out;
   }
 
-  return "Usage: /online friend [add <handle|account_id>|remove <account_id>|block "
-         "<account_id>]\n";
+  return "Usage: /online friend [add <handle|account_id>|accept <handle|account_id>|"
+         "deny <handle|account_id>|remove <handle|account_id>|"
+         "block <handle|account_id>]\n";
 }
 
 std::string handle_online_party(std::string_view rest, const OnlineEnvConfig &env) {
@@ -3016,16 +3092,26 @@ std::string handle_online(std::string_view args) {
     }
     const auto &edges = res.value();
     std::size_t friend_n = 0;
-    std::size_t pending_n = 0;
+    std::size_t pending_received_n = 0;
+    std::size_t pending_sent_n = 0;
     std::size_t blocked_n = 0;
     for (const auto &e : edges) {
-      if (e.state == mp::FriendEdgeState::friend_edge)
+      switch (e.state) {
+      case mp::FriendEdgeState::friend_edge:
         ++friend_n;
-      else if (e.state == mp::FriendEdgeState::blocked)
+        break;
+      case mp::FriendEdgeState::invite_received:
+        ++pending_received_n;
+        break;
+      case mp::FriendEdgeState::invite_sent:
+        ++pending_sent_n;
+        break;
+      case mp::FriendEdgeState::blocked:
         ++blocked_n;
-      else
-        ++pending_n;
+        break;
+      }
     }
+    const std::size_t pending_n = pending_received_n + pending_sent_n;
     std::string out = "Online friends (friends=" + std::to_string(friend_n) +
                       ", pending=" + std::to_string(pending_n) +
                       ", blocked=" + std::to_string(blocked_n) + "):\n";
@@ -3033,15 +3119,30 @@ std::string handle_online(std::string_view args) {
       out += "  (none)\n";
       return out;
     }
-    const std::size_t shown = std::min(edges.size(), kMaxListRows);
+    if (pending_received_n > 0) {
+      out += "  Pending incoming requests: " + std::to_string(pending_received_n) +
+             " (use /online friend accept <handle|account_id> or "
+             "/online friend deny <handle|account_id>)\n";
+    }
+    std::vector<std::size_t> order;
+    order.reserve(edges.size());
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+      if (edges[i].state == mp::FriendEdgeState::invite_received)
+        order.push_back(i);
+    }
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+      if (edges[i].state != mp::FriendEdgeState::invite_received)
+        order.push_back(i);
+    }
+    const std::size_t shown = std::min(order.size(), kMaxListRows);
     for (std::size_t i = 0; i < shown; ++i) {
-      const auto &e = edges[i];
+      const auto &e = edges[order[i]];
       out += "  account_id=" + e.peer_account_id.to_decimal() + " [" +
              std::string{friend_edge_state_name(e.state)} +
              "] updated_ms=" + std::to_string(e.updated_at_ms) + "\n";
     }
-    if (edges.size() > shown) {
-      out += "  ... (" + std::to_string(edges.size() - shown) + " more)\n";
+    if (order.size() > shown) {
+      out += "  ... (" + std::to_string(order.size() - shown) + " more)\n";
     }
     return out;
   }

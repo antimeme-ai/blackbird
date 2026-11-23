@@ -16,6 +16,7 @@
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/platoon_runner.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/self_upgrade.hpp"
 #include "blackbird/value.hpp"
 #include "blackbird/worktree_lease.hpp"
 
@@ -7886,7 +7887,25 @@ int run_online_friends_list(std::span<char *> args, std::size_t start_idx, CliIo
 
   Value::Array arr;
   arr.reserve(list.value().size());
+  std::uint64_t friend_count = 0;
+  std::uint64_t pending_received_count = 0;
+  std::uint64_t pending_sent_count = 0;
+  std::uint64_t blocked_count = 0;
   for (const auto &edge : list.value()) {
+    switch (edge.state) {
+    case mp::FriendEdgeState::friend_edge:
+      ++friend_count;
+      break;
+    case mp::FriendEdgeState::invite_received:
+      ++pending_received_count;
+      break;
+    case mp::FriendEdgeState::invite_sent:
+      ++pending_sent_count;
+      break;
+    case mp::FriendEdgeState::blocked:
+      ++blocked_count;
+      break;
+    }
     arr.push_back(Value::object({
         {"peer_account_id", Value{Number{edge.peer_account_id.value()}}},
         {"state", Value{std::string{friend_edge_state_name(edge.state)}}},
@@ -7897,20 +7916,47 @@ int run_online_friends_list(std::span<char *> args, std::size_t start_idx, CliIo
       io, Value::object({
               {"friends", Value{std::move(arr)}},
               {"count", Value{Number{static_cast<std::uint64_t>(list.value().size())}}},
+              {"friend_count", Value{Number{friend_count}}},
+              {"pending_received_count", Value{Number{pending_received_count}}},
+              {"pending_sent_count", Value{Number{pending_sent_count}}},
+              {"blocked_count", Value{Number{blocked_count}}},
           }));
 }
 
-int run_online_friends_add(std::span<char *> args, CliIo io) {
-  OnlineCommonOpts opts{};
-  std::optional<std::string> target;
+enum class OnlineFriendRequestMode : std::uint8_t {
+  add,
+  accept,
+};
 
+enum class OnlineFriendMutateMode : std::uint8_t {
+  deny,
+  remove,
+  block,
+};
+
+struct ParsedOnlineFriendTarget {
+  std::optional<mp::AccountId> account_id;
+  std::string raw;
+};
+
+struct ResolvedOnlineFriendTarget {
+  std::optional<mp::AccountId> account_id;
+  std::optional<std::string> handle;
+  int exit_code = 0;
+};
+
+// Returns 0 on success, -1 if --help was printed, or a non-zero CLI exit code.
+int parse_online_friend_target_args(
+    std::span<char *> args, std::string_view ctx, CliIo io, OnlineCommonOpts &opts,
+    std::optional<ParsedOnlineFriendTarget> &out_target) {
+  std::optional<std::string> target;
   for (std::size_t i = 3; i < args.size(); ++i) {
     const std::string_view arg{args[i]};
     if (arg == "--help" || arg == "-h") {
-      io.err << "usage: blackbird online friends add <account_id|handle> "
-                "[--state-dir DIR] [--authority HOST] [--connect-host HOST] "
-                "[--port N] [--ca-bundle PATH]\n";
-      return 0;
+      io.err << "usage: blackbird " << ctx
+             << " <handle|account_id> [--state-dir DIR] [--authority HOST] "
+                "[--connect-host HOST] [--port N] [--ca-bundle PATH]\n";
+      return -1;
     }
     const int common = parse_online_common_flag(args, i, opts, true, io);
     if (common == 1)
@@ -7918,42 +7964,89 @@ int run_online_friends_add(std::span<char *> args, CliIo io) {
     if (common == 2)
       return 2;
     if (arg.starts_with('-'))
-      return fail_usage(io, "online friends add: unknown option: " + std::string{arg});
+      return fail_usage(io, std::string{ctx} + ": unknown option: " + std::string{arg});
     if (target.has_value())
-      return fail_usage(io, "online friends add: unexpected extra argument");
+      return fail_usage(io, std::string{ctx} + ": unexpected extra argument");
     target = std::string{arg};
   }
 
   if (!target.has_value())
-    return fail_usage(io, "online friends add: <account_id|handle> is required");
+    return fail_usage(io, std::string{ctx} + ": <handle|account_id> is required");
 
-  std::optional<mp::AccountId> numeric_id;
-  if (is_all_ascii_digits(*target)) {
-    const auto parsed = mp::AccountId::parse_decimal(*target);
-    if (!parsed.has_value())
-      return fail_usage(io, "online friends add: invalid account_id");
-    numeric_id = parsed.value();
+  ParsedOnlineFriendTarget parsed{};
+  parsed.raw = *target;
+  if (is_all_ascii_digits(parsed.raw)) {
+    const auto id = mp::AccountId::parse_decimal(parsed.raw);
+    if (!id.has_value())
+      return fail_usage(io, std::string{ctx} + ": invalid account_id");
+    parsed.account_id = id.value();
   } else {
-    if (const auto parsed = mp::AccountHandle::parse(*target); !parsed.has_value())
-      return fail_usage(io, "online friends add: invalid handle");
+    if (const auto handle = mp::AccountHandle::parse(parsed.raw); !handle.has_value())
+      return fail_usage(io, std::string{ctx} + ": invalid handle");
   }
 
-  auto opened = open_online_context(opts, "online friends add", io);
+  out_target = std::move(parsed);
+  return 0;
+}
+
+ResolvedOnlineFriendTarget
+resolve_online_friend_target(mp::MpControlClient &client,
+                             const ParsedOnlineFriendTarget &parsed,
+                             std::string_view ctx, CliIo io) {
+  ResolvedOnlineFriendTarget out{};
+  if (parsed.account_id.has_value()) {
+    out.account_id = parsed.account_id;
+    return out;
+  }
+  const auto resolved = client.resolve_handle(parsed.raw);
+  if (!resolved.has_value()) {
+    out.exit_code = fail_mp_error(io, ctx, resolved.error());
+    return out;
+  }
+  out.account_id = resolved.value().account_id;
+  out.handle = resolved.value().handle;
+  return out;
+}
+
+int run_online_friends_request(std::span<char *> args, OnlineFriendRequestMode mode,
+                               CliIo io) {
+  const std::string_view ctx = mode == OnlineFriendRequestMode::accept
+                                   ? "online friends accept"
+                                   : "online friends add";
+  OnlineCommonOpts opts{};
+  std::optional<ParsedOnlineFriendTarget> parsed;
+  const int parse_rc = parse_online_friend_target_args(args, ctx, io, opts, parsed);
+  if (parse_rc == -1)
+    return 0;
+  if (parse_rc != 0 || !parsed.has_value())
+    return parse_rc != 0 ? parse_rc : 2;
+
+  auto opened = open_online_context(opts, ctx, io);
   if (!opened.ctx.has_value())
     return opened.exit_code;
 
-  std::optional<std::string> resolved_handle;
-  if (!numeric_id.has_value()) {
-    const auto resolved = opened.ctx->client.resolve_handle(*target);
-    if (!resolved.has_value())
-      return fail_mp_error(io, "online friends add", resolved.error());
-    numeric_id = resolved.value().account_id;
-    resolved_handle = resolved.value().handle;
-  }
+  const auto resolved =
+      resolve_online_friend_target(opened.ctx->client, *parsed, ctx, io);
+  if (!resolved.account_id.has_value())
+    return resolved.exit_code;
 
-  const auto res = opened.ctx->client.send_or_accept_friend(*numeric_id);
+  const auto res = opened.ctx->client.send_or_accept_friend(*resolved.account_id);
   if (!res.has_value())
-    return fail_mp_error(io, "online friends add", res.error());
+    return fail_mp_error(io, ctx, res.error());
+
+  if (mode == OnlineFriendRequestMode::accept) {
+    return emit_json(
+        io,
+        Value::object({
+            {"account_id", Value{Number{res.value().target_account_id.value()}}},
+            {"handle",
+             resolved.handle.has_value() ? Value{*resolved.handle} : Value{nullptr}},
+            {"state", Value{std::string{friend_edge_state_name(res.value().state)}}},
+            {"action", Value{"accept"}},
+            {"http_status",
+             Value{Number{static_cast<std::int64_t>(res.value().http_status)}}},
+        }));
+  }
 
   Value::Object obj{
       {"target_account_id", Value{Number{res.value().target_account_id.value()}}},
@@ -7961,57 +8054,62 @@ int run_online_friends_add(std::span<char *> args, CliIo io) {
       {"http_status",
        Value{Number{static_cast<std::int64_t>(res.value().http_status)}}},
   };
-  if (resolved_handle.has_value())
-    obj.emplace_back("handle", Value{*resolved_handle});
+  if (resolved.handle.has_value())
+    obj.emplace_back("handle", Value{*resolved.handle});
   return emit_json(io, Value::object(std::move(obj)));
 }
 
-int run_online_friends_mutate(std::span<char *> args, bool is_block, CliIo io) {
-  const std::string_view action = is_block ? "block" : "remove";
-  const std::string ctx = std::string{"online friends "} + std::string{action};
+int run_online_friends_mutate(std::span<char *> args, OnlineFriendMutateMode mode,
+                              CliIo io) {
+  std::string_view ctx = "online friends remove";
+  if (mode == OnlineFriendMutateMode::block)
+    ctx = "online friends block";
+  else if (mode == OnlineFriendMutateMode::deny)
+    ctx = "online friends deny";
+
   OnlineCommonOpts opts{};
-  std::optional<std::string> account_arg;
-
-  for (std::size_t i = 3; i < args.size(); ++i) {
-    const std::string_view arg{args[i]};
-    if (arg == "--help" || arg == "-h") {
-      io.err << "usage: blackbird " << ctx
-             << " <account_id> [--state-dir DIR] [--authority HOST] "
-                "[--connect-host HOST] [--port N] [--ca-bundle PATH]\n";
-      return 0;
-    }
-    const int common = parse_online_common_flag(args, i, opts, true, io);
-    if (common == 1)
-      continue;
-    if (common == 2)
-      return 2;
-    if (arg.starts_with('-'))
-      return fail_usage(io, ctx + ": unknown option: " + std::string{arg});
-    if (account_arg.has_value())
-      return fail_usage(io, ctx + ": unexpected extra argument");
-    account_arg = std::string{arg};
-  }
-
-  if (!account_arg.has_value())
-    return fail_usage(io, ctx + ": <account_id> is required");
-  const auto target_id = mp::AccountId::parse_decimal(*account_arg);
-  if (!target_id.has_value())
-    return fail_usage(io, ctx + ": invalid <account_id>");
+  std::optional<ParsedOnlineFriendTarget> parsed;
+  const int parse_rc = parse_online_friend_target_args(args, ctx, io, opts, parsed);
+  if (parse_rc == -1)
+    return 0;
+  if (parse_rc != 0 || !parsed.has_value())
+    return parse_rc != 0 ? parse_rc : 2;
 
   auto opened = open_online_context(opts, ctx, io);
   if (!opened.ctx.has_value())
     return opened.exit_code;
 
-  const auto res = is_block ? opened.ctx->client.block_account(target_id.value())
-                            : opened.ctx->client.remove_friend(target_id.value());
+  const auto resolved =
+      resolve_online_friend_target(opened.ctx->client, *parsed, ctx, io);
+  if (!resolved.account_id.has_value())
+    return resolved.exit_code;
+
+  const mp::AccountId target_id = *resolved.account_id;
+  const auto res = mode == OnlineFriendMutateMode::block
+                       ? opened.ctx->client.block_account(target_id)
+                       : opened.ctx->client.remove_friend(target_id);
   if (!res.has_value())
     return fail_mp_error(io, ctx, res.error());
 
-  return emit_json(io,
-                   Value::object({
-                       {is_block ? "blocked" : "removed", Value{true}},
-                       {"target_account_id", Value{Number{target_id.value().value()}}},
-                   }));
+  if (mode == OnlineFriendMutateMode::deny) {
+    return emit_json(
+        io, Value::object({
+                {"account_id", Value{Number{target_id.value()}}},
+                {"handle", resolved.handle.has_value() ? Value{*resolved.handle}
+                                                       : Value{nullptr}},
+                {"denied", Value{true}},
+            }));
+  }
+
+  return emit_json(
+      io,
+      Value::object({
+          {mode == OnlineFriendMutateMode::block ? "blocked" : "removed", Value{true}},
+          {"target_account_id", Value{Number{target_id.value()}}},
+          {"account_id", Value{Number{target_id.value()}}},
+          {"handle",
+           resolved.handle.has_value() ? Value{*resolved.handle} : Value{nullptr}},
+      }));
 }
 
 int run_online_friends(std::span<char *> args, CliIo io) {
@@ -8019,8 +8117,11 @@ int run_online_friends(std::span<char *> args, CliIo io) {
     return run_online_friends_list(args, 2, io);
   const std::string_view action{args[2]};
   if (action == "--help" || action == "-h") {
-    io.err << "usage: blackbird online friends [list|add <account_id|handle>|"
-              "remove <account_id>|block <account_id>] [options]\n";
+    io.err << "usage: blackbird online friends "
+              "[list|add <handle|account_id>|accept <handle|account_id>|"
+              "deny <handle|account_id>|remove <handle|account_id>|"
+              "block <handle|account_id>] [options]\n"
+              "  alias: decline <handle|account_id> (same as deny)\n";
     return 0;
   }
   if (action.starts_with('-'))
@@ -8028,11 +8129,15 @@ int run_online_friends(std::span<char *> args, CliIo io) {
   if (action == "list")
     return run_online_friends_list(args, 3, io);
   if (action == "add")
-    return run_online_friends_add(args, io);
+    return run_online_friends_request(args, OnlineFriendRequestMode::add, io);
+  if (action == "accept")
+    return run_online_friends_request(args, OnlineFriendRequestMode::accept, io);
+  if (action == "deny" || action == "decline")
+    return run_online_friends_mutate(args, OnlineFriendMutateMode::deny, io);
   if (action == "remove")
-    return run_online_friends_mutate(args, false, io);
+    return run_online_friends_mutate(args, OnlineFriendMutateMode::remove, io);
   if (action == "block")
-    return run_online_friends_mutate(args, true, io);
+    return run_online_friends_mutate(args, OnlineFriendMutateMode::block, io);
   return fail_usage(io, "online friends: unknown action: " + std::string{action});
 }
 
@@ -8800,7 +8905,9 @@ int run_online_cli(std::span<char *> args, CliIo io) {
               "{health|register|whoami|resolve|devices|friends|party|web-approve} "
               "[options]\n"
               "  devices: blackbird online devices {init|install-cwt|enroll|revoke} "
-              "[options]\n";
+              "[options]\n"
+              "  friends: blackbird online friends "
+              "{list|add|accept|deny|remove|block} <handle|account_id> [options]\n";
     return 0;
   }
   if (action == "health")
@@ -8822,13 +8929,200 @@ int run_online_cli(std::span<char *> args, CliIo io) {
   return fail_usage(io, "online: unknown action: " + std::string{action});
 }
 
+int run_upgrade_cli(std::span<char *> args, CliIo io) {
+  UpgradeConfig cfg{};
+#ifdef BLACKBIRD_VERSION_STRING
+  cfg.current_version_string = BLACKBIRD_VERSION_STRING;
+#endif
+  bool restart_after = false;
+  bool json_out = false;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird upgrade [--check] [--no-ask|-y|--yes] "
+                "[--version vX.Y.Z|latest] [--prefix DIR] [--base-url URL] "
+                "[--force] [--restart] [--json] [--help]\n";
+      return 0;
+    }
+    if (arg == "--check") {
+      cfg.check_only = true;
+    } else if (arg == "--no-ask" || arg == "--yes" || arg == "-y") {
+      cfg.no_ask = true;
+    } else if (arg == "--force") {
+      cfg.force = true;
+    } else if (arg == "--restart") {
+      restart_after = true;
+    } else if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--version") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.version = std::move(*v);
+    } else if (arg == "--prefix") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.prefix = fs::path{std::move(*v)};
+    } else if (arg == "--base-url") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.base_url = std::move(*v);
+    } else {
+      return fail_usage(io, "upgrade: unknown option: " + std::string{arg});
+    }
+  }
+
+  const bool tty_err = ::isatty(STDERR_FILENO) != 0;
+  bool last_was_cr = false;
+  auto on_progress = [&](const UpgradeProgress &p) {
+    if (json_out)
+      return;
+    const std::string line = format_upgrade_progress_line(p);
+    if (tty_err && p.stage == UpgradeStage::downloading) {
+      io.err << '\r' << line << "   " << std::flush;
+      last_was_cr = true;
+    } else {
+      if (last_was_cr) {
+        io.err << '\n';
+        last_was_cr = false;
+      }
+      io.err << line << '\n' << std::flush;
+    }
+  };
+
+  auto clear_cr = [&] {
+    if (last_was_cr) {
+      io.err << '\n' << std::flush;
+      last_was_cr = false;
+    }
+  };
+
+  if (cfg.check_only) {
+    const auto checked = check_for_upgrade(cfg, on_progress);
+    clear_cr();
+    if (!checked.has_value())
+      return fail_error(io, "upgrade", checked.error());
+    const UpgradeCheckResult &c = checked.value();
+    if (json_out) {
+      return emit_json(
+          io, Value::object({
+                  {"target", Value{c.target}},
+                  {"current_version", Value{c.current_version}},
+                  {"current_commit", Value{c.current_commit}},
+                  {"latest_version", Value{c.latest_version}},
+                  {"latest_commit", Value{c.latest_commit}},
+                  {"asset_name", Value{c.asset_name}},
+                  {"expected_sha256", Value{c.expected_sha256}},
+                  {"expected_size_bytes", Value{Number{c.expected_size_bytes}}},
+                  {"update_available", Value{c.update_available}},
+              }));
+    }
+    if (!c.update_available && !cfg.force) {
+      io.out << "Blackbird is already up to date ("
+             << (c.latest_version.empty() ? c.latest_commit : c.latest_version) << ", "
+             << c.target << ").\n";
+      return 0;
+    }
+    const fs::path display_prefix =
+        cfg.prefix.empty()
+            ? (std::getenv("HOME") != nullptr ? fs::path{std::getenv("HOME")} / ".local"
+                                              : fs::path{"~/.local"})
+            : cfg.prefix;
+    io.out
+        << format_upgrade_prompt_summary(c, display_prefix)
+        << "\nRun `blackbird upgrade` (or `blackbird upgrade --no-ask`) to install.\n";
+    return 0;
+  }
+
+  auto confirm = [&](const UpgradeCheckResult &c) -> bool {
+    clear_cr();
+    const fs::path display_prefix =
+        cfg.prefix.empty()
+            ? (std::getenv("HOME") != nullptr ? fs::path{std::getenv("HOME")} / ".local"
+                                              : fs::path{"~/.local"})
+            : cfg.prefix;
+    io.err
+        << format_upgrade_prompt_summary(c, display_prefix)
+        << "\nProceed with download, SHA-256 verification, and atomic install? [y/N]: "
+        << std::flush;
+    std::string reply;
+    if (!std::getline(io.in, reply))
+      return false;
+    while (!reply.empty() &&
+           (reply.back() == '\r' || reply.back() == ' ' || reply.back() == '\t')) {
+      reply.pop_back();
+    }
+    std::size_t start = 0;
+    while (start < reply.size() && (reply[start] == ' ' || reply[start] == '\t'))
+      ++start;
+    std::string norm;
+    for (std::size_t i = start; i < reply.size(); ++i) {
+      norm.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(reply[i]))));
+    }
+    return norm == "y" || norm == "yes";
+  };
+
+  const auto res = perform_upgrade(cfg, on_progress, confirm);
+  clear_cr();
+  if (!res.has_value())
+    return fail_error(io, "upgrade", res.error());
+  const UpgradeResult &r = res.value();
+
+  if (json_out) {
+    return emit_json(
+        io, Value::object({
+                {"upgraded", Value{r.upgraded}},
+                {"already_up_to_date", Value{r.already_up_to_date}},
+                {"cancelled_by_user", Value{r.cancelled_by_user}},
+                {"target", Value{r.check.target}},
+                {"latest_version", Value{r.check.latest_version}},
+                {"latest_commit", Value{r.check.latest_commit}},
+                {"installed_binary", Value{r.installed_binary.string()}},
+                {"generation_dir", Value{r.generation_dir.string()}},
+                {"installed_version_output", Value{r.installed_version_output}},
+            }));
+  }
+
+  if (r.already_up_to_date) {
+    io.out << "Blackbird is already up to date ("
+           << (r.check.latest_version.empty() ? r.check.latest_commit
+                                              : r.check.latest_version)
+           << ", " << r.check.target << ").\n";
+    return 0;
+  }
+  if (r.cancelled_by_user) {
+    io.out << "Upgrade cancelled; existing installation untouched.\n";
+    return 0;
+  }
+  io.out << "Upgraded Blackbird to " << r.check.latest_version << " (" << r.check.target
+         << ")\n"
+         << "  Binary:     " << r.installed_binary.string() << "\n"
+         << "  Version:    " << r.installed_version_output << "\n"
+         << "  Generation: " << r.generation_dir.string() << "\n";
+
+  if (restart_after && !r.installed_binary.empty()) {
+    io.err << "Restarting into " << r.installed_binary.string() << "...\n"
+           << std::flush;
+    std::string bin_path = r.installed_binary.string();
+    char *exec_argv[] = {bin_path.data(), nullptr};
+    ::execv(bin_path.c_str(), exec_argv);
+    return fail_message(io, "upgrade: failed to execv upgraded binary (errno=" +
+                                std::to_string(errno) + ")");
+  }
+  return 0;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
-         arg == "online";
+         arg == "online" || arg == "upgrade";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -8865,6 +9159,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_flightdeck_cli(args, io);
     if (subcommand == "online")
       return run_online_cli(args, io);
+    if (subcommand == "upgrade")
+      return run_upgrade_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

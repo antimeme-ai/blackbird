@@ -34,6 +34,8 @@ enum class MpError : std::int64_t {
   invalid_handle = 203,
   reserved_handle = 204,
   crypto_internal = 205,
+  invalid_recovery_key = 206,
+  invalid_device_label = 207,
 
   // EndpointDescriptor
   endpoint_too_large = 300,
@@ -98,6 +100,14 @@ enum class MpError : std::int64_t {
   mp1_invalid_count = 610,
   mp1_safe_int_exceeded = 611,
   mp1_invalid_cwt_length = 612,
+
+  // Portable encrypted .mpkey v1 container
+  mpkey_invalid_passphrase = 700,
+  mpkey_invalid_pem = 701,
+  mpkey_invalid_magic = 702,
+  mpkey_invalid_params = 703,
+  mpkey_decrypt_failed = 704,
+  mpkey_invalid_payload = 705,
 };
 
 constexpr MpError mp_error_of(const Error &error) noexcept {
@@ -247,9 +257,21 @@ hash_party_invite_secret(PartyId party_id,
                          std::span<const std::uint8_t, 32> raw_secret);
 
 inline constexpr std::size_t kSafetyNumberFormattedLength = 39U;
+inline constexpr std::string_view kRecoveryKeyPrefix = "mprk1_";
+inline constexpr std::size_t kRecoveryKeyFormattedLength = 71U;
+inline constexpr std::size_t kMaxRecoveryKeyInputLength = 128U;
+inline constexpr std::size_t kDeviceFingerprintFormattedLength = 35U;
+inline constexpr std::size_t kMaxDeviceLabelLength = 64U;
 
 Result<std::string> compute_safety_number(AccountId account_id,
                                           const Ed25519PubKey &root_pubkey);
+
+Result<std::string> encode_recovery_key(const Ed25519Seed &root_seed);
+Result<Ed25519Seed> decode_recovery_key(std::string_view raw);
+
+Result<std::string> compute_device_fingerprint(const Ed25519PubKey &device_pubkey);
+
+bool valid_device_label(std::string_view label) noexcept;
 
 class AccountHandle {
 public:
@@ -613,11 +635,27 @@ struct RegistrationKeyId {
   bool operator==(const RegistrationKeyId &) const = default;
 };
 
-using KeyId = std::variant<DeviceKeyId, RootKeyId, RegistrationKeyId>;
+struct RecoveryKeyId {
+  std::array<std::uint8_t, 16> root_pubkey_sha256_prefix{};
+  bool operator==(const RecoveryKeyId &) const = default;
+};
+
+struct DeviceLinkKeyId {
+  std::array<std::uint8_t, 16> device_pubkey_sha256_prefix{};
+  bool operator==(const DeviceLinkKeyId &) const = default;
+};
+
+using KeyId = std::variant<DeviceKeyId, RootKeyId, RegistrationKeyId, RecoveryKeyId,
+                           DeviceLinkKeyId>;
 
 Result<KeyId> parse_key_id(std::string_view raw);
 std::string format_key_id(const KeyId &key_id);
 Result<RegistrationKeyId> registration_key_id_for_pubkey(const Ed25519PubKey &pubkey);
+Result<RecoveryKeyId> recovery_key_id_for_pubkey(const Ed25519PubKey &root_pubkey);
+Result<DeviceLinkKeyId>
+device_link_key_id_for_pubkey(const Ed25519PubKey &device_pubkey);
+Result<std::string> format_recovery_keyid(const Ed25519PubKey &root_pubkey);
+Result<std::string> format_device_link_keyid(const Ed25519PubKey &device_pubkey);
 
 Result<std::string> compute_content_digest(std::span<const std::uint8_t> body);
 
@@ -742,5 +780,56 @@ Result<CwtClaims> verify_device_cwt(const DeviceCwtVerifyRequest &request);
 // member.device_pubkey under member.root_pubkey and is unexpired at now_s.
 Result<CwtClaims> verify_party_member_cwt(const PartyMemberRecord &member,
                                           std::int64_t now_s);
+
+// ---------------------------------------------------------------------------
+// 7. Portable Encrypted .mpkey v1 Recovery Container (Argon2id + AES-256-GCM)
+// ---------------------------------------------------------------------------
+
+inline constexpr std::uint32_t kMpKeyV1Argon2MemCostKiB = 65536U;
+inline constexpr std::uint32_t kMpKeyV1Argon2MaxMemCostKiB = 524288U;
+inline constexpr std::uint32_t kMpKeyV1Argon2Iter = 3U;
+inline constexpr std::uint32_t kMpKeyV1Argon2MaxIter = 16U;
+inline constexpr std::uint32_t kMpKeyV1Argon2Lanes = 1U;
+inline constexpr std::uint32_t kMpKeyV1Argon2MaxLanes = 8U;
+inline constexpr std::uint32_t kMpKeyV1Argon2Version = 0x13U;
+inline constexpr std::size_t kMpKeyV1SaltBytes = 16U;
+inline constexpr std::size_t kMpKeyV1NonceBytes = 12U;
+inline constexpr std::size_t kMpKeyV1TagBytes = 16U;
+inline constexpr std::size_t kMpKeyV1MaxPemBytes = 4096U;
+inline constexpr std::size_t kMpKeyV1MinBinaryBytes = 64U;
+inline constexpr std::size_t kMpKeyV1MaxBinaryBytes = 1024U;
+inline constexpr std::size_t kMpKeyV1MaxPassphraseBytes = 4096U;
+
+struct MpKeyPayload {
+  std::optional<AccountId> account_id;
+  std::optional<std::string> handle;
+  Ed25519Seed root_seed{};
+  bool operator==(const MpKeyPayload &) const = default;
+};
+
+struct MpKeyEncryptOptions {
+  // Optional deterministic salt/nonce overrides ONLY for test vectors; when omitted,
+  // fresh CSPRNG bytes are generated via OpenSSL RAND_bytes.
+  std::optional<std::array<std::uint8_t, kMpKeyV1SaltBytes>> salt_override;
+  std::optional<std::array<std::uint8_t, kMpKeyV1NonceBytes>> nonce_override;
+};
+
+struct MpKeyDecryptInput {
+  std::string_view armored_pem;
+  std::string_view passphrase;
+};
+
+// Encrypts a root seed + optional account metadata into a PEM-armored `.mpkey` v1
+// container using Argon2id (v0x13, m=65536 KiB, t=3, p=1) + AES-256-GCM.
+// Passphrase MUST be non-empty valid UTF-8 (callers supplying non-ASCII passphrases
+// should normalize to Unicode NFC prior to calling; ASCII is natively NFC).
+Result<std::string> encrypt_mpkey_v1(const MpKeyPayload &payload,
+                                     std::string_view passphrase,
+                                     const MpKeyEncryptOptions &options = {});
+
+// Validates PEM framing and binary header bounds BEFORE allocating Argon2id memory,
+// derives the key via Argon2id v0x13, verifies the AES-256-GCM tag FIRST, and only
+// then parses the strict UTF-8 JSON payload.
+Result<MpKeyPayload> decrypt_mpkey_v1(const MpKeyDecryptInput &input);
 
 } // namespace blackbird::mp

@@ -1931,6 +1931,14 @@ void test_online_tui_slash_env_validation_and_loopback_tls13() {
               help_text.find("/online whoami") != std::string::npos &&
               help_text.find("/online resolve <handle>") != std::string::npos &&
               help_text.find("/online friends") != std::string::npos &&
+              help_text.find("/online friend accept <handle|account_id>") !=
+                  std::string::npos &&
+              help_text.find("/online friend deny <handle|account_id>") !=
+                  std::string::npos &&
+              help_text.find("/online friend remove <handle|account_id>") !=
+                  std::string::npos &&
+              help_text.find("/online friend block <handle|account_id>") !=
+                  std::string::npos &&
               help_text.find("/online party create") != std::string::npos,
           "/online help prints concise usage summary");
   const auto alias_help = handle_command_post_slash("/party online help", ctx);
@@ -2111,6 +2119,22 @@ with open(state_path, "r", encoding="utf-8") as f:
     KEYS = json.load(f)
 
 PARTY_STATE = {"epoch": 1, "last_create": None}
+SEED_FRIENDS_PATH = os.path.join(os.path.dirname(state_path), "seed_friends.json")
+FRIENDS_STATE = {
+    1002: (0, 1700000001000),
+    1003: (1, 1700000002000),
+    1004: (3, 1700000003000),
+}
+
+def _load_seeded_friends():
+    if os.path.exists(SEED_FRIENDS_PATH):
+        with open(SEED_FRIENDS_PATH, "r", encoding="utf-8") as sf:
+            seeded = json.load(sf)
+        os.remove(SEED_FRIENDS_PATH)
+        ts = 1700000004000
+        for k, v in seeded.items():
+            FRIENDS_STATE[int(k)] = (int(v), ts)
+            ts += 1000
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -2170,22 +2194,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/accounts/resolve":
             qs = urllib.parse.parse_qs(parsed.query)
-            h = (qs.get("handle") or [""])[0]
-            if h.lower() == "wingman":
+            h = (qs.get("handle") or [""])[0].lower()
+            handles = {
+                "wingman": (1002, "wingman"),
+                "phall": (1005, "phall"),
+                "rivet": (1006, "rivet"),
+            }
+            if h in handles:
+                aid, disp = handles[h]
                 self._send_json(200, {
-                    "account_id": 1002,
-                    "handle": "wingman",
+                    "account_id": aid,
+                    "handle": disp,
                     "root_pubkey_b64": KEYS["wingman_pubkey_b64"],
                 })
                 return
             self._send_json(404, {"error": "not_found"})
             return
         if parsed.path == "/v1/friends":
+            _load_seeded_friends()
             self._send_json(200, {
                 "friends": [
-                    {"peer_account_id": 1002, "state": 0, "updated_at_ms": 1700000001000},
-                    {"peer_account_id": 1003, "state": 1, "updated_at_ms": 1700000002000},
-                    {"peer_account_id": 1004, "state": 3, "updated_at_ms": 1700000003000},
+                    {"peer_account_id": pid, "state": st, "updated_at_ms": ts}
+                    for pid, (st, ts) in sorted(FRIENDS_STATE.items())
                 ]
             })
             return
@@ -2211,9 +2241,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         body = self._read_json()
         if parsed.path == "/v1/friends/requests":
-            self._send_json(202, {"target_account_id": body["target_account_id"], "state": 1})
+            _load_seeded_friends()
+            tid = int(body["target_account_id"])
+            cur = FRIENDS_STATE.get(tid)
+            if cur is not None and cur[0] == 2:
+                FRIENDS_STATE[tid] = (0, 1700000009000)
+                self._send_json(200, {"target_account_id": tid, "state": 0})
+            else:
+                FRIENDS_STATE[tid] = (1, 1700000009000)
+                self._send_json(202, {"target_account_id": tid, "state": 1})
             return
-        if parsed.path == "/v1/friends/1004/block":
+        if parsed.path.startswith("/v1/friends/") and parsed.path.endswith("/block"):
+            _load_seeded_friends()
+            tid = int(parsed.path.split("/")[3])
+            FRIENDS_STATE[tid] = (3, 1700000010000)
             self._send_json(200, {"ok": True})
             return
         if parsed.path == "/v1/parties":
@@ -2271,7 +2312,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(401, {"error": "missing_signature"})
             return
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/v1/friends/1002":
+        if parsed.path.startswith("/v1/friends/"):
+            _load_seeded_friends()
+            tid = int(parsed.path.split("/")[3])
+            FRIENDS_STATE.pop(tid, None)
             self._send_json(200, {"ok": True})
             return
         self._send_json(404, {"error": "unknown_route"})
@@ -2364,16 +2408,17 @@ srv.serve_forever()
               resolve_out.find(expected_wingman_fp) != std::string::npos,
           "/online resolve prints account_id, handle, and SHA-256 root_pubkey hex");
 
-  // /online friends
+  // /online friends (no incoming requests -> no pending-incoming hint)
   const auto friends_res = handle_command_post_slash("/online friends", ctx);
   const std::string &friends_out = check_safe(friends_res, "/online friends");
   require(friends_out.find("friends=1, pending=1, blocked=1") != std::string::npos &&
+              friends_out.find("Pending incoming requests:") == std::string::npos &&
               friends_out.find("account_id=1002 [friend]") != std::string::npos &&
               friends_out.find("account_id=1003 [invite_sent]") != std::string::npos &&
               friends_out.find("account_id=1004 [blocked]") != std::string::npos,
           "/online friends renders friend/pending/blocked counts and rows");
 
-  // /online friend add/remove/block
+  // /online friend add/remove/block (existing numeric + handle checks)
   const auto fadd_handle_res =
       handle_command_post_slash("/online friend add wingman", ctx);
   const std::string &fadd_handle_out =
@@ -2397,6 +2442,81 @@ srv.serve_forever()
   const std::string &fblk_out = check_safe(fblk_res, "/online friend block 1004");
   require(fblk_out.find("Blocked online account: account_id=1004") != std::string::npos,
           "/online friend block succeeds");
+
+  // Seed incoming requests (1005=phall, 1006=rivet) to verify /online friends
+  // incoming highlight + /online friend accept|deny|decline|remove|block by handle!
+  write_text_file(root_dir.path / "seed_friends.json", R"({"1005": 2, "1006": 2})");
+
+  const auto friends_incoming_res = handle_command_post_slash("/online friends", ctx);
+  const std::string &friends_incoming_out =
+      check_safe(friends_incoming_res, "/online friends incoming");
+  const auto pos_hint =
+      friends_incoming_out.find("Pending incoming requests: 2 (use /online friend "
+                                "accept <handle|account_id> or /online friend deny "
+                                "<handle|account_id>)");
+  const auto pos_1005 = friends_incoming_out.find("account_id=1005 [invite_received]");
+  const auto pos_1006 = friends_incoming_out.find("account_id=1006 [invite_received]");
+  const auto pos_1003 = friends_incoming_out.find("account_id=1003 [invite_sent]");
+  require(
+      pos_hint != std::string::npos && pos_1005 != std::string::npos &&
+          pos_1006 != std::string::npos && pos_1003 != std::string::npos &&
+          pos_hint < pos_1005 && pos_1005 < pos_1003 && pos_1006 < pos_1003,
+      "/online friends highlights incoming pending requests at top with action hint");
+
+  const auto faccept_res =
+      handle_command_post_slash("/online friend accept phall", ctx);
+  const std::string &faccept_out =
+      check_safe(faccept_res, "/online friend accept phall");
+  require(faccept_out.find("Accepted online friend request: account_id=1005 "
+                           "handle=phall state=friend") != std::string::npos,
+          "/online friend accept <handle> resolves and accepts request");
+
+  const auto fdeny_res = handle_command_post_slash("/online friend deny rivet", ctx);
+  const std::string &fdeny_out = check_safe(fdeny_res, "/online friend deny rivet");
+  require(fdeny_out.find("Denied online friend request: account_id=1006 "
+                         "handle=rivet") != std::string::npos,
+          "/online friend deny <handle> resolves and denies request");
+
+  const auto fdecline_res =
+      handle_command_post_slash("/online friend decline 1003", ctx);
+  const std::string &fdecline_out =
+      check_safe(fdecline_res, "/online friend decline 1003");
+  require(fdecline_out.find("Denied online friend request: account_id=1003") !=
+              std::string::npos,
+          "/online friend decline <account_id> alias denies cleanly");
+
+  const auto frem_handle_res =
+      handle_command_post_slash("/online friend remove phall", ctx);
+  const std::string &frem_handle_out =
+      check_safe(frem_handle_res, "/online friend remove phall");
+  require(frem_handle_out.find("Removed online friend: account_id=1005 "
+                               "handle=phall") != std::string::npos,
+          "/online friend remove <handle> resolves and removes friend");
+
+  const auto fblk_handle_res =
+      handle_command_post_slash("/online friend block wingman", ctx);
+  const std::string &fblk_handle_out =
+      check_safe(fblk_handle_res, "/online friend block wingman");
+  require(fblk_handle_out.find("Blocked online account: account_id=1002 "
+                               "handle=wingman") != std::string::npos,
+          "/online friend block <handle> resolves and blocks account");
+
+  const auto faccept_id_res =
+      handle_command_post_slash("/online friend accept 1002", ctx);
+  const std::string &faccept_id_out =
+      check_safe(faccept_id_res, "/online friend accept 1002");
+  require(faccept_id_out.find("Accepted online friend request: account_id=1002") !=
+              std::string::npos,
+          "/online friend accept <account_id> succeeds");
+
+  for (const char *bad_cmd :
+       {"/online friend accept 0", "/online friend deny admin",
+        "/online friend remove 0", "/online friend block admin"}) {
+    const auto bad_res = handle_command_post_slash(bad_cmd, ctx);
+    const std::string &bad_out = check_safe(bad_res, bad_cmd);
+    require(bad_out.find("Invalid ") != std::string::npos,
+            "invalid /online friend target fails cleanly");
+  }
 
   // /online party create (default friends + force_relays + max_members=4 + relay URL)
   const auto pcreate_res = handle_command_post_slash("/online party create", ctx);

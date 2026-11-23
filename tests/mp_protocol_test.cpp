@@ -1,10 +1,12 @@
 #include "blackbird/mp_protocol.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -12,6 +14,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
 
 using namespace blackbird;
 using namespace blackbird::mp;
@@ -1767,6 +1774,739 @@ void test_safety_number() {
              "mixed-order y=3 point rejected");
 }
 
+void test_recovery_key_mprk1() {
+  g_stage = "recovery_key_mprk1";
+
+  static constexpr std::string_view kGoldenSeedHex =
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+  static constexpr std::string_view kGoldenKey =
+      "mprk1_000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00";
+
+  const auto seed_vec = from_hex(kGoldenSeedHex);
+  require(seed_vec.size() == 32U, "golden seed 32 bytes");
+  Ed25519Seed golden_seed{};
+  std::memcpy(golden_seed.data(), seed_vec.data(), golden_seed.size());
+
+  const auto encoded = must(encode_recovery_key(golden_seed), "encode golden mprk1");
+  require(encoded.size() == kRecoveryKeyFormattedLength, "mprk1 formatted length 71");
+  require(encoded == kGoldenKey, "mprk1 golden vector bit-exact");
+
+  const auto decoded = must(decode_recovery_key(encoded), "decode golden mprk1");
+  require(decoded == golden_seed, "mprk1 golden decode exact");
+
+  // Case-insensitive prefix & body, whitespace/newlines/no hyphens, Crockford aliases.
+  const std::string lowercase_ws = "  \nMPRK1_000g4 0r40m\t30e20\r\n9185g-r38e1 w8124 "
+                                   "gk2ga hc5rr 34d1p 70x3r fpd00 ";
+  require(must(decode_recovery_key(lowercase_ws), "decode lowercase+ws") == golden_seed,
+          "mprk1 lowercase+ws accepted");
+
+  // Replace 0->O/o and 1->I/i/L/l in the body after mprk1_.
+  std::string aliased{kGoldenKey};
+  for (std::size_t i = kRecoveryKeyPrefix.size(); i < aliased.size(); ++i) {
+    if (aliased[i] == '0') {
+      aliased[i] = ((i % 2U) == 0U) ? 'O' : 'o';
+    } else if (aliased[i] == '1') {
+      aliased[i] = ((i % 3U) == 0U) ? 'I' : (((i % 3U) == 1U) ? 'L' : 'l');
+    }
+  }
+  require(must(decode_recovery_key(aliased), "decode Crockford aliases") == golden_seed,
+          "mprk1 Crockford typo aliases O/o->0, I/L/l->1 accepted");
+
+  // Exact 128-byte padded input accepted; 129-byte padded input rejected BEFORE trim.
+  const std::string padded_128 = std::string(57U, ' ') + std::string{kGoldenKey};
+  require(padded_128.size() == kMaxRecoveryKeyInputLength, "padded_128 exact len");
+  require(must(decode_recovery_key(padded_128), "decode 128B padded") == golden_seed,
+          "128B padded mprk1 accepted");
+  const std::string padded_129 = std::string(58U, ' ') + std::string{kGoldenKey};
+  require(padded_129.size() == kMaxRecoveryKeyInputLength + 1U, "padded_129 len");
+  expect_err(decode_recovery_key(padded_129), MpError::invalid_recovery_key,
+             ">128B rejected before trim");
+
+  // Non-ASCII rejected before trim.
+  expect_err(decode_recovery_key(std::string{kGoldenKey} + "\xc2\xa0"),
+             MpError::invalid_recovery_key, "non-ASCII NBSP rejected");
+  expect_err(decode_recovery_key(
+                 "mprk1_000G4\xe2\x80\x94"
+                 "0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00"),
+             MpError::invalid_recovery_key, "non-ASCII em-dash rejected");
+
+  // Wrong prefix, unprefixed, wrong length, invalid 'U' char.
+  expect_err(decode_recovery_key("mprk2_" + std::string{kGoldenKey.substr(6U)}),
+             MpError::invalid_recovery_key, "wrong prefix mprk2_");
+  expect_err(decode_recovery_key(kGoldenKey.substr(6U)), MpError::invalid_recovery_key,
+             "unprefixed 55 chars rejected");
+  expect_err(decode_recovery_key(kGoldenKey.substr(0U, kGoldenKey.size() - 1U)),
+             MpError::invalid_recovery_key, "54 symbols rejected");
+  expect_err(decode_recovery_key(std::string{kGoldenKey} + "0"),
+             MpError::invalid_recovery_key, "56 symbols rejected");
+  std::string with_u{kGoldenKey};
+  with_u[6] = 'U';
+  expect_err(decode_recovery_key(with_u), MpError::invalid_recovery_key,
+             "invalid Crockford char U rejected");
+
+  // Non-zero trailing 3 padding bits rejected (last symbol '0' -> '1'..'7').
+  for (const char bad_last : {'1', '2', '3', '4', '5', '6', '7'}) {
+    std::string bad_pad{kGoldenKey};
+    bad_pad.back() = bad_last;
+    expect_err(decode_recovery_key(bad_pad), MpError::invalid_recovery_key,
+               "non-zero trailing 3 pad bits rejected");
+  }
+
+  // Corrupted body symbol -> checksum mismatch rejected.
+  std::string bad_chk{kGoldenKey};
+  bad_chk[6] = '1';
+  expect_err(decode_recovery_key(bad_chk), MpError::invalid_recovery_key,
+             "bad checksum rejected");
+
+  // Random seeds round-trip & strict format check.
+  static constexpr std::string_view kCrockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  for (int i = 0; i < 8; ++i) {
+    Ed25519Seed rand_seed{};
+    must_void(random_bytes(rand_seed), "random seed");
+    const auto rk = must(encode_recovery_key(rand_seed), "encode random mprk1");
+    require(rk.size() == kRecoveryKeyFormattedLength, "random mprk1 len 71");
+    require(rk.starts_with(kRecoveryKeyPrefix), "random mprk1 prefix");
+    const std::string_view body =
+        std::string_view{rk}.substr(kRecoveryKeyPrefix.size());
+    require(body.size() == 65U, "random mprk1 body len 65");
+    for (std::size_t idx = 0U; idx < body.size(); ++idx) {
+      if ((idx % 6U) == 5U) {
+        require(body[idx] == '-', "hyphen every 5 chars");
+      } else {
+        require(kCrockford.find(body[idx]) != std::string_view::npos,
+                "canonical uppercase Crockford char");
+      }
+    }
+    require(must(decode_recovery_key(rk), "decode random mprk1") == rand_seed,
+            "random mprk1 roundtrip");
+  }
+}
+
+void test_device_fingerprint_and_label() {
+  g_stage = "device_fingerprint_and_label";
+
+  static constexpr std::string_view kGoldenPubkeyHex =
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+  static constexpr std::string_view kGoldenFp = "ad1a8375-03ecc659-ad64922d-16cf6eb6";
+
+  const auto pk_vec = from_hex(kGoldenPubkeyHex);
+  require(pk_vec.size() == 32U, "golden device pubkey 32 bytes");
+  Ed25519PubKey dev_pk{};
+  std::memcpy(dev_pk.data(), pk_vec.data(), dev_pk.size());
+
+  const auto fp = must(compute_device_fingerprint(dev_pk), "golden device fingerprint");
+  require(fp.size() == kDeviceFingerprintFormattedLength, "fingerprint length 35");
+  require(fp == kGoldenFp, "mpdevfp2 golden vector bit-exact");
+
+  // 1-bit flip changes fingerprint completely.
+  Ed25519PubKey flipped_pk = dev_pk;
+  flipped_pk[31] ^= 0x80U;
+  const auto flipped_fp =
+      must(compute_device_fingerprint(flipped_pk), "flipped device fingerprint");
+  require(flipped_fp.size() == kDeviceFingerprintFormattedLength, "flipped fp len 35");
+  require(flipped_fp != fp, "flipped pubkey produces distinct fingerprint");
+
+  // Off-curve / non-canonical / weak / mixed-order pubkeys rejected.
+  Ed25519PubKey off_curve{};
+  off_curve[0] = 2U;
+  expect_err(compute_device_fingerprint(off_curve), MpError::invalid_public_key,
+             "off-curve rejected");
+  Ed25519PubKey weak_id{};
+  weak_id[0] = 1U;
+  expect_err(compute_device_fingerprint(weak_id), MpError::weak_public_key,
+             "small-order identity rejected");
+  Ed25519PubKey mixed_y3{};
+  mixed_y3[0] = 3U;
+  expect_err(compute_device_fingerprint(mixed_y3), MpError::weak_public_key,
+             "mixed-order y=3 rejected");
+
+  // valid_device_label: printable ASCII 0x20..0x7e, 1..64 chars.
+  require(valid_device_label("a"), "1-char label valid");
+  require(valid_device_label("wintermute"), "ordinary label valid");
+  require(valid_device_label("MacBook Pro (2026) ~!@#$%^&*()_+-="),
+          "printable ASCII punctuation valid");
+  require(valid_device_label(std::string(64U, 'x')), "64-char label valid");
+  require(!valid_device_label(""), "empty label rejected");
+  require(!valid_device_label(std::string(65U, 'x')), "65-char label rejected");
+  require(!valid_device_label("\x1b[31mred"), "ANSI ESC C0 control rejected");
+  require(!valid_device_label("line1\nline2"), "newline rejected");
+  require(!valid_device_label("tab\tlabel"), "tab rejected");
+  require(!valid_device_label(std::string_view{"nul\0byte", 8U}), "NUL rejected");
+  require(!valid_device_label("del\x7f"), "DEL 0x7f rejected");
+  require(!valid_device_label("c1\xc2\x9b"), "C1 UTF-8 control rejected");
+  require(!valid_device_label("bidi\xe2\x80\xae"), "BiDi override rejected");
+}
+
+void test_rfc9421_recovery_and_device_link_keyids() {
+  g_stage = "rfc9421_portability_keyids";
+
+  const auto root_sk = test_signing_key(21U);
+  const auto dev_sk = test_signing_key(22U);
+  const Ed25519PubKey &root_pk = root_sk.public_key();
+  const Ed25519PubKey &dev_pk = dev_sk.public_key();
+  const std::int64_t now = 1795453800;
+
+  const auto rec_kid_str =
+      must(format_recovery_keyid(root_pk), "format_recovery_keyid");
+  require(rec_kid_str.size() == 36U && rec_kid_str.starts_with("rec."),
+          "rec.<32hex> exact 36-char format");
+  const auto rec_digest = must(sha256(root_pk), "sha256 root_pk");
+  require(rec_kid_str ==
+              "rec." + hex_lower(std::span<const std::uint8_t>{rec_digest.data(), 16U}),
+          "format_recovery_keyid matches sha256[0..16]");
+
+  const auto link_kid_str =
+      must(format_device_link_keyid(dev_pk), "format_device_link_keyid");
+  require(link_kid_str.size() == 37U && link_kid_str.starts_with("link."),
+          "link.<32hex> exact 37-char format");
+  const auto link_digest = must(sha256(dev_pk), "sha256 dev_pk");
+  require(link_kid_str == "link." + hex_lower(std::span<const std::uint8_t>{
+                                        link_digest.data(), 16U}),
+          "format_device_link_keyid matches sha256[0..16]");
+
+  const auto parsed_rec = must(parse_key_id(rec_kid_str), "parse rec keyid");
+  require(std::holds_alternative<RecoveryKeyId>(parsed_rec), "parsed RecoveryKeyId");
+  require(format_key_id(parsed_rec) == rec_kid_str, "format RecoveryKeyId roundtrip");
+
+  const auto parsed_link = must(parse_key_id(link_kid_str), "parse link keyid");
+  require(std::holds_alternative<DeviceLinkKeyId>(parsed_link),
+          "parsed DeviceLinkKeyId");
+  require(format_key_id(parsed_link) == link_kid_str,
+          "format DeviceLinkKeyId roundtrip");
+
+  // Reject malformed rec./link. keyids (uppercase, wrong len, bad hex).
+  expect_err(parse_key_id("rec.00112233445566778899AABBCCDDEEFF"),
+             MpError::rfc9421_invalid_key_id, "uppercase rec rejected");
+  expect_err(parse_key_id("rec.00112233"), MpError::rfc9421_invalid_key_id,
+             "short rec rejected");
+  expect_err(parse_key_id("link.00112233445566778899aabbccddeeff00"),
+             MpError::rfc9421_invalid_key_id, "long link rejected");
+  expect_err(parse_key_id("link.zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+             MpError::rfc9421_invalid_key_id, "non-hex link rejected");
+
+  // Sign & verify POST /v1/accounts/recover-lookup with rec.<32hex>.
+  const auto rec_body = to_bytes(R"({"root_pubkey_b64":"placeholder"})");
+  const auto rec_signed = must(sign_rfc9421_request(root_sk,
+                                                    Rfc9421SignRequest{
+                                                        HttpMethod::post,
+                                                        "api.multiplayer.tech",
+                                                        "/v1/accounts/recover-lookup",
+                                                        "?",
+                                                        "application/json",
+                                                        rec_body,
+                                                        parsed_rec,
+                                                        now - 5,
+                                                        now + 55,
+                                                        "RecoveryLookupNonce_01234567",
+                                                    }),
+                               "sign recover-lookup");
+  const Rfc9421Request rec_req{
+      HttpMethod::post,
+      "api.multiplayer.tech",
+      "/v1/accounts/recover-lookup",
+      "?",
+      "application/json",
+      must_opt(rec_signed.content_digest, "rec digest"),
+      false,
+      rec_body,
+      rec_signed.signature_input,
+      rec_signed.signature,
+  };
+  const auto rec_verified =
+      must(verify_rfc9421_request({rec_req, "api.multiplayer.tech", root_pk, now}),
+           "verify recover-lookup");
+  require(rec_verified.keyid == parsed_rec, "verified RecoveryKeyId exact");
+
+  // Wrong keyid binding rejected on BOTH sign and verify for rec. and link.!
+  expect_err(verify_rfc9421_request({rec_req, "api.multiplayer.tech", dev_pk, now}),
+             MpError::rfc9421_invalid_key_id, "verify rec keyid mismatch rejected");
+  expect_err(sign_rfc9421_request(dev_sk,
+                                  Rfc9421SignRequest{
+                                      HttpMethod::post,
+                                      "api.multiplayer.tech",
+                                      "/v1/accounts/recover-lookup",
+                                      "?",
+                                      "application/json",
+                                      rec_body,
+                                      parsed_rec,
+                                      now - 5,
+                                      now + 55,
+                                      "RecoveryLookupNonce_01234567",
+                                  }),
+             MpError::rfc9421_invalid_key_id, "sign rec keyid mismatch rejected");
+
+  // Sign & verify POST /v1/device-links/claim with link.<32hex>.
+  const auto link_body = to_bytes(R"({"link_code":"W4K9-M2P7"})");
+  const auto link_signed = must(sign_rfc9421_request(dev_sk,
+                                                     Rfc9421SignRequest{
+                                                         HttpMethod::post,
+                                                         "api.multiplayer.tech",
+                                                         "/v1/device-links/claim",
+                                                         "?",
+                                                         "application/json",
+                                                         link_body,
+                                                         parsed_link,
+                                                         now - 5,
+                                                         now + 55,
+                                                         "DeviceLinkClaimNonce_0123456",
+                                                     }),
+                                "sign device-links/claim");
+  const Rfc9421Request link_req{
+      HttpMethod::post,
+      "api.multiplayer.tech",
+      "/v1/device-links/claim",
+      "?",
+      "application/json",
+      must_opt(link_signed.content_digest, "link digest"),
+      false,
+      link_body,
+      link_signed.signature_input,
+      link_signed.signature,
+  };
+  const auto link_verified =
+      must(verify_rfc9421_request({link_req, "api.multiplayer.tech", dev_pk, now}),
+           "verify device-links/claim");
+  require(link_verified.keyid == parsed_link, "verified DeviceLinkKeyId exact");
+
+  expect_err(verify_rfc9421_request({link_req, "api.multiplayer.tech", root_pk, now}),
+             MpError::rfc9421_invalid_key_id, "verify link keyid mismatch rejected");
+  expect_err(sign_rfc9421_request(root_sk,
+                                  Rfc9421SignRequest{
+                                      HttpMethod::post,
+                                      "api.multiplayer.tech",
+                                      "/v1/device-links/claim",
+                                      "?",
+                                      "application/json",
+                                      link_body,
+                                      parsed_link,
+                                      now - 5,
+                                      now + 55,
+                                      "DeviceLinkClaimNonce_0123456",
+                                  }),
+             MpError::rfc9421_invalid_key_id, "sign link keyid mismatch rejected");
+}
+
+std::string wrap_test_mpkey_pem(std::span<const std::uint8_t> binary) {
+  const std::string b64 = encode_base64(binary, false);
+  std::string out = "-----BEGIN MULTIPLAYER RECOVERY KEY-----\n";
+  for (std::size_t off = 0U; off < b64.size(); off += 64U) {
+    const std::size_t n = std::min<std::size_t>(64U, b64.size() - off);
+    out.append(b64, off, n);
+    out.push_back('\n');
+  }
+  out.append("-----END MULTIPLAYER RECOVERY KEY-----\n");
+  return out;
+}
+
+std::vector<std::uint8_t> unwrap_test_mpkey_pem(std::string_view pem) {
+  static constexpr std::string_view kBegin =
+      "-----BEGIN MULTIPLAYER RECOVERY KEY-----\n";
+  static constexpr std::string_view kEnd = "-----END MULTIPLAYER RECOVERY KEY-----\n";
+  require(pem.starts_with(kBegin) && pem.ends_with(kEnd), "PEM begin/end exact");
+  const std::string_view middle =
+      pem.substr(kBegin.size(), pem.size() - kBegin.size() - kEnd.size());
+  std::string b64;
+  std::size_t line_len = 0U;
+  for (const char ch : middle) {
+    if (ch == '\n') {
+      require(line_len > 0U && line_len <= 64U, "PEM line width 1..64");
+      line_len = 0U;
+    } else {
+      b64.push_back(ch);
+      ++line_len;
+    }
+  }
+  require(line_len == 0U, "PEM body ends with newline");
+
+  auto b64_val = [](char ch) -> int {
+    if (ch >= 'A' && ch <= 'Z') {
+      return ch - 'A';
+    }
+    if (ch >= 'a' && ch <= 'z') {
+      return ch - 'a' + 26;
+    }
+    if (ch >= '0' && ch <= '9') {
+      return ch - '0' + 52;
+    }
+    if (ch == '+') {
+      return 62;
+    }
+    if (ch == '/') {
+      return 63;
+    }
+    return -1;
+  };
+  require((b64.size() % 4U) == 0U, "b64 multiple of 4");
+  std::vector<std::uint8_t> out;
+  for (std::size_t i = 0U; i < b64.size(); i += 4U) {
+    const int v0 = b64_val(b64[i]);
+    const int v1 = b64_val(b64[i + 1U]);
+    require(v0 >= 0 && v1 >= 0, "valid b64 quad");
+    out.push_back(static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
+    if (b64[i + 2U] != '=') {
+      const int v2 = b64_val(b64[i + 2U]);
+      require(v2 >= 0, "valid b64 c2");
+      out.push_back(static_cast<std::uint8_t>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+      if (b64[i + 3U] != '=') {
+        const int v3 = b64_val(b64[i + 3U]);
+        require(v3 >= 0, "valid b64 c3");
+        out.push_back(static_cast<std::uint8_t>(((v2 & 0x03) << 6) | v3));
+      }
+    }
+  }
+  return out;
+}
+
+// Independent OpenSSL 3 helper to craft authenticated raw-plaintext .mpkey containers
+// so we can test strict JSON rejection AFTER valid AES-256-GCM tag verification.
+struct RawMpKeyForgeInput {
+  std::string_view passphrase;
+  std::array<std::uint8_t, kMpKeyV1SaltBytes> salt{};
+  std::array<std::uint8_t, kMpKeyV1NonceBytes> nonce{};
+  std::uint32_t m = kMpKeyV1Argon2MemCostKiB;
+  std::uint32_t t = kMpKeyV1Argon2Iter;
+  std::uint32_t p = kMpKeyV1Argon2Lanes;
+  std::span<const std::uint8_t> raw_plaintext;
+};
+
+std::string forge_authenticated_mpkey_pem(const RawMpKeyForgeInput &in) {
+  std::array<std::uint8_t, 32U> key{};
+  std::vector<std::uint8_t> pass_copy(in.passphrase.begin(), in.passphrase.end());
+  auto salt_copy = in.salt;
+  std::uint32_t iter = in.t;
+  std::uint32_t memcost = in.m;
+  std::uint32_t lanes = in.p;
+  std::uint32_t threads = 1U;
+  std::uint32_t version = 0x13U;
+
+  EVP_KDF *kdf = EVP_KDF_fetch(nullptr, "ARGON2ID", nullptr);
+  require(kdf != nullptr, "test EVP_KDF_fetch ARGON2ID");
+  EVP_KDF_CTX *kctx = EVP_KDF_CTX_new(kdf);
+  require(kctx != nullptr, "test EVP_KDF_CTX_new");
+  OSSL_PARAM params[8] = {
+      OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD, pass_copy.data(),
+                                        pass_copy.size()),
+      OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, salt_copy.data(),
+                                        salt_copy.size()),
+      OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &iter),
+      OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost),
+      OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &lanes),
+      OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &threads),
+      OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_VERSION, &version),
+      OSSL_PARAM_construct_end(),
+  };
+  require(EVP_KDF_derive(kctx, key.data(), key.size(), params) == 1,
+          "test EVP_KDF_derive");
+  EVP_KDF_CTX_free(kctx);
+  EVP_KDF_free(kdf);
+
+  auto append_le32 = [](std::vector<std::uint8_t> &dst, std::uint32_t v) {
+    for (std::size_t i = 0U; i < 4U; ++i) {
+      dst.push_back(static_cast<std::uint8_t>((v >> (i * 8U)) & 0xffU));
+    }
+  };
+  std::vector<std::uint8_t> aad = to_bytes("mpkey-v1:");
+  aad.insert(aad.end(), in.salt.begin(), in.salt.end());
+  append_le32(aad, in.m);
+  append_le32(aad, in.t);
+  append_le32(aad, in.p);
+
+  EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
+  require(cctx != nullptr, "test EVP_CIPHER_CTX_new");
+  require(EVP_EncryptInit_ex(cctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1,
+          "test gcm init");
+  require(EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1,
+          "test gcm ivlen");
+  require(EVP_EncryptInit_ex(cctx, nullptr, nullptr, key.data(), in.nonce.data()) == 1,
+          "test gcm key/iv");
+  int out_len = 0;
+  require(EVP_EncryptUpdate(cctx, nullptr, &out_len, aad.data(),
+                            static_cast<int>(aad.size())) == 1,
+          "test gcm aad");
+  std::vector<std::uint8_t> ct(in.raw_plaintext.size(), 0U);
+  int ct_len = 0;
+  if (!in.raw_plaintext.empty()) {
+    require(EVP_EncryptUpdate(cctx, ct.data(), &ct_len, in.raw_plaintext.data(),
+                              static_cast<int>(in.raw_plaintext.size())) == 1,
+            "test gcm enc");
+  }
+  std::uint8_t dummy = 0U;
+  int fin_len = 0;
+  require(EVP_EncryptFinal_ex(cctx, ct.empty() ? &dummy : ct.data() + ct_len,
+                              &fin_len) == 1,
+          "test gcm fin");
+  std::array<std::uint8_t, 16U> tag{};
+  require(EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) == 1,
+          "test gcm tag");
+  EVP_CIPHER_CTX_free(cctx);
+
+  std::vector<std::uint8_t> bin = {'M', 'P', 'K', 'E', 'Y', '1', 0x00U, 0x00U};
+  bin.insert(bin.end(), in.salt.begin(), in.salt.end());
+  append_le32(bin, in.m);
+  append_le32(bin, in.t);
+  append_le32(bin, in.p);
+  bin.insert(bin.end(), in.nonce.begin(), in.nonce.end());
+  bin.insert(bin.end(), ct.begin(), ct.end());
+  bin.insert(bin.end(), tag.begin(), tag.end());
+  return wrap_test_mpkey_pem(bin);
+}
+
+void test_mpkey_v1_codec() {
+  g_stage = "mpkey_v1_codec";
+
+  const auto seed_vec =
+      from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  Ed25519Seed seed{};
+  std::memcpy(seed.data(), seed_vec.data(), seed.size());
+
+  const std::array<std::uint8_t, kMpKeyV1SaltBytes> det_salt = {
+      0x10U, 0x11U, 0x12U, 0x13U, 0x14U, 0x15U, 0x16U, 0x17U,
+      0x18U, 0x19U, 0x1aU, 0x1bU, 0x1cU, 0x1dU, 0x1eU, 0x1fU,
+  };
+  const std::array<std::uint8_t, kMpKeyV1NonceBytes> det_nonce = {
+      0x20U, 0x21U, 0x22U, 0x23U, 0x24U, 0x25U,
+      0x26U, 0x27U, 0x28U, 0x29U, 0x2aU, 0x2bU,
+  };
+
+  const MpKeyPayload full_payload{
+      must(AccountId::create(1001U), "mpkey acct 1001"),
+      std::string{"antimeme"},
+      seed,
+  };
+  static constexpr std::string_view kPass = "correct-horse-battery-staple";
+
+  // 1. Deterministic encrypt + exact binary/PEM layout verification + roundtrip.
+  const auto pem = must(
+      encrypt_mpkey_v1(full_payload, kPass, MpKeyEncryptOptions{det_salt, det_nonce}),
+      "encrypt deterministic mpkey");
+  const auto bin = unwrap_test_mpkey_pem(pem);
+  require(bin.size() >= kMpKeyV1MinBinaryBytes && bin.size() <= kMpKeyV1MaxBinaryBytes,
+          "binary container in 64..1024B");
+  const std::array<std::uint8_t, 8U> expected_magic = {
+      'M', 'P', 'K', 'E', 'Y', '1', 0x00U, 0x00U,
+  };
+  require(std::memcmp(bin.data(), expected_magic.data(), 8U) == 0,
+          "magic == MPKEY1\\0\\0");
+  require(std::memcmp(bin.data() + 8U, det_salt.data(), 16U) == 0, "salt exact");
+  // m = 65536 (0x00010000 LE), t = 3, p = 1
+  require(bin[24] == 0x00U && bin[25] == 0x00U && bin[26] == 0x01U && bin[27] == 0x00U,
+          "m_le32 == 65536");
+  require(bin[28] == 0x03U && bin[29] == 0x00U && bin[30] == 0x00U && bin[31] == 0x00U,
+          "t_le32 == 3");
+  require(bin[32] == 0x01U && bin[33] == 0x00U && bin[34] == 0x00U && bin[35] == 0x00U,
+          "p_le32 == 1");
+  require(std::memcmp(bin.data() + 36U, det_nonce.data(), 12U) == 0, "nonce exact");
+
+  // Cross-check bit-exact parity against independent OpenSSL forge helper!
+  const std::string expected_json =
+      std::string{R"({"v":1,"account_id":1001,"handle":"antimeme","root_seed_b64":")"} +
+      encode_base64(seed, false) + "\"}";
+  const auto expected_json_bytes = to_bytes(expected_json);
+  const std::string independent_pem = forge_authenticated_mpkey_pem(RawMpKeyForgeInput{
+      kPass, det_salt, det_nonce, 65536U, 3U, 1U, expected_json_bytes});
+  require(pem == independent_pem,
+          "mpkey PEM bit-exact against independent Argon2id+GCM");
+
+  const auto dec = must(decrypt_mpkey_v1({pem, kPass}), "decrypt deterministic mpkey");
+  require(dec == full_payload, "full payload roundtrip exact");
+
+  // CRLF line endings & trailing blank line accepted on read.
+  std::string crlf_pem = "\r\n";
+  for (const char ch : pem) {
+    if (ch == '\n') {
+      crlf_pem.append("\r\n");
+    } else {
+      crlf_pem.push_back(ch);
+    }
+  }
+  require(must(decrypt_mpkey_v1({crlf_pem, kPass}), "decrypt CRLF mpkey") ==
+              full_payload,
+          "CRLF PEM accepted");
+
+  // 2. Null metadata + default CSPRNG salt/nonce + non-ASCII UTF-8 passphrase.
+  const MpKeyPayload null_meta_payload{std::nullopt, std::nullopt, seed};
+  static constexpr std::string_view kUtf8Pass = "caf\xc3\xa9-sr71-recovery";
+  const auto rand_pem1 =
+      must(encrypt_mpkey_v1(null_meta_payload, kUtf8Pass), "encrypt rand mpkey 1");
+  const auto rand_pem2 =
+      must(encrypt_mpkey_v1(null_meta_payload, kUtf8Pass), "encrypt rand mpkey 2");
+  require(rand_pem1 != rand_pem2, "CSPRNG salt/nonce yields distinct ciphertexts");
+  require(must(decrypt_mpkey_v1({rand_pem1, kUtf8Pass}), "decrypt rand mpkey 1") ==
+              null_meta_payload,
+          "null metadata + UTF-8 passphrase roundtrip");
+
+  // 3. Passphrase validation (empty & invalid UTF-8 rejected).
+  expect_err(encrypt_mpkey_v1(full_payload, ""), MpError::mpkey_invalid_passphrase,
+             "encrypt empty passphrase rejected");
+  expect_err(encrypt_mpkey_v1(full_payload, "\xff\xfe"),
+             MpError::mpkey_invalid_passphrase, "encrypt invalid UTF-8 passphrase");
+  expect_err(decrypt_mpkey_v1({pem, ""}), MpError::mpkey_invalid_passphrase,
+             "decrypt empty passphrase rejected");
+  expect_err(decrypt_mpkey_v1({pem, "\xc0\xaf"}), MpError::mpkey_invalid_passphrase,
+             "decrypt overlong UTF-8 passphrase");
+
+  // 4. Wrong passphrase & tampered tag / ciphertext / nonce / AAD.
+  expect_err(decrypt_mpkey_v1({pem, "wrong-passphrase-12345"}),
+             MpError::mpkey_decrypt_failed, "wrong passphrase rejected");
+
+  auto bad_tag_bin = bin;
+  bad_tag_bin.back() ^= 0x01U;
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_tag_bin), kPass}),
+             MpError::mpkey_decrypt_failed, "tampered tag rejected");
+
+  auto bad_ct_bin = bin;
+  bad_ct_bin[50] ^= 0x01U;
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_ct_bin), kPass}),
+             MpError::mpkey_decrypt_failed, "tampered ciphertext rejected");
+
+  auto bad_nonce_bin = bin;
+  bad_nonce_bin[36] ^= 0x01U;
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_nonce_bin), kPass}),
+             MpError::mpkey_decrypt_failed, "tampered nonce rejected");
+
+  // Tamper AAD-covered header field t=3 -> t=4 (still in valid reader range 3..16).
+  auto bad_aad_bin = bin;
+  bad_aad_bin[28] = 0x04U;
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_aad_bin), kPass}),
+             MpError::mpkey_decrypt_failed, "tampered header t (AAD) rejected");
+
+  // 5. Magic & out-of-bounds m/t/p rejected INSTANTLY BEFORE KDF allocation!
+  auto bad_magic_bin = bin;
+  bad_magic_bin[5] = '2';
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_magic_bin), kPass}),
+             MpError::mpkey_invalid_magic, "magic MPKEY2 rejected");
+  auto bad_reserved_bin = bin;
+  bad_reserved_bin[7] = 0x01U;
+  expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(bad_reserved_bin), kPass}),
+             MpError::mpkey_invalid_magic, "non-zero reserved magic byte rejected");
+
+  auto set_le32 = [](std::vector<std::uint8_t> &buf, std::size_t off, std::uint32_t v) {
+    for (std::size_t i = 0U; i < 4U; ++i) {
+      buf[off + i] = static_cast<std::uint8_t>((v >> (i * 8U)) & 0xffU);
+    }
+  };
+  // m = 1048576 (1 GiB!) MUST be rejected instantaneously without allocating 1 GiB.
+  auto huge_m_bin = bin;
+  set_le32(huge_m_bin, 24U, 1048576U);
+  const std::string huge_m_pem = wrap_test_mpkey_pem(huge_m_bin);
+  const auto t0 = std::chrono::steady_clock::now();
+  expect_err(decrypt_mpkey_v1({huge_m_pem, kPass}), MpError::mpkey_invalid_params,
+             "m=1048576 (1 GiB) rejected before KDF");
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+  require(elapsed_ms < 50, "out-of-bounds m rejected instantaneously (<50ms)");
+
+  const std::array<std::pair<std::size_t, std::uint32_t>, 6> bad_params = {{
+      {24U, 65535U},
+      {24U, 524289U},
+      {28U, 2U},
+      {28U, 17U},
+      {32U, 0U},
+      {32U, 9U},
+  }};
+  for (const auto &[off, val] : bad_params) {
+    auto mutated = bin;
+    set_le32(mutated, off, val);
+    expect_err(decrypt_mpkey_v1({wrap_test_mpkey_pem(mutated), kPass}),
+               MpError::mpkey_invalid_params, "out-of-bounds m/t/p rejected");
+  }
+
+  // 6. PEM framing & binary length bounds (rejected before KDF).
+  const std::string huge_pem = "-----BEGIN MULTIPLAYER RECOVERY KEY-----\n" +
+                               std::string(4097U, 'A') +
+                               "\n-----END MULTIPLAYER RECOVERY KEY-----\n";
+  expect_err(decrypt_mpkey_v1({huge_pem, kPass}), MpError::mpkey_invalid_pem,
+             ">4096B PEM rejected");
+  expect_err(decrypt_mpkey_v1({"-----BEGIN PRIVATE KEY-----\nAAAA\n"
+                               "-----END PRIVATE KEY-----\n",
+                               kPass}),
+             MpError::mpkey_invalid_pem, "wrong PEM header rejected");
+  expect_err(decrypt_mpkey_v1({pem + "trailing\n", kPass}), MpError::mpkey_invalid_pem,
+             "trailing data after END rejected");
+  expect_err(decrypt_mpkey_v1(
+                 {wrap_test_mpkey_pem(std::vector<std::uint8_t>(63U, 0U)), kPass}),
+             MpError::mpkey_invalid_pem, "63B binary (<64) rejected");
+  expect_err(decrypt_mpkey_v1(
+                 {wrap_test_mpkey_pem(std::vector<std::uint8_t>(1025U, 0U)), kPass}),
+             MpError::mpkey_invalid_pem, "1025B binary (>1024) rejected");
+
+  // 7. Strict JSON payload validation AFTER valid AES-256-GCM tag verification.
+  const std::string good_b64 = encode_base64(seed, false);
+  std::string non_canon_b64 = good_b64;
+  // Last char before '=' has 2 unused bits; set bit 0 to make non-canonical base64.
+  non_canon_b64[42] = 'B';
+  const std::vector<std::string> bad_jsons = {
+      R"({"v":2,"account_id":null,"handle":null,"root_seed_b64":")" + good_b64 + "\"}",
+      R"({"v":1,"account_id":null,"handle":null,"root_seed_b64":")" + good_b64 +
+          R"(","extra":true})",
+      R"({"v":1,"v":1,"account_id":null,"handle":null,"root_seed_b64":")" + good_b64 +
+          "\"}",
+      R"({"v":1,"account_id":null,"root_seed_b64":")" + good_b64 + "\"}",
+      R"({"v":1,"account_id":0,"handle":null,"root_seed_b64":")" + good_b64 + "\"}",
+      R"({"v":1,"account_id":"1001","handle":null,"root_seed_b64":")" + good_b64 +
+          "\"}",
+      R"({"v":1,"account_id":null,"handle":null,"root_seed_b64":")" + non_canon_b64 +
+          "\"}",
+      R"({"v":1,"account_id":null,"handle":null,"root_seed_b64":"AAAA"})",
+      R"({"v":1,"account_id":null,"handle":null,"root_seed_b64":")" + good_b64 +
+          "\"} trailing",
+  };
+  for (const auto &bad_json : bad_jsons) {
+    const auto pt = to_bytes(bad_json);
+    const std::string forged = forge_authenticated_mpkey_pem(
+        RawMpKeyForgeInput{kPass, det_salt, det_nonce, 65536U, 3U, 1U, pt});
+    expect_err(decrypt_mpkey_v1({forged, kPass}), MpError::mpkey_invalid_payload,
+               "malformed JSON rejected after AEAD verify");
+  }
+  const std::array<std::uint8_t, 4U> bad_utf8 = {0xffU, 0xfeU, 0x00U, 0x01U};
+  const std::string forged_utf8 = forge_authenticated_mpkey_pem(
+      RawMpKeyForgeInput{kPass, det_salt, det_nonce, 65536U, 3U, 1U, bad_utf8});
+  expect_err(decrypt_mpkey_v1({forged_utf8, kPass}), MpError::mpkey_invalid_payload,
+             "non-UTF-8 plaintext rejected after AEAD verify");
+
+  // Cross-company golden vector from Platoon 3 (mp-outpost v0.2.0, xplat-board seq
+  // #29): Proves 100% bit-exact Rust (argon2+aes-gcm) <-> C++23 (OpenSSL 3.6 native
+  // Argon2id) .mpkey v1 container interoperability in BOTH directions.
+  {
+    const std::vector<std::uint8_t> outpost_container = from_hex(
+        "4d504b4559310000101112131415161718191a1b1c1d1e1f000001000300000001000000"
+        "202122232425262728292a2b7b615a0e2f490ad52cea523d15a71cde2b8b6d86fb7116ee"
+        "d57d7b7333d722dbbd882e8009ab5e5097f5ccb300f0feaa6f87aa599061ec5c65b1f91c"
+        "5e237bc3e949ee509ec528f50e64dfcdec2d646d615f9780f237ff17d9e2e59bb742ab60"
+        "5b844d11fd7ba68fb2299907b10d60461379f6c6be40e15144ed845d");
+    require(outpost_container.size() == 172U, "outpost .mpkey golden vector is 172B");
+    const std::string outpost_pem = wrap_test_mpkey_pem(outpost_container);
+    const MpKeyPayload dec_outpost =
+        must(decrypt_mpkey_v1({outpost_pem, "correct-horse-battery-staple"}),
+             "decrypt mp-outpost v0.2.0 .mpkey golden vector");
+    require(dec_outpost.account_id.has_value() &&
+                dec_outpost.account_id->value() == 1001ULL,
+            "outpost golden vector account_id == 1001");
+    require(dec_outpost.handle.has_value() && *dec_outpost.handle == "antimeme",
+            "outpost golden vector handle == antimeme");
+    Ed25519Seed expected_seed{};
+    for (std::size_t i = 0U; i < expected_seed.size(); ++i) {
+      expected_seed[i] = static_cast<std::uint8_t>(i);
+    }
+    require(dec_outpost.root_seed == expected_seed,
+            "outpost golden vector root_seed bit-exact");
+
+    MpKeyEncryptOptions outpost_opts{};
+    outpost_opts.salt_override = std::array<std::uint8_t, 16U>{
+        0x10U, 0x11U, 0x12U, 0x13U, 0x14U, 0x15U, 0x16U, 0x17U,
+        0x18U, 0x19U, 0x1aU, 0x1bU, 0x1cU, 0x1dU, 0x1eU, 0x1fU};
+    outpost_opts.nonce_override =
+        std::array<std::uint8_t, 12U>{0x20U, 0x21U, 0x22U, 0x23U, 0x24U, 0x25U,
+                                      0x26U, 0x27U, 0x28U, 0x29U, 0x2aU, 0x2bU};
+    const std::string bb_pem = must(
+        encrypt_mpkey_v1(dec_outpost, "correct-horse-battery-staple", outpost_opts),
+        "encrypt matching mp-outpost v0.2.0 .mpkey golden vector");
+    require(unwrap_test_mpkey_pem(bb_pem) == outpost_container,
+            "Blackbird C++23 .mpkey container matches mp-outpost Rust byte-for-byte!");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1780,6 +2520,10 @@ int main() {
     test_rust_mp_protocol_bit_exact_parity();
     test_official_multiplayer_site_test_vectors();
     test_safety_number();
+    test_recovery_key_mprk1();
+    test_device_fingerprint_and_label();
+    test_rfc9421_recovery_and_device_link_keyids();
+    test_mpkey_v1_codec();
     std::cout << "mp_protocol_test: ALL PASSED\n";
     return 0;
   } catch (const std::exception &ex) {

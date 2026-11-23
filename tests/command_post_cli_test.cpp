@@ -301,7 +301,7 @@ void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
 void test_subcommand_dispatch_table() {
   for (const char *name :
        {"mcp", "platoon", "issues", "memory", "peer", "capabilities", "metrics",
-        "bridge", "join", "party", "flightdeck", "online"}) {
+        "bridge", "join", "party", "flightdeck", "online", "upgrade"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -2167,6 +2167,12 @@ void test_online_cli_subcommand(const fs::path &base) {
            {"online", "devices", "install-cwt", "--help"},
            {"online", "web-approve", "--help"},
            {"online", "friends", "--help"},
+           {"online", "friends", "add", "--help"},
+           {"online", "friends", "accept", "--help"},
+           {"online", "friends", "deny", "--help"},
+           {"online", "friends", "decline", "--help"},
+           {"online", "friends", "remove", "--help"},
+           {"online", "friends", "block", "--help"},
            {"online", "party", "--help"},
            {"online", "party", "create", "--help"},
            {"online", "party", "join", "--help"},
@@ -2181,6 +2187,14 @@ void test_online_cli_subcommand(const fs::path &base) {
               top_help.err.find("init") != std::string::npos &&
               top_help.err.find("install-cwt") != std::string::npos,
           "online --help must list web-approve and devices init|install-cwt");
+    const auto friends_help = run_cli({"online", "friends", "--help"});
+    check(friends_help.err.find("accept") != std::string::npos &&
+              friends_help.err.find("deny") != std::string::npos &&
+              friends_help.err.find("remove") != std::string::npos &&
+              friends_help.err.find("block") != std::string::npos &&
+              friends_help.err.find("<handle|account_id>") != std::string::npos,
+          "online friends --help must list accept|deny|remove|block "
+          "<handle|account_id>");
   }
 
   // 2. Invalid paths (.. traversal, C1, BiDi, BOM) fail closed with exit 2 and ZERO
@@ -2218,6 +2232,14 @@ void test_online_cli_subcommand(const fs::path &base) {
            {"online", "whoami", "--state-dir", absent_state.string()},
            {"online", "resolve", "wingman", "--state-dir", absent_state.string()},
            {"online", "friends", "list", "--state-dir", absent_state.string()},
+           {"online", "friends", "accept", "wingman", "--state-dir",
+            absent_state.string()},
+           {"online", "friends", "deny", "wingman", "--state-dir",
+            absent_state.string()},
+           {"online", "friends", "remove", "wingman", "--state-dir",
+            absent_state.string()},
+           {"online", "friends", "block", "wingman", "--state-dir",
+            absent_state.string()},
            {"online", "party", "info", "5001", "--state-dir", absent_state.string()},
            {"online", "web-approve", "ABCD-EFGH", "--state-dir", absent_state.string()},
        }) {
@@ -2226,6 +2248,16 @@ void test_online_cli_subcommand(const fs::path &base) {
           "unregistered online command must fail cleanly on stderr");
     check(!fs::exists(absent_state),
           "read-only online command must NEVER create absent --state-dir");
+  }
+  for (const char *action : {"accept", "deny", "decline", "remove", "block"}) {
+    for (const char *bad_target : {"0", "admin"}) {
+      const auto bad = run_cli({"online", "friends", action, bad_target, "--state-dir",
+                                absent_state.string()});
+      check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+            "invalid friends target must exit 2");
+      check(!fs::exists(absent_state),
+            "invalid friends target must create zero directories");
+    }
   }
 
   // Invalid handle on register must exit 2, create zero dirs, and never leak invite.
@@ -2281,6 +2313,7 @@ void test_online_cli_subcommand(const fs::path &base) {
 
   const std::string mock_server_py = R"PY(
 import json
+import os
 import signal
 import socket
 import ssl
@@ -2292,6 +2325,7 @@ crt_path = sys.argv[1]
 key_path = sys.argv[2]
 wingman_pub_b64 = sys.argv[3]
 req_log_path = sys.argv[4]
+seed_friends_path = os.path.join(os.path.dirname(req_log_path), "seed_friends.json")
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -2418,12 +2452,25 @@ def handle_request(method, target, headers, body_bytes):
             "active_party_ids": list(state["parties"].keys()),
         }
 
+    if os.path.exists(seed_friends_path):
+        with open(seed_friends_path, "r", encoding="utf-8") as sf:
+            seeded = json.load(sf)
+        os.remove(seed_friends_path)
+        for k, v in seeded.items():
+            state["friends"][int(k)] = int(v)
+
     if method == "GET" and path == "/v1/accounts/resolve":
-        h = query.get("handle", [""])[0]
-        if h.lower() == "wingman":
+        h = query.get("handle", [""])[0].lower()
+        handles = {
+            "wingman": (1002, "wingman"),
+            "phall": (1005, "phall"),
+            "rivet": (1006, "rivet"),
+        }
+        if h in handles:
+            aid, disp = handles[h]
             return 200, {
-                "account_id": 1002,
-                "handle": "wingman",
+                "account_id": aid,
+                "handle": disp,
                 "root_pubkey_b64": wingman_pub_b64,
             }
         return 404, {"error": "not_found"}
@@ -2472,8 +2519,9 @@ def handle_request(method, target, headers, body_bytes):
 
     if method == "POST" and path == "/v1/friends/requests":
         tid = int(body["target_account_id"])
-        state["friends"][tid] = 1
-        return 200, {"target_account_id": tid, "state": 1}
+        new_state = 0 if state["friends"].get(tid) == 2 else 1
+        state["friends"][tid] = new_state
+        return 200, {"target_account_id": tid, "state": new_state}
 
     if method == "POST" and path.startswith("/v1/friends/") and path.endswith("/block"):
         tid = int(path.split("/")[3])
@@ -2803,14 +2851,20 @@ finally:
           "online devices revoke mismatch");
   }
 
-  // 11. `online friends list / add (handle + numeric) / block / remove`
+  // 11. `online friends list / add / accept / deny / decline / block / remove`
+  //     (both handles and numeric account_ids, plus summary counts)
   {
     const Value empty_list = parse_stdout_json(
         run_cli({"online", "friends", "list", "--state-dir", state_dir.string(),
                  "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
                  crt_path.string()}),
         "online friends list initial");
-    check(req_int(empty_list, "count") == 0, "expected 0 initial friends");
+    check(req_int(empty_list, "count") == 0 &&
+              req_int(empty_list, "friend_count") == 0 &&
+              req_int(empty_list, "pending_received_count") == 0 &&
+              req_int(empty_list, "pending_sent_count") == 0 &&
+              req_int(empty_list, "blocked_count") == 0,
+          "expected 0 initial friends and summary counts");
 
     // Add via handle (auto-resolves wingman -> 1002)
     const Value added_handle = parse_stdout_json(
@@ -2839,7 +2893,8 @@ finally:
                  "--ca-bundle", crt_path.string()}),
         "online friends block");
     check(std::get<bool>(req_field(blocked, "blocked").value()) &&
-              req_int(blocked, "target_account_id") == 1002,
+              req_int(blocked, "target_account_id") == 1002 &&
+              req_int(blocked, "account_id") == 1002,
           "online friends block mismatch");
 
     const Value removed = parse_stdout_json(
@@ -2848,7 +2903,8 @@ finally:
                  "--ca-bundle", crt_path.string()}),
         "online friends remove");
     check(std::get<bool>(req_field(removed, "removed").value()) &&
-              req_int(removed, "target_account_id") == 1003,
+              req_int(removed, "target_account_id") == 1003 &&
+              req_int(removed, "account_id") == 1003,
           "online friends remove mismatch");
 
     const Value final_list = parse_stdout_json(
@@ -2856,11 +2912,117 @@ finally:
                  "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
                  crt_path.string()}),
         "online friends default list");
-    check(req_int(final_list, "count") == 1, "expected 1 blocked edge remaining");
+    check(req_int(final_list, "count") == 1 &&
+              req_int(final_list, "friend_count") == 0 &&
+              req_int(final_list, "pending_received_count") == 0 &&
+              req_int(final_list, "pending_sent_count") == 0 &&
+              req_int(final_list, "blocked_count") == 1,
+          "expected 1 blocked edge remaining");
     const auto &first_edge = req_field(final_list, "friends").array().at(0);
     check(req_int(first_edge, "peer_account_id") == 1002 &&
               req_str(first_edge, "state") == "blocked",
           "remaining friend edge mismatch");
+
+    // Seed incoming pending requests (state=2) + outgoing pending (state=1) to verify
+    // accept, deny, decline, remove-by-handle, block-by-handle, and summary counts.
+    write_text_file(tls_dir / "seed_friends.json",
+                    R"({"1005": 2, "1006": 2, "1007": 2, "1008": 2, "1009": 1})");
+
+    const Value pending_list = parse_stdout_json(
+        run_cli({"online", "friends", "list", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online friends list with pending");
+    check(req_int(pending_list, "count") == 6 &&
+              req_int(pending_list, "friend_count") == 0 &&
+              req_int(pending_list, "pending_received_count") == 4 &&
+              req_int(pending_list, "pending_sent_count") == 1 &&
+              req_int(pending_list, "blocked_count") == 1,
+          "friends list summary counts mismatch");
+
+    // Accept incoming request by handle (phall -> 1005 -> state=friend)
+    const Value acc_handle = parse_stdout_json(
+        run_cli({"online", "friends", "accept", "phall", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends accept handle");
+    check(req_int(acc_handle, "account_id") == 1005 &&
+              req_str(acc_handle, "handle") == "phall" &&
+              req_str(acc_handle, "state") == "friend" &&
+              req_str(acc_handle, "action") == "accept",
+          "online friends accept by handle mismatch");
+
+    // Accept incoming request by numeric account_id (1007 -> state=friend)
+    const Value acc_num = parse_stdout_json(
+        run_cli({"online", "friends", "accept", "1007", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends accept numeric");
+    check(req_int(acc_num, "account_id") == 1007 &&
+              std::holds_alternative<std::nullptr_t>(
+                  req_field(acc_num, "handle").value()) &&
+              req_str(acc_num, "state") == "friend" &&
+              req_str(acc_num, "action") == "accept",
+          "online friends accept numeric mismatch");
+
+    // Deny incoming request by handle (rivet -> 1006)
+    const Value denied_handle = parse_stdout_json(
+        run_cli({"online", "friends", "deny", "rivet", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends deny handle");
+    check(req_int(denied_handle, "account_id") == 1006 &&
+              req_str(denied_handle, "handle") == "rivet" &&
+              std::get<bool>(req_field(denied_handle, "denied").value()),
+          "online friends deny by handle mismatch");
+
+    // Decline alias by numeric account_id (1008)
+    const Value declined_num = parse_stdout_json(
+        run_cli({"online", "friends", "decline", "1008", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends decline numeric");
+    check(req_int(declined_num, "account_id") == 1008 &&
+              std::holds_alternative<std::nullptr_t>(
+                  req_field(declined_num, "handle").value()) &&
+              std::get<bool>(req_field(declined_num, "denied").value()),
+          "online friends decline numeric mismatch");
+
+    const Value after_triage = parse_stdout_json(
+        run_cli({"online", "friends", "list", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online friends list after triage");
+    check(req_int(after_triage, "count") == 4 &&
+              req_int(after_triage, "friend_count") == 2 &&
+              req_int(after_triage, "pending_received_count") == 0 &&
+              req_int(after_triage, "pending_sent_count") == 1 &&
+              req_int(after_triage, "blocked_count") == 1,
+          "friends list counts after accept/deny/decline mismatch");
+
+    // Remove by handle (phall -> 1005)
+    const Value removed_handle = parse_stdout_json(
+        run_cli({"online", "friends", "remove", "phall", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends remove handle");
+    check(std::get<bool>(req_field(removed_handle, "removed").value()) &&
+              req_int(removed_handle, "target_account_id") == 1005 &&
+              req_int(removed_handle, "account_id") == 1005 &&
+              req_str(removed_handle, "handle") == "phall",
+          "online friends remove by handle mismatch");
+
+    // Block by handle (wingman -> 1002)
+    const Value blocked_handle = parse_stdout_json(
+        run_cli({"online", "friends", "block", "wingman", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends block handle");
+    check(std::get<bool>(req_field(blocked_handle, "blocked").value()) &&
+              req_int(blocked_handle, "target_account_id") == 1002 &&
+              req_int(blocked_handle, "account_id") == 1002 &&
+              req_str(blocked_handle, "handle") == "wingman",
+          "online friends block by handle mismatch");
   }
 
   // 12. `online party create / info / invite / join / kick / leave / disband`
@@ -3221,6 +3383,21 @@ int main(int argc, char **argv) {
     test_party_lobby_serve_and_status({temp.path(), self_exe});
     test_flightdeck_cli_once_and_themes(temp.path());
     test_online_cli_subcommand(temp.path());
+    {
+      const auto up_help = run_cli({"upgrade", "--help"});
+      check(up_help.exit_code == 0 &&
+                up_help.err.find("blackbird upgrade") != std::string::npos &&
+                up_help.err.find("--no-ask") != std::string::npos,
+            "upgrade --help must exit 0 with --no-ask usage");
+      const auto up_bad = run_cli({"upgrade", "--bogus-flag"});
+      check(up_bad.exit_code == 2 &&
+                up_bad.err.find("unknown option") != std::string::npos,
+            "upgrade must reject unknown options");
+      const auto up_bad_url =
+          run_cli({"upgrade", "--check", "--base-url", "http://insecure.example"});
+      check(up_bad_url.exit_code != 0,
+            "upgrade --check must refuse insecure http:// base URL");
+    }
 
     std::cout << "PASS command_post_cli\n";
     return 0;

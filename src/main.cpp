@@ -22,6 +22,7 @@
 #include "blackbird/responses_provider.hpp"
 #include "blackbird/runtime_paths.hpp"
 #include "blackbird/saved_state.hpp"
+#include "blackbird/self_upgrade.hpp"
 #include "blackbird/sprite.hpp"
 #include "blackbird/station.hpp"
 #include "blackbird/terminal.hpp"
@@ -781,6 +782,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                "blackbird resume [last|N|query] [--root DIR] [--plain]\n"
                "blackbird flightdeck [--session DIR] [--theme NAME] [--fps 1..30] "
                "[--once] [--halfblock]\n"
+               "blackbird upgrade [--check] [--no-ask|-y|--yes] [--version TAG] "
+               "[--restart]\n"
                "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
                "[--model NAME] [--workflow FILE] "
                "[--once "
@@ -796,7 +799,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                "/originals, /restore "
                "ENTRY, /lua CODE, /model NAME, /effort LEVEL, /workflow FILE, "
                "/session, /sessions, /resume, /cwd [PATH], /profile, /new, "
-               "/restart NOTE, /paste (until /send), /quit or /exit\n";
+               "/restart NOTE, /upgrade [--check|--no-ask], /paste (until /send), "
+               "/quit or /exit\n";
         return 0;
       }
       if (arg == "--list-sessions") {
@@ -1236,6 +1240,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     ContextStore &context = *opened_context;
     // Set once this process records a restart: that exit is a handoff.
     std::atomic_bool restart_pending{false};
+    std::optional<std::filesystem::path> upgrade_exec_binary;
     struct CleanStop {
       RetainedState &root;
       ContextStore &context;
@@ -2517,6 +2522,93 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               session_store.restart(prompt.substr(9), &command_context);
               restart_capture = command_context;
               restart_pending.store(true);
+            } else if (prompt == "/upgrade" || prompt.starts_with("/upgrade ")) {
+              raw_main_branch(dispatch, 25);
+              UpgradeConfig up_cfg{};
+              up_cfg.current_version_string = BLACKBIRD_VERSION_STRING;
+              bool usage_err = false;
+              std::istringstream tok_in{
+                  prompt.size() > 8 ? std::string{prompt.substr(8)} : std::string{}};
+              std::string tok;
+              while (tok_in >> tok) {
+                if (tok == "--check") {
+                  up_cfg.check_only = true;
+                } else if (tok == "--no-ask" || tok == "--yes" || tok == "-y") {
+                  up_cfg.no_ask = true;
+                } else if (tok == "--force") {
+                  up_cfg.force = true;
+                } else if (tok == "--version") {
+                  if (!(tok_in >> up_cfg.version)) {
+                    usage_err = true;
+                    break;
+                  }
+                } else {
+                  usage_err = true;
+                  break;
+                }
+              }
+              auto report_upgrade = [&](const std::string &msg) {
+                if (tui)
+                  ui.notice(msg);
+                else
+                  emit(msg);
+              };
+              if (usage_err) {
+                report_upgrade("Usage: /upgrade [--check] [--no-ask|-y|--yes] "
+                               "[--version vX.Y.Z] [--force]\n");
+              } else {
+                auto on_prog = [&](const UpgradeProgress &p) {
+                  if (p.stage == UpgradeStage::downloading && p.bytes_done > 0 &&
+                      p.bytes_done < p.bytes_total) {
+                    return;
+                  }
+                  report_upgrade(format_upgrade_progress_line(p) + "\n");
+                };
+                if (up_cfg.check_only || !up_cfg.no_ask) {
+                  const auto checked = check_for_upgrade(up_cfg, on_prog);
+                  if (!checked.has_value()) {
+                    report_upgrade(std::string{"Upgrade check failed: "} +
+                                   error_name(checked.error().code) + "\n");
+                  } else if (!checked.value().update_available && !up_cfg.force) {
+                    report_upgrade("Blackbird is already up to date (" +
+                                   (checked.value().latest_version.empty()
+                                        ? checked.value().latest_commit
+                                        : checked.value().latest_version) +
+                                   ", " + checked.value().target + ").\n");
+                  } else {
+                    const std::filesystem::path disp_prefix =
+                        std::getenv("HOME") != nullptr
+                            ? std::filesystem::path{std::getenv("HOME")} / ".local"
+                            : std::filesystem::path{"~/.local"};
+                    report_upgrade(
+                        format_upgrade_prompt_summary(checked.value(), disp_prefix) +
+                        "\nPermission required: run `/upgrade --yes` (or "
+                        "`/upgrade --no-ask`) to download, SHA-256 verify, "
+                        "install, and seamlessly restart this session.\n");
+                  }
+                } else {
+                  const auto res = perform_upgrade(up_cfg, on_prog);
+                  if (!res.has_value()) {
+                    report_upgrade(std::string{"Upgrade failed: "} +
+                                   error_name(res.error().code) + "\n");
+                  } else if (res.value().already_up_to_date) {
+                    report_upgrade("Blackbird is already up to date (" +
+                                   res.value().check.latest_version + ", " +
+                                   res.value().check.target + ").\n");
+                  } else if (res.value().upgraded) {
+                    report_upgrade("Upgraded to " + res.value().check.latest_version +
+                                   " (" + res.value().installed_binary.string() +
+                                   ") — restarting seamlessly into this session...\n");
+                    engine.validate_restart(&command_context);
+                    session_store.restart("upgraded to " +
+                                              res.value().check.latest_version,
+                                          &command_context);
+                    upgrade_exec_binary = res.value().installed_binary;
+                    restart_capture = command_context;
+                    restart_pending.store(true);
+                  }
+                }
+              }
             } else if (prompt.starts_with("/workflow ")) {
               raw_main_branch(dispatch, 26);
               auto candidate = session_store.settings();
@@ -3096,7 +3188,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         return terminated_status;
       if (!restart_pending.load())
         return 0;
-      if (!switched_session)
+      if (!switched_session && !upgrade_exec_binary.has_value())
         return 75;
       const std::uint8_t method = 3;
       RawSessionCall selection{4460, 4461, &restart_capture,
@@ -3104,9 +3196,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       selection.run([&] {
         handoff.select(selection);
         const auto path = raw_restart_path(selection, session);
+        const std::string exec_target = upgrade_exec_binary.has_value()
+                                            ? upgrade_exec_binary->string()
+                                            : std::string{argv[0]};
         std::vector<std::string> arguments;
         for (const auto value :
-             {std::string_view{argv[0]}, std::string_view{"--session"},
+             {std::string_view{exec_target}, std::string_view{"--session"},
               std::string_view{path}, std::string_view{"--resume-continue"},
               std::string_view{"--new-session-instance"}})
           arguments.emplace_back(

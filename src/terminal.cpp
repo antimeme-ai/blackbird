@@ -111,6 +111,10 @@ const std::array builtin_commands{
     ChatCommand{"/workflow", "FILE", "Select the turn workflow", "Programs"},
     ChatCommand{"/restart", "NOTE", "Request native restart; build replacement first",
                 "Programs"},
+    ChatCommand{
+        "/upgrade", "[--check|--no-ask]",
+        "Check, SHA-256 verify, install & seamlessly restart into latest release",
+        "Programs"},
     ChatCommand{"/decision", "JSON", "Evaluate a native decision-model batch (Jev)",
                 "Tools"},
     ChatCommand{"/exec", "JSON", "Launch a command; yield_ms releases its wait",

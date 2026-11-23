@@ -16,8 +16,11 @@
 #include <vector>
 
 #include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
 #include <openssl/rand.h>
 
 namespace blackbird::mp {
@@ -62,9 +65,88 @@ struct BnCtxDeleter {
   }
 };
 
+struct EvpCipherCtxDeleter {
+  void operator()(EVP_CIPHER_CTX *ctx) const noexcept {
+    if (ctx != nullptr) {
+      EVP_CIPHER_CTX_free(ctx);
+    }
+  }
+};
+
+struct EvpKdfDeleter {
+  void operator()(EVP_KDF *kdf) const noexcept {
+    if (kdf != nullptr) {
+      EVP_KDF_free(kdf);
+    }
+  }
+};
+
+struct EvpKdfCtxDeleter {
+  void operator()(EVP_KDF_CTX *ctx) const noexcept {
+    if (ctx != nullptr) {
+      EVP_KDF_CTX_free(ctx);
+    }
+  }
+};
+
 using UniqueEvpPkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
 using UniqueEvpMdCtx = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
 using UniqueBnCtx = std::unique_ptr<BN_CTX, BnCtxDeleter>;
+using UniqueEvpCipherCtx = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter>;
+using UniqueEvpKdf = std::unique_ptr<EVP_KDF, EvpKdfDeleter>;
+using UniqueEvpKdfCtx = std::unique_ptr<EVP_KDF_CTX, EvpKdfCtxDeleter>;
+
+template <std::size_t N> class CleanseArrayGuard {
+public:
+  explicit CleanseArrayGuard(std::array<std::uint8_t, N> &buf) noexcept : buf_(buf) {}
+  CleanseArrayGuard(const CleanseArrayGuard &) = delete;
+  CleanseArrayGuard &operator=(const CleanseArrayGuard &) = delete;
+  ~CleanseArrayGuard() { OPENSSL_cleanse(buf_.data(), buf_.size()); }
+
+private:
+  std::array<std::uint8_t, N> &buf_;
+};
+
+class CleanseVectorGuard {
+public:
+  explicit CleanseVectorGuard(std::vector<std::uint8_t> &buf) noexcept : buf_(buf) {}
+  CleanseVectorGuard(const CleanseVectorGuard &) = delete;
+  CleanseVectorGuard &operator=(const CleanseVectorGuard &) = delete;
+  ~CleanseVectorGuard() {
+    if (!buf_.empty()) {
+      OPENSSL_cleanse(buf_.data(), buf_.size());
+    }
+  }
+
+private:
+  std::vector<std::uint8_t> &buf_;
+};
+
+class CleanseStringGuard {
+public:
+  explicit CleanseStringGuard(std::string &buf) noexcept : buf_(buf) {}
+  CleanseStringGuard(const CleanseStringGuard &) = delete;
+  CleanseStringGuard &operator=(const CleanseStringGuard &) = delete;
+  ~CleanseStringGuard() {
+    if (!buf_.empty()) {
+      OPENSSL_cleanse(buf_.data(), buf_.size());
+    }
+  }
+
+private:
+  std::string &buf_;
+};
+
+template <typename T> class CleanseScalarGuard {
+public:
+  explicit CleanseScalarGuard(T &value) noexcept : value_(value) {}
+  CleanseScalarGuard(const CleanseScalarGuard &) = delete;
+  CleanseScalarGuard &operator=(const CleanseScalarGuard &) = delete;
+  ~CleanseScalarGuard() { OPENSSL_cleanse(&value_, sizeof(value_)); }
+
+private:
+  T &value_;
+};
 
 class BnCtxScope {
 public:
@@ -310,16 +392,16 @@ std::optional<std::uint8_t> base64_std_value(char ch) noexcept {
   return std::nullopt;
 }
 
-// Strict RFC 4648 standard Base64 decode: exact multiple of 4, canonical '=' padding,
-// non-zero unused pad bits rejected.
-std::optional<std::vector<std::uint8_t>> base64_std_decode(std::string_view text) {
+// Strict RFC 4648 standard Base64 decode into a caller-supplied buffer: exact multiple
+// of 4, canonical '=' padding, non-zero unused pad bits rejected.
+bool base64_std_decode_into(std::string_view text, std::vector<std::uint8_t> &out) {
+  out.clear();
   if (text.empty()) {
-    return std::vector<std::uint8_t>{};
+    return true;
   }
   if ((text.size() % 4U) != 0U) {
-    return std::nullopt;
+    return false;
   }
-  std::vector<std::uint8_t> out;
   out.reserve((text.size() / 4U) * 3U);
   for (std::size_t i = 0U; i < text.size(); i += 4U) {
     const bool is_last = (i + 4U == text.size());
@@ -330,28 +412,28 @@ std::optional<std::vector<std::uint8_t>> base64_std_decode(std::string_view text
     const auto v0 = base64_std_value(c0);
     const auto v1 = base64_std_value(c1);
     if (!v0.has_value() || !v1.has_value()) {
-      return std::nullopt;
+      return false;
     }
     if (c2 == '=' && c3 == '=') {
       if (!is_last) {
-        return std::nullopt;
+        return false;
       }
       if ((*v1 & 0x0fU) != 0U) {
-        return std::nullopt;
+        return false;
       }
       out.push_back(static_cast<std::uint8_t>((*v0 << 2U) | (*v1 >> 4U)));
       continue;
     }
     const auto v2 = base64_std_value(c2);
     if (!v2.has_value()) {
-      return std::nullopt;
+      return false;
     }
     if (c3 == '=') {
       if (!is_last) {
-        return std::nullopt;
+        return false;
       }
       if ((*v2 & 0x03U) != 0U) {
-        return std::nullopt;
+        return false;
       }
       out.push_back(static_cast<std::uint8_t>((*v0 << 2U) | (*v1 >> 4U)));
       out.push_back(static_cast<std::uint8_t>(((*v1 & 0x0fU) << 4U) | (*v2 >> 2U)));
@@ -359,11 +441,19 @@ std::optional<std::vector<std::uint8_t>> base64_std_decode(std::string_view text
     }
     const auto v3 = base64_std_value(c3);
     if (!v3.has_value()) {
-      return std::nullopt;
+      return false;
     }
     out.push_back(static_cast<std::uint8_t>((*v0 << 2U) | (*v1 >> 4U)));
     out.push_back(static_cast<std::uint8_t>(((*v1 & 0x0fU) << 4U) | (*v2 >> 2U)));
     out.push_back(static_cast<std::uint8_t>(((*v2 & 0x03U) << 6U) | *v3));
+  }
+  return true;
+}
+
+std::optional<std::vector<std::uint8_t>> base64_std_decode(std::string_view text) {
+  std::vector<std::uint8_t> out;
+  if (!base64_std_decode_into(text, out)) {
+    return std::nullopt;
   }
   return out;
 }
@@ -1400,6 +1490,10 @@ const char *mp_error_name(MpError detail) noexcept {
     return "reserved_handle";
   case MpError::crypto_internal:
     return "crypto_internal";
+  case MpError::invalid_recovery_key:
+    return "invalid_recovery_key";
+  case MpError::invalid_device_label:
+    return "invalid_device_label";
   case MpError::endpoint_too_large:
     return "endpoint_too_large";
   case MpError::endpoint_truncated:
@@ -1512,6 +1606,18 @@ const char *mp_error_name(MpError detail) noexcept {
     return "mp1_safe_int_exceeded";
   case MpError::mp1_invalid_cwt_length:
     return "mp1_invalid_cwt_length";
+  case MpError::mpkey_invalid_passphrase:
+    return "mpkey_invalid_passphrase";
+  case MpError::mpkey_invalid_pem:
+    return "mpkey_invalid_pem";
+  case MpError::mpkey_invalid_magic:
+    return "mpkey_invalid_magic";
+  case MpError::mpkey_invalid_params:
+    return "mpkey_invalid_params";
+  case MpError::mpkey_decrypt_failed:
+    return "mpkey_decrypt_failed";
+  case MpError::mpkey_invalid_payload:
+    return "mpkey_invalid_payload";
   }
   return "unknown";
 }
@@ -2072,6 +2178,250 @@ Result<std::string> compute_safety_number(AccountId account_id,
     }
   }
   return Result<std::string>::success(std::move(out));
+}
+
+namespace {
+
+inline constexpr std::string_view kCrockfordBase32Alphabet =
+    "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+inline constexpr std::string_view kRecoveryKeyDomainSep = "mp-recovery-v1:";
+inline constexpr std::string_view kDeviceFingerprintDomainSep = "mpdevfp2:";
+
+constexpr bool is_recovery_body_ws(char ch) noexcept {
+  return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\f' || ch == '\r';
+}
+
+constexpr std::optional<std::uint8_t> crockford_decode_char(char ch) noexcept {
+  if (ch == '0' || ch == 'O' || ch == 'o') {
+    return 0U;
+  }
+  if (ch == '1' || ch == 'I' || ch == 'i' || ch == 'L' || ch == 'l') {
+    return 1U;
+  }
+  if (ch >= '2' && ch <= '9') {
+    return static_cast<std::uint8_t>(ch - '0');
+  }
+  if (ch >= 'A' && ch <= 'H') {
+    return static_cast<std::uint8_t>(ch - 'A' + 10);
+  }
+  if (ch >= 'a' && ch <= 'h') {
+    return static_cast<std::uint8_t>(ch - 'a' + 10);
+  }
+  if (ch == 'J' || ch == 'j') {
+    return 18U;
+  }
+  if (ch == 'K' || ch == 'k') {
+    return 19U;
+  }
+  if (ch == 'M' || ch == 'm') {
+    return 20U;
+  }
+  if (ch == 'N' || ch == 'n') {
+    return 21U;
+  }
+  if (ch >= 'P' && ch <= 'T') {
+    return static_cast<std::uint8_t>(ch - 'P' + 22);
+  }
+  if (ch >= 'p' && ch <= 't') {
+    return static_cast<std::uint8_t>(ch - 'p' + 22);
+  }
+  if (ch >= 'V' && ch <= 'Z') {
+    return static_cast<std::uint8_t>(ch - 'V' + 27);
+  }
+  if (ch >= 'v' && ch <= 'z') {
+    return static_cast<std::uint8_t>(ch - 'v' + 27);
+  }
+  return std::nullopt;
+}
+
+Result<std::array<std::uint8_t, 2>>
+recovery_key_checksum(const Ed25519Seed &root_seed) {
+  static_assert(kRecoveryKeyDomainSep.size() == 15U);
+  std::array<std::uint8_t, kRecoveryKeyDomainSep.size() + 32U> preimage{};
+  CleanseArrayGuard preimage_guard{preimage};
+  std::memcpy(preimage.data(), kRecoveryKeyDomainSep.data(),
+              kRecoveryKeyDomainSep.size());
+  std::memcpy(preimage.data() + kRecoveryKeyDomainSep.size(), root_seed.data(),
+              root_seed.size());
+  const auto digest = sha256(preimage);
+  if (!digest.has_value()) {
+    return Result<std::array<std::uint8_t, 2>>::failure(digest.error());
+  }
+  return Result<std::array<std::uint8_t, 2>>::success(
+      std::array<std::uint8_t, 2>{digest.value()[0], digest.value()[1]});
+}
+
+bool starts_with_ascii_icase(std::string_view text, std::string_view prefix) noexcept {
+  if (text.size() < prefix.size()) {
+    return false;
+  }
+  for (std::size_t i = 0U; i < prefix.size(); ++i) {
+    if (to_ascii_lower(text[i]) != to_ascii_lower(prefix[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
+Result<std::string> encode_recovery_key(const Ed25519Seed &root_seed) {
+  const auto chk = recovery_key_checksum(root_seed);
+  if (!chk.has_value()) {
+    return Result<std::string>::failure(chk.error());
+  }
+
+  std::array<std::uint8_t, 34U> payload{};
+  CleanseArrayGuard payload_guard{payload};
+  std::memcpy(payload.data(), root_seed.data(), root_seed.size());
+  payload[32] = chk.value()[0];
+  payload[33] = chk.value()[1];
+
+  std::string out;
+  out.reserve(kRecoveryKeyFormattedLength);
+  out.append(kRecoveryKeyPrefix);
+
+  std::uint32_t bit_buf = 0U;
+  CleanseScalarGuard bit_buf_guard{bit_buf};
+  std::uint32_t bit_len = 0U;
+  std::size_t emitted = 0U;
+
+  for (const std::uint8_t byte : payload) {
+    bit_buf = (bit_buf << 8U) | static_cast<std::uint32_t>(byte);
+    bit_len += 8U;
+    while (bit_len >= 5U) {
+      bit_len -= 5U;
+      const auto idx = static_cast<std::size_t>((bit_buf >> bit_len) & 0x1fU);
+      if (emitted > 0U && (emitted % 5U) == 0U) {
+        out.push_back('-');
+      }
+      out.push_back(kCrockfordBase32Alphabet[idx]);
+      ++emitted;
+    }
+  }
+  // 272 mod 5 == 2 remaining bits; pad 3 trailing zero bits for the 55th symbol.
+  if (bit_len > 0U) {
+    const auto idx = static_cast<std::size_t>((bit_buf << (5U - bit_len)) & 0x1fU);
+    if (emitted > 0U && (emitted % 5U) == 0U) {
+      out.push_back('-');
+    }
+    out.push_back(kCrockfordBase32Alphabet[idx]);
+  }
+  return Result<std::string>::success(std::move(out));
+}
+
+Result<Ed25519Seed> decode_recovery_key(std::string_view raw) {
+  if (raw.size() > kMaxRecoveryKeyInputLength) {
+    return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+  }
+  for (const char ch : raw) {
+    if ((static_cast<std::uint8_t>(ch) & 0x80U) != 0U) {
+      return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+    }
+  }
+
+  const std::string_view trimmed = trim_ascii_ws(raw);
+  if (!starts_with_ascii_icase(trimmed, kRecoveryKeyPrefix)) {
+    return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+  }
+  const std::string_view body = trimmed.substr(kRecoveryKeyPrefix.size());
+
+  std::array<std::uint8_t, 55U> symbols{};
+  CleanseArrayGuard symbols_guard{symbols};
+  std::size_t count = 0U;
+  for (const char ch : body) {
+    if (ch == '-' || is_recovery_body_ws(ch)) {
+      continue;
+    }
+    const auto val = crockford_decode_char(ch);
+    if (!val.has_value() || count >= symbols.size()) {
+      return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+    }
+    symbols[count++] = *val;
+  }
+  if (count != symbols.size()) {
+    return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+  }
+
+  std::array<std::uint8_t, 34U> payload{};
+  CleanseArrayGuard payload_guard{payload};
+  std::size_t out_idx = 0U;
+  std::uint32_t bit_buf = 0U;
+  CleanseScalarGuard bit_buf_guard{bit_buf};
+  std::uint32_t bit_len = 0U;
+  for (const std::uint8_t sym : symbols) {
+    bit_buf = (bit_buf << 5U) | static_cast<std::uint32_t>(sym);
+    bit_len += 5U;
+    while (bit_len >= 8U) {
+      bit_len -= 8U;
+      if (out_idx >= payload.size()) {
+        return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+      }
+      payload[out_idx++] = static_cast<std::uint8_t>((bit_buf >> bit_len) & 0xffU);
+    }
+  }
+  // Enforce canonical zero padding in the final 3 unused bits.
+  if (out_idx != payload.size() || bit_len != 3U || (bit_buf & 0x07U) != 0U) {
+    return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+  }
+
+  Ed25519Seed seed{};
+  CleanseArrayGuard seed_guard{seed};
+  std::memcpy(seed.data(), payload.data(), seed.size());
+  const auto expected = recovery_key_checksum(seed);
+  if (!expected.has_value()) {
+    return Result<Ed25519Seed>::failure(expected.error());
+  }
+  const std::span<const std::uint8_t> got_chk{payload.data() + 32U, 2U};
+  if (!constant_time_equal({got_chk, expected.value()})) {
+    return fail<Ed25519Seed>(ErrorCode::corrupt, MpError::invalid_recovery_key);
+  }
+  return Result<Ed25519Seed>::success(seed);
+}
+
+Result<std::string> compute_device_fingerprint(const Ed25519PubKey &device_pubkey) {
+  if (const auto valid = validate_ed25519_pubkey_strict(device_pubkey);
+      !valid.has_value()) {
+    return Result<std::string>::failure(valid.error());
+  }
+
+  static_assert(kDeviceFingerprintDomainSep.size() == 9U);
+  std::array<std::uint8_t, kDeviceFingerprintDomainSep.size() + 32U> preimage{};
+  std::memcpy(preimage.data(), kDeviceFingerprintDomainSep.data(),
+              kDeviceFingerprintDomainSep.size());
+  std::memcpy(preimage.data() + kDeviceFingerprintDomainSep.size(),
+              device_pubkey.data(), device_pubkey.size());
+
+  const auto digest = sha256(preimage);
+  if (!digest.has_value()) {
+    return Result<std::string>::failure(digest.error());
+  }
+
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(kDeviceFingerprintFormattedLength);
+  for (std::size_t i = 0U; i < 16U; ++i) {
+    if (i > 0U && (i % 4U) == 0U) {
+      out.push_back('-');
+    }
+    const std::uint8_t byte = digest.value()[i];
+    out.push_back(kHex[(byte >> 4U) & 0x0fU]);
+    out.push_back(kHex[byte & 0x0fU]);
+  }
+  return Result<std::string>::success(std::move(out));
+}
+
+bool valid_device_label(std::string_view label) noexcept {
+  if (label.empty() || label.size() > kMaxDeviceLabelLength) {
+    return false;
+  }
+  for (const char ch : label) {
+    const auto byte = static_cast<std::uint8_t>(ch);
+    if (byte < 0x20U || byte > 0x7eU) {
+      return false;
+    }
+  }
+  return true;
 }
 
 Result<AccountHandle> AccountHandle::parse(std::string_view raw) {
@@ -3140,25 +3490,68 @@ Result<HttpMethod> parse_http_method(std::string_view name) {
   return fail<HttpMethod>(ErrorCode::unsupported, MpError::rfc9421_unsupported_method);
 }
 
+namespace {
+
+Result<std::array<std::uint8_t, 16>> parse_hex16_prefix(std::string_view hex_part) {
+  if (hex_part.size() != 32U) {
+    return fail<std::array<std::uint8_t, 16>>(ErrorCode::invalid_identity,
+                                              MpError::rfc9421_invalid_key_id);
+  }
+  std::array<std::uint8_t, 16> prefix{};
+  for (std::size_t i = 0U; i < prefix.size(); ++i) {
+    const auto hi = hex_nibble_lower(hex_part[i * 2U]);
+    const auto lo = hex_nibble_lower(hex_part[(i * 2U) + 1U]);
+    if (!hi.has_value() || !lo.has_value()) {
+      return fail<std::array<std::uint8_t, 16>>(ErrorCode::invalid_identity,
+                                                MpError::rfc9421_invalid_key_id);
+    }
+    prefix[i] = static_cast<std::uint8_t>((hi.value() << 4U) | lo.value());
+  }
+  return Result<std::array<std::uint8_t, 16>>::success(prefix);
+}
+
+std::optional<std::span<const std::uint8_t, 16>>
+pubkey_bound_key_id_prefix(const KeyId &key_id) noexcept {
+  if (const auto *reg = std::get_if<RegistrationKeyId>(&key_id)) {
+    return std::span<const std::uint8_t, 16>{reg->root_pubkey_sha256_prefix};
+  }
+  if (const auto *rec = std::get_if<RecoveryKeyId>(&key_id)) {
+    return std::span<const std::uint8_t, 16>{rec->root_pubkey_sha256_prefix};
+  }
+  if (const auto *link = std::get_if<DeviceLinkKeyId>(&key_id)) {
+    return std::span<const std::uint8_t, 16>{link->device_pubkey_sha256_prefix};
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
 Result<KeyId> parse_key_id(std::string_view raw) {
   static constexpr std::string_view kRegPrefix = "reg.";
   if (raw.starts_with(kRegPrefix)) {
-    const std::string_view hex_part = raw.substr(kRegPrefix.size());
-    if (hex_part.size() != 32U) {
-      return fail<KeyId>(ErrorCode::invalid_identity, MpError::rfc9421_invalid_key_id);
+    const auto prefix = parse_hex16_prefix(raw.substr(kRegPrefix.size()));
+    if (!prefix.has_value()) {
+      return Result<KeyId>::failure(prefix.error());
     }
-    RegistrationKeyId reg{};
-    for (std::size_t i = 0U; i < 16U; ++i) {
-      const auto hi = hex_nibble_lower(hex_part[i * 2U]);
-      const auto lo = hex_nibble_lower(hex_part[(i * 2U) + 1U]);
-      if (!hi.has_value() || !lo.has_value()) {
-        return fail<KeyId>(ErrorCode::invalid_identity,
-                           MpError::rfc9421_invalid_key_id);
-      }
-      reg.root_pubkey_sha256_prefix[i] =
-          static_cast<std::uint8_t>((hi.value() << 4U) | lo.value());
+    return Result<KeyId>::success(RegistrationKeyId{prefix.value()});
+  }
+
+  static constexpr std::string_view kRecPrefix = "rec.";
+  if (raw.starts_with(kRecPrefix)) {
+    const auto prefix = parse_hex16_prefix(raw.substr(kRecPrefix.size()));
+    if (!prefix.has_value()) {
+      return Result<KeyId>::failure(prefix.error());
     }
-    return Result<KeyId>::success(reg);
+    return Result<KeyId>::success(RecoveryKeyId{prefix.value()});
+  }
+
+  static constexpr std::string_view kLinkPrefix = "link.";
+  if (raw.starts_with(kLinkPrefix)) {
+    const auto prefix = parse_hex16_prefix(raw.substr(kLinkPrefix.size()));
+    if (!prefix.has_value()) {
+      return Result<KeyId>::failure(prefix.error());
+    }
+    return Result<KeyId>::success(DeviceLinkKeyId{prefix.value()});
   }
 
   const std::size_t dot = raw.find('.');
@@ -3188,8 +3581,14 @@ std::string format_key_id(const KeyId &key_id) {
   if (const auto *root = std::get_if<RootKeyId>(&key_id)) {
     return root->account_id.to_decimal() + ".root";
   }
-  const auto &reg = std::get<RegistrationKeyId>(key_id);
-  return "reg." + hex_lower(reg.root_pubkey_sha256_prefix);
+  if (const auto *reg = std::get_if<RegistrationKeyId>(&key_id)) {
+    return "reg." + hex_lower(reg->root_pubkey_sha256_prefix);
+  }
+  if (const auto *rec = std::get_if<RecoveryKeyId>(&key_id)) {
+    return "rec." + hex_lower(rec->root_pubkey_sha256_prefix);
+  }
+  const auto &link = std::get<DeviceLinkKeyId>(key_id);
+  return "link." + hex_lower(link.device_pubkey_sha256_prefix);
 }
 
 Result<RegistrationKeyId> registration_key_id_for_pubkey(const Ed25519PubKey &pubkey) {
@@ -3201,6 +3600,45 @@ Result<RegistrationKeyId> registration_key_id_for_pubkey(const Ed25519PubKey &pu
   std::memcpy(reg.root_pubkey_sha256_prefix.data(), digest.value().data(),
               reg.root_pubkey_sha256_prefix.size());
   return Result<RegistrationKeyId>::success(reg);
+}
+
+Result<RecoveryKeyId> recovery_key_id_for_pubkey(const Ed25519PubKey &root_pubkey) {
+  const auto digest = sha256(root_pubkey);
+  if (!digest.has_value()) {
+    return Result<RecoveryKeyId>::failure(digest.error());
+  }
+  RecoveryKeyId rec{};
+  std::memcpy(rec.root_pubkey_sha256_prefix.data(), digest.value().data(),
+              rec.root_pubkey_sha256_prefix.size());
+  return Result<RecoveryKeyId>::success(rec);
+}
+
+Result<DeviceLinkKeyId>
+device_link_key_id_for_pubkey(const Ed25519PubKey &device_pubkey) {
+  const auto digest = sha256(device_pubkey);
+  if (!digest.has_value()) {
+    return Result<DeviceLinkKeyId>::failure(digest.error());
+  }
+  DeviceLinkKeyId link{};
+  std::memcpy(link.device_pubkey_sha256_prefix.data(), digest.value().data(),
+              link.device_pubkey_sha256_prefix.size());
+  return Result<DeviceLinkKeyId>::success(link);
+}
+
+Result<std::string> format_recovery_keyid(const Ed25519PubKey &root_pubkey) {
+  const auto rec = recovery_key_id_for_pubkey(root_pubkey);
+  if (!rec.has_value()) {
+    return Result<std::string>::failure(rec.error());
+  }
+  return Result<std::string>::success(format_key_id(rec.value()));
+}
+
+Result<std::string> format_device_link_keyid(const Ed25519PubKey &device_pubkey) {
+  const auto link = device_link_key_id_for_pubkey(device_pubkey);
+  if (!link.has_value()) {
+    return Result<std::string>::failure(link.error());
+  }
+  return Result<std::string>::success(format_key_id(link.value()));
 }
 
 Result<std::string> compute_content_digest(std::span<const std::uint8_t> body) {
@@ -3638,13 +4076,14 @@ Result<SignedRfc9421Headers> sign_rfc9421_request(const Ed25519SigningKey &signi
     return fail<SignedRfc9421Headers>(ErrorCode::invalid_range,
                                       MpError::rfc9421_invalid_window);
   }
-  if (const auto *reg = std::get_if<RegistrationKeyId>(&request.keyid)) {
-    const auto expected_reg = registration_key_id_for_pubkey(signing_key.public_key());
-    if (!expected_reg.has_value()) {
-      return Result<SignedRfc9421Headers>::failure(expected_reg.error());
+  if (const auto bound_prefix = pubkey_bound_key_id_prefix(request.keyid);
+      bound_prefix.has_value()) {
+    const auto digest = sha256(signing_key.public_key());
+    if (!digest.has_value()) {
+      return Result<SignedRfc9421Headers>::failure(digest.error());
     }
-    if (!constant_time_equal({expected_reg.value().root_pubkey_sha256_prefix,
-                              reg->root_pubkey_sha256_prefix})) {
+    const std::span<const std::uint8_t> expected_prefix{digest.value().data(), 16U};
+    if (!constant_time_equal({expected_prefix, *bound_prefix})) {
       return fail<SignedRfc9421Headers>(ErrorCode::invalid_identity,
                                         MpError::rfc9421_invalid_key_id);
     }
@@ -3763,13 +4202,14 @@ Result<VerifiedSignature> verify_rfc9421_request(const Rfc9421VerifyInput &input
     return Result<VerifiedSignature>::failure(parsed.error());
   }
 
-  if (const auto *reg = std::get_if<RegistrationKeyId>(&parsed.value().keyid)) {
+  if (const auto bound_prefix = pubkey_bound_key_id_prefix(parsed.value().keyid);
+      bound_prefix.has_value()) {
     const auto digest = sha256(input.pubkey);
     if (!digest.has_value()) {
       return Result<VerifiedSignature>::failure(digest.error());
     }
     const std::span<const std::uint8_t> prefix{digest.value().data(), 16U};
-    if (!constant_time_equal({prefix, reg->root_pubkey_sha256_prefix})) {
+    if (!constant_time_equal({prefix, *bound_prefix})) {
       return fail<VerifiedSignature>(ErrorCode::provider_auth,
                                      MpError::rfc9421_invalid_key_id);
     }
@@ -4125,6 +4565,843 @@ Result<CwtClaims> verify_party_member_cwt(const PartyMemberRecord &member,
       member.device_pubkey,
       now_s,
   });
+}
+
+// ---------------------------------------------------------------------------
+// 7. Portable Encrypted .mpkey v1 Recovery Container (Argon2id + AES-256-GCM)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline constexpr std::array<std::uint8_t, 8U> kMpKeyV1Magic = {
+    'M', 'P', 'K', 'E', 'Y', '1', 0x00U, 0x00U,
+};
+inline constexpr std::string_view kMpKeyV1AadPrefix = "mpkey-v1:";
+inline constexpr std::string_view kMpKeyPemBegin =
+    "-----BEGIN MULTIPLAYER RECOVERY KEY-----";
+inline constexpr std::string_view kMpKeyPemEnd =
+    "-----END MULTIPLAYER RECOVERY KEY-----";
+inline constexpr std::size_t kMpKeyV1HeaderBytes =
+    8U + kMpKeyV1SaltBytes + 4U + 4U + 4U + kMpKeyV1NonceBytes; // 48 bytes
+inline constexpr std::size_t kMpKeyV1AadBytes =
+    9U + kMpKeyV1SaltBytes + 12U; // 37 bytes
+inline constexpr std::size_t kMpKeyPemLineWidth = 64U;
+
+static_assert(kMpKeyV1HeaderBytes + kMpKeyV1TagBytes == kMpKeyV1MinBinaryBytes);
+
+Result<void> validate_mpkey_passphrase(std::string_view passphrase) {
+  if (passphrase.empty() || passphrase.size() > kMpKeyV1MaxPassphraseBytes) {
+    return fail_void(ErrorCode::invalid_range, MpError::mpkey_invalid_passphrase);
+  }
+  const std::span<const std::uint8_t> bytes{
+      reinterpret_cast<const std::uint8_t *>(passphrase.data()), passphrase.size()};
+  if (!is_valid_utf8(bytes)) {
+    return fail_void(ErrorCode::corrupt, MpError::mpkey_invalid_passphrase);
+  }
+  return Result<void>::success();
+}
+
+struct Argon2idDeriveInput {
+  std::string_view passphrase;
+  std::span<const std::uint8_t, kMpKeyV1SaltBytes> salt;
+  std::uint32_t memcost_kib = kMpKeyV1Argon2MemCostKiB;
+  std::uint32_t iterations = kMpKeyV1Argon2Iter;
+  std::uint32_t lanes = kMpKeyV1Argon2Lanes;
+};
+
+Result<void> derive_mpkey_argon2id(const Argon2idDeriveInput &in,
+                                   std::array<std::uint8_t, 32U> &out_key) {
+  std::vector<std::uint8_t> pass_buf(in.passphrase.size());
+  CleanseVectorGuard pass_guard{pass_buf};
+  if (!pass_buf.empty()) {
+    std::memcpy(pass_buf.data(), in.passphrase.data(), pass_buf.size());
+  }
+  std::array<std::uint8_t, kMpKeyV1SaltBytes> salt_buf{};
+  std::memcpy(salt_buf.data(), in.salt.data(), salt_buf.size());
+
+  std::uint32_t iter = in.iterations;
+  std::uint32_t memcost = in.memcost_kib;
+  std::uint32_t lanes = in.lanes;
+  std::uint32_t threads = 1U;
+  std::uint32_t version = kMpKeyV1Argon2Version;
+  std::uint32_t early_clean = 1U;
+
+  UniqueEvpKdf kdf{EVP_KDF_fetch(nullptr, "ARGON2ID", nullptr)};
+  if (!kdf) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  UniqueEvpKdfCtx kctx{EVP_KDF_CTX_new(kdf.get())};
+  if (!kctx) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  std::array<OSSL_PARAM, 9U> params{};
+  params[0] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
+                                                pass_buf.data(), pass_buf.size());
+  params[1] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, salt_buf.data(),
+                                                salt_buf.size());
+  params[2] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &iter);
+  params[3] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost);
+  params[4] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &lanes);
+  params[5] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &threads);
+  params[6] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_VERSION, &version);
+  params[7] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_EARLY_CLEAN, &early_clean);
+  params[8] = OSSL_PARAM_construct_end();
+
+  if (EVP_KDF_derive(kctx.get(), out_key.data(), out_key.size(), params.data()) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  return Result<void>::success();
+}
+
+struct MpKeyAadInput {
+  std::span<const std::uint8_t, kMpKeyV1SaltBytes> salt;
+  std::uint32_t memcost_kib = 0U;
+  std::uint32_t iterations = 0U;
+  std::uint32_t lanes = 0U;
+};
+
+void write_u32_le_into(std::uint8_t *dst, std::uint32_t value) noexcept {
+  for (std::size_t i = 0U; i < 4U; ++i) {
+    dst[i] = static_cast<std::uint8_t>((value >> (i * 8U)) & 0xffU);
+  }
+}
+
+std::uint32_t read_u32_le_from(const std::uint8_t *src) noexcept {
+  std::uint32_t value = 0U;
+  for (std::size_t i = 0U; i < 4U; ++i) {
+    value |= static_cast<std::uint32_t>(src[i]) << (i * 8U);
+  }
+  return value;
+}
+
+std::array<std::uint8_t, kMpKeyV1AadBytes> build_mpkey_aad(const MpKeyAadInput &in) {
+  static_assert(kMpKeyV1AadPrefix.size() == 9U);
+  std::array<std::uint8_t, kMpKeyV1AadBytes> aad{};
+  std::memcpy(aad.data(), kMpKeyV1AadPrefix.data(), kMpKeyV1AadPrefix.size());
+  std::memcpy(aad.data() + 9U, in.salt.data(), kMpKeyV1SaltBytes);
+  write_u32_le_into(aad.data() + 25U, in.memcost_kib);
+  write_u32_le_into(aad.data() + 29U, in.iterations);
+  write_u32_le_into(aad.data() + 33U, in.lanes);
+  return aad;
+}
+
+struct AesGcmEncryptInput {
+  std::span<const std::uint8_t, 32U> key;
+  std::span<const std::uint8_t, kMpKeyV1NonceBytes> nonce;
+  std::span<const std::uint8_t> aad;
+  std::span<const std::uint8_t> plaintext;
+};
+
+Result<void> aes256_gcm_encrypt(const AesGcmEncryptInput &in,
+                                std::vector<std::uint8_t> &ciphertext,
+                                std::array<std::uint8_t, kMpKeyV1TagBytes> &tag) {
+  if (in.plaintext.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      in.aad.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return fail_void(ErrorCode::invalid_range, MpError::crypto_internal);
+  }
+  UniqueEvpCipherCtx ctx{EVP_CIPHER_CTX_new()};
+  if (!ctx) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
+          1 ||
+      EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN,
+                          static_cast<int>(kMpKeyV1NonceBytes), nullptr) != 1 ||
+      EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, in.key.data(), in.nonce.data()) !=
+          1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  int aad_out_len = 0;
+  if (!in.aad.empty() &&
+      EVP_EncryptUpdate(ctx.get(), nullptr, &aad_out_len, in.aad.data(),
+                        static_cast<int>(in.aad.size())) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  ciphertext.assign(in.plaintext.size(), 0U);
+  int ct_len = 0;
+  if (!in.plaintext.empty() &&
+      EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &ct_len, in.plaintext.data(),
+                        static_cast<int>(in.plaintext.size())) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  std::uint8_t final_dummy = 0U;
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(
+          ctx.get(), ciphertext.empty() ? &final_dummy : ciphertext.data() + ct_len,
+          &final_len) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  if (static_cast<std::size_t>(ct_len) + static_cast<std::size_t>(final_len) !=
+      ciphertext.size()) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, static_cast<int>(tag.size()),
+                          tag.data()) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  return Result<void>::success();
+}
+
+struct AesGcmDecryptInput {
+  std::span<const std::uint8_t, 32U> key;
+  std::span<const std::uint8_t, kMpKeyV1NonceBytes> nonce;
+  std::span<const std::uint8_t> aad;
+  std::span<const std::uint8_t> ciphertext;
+  std::span<const std::uint8_t, kMpKeyV1TagBytes> tag;
+};
+
+Result<void> aes256_gcm_decrypt(const AesGcmDecryptInput &in,
+                                std::vector<std::uint8_t> &plaintext) {
+  if (in.ciphertext.size() >
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      in.aad.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return fail_void(ErrorCode::invalid_range, MpError::crypto_internal);
+  }
+  UniqueEvpCipherCtx ctx{EVP_CIPHER_CTX_new()};
+  if (!ctx) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
+          1 ||
+      EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN,
+                          static_cast<int>(kMpKeyV1NonceBytes), nullptr) != 1 ||
+      EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, in.key.data(), in.nonce.data()) !=
+          1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  int aad_out_len = 0;
+  if (!in.aad.empty() &&
+      EVP_DecryptUpdate(ctx.get(), nullptr, &aad_out_len, in.aad.data(),
+                        static_cast<int>(in.aad.size())) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  plaintext.assign(in.ciphertext.size(), 0U);
+  int pt_len = 0;
+  if (!in.ciphertext.empty() &&
+      EVP_DecryptUpdate(ctx.get(), plaintext.data(), &pt_len, in.ciphertext.data(),
+                        static_cast<int>(in.ciphertext.size())) != 1) {
+    return fail_void(ErrorCode::provider_auth, MpError::mpkey_decrypt_failed);
+  }
+
+  std::array<std::uint8_t, kMpKeyV1TagBytes> tag_copy{};
+  std::memcpy(tag_copy.data(), in.tag.data(), tag_copy.size());
+  if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG,
+                          static_cast<int>(tag_copy.size()), tag_copy.data()) != 1) {
+    return fail_void(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+
+  std::uint8_t final_dummy = 0U;
+  int final_len = 0;
+  if (EVP_DecryptFinal_ex(ctx.get(),
+                          plaintext.empty() ? &final_dummy : plaintext.data() + pt_len,
+                          &final_len) != 1) {
+    return fail_void(ErrorCode::provider_auth, MpError::mpkey_decrypt_failed);
+  }
+  if (static_cast<std::size_t>(pt_len) + static_cast<std::size_t>(final_len) !=
+      plaintext.size()) {
+    return fail_void(ErrorCode::provider_auth, MpError::mpkey_decrypt_failed);
+  }
+  return Result<void>::success();
+}
+
+void append_json_escaped_string(std::string &out, std::string_view text) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  out.push_back('"');
+  for (const char ch : text) {
+    const auto byte = static_cast<std::uint8_t>(ch);
+    if (ch == '"') {
+      out.append("\\\"");
+    } else if (ch == '\\') {
+      out.append("\\\\");
+    } else if (ch == '\b') {
+      out.append("\\b");
+    } else if (ch == '\f') {
+      out.append("\\f");
+    } else if (ch == '\n') {
+      out.append("\\n");
+    } else if (ch == '\r') {
+      out.append("\\r");
+    } else if (ch == '\t') {
+      out.append("\\t");
+    } else if (byte < 0x20U) {
+      out.append("\\u00");
+      out.push_back(kHex[(byte >> 4U) & 0x0fU]);
+      out.push_back(kHex[byte & 0x0fU]);
+    } else {
+      out.push_back(ch);
+    }
+  }
+  out.push_back('"');
+}
+
+Result<void> encode_mpkey_json_payload(const MpKeyPayload &payload, std::string &out) {
+  out.clear();
+  if (payload.handle.has_value()) {
+    const std::span<const std::uint8_t> hbytes{
+        reinterpret_cast<const std::uint8_t *>(payload.handle->data()),
+        payload.handle->size()};
+    if (!is_valid_utf8(hbytes)) {
+      return fail_void(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+  }
+
+  std::string seed_b64 = base64_std_encode(payload.root_seed);
+  CleanseStringGuard seed_b64_guard{seed_b64};
+
+  out.reserve(128U + (payload.handle.has_value() ? payload.handle->size() : 0U));
+  out.append("{\"v\":1,\"account_id\":");
+  if (payload.account_id.has_value()) {
+    out.append(payload.account_id->to_decimal());
+  } else {
+    out.append("null");
+  }
+  out.append(",\"handle\":");
+  if (payload.handle.has_value()) {
+    append_json_escaped_string(out, *payload.handle);
+  } else {
+    out.append("null");
+  }
+  out.append(",\"root_seed_b64\":\"");
+  out.append(seed_b64);
+  out.append("\"}");
+
+  if (kMpKeyV1HeaderBytes + out.size() + kMpKeyV1TagBytes > kMpKeyV1MaxBinaryBytes) {
+    return fail_void(ErrorCode::invalid_range, MpError::mpkey_invalid_payload);
+  }
+  return Result<void>::success();
+}
+
+void append_utf8_scalar(std::string &out, std::uint32_t scalar) {
+  if (scalar < 0x80U) {
+    out.push_back(static_cast<char>(scalar));
+  } else if (scalar < 0x800U) {
+    out.push_back(static_cast<char>(0xc0U | (scalar >> 6U)));
+    out.push_back(static_cast<char>(0x80U | (scalar & 0x3fU)));
+  } else if (scalar < 0x10000U) {
+    out.push_back(static_cast<char>(0xe0U | (scalar >> 12U)));
+    out.push_back(static_cast<char>(0x80U | ((scalar >> 6U) & 0x3fU)));
+    out.push_back(static_cast<char>(0x80U | (scalar & 0x3fU)));
+  } else {
+    out.push_back(static_cast<char>(0xf0U | (scalar >> 18U)));
+    out.push_back(static_cast<char>(0x80U | ((scalar >> 12U) & 0x3fU)));
+    out.push_back(static_cast<char>(0x80U | ((scalar >> 6U) & 0x3fU)));
+    out.push_back(static_cast<char>(0x80U | (scalar & 0x3fU)));
+  }
+}
+
+class StrictMpKeyJsonParser {
+public:
+  explicit StrictMpKeyJsonParser(std::string_view text) noexcept : text_(text) {}
+
+  Result<MpKeyPayload> parse() {
+    skip_ws();
+    if (!eat('{')) {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+    skip_ws();
+    if (pos_ >= text_.size() || text_[pos_] == '}') {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+
+    bool seen_v = false;
+    bool seen_account_id = false;
+    bool seen_handle = false;
+    bool seen_root_seed_b64 = false;
+
+    std::optional<AccountId> account_id;
+    std::optional<std::string> handle;
+    std::string seed_b64;
+    CleanseStringGuard seed_b64_guard{seed_b64};
+
+    while (true) {
+      skip_ws();
+      std::string key;
+      if (!parse_string_into(key)) {
+        return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+      }
+      skip_ws();
+      if (!eat(':')) {
+        return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+      }
+      skip_ws();
+
+      if (key == "v") {
+        if (seen_v) {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+        seen_v = true;
+        const auto tok = parse_strict_uint_token();
+        if (!tok.has_value() || *tok != "1") {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+      } else if (key == "account_id") {
+        if (seen_account_id) {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+        seen_account_id = true;
+        if (eat_literal("null")) {
+          account_id = std::nullopt;
+        } else {
+          const auto tok = parse_strict_uint_token();
+          if (!tok.has_value()) {
+            return fail<MpKeyPayload>(ErrorCode::corrupt,
+                                      MpError::mpkey_invalid_payload);
+          }
+          const auto parsed_id = AccountId::parse_decimal(*tok);
+          if (!parsed_id.has_value()) {
+            return fail<MpKeyPayload>(ErrorCode::corrupt,
+                                      MpError::mpkey_invalid_payload);
+          }
+          account_id = parsed_id.value();
+        }
+      } else if (key == "handle") {
+        if (seen_handle) {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+        seen_handle = true;
+        if (eat_literal("null")) {
+          handle = std::nullopt;
+        } else {
+          std::string parsed_handle;
+          if (!parse_string_into(parsed_handle)) {
+            return fail<MpKeyPayload>(ErrorCode::corrupt,
+                                      MpError::mpkey_invalid_payload);
+          }
+          handle = std::move(parsed_handle);
+        }
+      } else if (key == "root_seed_b64") {
+        if (seen_root_seed_b64) {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+        seen_root_seed_b64 = true;
+        if (!parse_string_into(seed_b64)) {
+          return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+        }
+      } else {
+        return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+      }
+
+      skip_ws();
+      if (eat(',')) {
+        continue;
+      }
+      if (eat('}')) {
+        break;
+      }
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+
+    skip_ws();
+    if (pos_ != text_.size()) {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+    if (!seen_v || !seen_account_id || !seen_handle || !seen_root_seed_b64) {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+    if (seed_b64.size() != 44U) {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+
+    std::vector<std::uint8_t> seed_bytes;
+    CleanseVectorGuard seed_bytes_guard{seed_bytes};
+    if (!base64_std_decode_into(seed_b64, seed_bytes) || seed_bytes.size() != 32U) {
+      return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+    }
+
+    Ed25519Seed root_seed{};
+    CleanseArrayGuard root_seed_guard{root_seed};
+    std::memcpy(root_seed.data(), seed_bytes.data(), root_seed.size());
+    return Result<MpKeyPayload>::success(
+        MpKeyPayload{account_id, std::move(handle), root_seed});
+  }
+
+private:
+  void skip_ws() noexcept {
+    while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' ||
+                                   text_[pos_] == '\r' || text_[pos_] == '\n')) {
+      ++pos_;
+    }
+  }
+
+  bool eat(char expected) noexcept {
+    if (pos_ < text_.size() && text_[pos_] == expected) {
+      ++pos_;
+      return true;
+    }
+    return false;
+  }
+
+  bool eat_literal(std::string_view literal) noexcept {
+    if (text_.substr(pos_).starts_with(literal)) {
+      pos_ += literal.size();
+      return true;
+    }
+    return false;
+  }
+
+  std::optional<std::uint32_t> parse_hex4() noexcept {
+    if (text_.size() - pos_ < 4U) {
+      return std::nullopt;
+    }
+    std::uint32_t value = 0U;
+    for (std::size_t i = 0U; i < 4U; ++i) {
+      const char ch = text_[pos_++];
+      std::uint32_t nibble = 0U;
+      if (ch >= '0' && ch <= '9') {
+        nibble = static_cast<std::uint32_t>(ch - '0');
+      } else if (ch >= 'a' && ch <= 'f') {
+        nibble = static_cast<std::uint32_t>(ch - 'a' + 10);
+      } else if (ch >= 'A' && ch <= 'F') {
+        nibble = static_cast<std::uint32_t>(ch - 'A' + 10);
+      } else {
+        return std::nullopt;
+      }
+      value = (value << 4U) | nibble;
+    }
+    return value;
+  }
+
+  bool parse_string_into(std::string &out) {
+    out.clear();
+    if (!eat('"')) {
+      return false;
+    }
+    while (pos_ < text_.size()) {
+      const char ch = text_[pos_++];
+      if (ch == '"') {
+        const std::span<const std::uint8_t> bytes{
+            reinterpret_cast<const std::uint8_t *>(out.data()), out.size()};
+        return is_valid_utf8(bytes);
+      }
+      if (static_cast<std::uint8_t>(ch) < 0x20U) {
+        return false;
+      }
+      if (ch != '\\') {
+        out.push_back(ch);
+        continue;
+      }
+      if (pos_ >= text_.size()) {
+        return false;
+      }
+      switch (text_[pos_++]) {
+      case '"':
+        out.push_back('"');
+        break;
+      case '\\':
+        out.push_back('\\');
+        break;
+      case '/':
+        out.push_back('/');
+        break;
+      case 'b':
+        out.push_back('\b');
+        break;
+      case 'f':
+        out.push_back('\f');
+        break;
+      case 'n':
+        out.push_back('\n');
+        break;
+      case 'r':
+        out.push_back('\r');
+        break;
+      case 't':
+        out.push_back('\t');
+        break;
+      case 'u': {
+        const auto first = parse_hex4();
+        if (!first.has_value()) {
+          return false;
+        }
+        std::uint32_t scalar = *first;
+        if (scalar >= 0xd800U && scalar <= 0xdbffU) {
+          if (!eat('\\') || !eat('u')) {
+            return false;
+          }
+          const auto low = parse_hex4();
+          if (!low.has_value() || *low < 0xdc00U || *low > 0xdfffU) {
+            return false;
+          }
+          scalar = 0x10000U + ((scalar - 0xd800U) << 10U) + (*low - 0xdc00U);
+        } else if (scalar >= 0xdc00U && scalar <= 0xdfffU) {
+          return false;
+        }
+        append_utf8_scalar(out, scalar);
+        break;
+      }
+      default:
+        return false;
+      }
+    }
+    return false;
+  }
+
+  std::optional<std::string_view> parse_strict_uint_token() noexcept {
+    const std::size_t start = pos_;
+    if (pos_ >= text_.size() || !is_ascii_digit(text_[pos_])) {
+      return std::nullopt;
+    }
+    if (text_[pos_] == '0') {
+      ++pos_;
+      if (pos_ < text_.size() && is_ascii_digit(text_[pos_])) {
+        return std::nullopt;
+      }
+    } else {
+      while (pos_ < text_.size() && is_ascii_digit(text_[pos_])) {
+        ++pos_;
+      }
+    }
+    if (pos_ < text_.size() &&
+        (text_[pos_] == '.' || text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      return std::nullopt;
+    }
+    return text_.substr(start, pos_ - start);
+  }
+
+  std::string_view text_;
+  std::size_t pos_ = 0U;
+};
+
+std::string format_mpkey_pem(std::span<const std::uint8_t> binary) {
+  const std::string b64 = base64_std_encode(binary);
+  std::string pem;
+  pem.reserve(kMpKeyPemBegin.size() + kMpKeyPemEnd.size() + b64.size() +
+              (b64.size() / kMpKeyPemLineWidth) + 4U);
+  pem.append(kMpKeyPemBegin);
+  pem.push_back('\n');
+  for (std::size_t offset = 0U; offset < b64.size(); offset += kMpKeyPemLineWidth) {
+    const std::size_t chunk = std::min(kMpKeyPemLineWidth, b64.size() - offset);
+    pem.append(b64, offset, chunk);
+    pem.push_back('\n');
+  }
+  pem.append(kMpKeyPemEnd);
+  pem.push_back('\n');
+  return pem;
+}
+
+Result<std::vector<std::uint8_t>> parse_mpkey_pem(std::string_view armored_pem) {
+  if (armored_pem.empty() || armored_pem.size() > kMpKeyV1MaxPemBytes) {
+    return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                           MpError::mpkey_invalid_pem);
+  }
+  for (const char ch : armored_pem) {
+    const auto byte = static_cast<std::uint8_t>(ch);
+    if (byte == 0x00U || (byte & 0x80U) != 0U) {
+      return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                             MpError::mpkey_invalid_pem);
+    }
+  }
+
+  std::vector<std::string_view> lines;
+  std::size_t pos = 0U;
+  while (pos < armored_pem.size()) {
+    const std::size_t nl = armored_pem.find('\n', pos);
+    std::string_view line = (nl == std::string_view::npos)
+                                ? armored_pem.substr(pos)
+                                : armored_pem.substr(pos, nl - pos);
+    if (!line.empty() && line.back() == '\r') {
+      line.remove_suffix(1U);
+    }
+    if (line.find('\r') != std::string_view::npos) {
+      return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                             MpError::mpkey_invalid_pem);
+    }
+    lines.push_back(line);
+    if (nl == std::string_view::npos) {
+      break;
+    }
+    pos = nl + 1U;
+  }
+
+  std::size_t first = 0U;
+  while (first < lines.size() && lines[first].empty()) {
+    ++first;
+  }
+  std::size_t last = lines.size();
+  while (last > first && lines[last - 1U].empty()) {
+    --last;
+  }
+  if (last - first < 3U) {
+    return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                           MpError::mpkey_invalid_pem);
+  }
+  if (lines[first] != kMpKeyPemBegin || lines[last - 1U] != kMpKeyPemEnd) {
+    return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                           MpError::mpkey_invalid_pem);
+  }
+
+  std::string b64_compact;
+  b64_compact.reserve(armored_pem.size());
+  for (std::size_t i = first + 1U; i + 1U < last; ++i) {
+    const std::string_view line = lines[i];
+    if (line.empty()) {
+      return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                             MpError::mpkey_invalid_pem);
+    }
+    for (const char ch : line) {
+      if (!is_ascii_alnum(ch) && ch != '+' && ch != '/' && ch != '=') {
+        return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                               MpError::mpkey_invalid_pem);
+      }
+    }
+    b64_compact.append(line);
+  }
+
+  std::vector<std::uint8_t> decoded;
+  if (!base64_std_decode_into(b64_compact, decoded)) {
+    return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                           MpError::mpkey_invalid_pem);
+  }
+  if (decoded.size() < kMpKeyV1MinBinaryBytes ||
+      decoded.size() > kMpKeyV1MaxBinaryBytes) {
+    return fail<std::vector<std::uint8_t>>(ErrorCode::corrupt,
+                                           MpError::mpkey_invalid_pem);
+  }
+  return Result<std::vector<std::uint8_t>>::success(std::move(decoded));
+}
+
+} // namespace
+
+Result<std::string> encrypt_mpkey_v1(const MpKeyPayload &payload,
+                                     std::string_view passphrase,
+                                     const MpKeyEncryptOptions &options) {
+  if (const auto ok = validate_mpkey_passphrase(passphrase); !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  std::string plaintext_json;
+  CleanseStringGuard plaintext_guard{plaintext_json};
+  if (const auto ok = encode_mpkey_json_payload(payload, plaintext_json);
+      !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  std::array<std::uint8_t, kMpKeyV1SaltBytes> salt{};
+  if (options.salt_override.has_value()) {
+    salt = *options.salt_override;
+  } else if (const auto ok = random_bytes(salt); !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  std::array<std::uint8_t, kMpKeyV1NonceBytes> nonce{};
+  if (options.nonce_override.has_value()) {
+    nonce = *options.nonce_override;
+  } else if (const auto ok = random_bytes(nonce); !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  std::array<std::uint8_t, 32U> derived_key{};
+  CleanseArrayGuard key_guard{derived_key};
+  if (const auto ok = derive_mpkey_argon2id(
+          Argon2idDeriveInput{passphrase, salt, kMpKeyV1Argon2MemCostKiB,
+                              kMpKeyV1Argon2Iter, kMpKeyV1Argon2Lanes},
+          derived_key);
+      !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  const auto aad = build_mpkey_aad(MpKeyAadInput{
+      salt, kMpKeyV1Argon2MemCostKiB, kMpKeyV1Argon2Iter, kMpKeyV1Argon2Lanes});
+  const std::span<const std::uint8_t> plaintext_span{
+      reinterpret_cast<const std::uint8_t *>(plaintext_json.data()),
+      plaintext_json.size()};
+
+  std::vector<std::uint8_t> ciphertext;
+  std::array<std::uint8_t, kMpKeyV1TagBytes> tag{};
+  if (const auto ok = aes256_gcm_encrypt(
+          AesGcmEncryptInput{derived_key, nonce, aad, plaintext_span}, ciphertext, tag);
+      !ok.has_value()) {
+    return Result<std::string>::failure(ok.error());
+  }
+
+  std::vector<std::uint8_t> binary;
+  binary.reserve(kMpKeyV1HeaderBytes + ciphertext.size() + tag.size());
+  append_bytes(binary, kMpKeyV1Magic);
+  append_bytes(binary, salt);
+  append_u32_le(binary, kMpKeyV1Argon2MemCostKiB);
+  append_u32_le(binary, kMpKeyV1Argon2Iter);
+  append_u32_le(binary, kMpKeyV1Argon2Lanes);
+  append_bytes(binary, nonce);
+  append_bytes(binary, ciphertext);
+  append_bytes(binary, tag);
+
+  if (binary.size() < kMpKeyV1MinBinaryBytes ||
+      binary.size() > kMpKeyV1MaxBinaryBytes) {
+    return fail<std::string>(ErrorCode::invalid_range, MpError::mpkey_invalid_payload);
+  }
+  return Result<std::string>::success(format_mpkey_pem(binary));
+}
+
+Result<MpKeyPayload> decrypt_mpkey_v1(const MpKeyDecryptInput &input) {
+  if (const auto ok = validate_mpkey_passphrase(input.passphrase); !ok.has_value()) {
+    return Result<MpKeyPayload>::failure(ok.error());
+  }
+
+  const auto binary_res = parse_mpkey_pem(input.armored_pem);
+  if (!binary_res.has_value()) {
+    return Result<MpKeyPayload>::failure(binary_res.error());
+  }
+  const std::vector<std::uint8_t> &binary = binary_res.value();
+
+  // Validate magic and KDF bounds strictly BEFORE allocating Argon2id memory!
+  if (std::memcmp(binary.data(), kMpKeyV1Magic.data(), kMpKeyV1Magic.size()) != 0) {
+    return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_magic);
+  }
+
+  const std::span<const std::uint8_t, kMpKeyV1SaltBytes> salt{binary.data() + 8U,
+                                                              kMpKeyV1SaltBytes};
+  const std::uint32_t memcost_kib = read_u32_le_from(binary.data() + 24U);
+  const std::uint32_t iterations = read_u32_le_from(binary.data() + 28U);
+  const std::uint32_t lanes = read_u32_le_from(binary.data() + 32U);
+
+  if (memcost_kib < kMpKeyV1Argon2MemCostKiB ||
+      memcost_kib > kMpKeyV1Argon2MaxMemCostKiB || iterations < kMpKeyV1Argon2Iter ||
+      iterations > kMpKeyV1Argon2MaxIter || lanes < kMpKeyV1Argon2Lanes ||
+      lanes > kMpKeyV1Argon2MaxLanes) {
+    return fail<MpKeyPayload>(ErrorCode::invalid_range, MpError::mpkey_invalid_params);
+  }
+
+  const std::span<const std::uint8_t, kMpKeyV1NonceBytes> nonce{binary.data() + 36U,
+                                                                kMpKeyV1NonceBytes};
+  const std::size_t ciphertext_len =
+      binary.size() - kMpKeyV1HeaderBytes - kMpKeyV1TagBytes;
+  const std::span<const std::uint8_t> ciphertext{binary.data() + kMpKeyV1HeaderBytes,
+                                                 ciphertext_len};
+  const std::span<const std::uint8_t, kMpKeyV1TagBytes> tag{
+      binary.data() + kMpKeyV1HeaderBytes + ciphertext_len, kMpKeyV1TagBytes};
+
+  std::array<std::uint8_t, 32U> derived_key{};
+  CleanseArrayGuard key_guard{derived_key};
+  if (const auto ok = derive_mpkey_argon2id(
+          Argon2idDeriveInput{input.passphrase, salt, memcost_kib, iterations, lanes},
+          derived_key);
+      !ok.has_value()) {
+    return Result<MpKeyPayload>::failure(ok.error());
+  }
+
+  const auto aad = build_mpkey_aad(MpKeyAadInput{salt, memcost_kib, iterations, lanes});
+
+  std::vector<std::uint8_t> plaintext;
+  CleanseVectorGuard plaintext_guard{plaintext};
+  if (const auto ok = aes256_gcm_decrypt(
+          AesGcmDecryptInput{derived_key, nonce, aad, ciphertext, tag}, plaintext);
+      !ok.has_value()) {
+    return Result<MpKeyPayload>::failure(ok.error());
+  }
+
+  // Strictly AFTER AES-256-GCM tag verification succeeds: validate UTF-8 & parse JSON.
+  if (!is_valid_utf8(plaintext)) {
+    return fail<MpKeyPayload>(ErrorCode::corrupt, MpError::mpkey_invalid_payload);
+  }
+  const std::string_view plaintext_view{
+      reinterpret_cast<const char *>(plaintext.data()), plaintext.size()};
+  return StrictMpKeyJsonParser{plaintext_view}.parse();
 }
 
 } // namespace blackbird::mp
