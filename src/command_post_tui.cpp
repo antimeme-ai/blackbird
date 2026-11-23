@@ -23,6 +23,7 @@
 #include <map>
 #include <sstream>
 #include <sys/random.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace blackbird {
@@ -1521,19 +1522,29 @@ std::string handle_flightdeck(std::string_view args, const CommandPostTuiContext
   std::uint64_t tick = 0;
   const auto [sub, rest] = split_first_token(args);
   if (!sub.empty()) {
+    if (sub == "detach") {
+      if (!rest.empty())
+        return "Usage: /flightdeck [tick <N>|detach]\n";
+      const std::string session_arg =
+          ctx.session_dir.empty() ? std::string{"<dir>"}
+                                  : sanitize_inline(ctx.session_dir.string(), 200);
+      return "Run in a second Ghostty window/monitor: blackbird flightdeck --session " +
+             session_arg +
+             " (or press Alt+F inside Blackbird to toggle the live Kitty cockpit!)\n";
+    }
     if (sub == "tick") {
       const auto [tick_tok, extra] = split_first_token(rest);
       const auto parsed = parse_u64_strict(tick_tok);
       if (!parsed.has_value() || !extra.empty())
-        return "Usage: /flightdeck [tick <N>]\n";
+        return "Usage: /flightdeck [tick <N>|detach]\n";
       tick = *parsed;
     } else if (rest.empty()) {
       const auto parsed = parse_u64_strict(sub);
       if (!parsed.has_value())
-        return "Usage: /flightdeck [tick <N>]\n";
+        return "Usage: /flightdeck [tick <N>|detach]\n";
       tick = *parsed;
     } else {
-      return "Usage: /flightdeck [tick <N>]\n";
+      return "Usage: /flightdeck [tick <N>|detach]\n";
     }
   }
 
@@ -1582,14 +1593,20 @@ std::string handle_flightdeck(std::string_view args, const CommandPostTuiContext
   const FlightDeckView view;
   const FlightDeckRenderOptions opts{
       .width = 96, .height = 24, .color = false, .honor_no_color_env = true};
-  return view.render(telemetry, opts).text();
+  std::string out = view.render(telemetry, opts).text();
+  if (!out.empty() && out.back() != '\n')
+    out += '\n';
+  out += "Tip: press Alt+F for live Ghostty Kitty Flight Deck, or run "
+         "'blackbird flightdeck' in a second monitor window.\n";
+  return out;
 }
 
 // --- /party ---
 constexpr std::string_view kPartyUsage =
-    "Usage: /party [status|all|operators|leaders|conflicts|say <text>|create [room]|"
-    "start [room]|join <room|bbjoin1:...> [--alias <name>]|invite [relay_url]|"
-    "leave|remove <alias>]\n";
+    "Usage: /party [status|peers|add <alias> [role=leader|operator] [ssh=user@host]|"
+    "all|operators|leaders|conflicts|say <text>|create [room]|start [room]|"
+    "join <room|bbjoin1:...> [--alias <name>]|invite [relay_url]|close|leave|"
+    "remove <alias>]\n";
 
 std::int64_t party_wall_now_ns() noexcept {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -1617,6 +1634,124 @@ bool is_solo_party_scope(std::string_view scope) noexcept {
   return scope.empty() || party_eq_ci(scope, "solo") || party_eq_ci(scope, "none");
 }
 
+bool is_user_owned_regular_file(const std::filesystem::path &path) noexcept {
+  if (path.empty())
+    return false;
+  auto strip_trailing_slashes = [](std::string raw) {
+    while (raw.size() > 1U && raw.back() == '/')
+      raw.pop_back();
+    return raw;
+  };
+  const std::string leaf_str = strip_trailing_slashes(path.string());
+  struct stat st{};
+  if (::lstat(leaf_str.c_str(), &st) != 0)
+    return false;
+  if (!S_ISREG(st.st_mode))
+    return false;
+  if (st.st_uid != ::geteuid())
+    return false;
+  if ((st.st_mode & 0022U) != 0U)
+    return false;
+  const std::filesystem::path parent = std::filesystem::path{leaf_str}.parent_path();
+  if (!parent.empty()) {
+    const std::string parent_str = strip_trailing_slashes(parent.string());
+    struct stat parent_st{};
+    if (::lstat(parent_str.c_str(), &parent_st) != 0)
+      return false;
+    if (!S_ISDIR(parent_st.st_mode))
+      return false;
+    if (parent_st.st_uid != ::geteuid())
+      return false;
+    if ((parent_st.st_mode & 0022U) != 0U)
+      return false;
+  }
+  return true;
+}
+
+std::filesystem::path resolve_party_config_path(const CommandPostTuiContext &ctx) {
+  if (!ctx.project_root.empty())
+    return ctx.project_root / ".blackbird" / "party.json";
+  if (const char *bb_home = std::getenv("BLACKBIRD_HOME");
+      bb_home != nullptr && bb_home[0] != '\0') {
+    return std::filesystem::path{bb_home} / "party.json";
+  }
+  if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0')
+    return std::filesystem::path{home} / ".blackbird" / "party.json";
+  return {};
+}
+
+std::string default_ssh_user() {
+  const char *raw = std::getenv("USER");
+  if (raw == nullptr || raw[0] == '\0')
+    raw = std::getenv("LOGNAME");
+  std::string out;
+  if (raw != nullptr) {
+    for (const char ch : std::string_view{raw}) {
+      if (out.size() >= 64)
+        break;
+      const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+      if (ok)
+        out.push_back(ch);
+    }
+  }
+  while (!out.empty() && (out.front() == '-' || out.front() == '.'))
+    out.erase(out.begin());
+  if (out.empty())
+    return "operator";
+  return out;
+}
+
+std::string default_local_hostname() {
+  std::array<char, 256> buf{};
+  if (::gethostname(buf.data(), buf.size() - 1U) == 0) {
+    buf.back() = '\0';
+    std::string out;
+    for (const char ch : std::string_view{buf.data()}) {
+      if (out.size() >= 128)
+        break;
+      const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
+      if (ok)
+        out.push_back(ch);
+    }
+    while (!out.empty() && (out.front() == '.' || out.front() == '-'))
+      out.erase(out.begin());
+    while (!out.empty() && (out.back() == '.' || out.back() == '-'))
+      out.pop_back();
+    if (!out.empty())
+      return out;
+  }
+  return "relay.blackbird.local";
+}
+
+std::string default_party_room_name(const std::filesystem::path &root) {
+  std::filesystem::path normalized = root.lexically_normal();
+  if (normalized.filename().empty() && normalized.has_parent_path())
+    normalized = normalized.parent_path();
+  std::string base = normalized.filename().string();
+  if (base.empty() || base == "." || base == "..") {
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec && !cwd.empty())
+      base = cwd.filename().string();
+  }
+  std::string clean;
+  clean.reserve(std::min<std::size_t>(base.size(), 64));
+  for (const char ch : base) {
+    if (clean.size() >= 64)
+      break;
+    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
+                    ch == ':';
+    if (ok)
+      clean.push_back(ch);
+  }
+  if (clean.empty() || is_solo_party_scope(clean))
+    return std::string{kPartyDefaultScope};
+  return clean;
+}
+
 std::optional<std::filesystem::path> resolve_peers_dir_from_home() {
   const char *home = std::getenv("HOME");
   if (home == nullptr || home[0] == '\0')
@@ -1624,9 +1759,97 @@ std::optional<std::filesystem::path> resolve_peers_dir_from_home() {
   return std::filesystem::path{home} / ".local" / "share" / "blackbird" / "peers";
 }
 
+struct KnownPeersReadResult {
+  bool store_present = false;
+  std::vector<PinnedPeer> peers;
+  std::optional<Error> error;
+};
+
+// Strictly passive read-only KnownPeersStore probe: NEVER creates directories
+// or lock files when `~/.local/share/blackbird/peers/known_peers.json` is absent.
+KnownPeersReadResult read_known_peers_if_present() {
+  KnownPeersReadResult out;
+  const auto peers_dir = resolve_peers_dir_from_home();
+  if (!peers_dir.has_value())
+    return out;
+  std::error_code ec;
+  const auto dir_st = std::filesystem::symlink_status(*peers_dir, ec);
+  if (ec || std::filesystem::is_symlink(dir_st) ||
+      !std::filesystem::is_directory(dir_st))
+    return out;
+  const auto json_path = *peers_dir / "known_peers.json";
+  const auto file_st = std::filesystem::symlink_status(json_path, ec);
+  if (ec || std::filesystem::is_symlink(file_st) ||
+      !std::filesystem::is_regular_file(file_st)) {
+    return out;
+  }
+  out.store_present = true;
+  auto store = KnownPeersStore::open(*peers_dir);
+  if (!store.has_value()) {
+    out.error = store.error();
+    return out;
+  }
+  auto listed = store.value().list_peers();
+  if (!listed.has_value()) {
+    out.error = listed.error();
+    return out;
+  }
+  out.peers = std::move(listed).value();
+  return out;
+}
+
+std::string format_pinned_peers_list(const KnownPeersReadResult &res,
+                                     bool show_add_usage) {
+  std::string out;
+  if (show_add_usage) {
+    out += "Usage: /party add <alias> [role=leader|operator] [ssh=user@host]\n";
+  }
+  if (res.error.has_value()) {
+    out +=
+        "Pinned peers unreadable: " + std::string{error_name(res.error->code)} + "\n";
+    return out;
+  }
+  if (!res.store_present) {
+    out +=
+        "Pinned peers: none (no known peers store yet).\n"
+        "  Tip: pin a peer with `blackbird peer pin` or `/party join <bbjoin1:...>`, "
+        "then run `/party add <alias>`.\n";
+    return out;
+  }
+  std::vector<const PinnedPeer *> active;
+  for (const auto &p : res.peers) {
+    if (!p.revoked)
+      active.push_back(&p);
+  }
+  if (active.empty()) {
+    out +=
+        "Pinned peers: 0 active.\n"
+        "  Tip: pin a peer with `blackbird peer pin` or `/party join <bbjoin1:...>`, "
+        "then run `/party add <alias>`.\n";
+    return out;
+  }
+  out += "Pinned peers (" + std::to_string(active.size()) + "):\n";
+  const std::size_t shown = std::min(active.size(), kMaxListRows);
+  for (std::size_t i = 0; i < shown; ++i) {
+    const auto &p = *active[i];
+    const std::string alias = sanitize_inline(p.alias, 48);
+    out += "  " + alias + " [" + sanitize_inline(p.fingerprint, 48) +
+           "] — /party add " + alias;
+    if (!p.trust_note.empty())
+      out += " (" + sanitize_inline(p.trust_note, 64) + ")";
+    out += '\n';
+  }
+  if (active.size() > shown)
+    out += "  ... (" + std::to_string(active.size() - shown) + " more)\n";
+  return out;
+}
+
 PartyConfig make_passive_party_config(const CommandPostTuiContext &ctx) {
   const auto root = resolve_project_root(ctx);
   PartyConfig cfg = PartyConfig::for_project(root);
+  const auto cfg_path = resolve_party_config_path(ctx);
+  cfg.party_config_path =
+      is_user_owned_regular_file(cfg_path) ? cfg_path : std::filesystem::path{};
   cfg.local_operator_id = ctx.actor.empty() ? std::string{"operator"} : ctx.actor;
   cfg.local_actor_fp = try_load_local_peer_fingerprint();
   return cfg;
@@ -1634,6 +1857,8 @@ PartyConfig make_passive_party_config(const CommandPostTuiContext &ctx) {
 
 Result<PartyRosterConfig>
 load_or_default_party_roster(const std::filesystem::path &path) {
+  if (path.empty())
+    return Result<PartyRosterConfig>::success(PartyRosterConfig{});
   std::error_code ec;
   const auto st = std::filesystem::symlink_status(path, ec);
   if (ec) {
@@ -1652,6 +1877,8 @@ std::string derive_creator_alias(std::string_view fingerprint) {
   std::string_view raw = fingerprint;
   if (raw.starts_with("SHA256:"))
     raw.remove_prefix(7);
+  else if (raw.starts_with("bb1-"))
+    raw.remove_prefix(4);
   std::string out = "peer-";
   for (const char ch : raw) {
     if (out.size() >= 17)
@@ -1694,9 +1921,136 @@ Result<std::string> generate_party_invite_code() {
 
 std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx) {
   const auto root = resolve_project_root(ctx);
-  const auto party_config_path = root / ".blackbird" / "party.json";
+  const auto party_config_path = resolve_party_config_path(ctx);
   const auto platoon_dir = root / ".blackbird" / "platoon";
   const auto [sub, rest] = split_first_token(args);
+
+  // /party close | /party hide
+  if (sub == "close" || sub == "hide") {
+    if (!rest.empty())
+      return "Usage: /party close\n";
+    return "Party Chat closed (Alt+P reopens in TUI).\n";
+  }
+
+  // /party peers (zero directory creation if absent)
+  if (sub == "peers") {
+    if (!rest.empty())
+      return "Usage: /party peers\n";
+    return format_pinned_peers_list(read_known_peers_if_present(), false);
+  }
+
+  // /party add [<alias> [role=leader|operator] [ssh=user@host]]
+  if (sub == "add") {
+    if (rest.empty())
+      return format_pinned_peers_list(read_known_peers_if_present(), true);
+    if (party_config_path.empty())
+      return "Party add failed: HOME or BLACKBIRD_HOME is not set\n";
+    const auto [alias_tok, opt_rest] = split_first_token(rest);
+    if (!valid_party_alias(alias_tok)) {
+      return "Invalid party alias: '" + sanitize_inline(alias_tok, 48) + "'\n";
+    }
+    PartyMemberRole role = PartyMemberRole::platoon_leader;
+    std::string host{alias_tok};
+    std::optional<std::string> explicit_ssh;
+    std::string_view rem = opt_rest;
+    while (!rem.empty()) {
+      const auto [kv, next] = split_first_token(rem);
+      const auto eq = kv.find('=');
+      if (eq == std::string_view::npos || eq == 0 || eq + 1 >= kv.size()) {
+        return "Usage: /party add <alias> [role=leader|operator] [ssh=user@host]\n";
+      }
+      const auto key = kv.substr(0, eq);
+      const auto val = kv.substr(eq + 1);
+      if (key == "role") {
+        auto parsed_role = parse_party_member_role(val);
+        if (!parsed_role.has_value()) {
+          return "Invalid role '" + sanitize_inline(val, 32) +
+                 "' (use leader or operator)\n";
+        }
+        role = parsed_role.value();
+      } else if (key == "ssh") {
+        if (val.empty() || val.starts_with('-') || val.size() > 256U) {
+          return "Invalid ssh target: '" + sanitize_inline(val, 64) + "'\n";
+        }
+        for (const char ch : val) {
+          const auto u = static_cast<unsigned char>(ch);
+          if (u <= 0x20U || u >= 0x7fU) {
+            return "Invalid ssh target: '" + sanitize_inline(val, 64) + "'\n";
+          }
+        }
+        explicit_ssh = std::string{val};
+      } else if (key == "host") {
+        if (val.empty() || val.starts_with('-') || val.size() > 256U) {
+          return "Invalid host: '" + sanitize_inline(val, 64) + "'\n";
+        }
+        for (const char ch : val) {
+          const auto u = static_cast<unsigned char>(ch);
+          if (u <= 0x20U || u >= 0x7fU) {
+            return "Invalid host: '" + sanitize_inline(val, 64) + "'\n";
+          }
+        }
+        host = std::string{val};
+      } else {
+        return "Usage: /party add <alias> [role=leader|operator] [ssh=user@host]\n";
+      }
+      rem = next;
+    }
+
+    PartyRosterPeerConfig entry{};
+    entry.alias = std::string{alias_tok};
+    entry.role = role;
+    entry.host = host;
+    entry.ssh_target =
+        explicit_ssh.has_value() ? *explicit_ssh : (default_ssh_user() + "@" + host);
+    // Leave provider/model empty so the remote node uses its own configured defaults.
+
+    // Auto-fill pinned fingerprint from KnownPeersStore if already present (zero dir
+    // creation if absent).
+    const auto known_res = read_known_peers_if_present();
+    if (known_res.store_present && !known_res.error.has_value()) {
+      for (const auto &kp : known_res.peers) {
+        if (!kp.revoked && party_eq_ci(kp.alias, alias_tok)) {
+          entry.fingerprint = kp.fingerprint;
+          break;
+        }
+      }
+    }
+
+    auto roster_res = load_or_default_party_roster(party_config_path);
+    if (!roster_res.has_value()) {
+      return "Party config unreadable: " +
+             std::string{error_name(roster_res.error().code)} + "\n";
+    }
+    PartyRosterConfig cfg = std::move(roster_res).value();
+    if (is_solo_party_scope(cfg.room_scope)) {
+      cfg.room_scope = default_party_room_name(root);
+      cfg.mode_override = PartyModeOverride::auto_detect;
+    }
+    bool updated = false;
+    for (auto &existing : cfg.peers) {
+      if (party_eq_ci(existing.alias, entry.alias)) {
+        existing = entry;
+        updated = true;
+        break;
+      }
+    }
+    if (!updated)
+      cfg.peers.push_back(entry);
+
+    auto saved = save_party_roster_config(party_config_path, cfg);
+    if (!saved.has_value()) {
+      return "Party add failed: " + std::string{error_name(saved.error().code)} + "\n";
+    }
+    std::string out = "Added party participant @" + sanitize_inline(entry.alias, 48) +
+                      " [" + std::string{party_member_role_name(entry.role)} +
+                      "] ssh=" + sanitize_inline(*entry.ssh_target, 64);
+    if (entry.fingerprint.has_value())
+      out += " pinned=" + sanitize_inline(*entry.fingerprint, 48);
+    else
+      out += " (unpinned)";
+    out += " in room " + sanitize_inline(cfg.room_scope, 64) + "\n";
+    return out;
+  }
 
   // Passive read-only inspection & filter views (zero dirs created!).
   if (sub.empty() || sub == "status" || sub == "all" || sub == "operators" ||
@@ -1822,7 +2176,10 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     const auto [room_tok, extra] = split_first_token(rest);
     if (!extra.empty())
       return "Usage: /party create [room]\n";
-    const std::string_view room = room_tok.empty() ? kPartyDefaultScope : room_tok;
+    if (party_config_path.empty())
+      return "Party create failed: HOME or BLACKBIRD_HOME is not set\n";
+    const std::string room =
+        room_tok.empty() ? default_party_room_name(root) : std::string{room_tok};
     if (is_solo_party_scope(room))
       return "Invalid party room name: '" + sanitize_inline(room, 64) + "'\n";
     auto roster_res = load_or_default_party_roster(party_config_path);
@@ -1831,7 +2188,7 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
              std::string{error_name(roster_res.error().code)} + "\n";
     }
     PartyRosterConfig cfg = std::move(roster_res).value();
-    cfg.room_scope = std::string{room};
+    cfg.room_scope = room;
     cfg.mode_override = PartyModeOverride::auto_detect;
     auto saved = save_party_roster_config(party_config_path, cfg);
     if (!saved.has_value()) {
@@ -1839,7 +2196,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
              "\n";
     }
     return "Party room active: " + sanitize_inline(cfg.room_scope, 128) +
-           " (saved to .blackbird/party.json; Alt+P opens Party Chat)\n";
+           " (saved to " + sanitize_inline(party_config_path.filename().string(), 64) +
+           "; Alt+P opens Party Chat)\n";
   }
 
   // /party join <bbjoin1:...> [--alias <name>] | /party join <room> [--alias <name>]
@@ -1863,6 +2221,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     }
 
     if (target.starts_with("bbjoin1:")) {
+      if (party_config_path.empty())
+        return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
       const std::int64_t now_ns = party_wall_now_ns();
       auto parsed_res = parse_room_invite(target, now_ns);
       if (!parsed_res.has_value()) {
@@ -1938,6 +2298,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     }
 
     // Plain room join/switch.
+    if (party_config_path.empty())
+      return "Party join failed: HOME or BLACKBIRD_HOME is not set\n";
     if (is_solo_party_scope(target))
       return "Invalid party room name: '" + sanitize_inline(target, 64) + "'\n";
     if (explicit_alias.has_value()) {
@@ -1957,7 +2319,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       return "Party join failed: " + std::string{error_name(saved.error().code)} + "\n";
     }
     return "Joined party room: " + sanitize_inline(cfg.room_scope, 128) +
-           " (saved to .blackbird/party.json)\n";
+           " (saved to " + sanitize_inline(party_config_path.filename().string(), 64) +
+           ")\n";
   }
 
   // /party invite [relay_url]
@@ -1966,16 +2329,21 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     if (!extra.empty())
       return "Usage: /party invite [relay_url]\n";
 
-    std::string room_scope{kPartyDefaultScope};
+    std::string room_scope = default_party_room_name(root);
     {
       auto roster_res = load_or_default_party_roster(party_config_path);
       if (!roster_res.has_value()) {
         return "Party config unreadable: " +
                std::string{error_name(roster_res.error().code)} + "\n";
       }
-      if (is_solo_party_scope(roster_res.value().room_scope))
-        return "No active party room (run `/party create <room>` first).\n";
-      room_scope = roster_res.value().room_scope;
+      if (!is_solo_party_scope(roster_res.value().room_scope) &&
+          roster_res.value().room_scope != kPartyDefaultScope) {
+        room_scope = roster_res.value().room_scope;
+      } else if (!party_config_path.empty() &&
+                 is_user_owned_regular_file(party_config_path) &&
+                 !is_solo_party_scope(roster_res.value().room_scope)) {
+        room_scope = roster_res.value().room_scope;
+      }
     }
 
     const auto peers_dir = resolve_peers_dir_from_home();
@@ -2006,6 +2374,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
              std::string{error_name(identity_res.error().code)} + ")\n";
     }
 
+    const std::string local_host = default_local_hostname();
+    const std::string ssh_hint = "ssh://" + default_ssh_user() + "@" + local_host;
     std::string relay_url;
     if (!relay_tok.empty()) {
       relay_url = std::string{relay_tok};
@@ -2013,7 +2383,7 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
                env_relay != nullptr && env_relay[0] != '\0') {
       relay_url = env_relay;
     } else {
-      relay_url = "https://relay.blackbird.local/v1";
+      relay_url = "https://" + local_host + "/party";
     }
 
     auto code_res = generate_party_invite_code();
@@ -2047,6 +2417,9 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
            "  Relay: " +
            sanitize_inline(invite.relay_url, 128) +
            "\n"
+           "  SSH:   " +
+           sanitize_inline(ssh_hint, 128) +
+           "\n"
            "  URI:   " +
            encoded.value() + "\n";
   }
@@ -2055,6 +2428,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   if (sub == "leave") {
     if (!rest.empty())
       return "Usage: /party leave\n";
+    if (party_config_path.empty())
+      return "Left party (already in solo mode; history and pinned peers untouched).\n";
     std::error_code ec;
     const auto st = std::filesystem::symlink_status(party_config_path, ec);
     if (ec == std::errc::no_such_file_or_directory ||
@@ -2062,7 +2437,8 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
       return "Left party (already in solo mode; history and pinned peers untouched).\n";
     }
     if (ec || std::filesystem::is_symlink(st))
-      return "Party leave failed: cannot access .blackbird/party.json\n";
+      return "Party leave failed: cannot access " +
+             sanitize_inline(party_config_path.filename().string(), 64) + "\n";
 
     auto loaded = load_party_roster_config(party_config_path);
     const std::string prev_scope =
@@ -2088,15 +2464,20 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
     const auto [alias, extra] = split_first_token(rest);
     if (alias.empty() || !extra.empty())
       return "Usage: /party remove <alias>\n";
+    if (party_config_path.empty()) {
+      return "Party participant not found: @" + sanitize_inline(alias, 48) +
+             " (no party config)\n";
+    }
     std::error_code ec;
     const auto st = std::filesystem::symlink_status(party_config_path, ec);
     if (ec == std::errc::no_such_file_or_directory ||
         ec == std::errc::not_a_directory || (!ec && !std::filesystem::exists(st))) {
-      return "Party participant not found: @" + sanitize_inline(alias, 48) +
-             " (no .blackbird/party.json)\n";
+      return "Party participant not found: @" + sanitize_inline(alias, 48) + " (no " +
+             sanitize_inline(party_config_path.filename().string(), 64) + ")\n";
     }
     if (ec || std::filesystem::is_symlink(st))
-      return "Party remove failed: cannot access .blackbird/party.json\n";
+      return "Party remove failed: cannot access " +
+             sanitize_inline(party_config_path.filename().string(), 64) + "\n";
     auto loaded = load_party_roster_config(party_config_path);
     if (!loaded.has_value()) {
       return "Party config unreadable: " +

@@ -3,6 +3,7 @@
 #include "blackbird/board_bridge.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/local_swarm.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
@@ -22,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -232,12 +234,37 @@ void validate_unused_string_array(const Value &args, StringArraySpec spec) {
   }
 }
 
+bool optional_bool(const Value &args, std::string_view key, bool default_val) {
+  const Value *val = args.find(key);
+  if (!val || std::holds_alternative<std::nullptr_t>(val->value()))
+    return default_val;
+  const auto *flag = std::get_if<bool>(&val->value());
+  if (!flag)
+    throw Error{ErrorCode::invalid_range};
+  return *flag;
+}
+
+void validate_unused_bool(const Value &args, std::string_view key) {
+  const Value *val = args.find(key);
+  if (!val || std::holds_alternative<std::nullptr_t>(val->value()))
+    return;
+  if (!std::holds_alternative<bool>(val->value()))
+    throw Error{ErrorCode::invalid_range};
+}
+
+fs::path strip_trailing_slashes(const fs::path &path) {
+  std::string text = path.string();
+  while (text.size() > 1 && text.back() == '/')
+    text.pop_back();
+  return fs::path{std::move(text)};
+}
+
 fs::path optional_path(const Value &args, std::string_view key, fs::path default_path) {
   auto value = optional_string(
       args, {.key = key, .max_bytes = kMaxPathArgBytes, .allow_empty = false});
   if (!value.has_value())
     return default_path;
-  return fs::path{*value};
+  return strip_trailing_slashes(fs::path{*value});
 }
 
 enum class DirPresence : std::uint8_t {
@@ -246,8 +273,9 @@ enum class DirPresence : std::uint8_t {
 };
 
 DirPresence probe_existing_dir(const fs::path &dir) {
+  const fs::path clean = strip_trailing_slashes(dir);
   std::error_code ec;
-  const auto status = fs::symlink_status(dir, ec);
+  const auto status = fs::symlink_status(clean, ec);
   if (ec) {
     if (ec == std::errc::no_such_file_or_directory ||
         ec == std::errc::not_a_directory) {
@@ -262,6 +290,21 @@ DirPresence probe_existing_dir(const fs::path &dir) {
   if (!fs::is_directory(status))
     throw Error{ErrorCode::io, ENOTDIR};
   return DirPresence::present_dir;
+}
+
+bool swarm_state_present_readonly(const fs::path &board_dir) {
+  if (probe_existing_dir(board_dir) == DirPresence::absent)
+    return false;
+  std::error_code ec;
+  const auto state_status =
+      fs::symlink_status(strip_trailing_slashes(board_dir) / "local_swarm.json", ec);
+  if (ec == std::errc::no_such_file_or_directory || !fs::exists(state_status))
+    return false;
+  if (ec)
+    throw Error{ErrorCode::io, ec.value()};
+  if (fs::is_symlink(state_status))
+    throw Error{ErrorCode::io, EPERM};
+  return true;
 }
 
 std::size_t valid_utf8_seq_len(std::string_view text, std::size_t i) noexcept {
@@ -1857,12 +1900,579 @@ Value handle_companion_timing(const Value &arguments,
   return Value::object(std::move(out));
 }
 
+// ============================================================================
+// Tool 6: local_swarm
+// ============================================================================
+
+constexpr std::uint64_t kSwarmMaxToolWaitTimeoutMs = 30000;
+constexpr std::size_t kSwarmMaxRepoChecks = 64;
+
+Value wrap_swarm_worker(const SwarmWorkerRecord &rec) {
+  Value::Array owned;
+  owned.reserve(rec.owned_files.size());
+  for (const auto &path : rec.owned_files) {
+    owned.emplace_back(sanitize_untrusted_text(path, kSwarmMaxOwnedPathBytes * 4));
+  }
+  return Value::object({
+      {"name", Value{rec.name}},
+      {"role", Value{sanitize_untrusted_text(rec.role, kPlatoonMaxFieldBytes * 4)}},
+      {"provider",
+       Value{sanitize_untrusted_text(rec.provider, kPlatoonMaxFieldBytes * 4)}},
+      {"model", Value{sanitize_untrusted_text(rec.model, kPlatoonMaxFieldBytes * 4)}},
+      {"workspace_mode",
+       Value{std::string{swarm_workspace_mode_name(rec.workspace_mode)}}},
+      {"state", Value{std::string{swarm_worker_state_name(rec.state)}}},
+      {"owned_files", Value{std::move(owned)}},
+      {"session_id",
+       Value{sanitize_untrusted_text(rec.session_id, kPlatoonMaxFieldBytes * 4)}},
+      {"workspace_path", Value{sanitize_untrusted_text(rec.workspace_path.string(),
+                                                       kPlatoonMaxFieldBytes * 4)}},
+      {"lease_id",
+       Value{sanitize_untrusted_text(rec.lease_id, kPlatoonMaxFieldBytes * 4)}},
+      {"branch", Value{sanitize_untrusted_text(rec.branch, kPlatoonMaxFieldBytes * 4)}},
+      {"brief_seq", Value{Number{rec.brief_seq}}},
+      {"created_ns", Value{Number{rec.created_ns}}},
+      {"updated_ns", Value{Number{rec.updated_ns}}},
+      {"read_only", Value{rec.read_only}},
+      {"untrusted_peer_data", Value{true}},
+      {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+      {"quoted_brief", Value{escape_and_quote_peer_text(rec.brief)}},
+  });
+}
+
+LocalSwarmConfig build_swarm_config(const fs::path &board_dir, const Value &arguments) {
+  LocalSwarmConfig cfg;
+  cfg.board_root = board_dir;
+  const auto repo_root = optional_string(
+      arguments,
+      {.key = "repo_root", .max_bytes = kMaxPathArgBytes, .allow_empty = false});
+  const auto lease_root = optional_string(
+      arguments,
+      {.key = "lease_root", .max_bytes = kMaxPathArgBytes, .allow_empty = false});
+  if (repo_root.has_value()) {
+    WorktreeLeaseConfig wt;
+    wt.repo_root = fs::path{*repo_root};
+    wt.lease_root =
+        lease_root.has_value() ? fs::path{*lease_root} : (board_dir / "worktrees");
+    cfg.worktree_config = std::move(wt);
+  } else if (lease_root.has_value()) {
+    throw Error{ErrorCode::invalid_range};
+  }
+  return cfg;
+}
+
+Value handle_local_swarm(const Value &arguments,
+                         const CommandPostToolContext &context) {
+  static constexpr std::array<std::string_view, 20> kAllowed{
+      "action", "board_dir", "repo_root",     "lease_root",      "name",
+      "role",   "provider",  "model",         "workspace_mode",  "owned_files",
+      "brief",  "base_name", "tasks",         "max_concurrency", "repo_checks",
+      "agent",  "since_seq", "mentions_only", "timeout_ms",      "reason",
+  };
+  validate_object_keys(arguments, kAllowed);
+  const std::string action = require_string(
+      arguments, {.key = "action", .max_bytes = 32, .allow_empty = false});
+  const fs::path board_dir =
+      optional_path(arguments, "board_dir", fs::path{".blackbird"} / "platoon");
+
+  if (action == "status") {
+    validate_unused_string(arguments, "repo_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "lease_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "name", kSwarmMaxWorkerNameLength);
+    validate_unused_string(arguments, "role", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "provider", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "model", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "workspace_mode", 32);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string(arguments, "brief", kPlatoonMaxBriefBytes);
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    if (!swarm_state_present_readonly(board_dir)) {
+      return Value::object({
+          {"action", Value{"status"}},
+          {"board_dir", Value{board_dir.string()}},
+          {"swarm_present", Value{false}},
+          {"title", Value{""}},
+          {"count", Value{Number{std::uint64_t{0}}}},
+          {"untrusted_peer_data", Value{true}},
+          {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+          {"workers", Value{Value::Array{}}},
+      });
+    }
+
+    LocalSwarmConfig cfg;
+    cfg.board_root = board_dir;
+    auto coord = unwrap_or_throw(LocalSwarmCoordinator::open(std::move(cfg)));
+    const auto workers = coord.status();
+    Value::Array wrapped;
+    wrapped.reserve(workers.size());
+    for (const auto &worker : workers)
+      wrapped.push_back(wrap_swarm_worker(worker));
+    return Value::object({
+        {"action", Value{"status"}},
+        {"board_dir", Value{board_dir.string()}},
+        {"swarm_present", Value{true}},
+        {"title",
+         Value{sanitize_untrusted_text(coord.title(), kPlatoonMaxFieldBytes * 4)}},
+        {"count", Value{Number{static_cast<std::uint64_t>(wrapped.size())}}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"workers", Value{std::move(wrapped)}},
+    });
+  }
+
+  if (action == "add") {
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    SwarmWorkerSpec spec;
+    spec.name = require_string(
+        arguments,
+        {.key = "name", .max_bytes = kSwarmMaxWorkerNameLength, .allow_empty = false});
+    spec.role = optional_string(arguments, {.key = "role",
+                                            .max_bytes = kPlatoonMaxFieldBytes,
+                                            .allow_empty = false})
+                    .value_or("builder");
+    spec.provider = optional_string(arguments, {.key = "provider",
+                                                .max_bytes = kPlatoonMaxFieldBytes,
+                                                .allow_empty = true})
+                        .value_or("");
+    spec.model = optional_string(arguments, {.key = "model",
+                                             .max_bytes = kPlatoonMaxFieldBytes,
+                                             .allow_empty = true})
+                     .value_or("");
+    const std::string ws_mode =
+        optional_string(
+            arguments, {.key = "workspace_mode", .max_bytes = 32, .allow_empty = false})
+            .value_or("inherit");
+    spec.workspace_mode = unwrap_or_throw(parse_swarm_workspace_mode(ws_mode));
+    spec.owned_files =
+        optional_string_array(arguments, {.key = "owned_files",
+                                          .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                          .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    spec.brief = require_string(
+        arguments,
+        {.key = "brief", .max_bytes = kPlatoonMaxBriefBytes, .allow_empty = false});
+
+    auto coord = unwrap_or_throw(
+        LocalSwarmCoordinator::open(build_swarm_config(board_dir, arguments)));
+    const auto rec = unwrap_or_throw(coord.add_worker(spec));
+    return Value::object({
+        {"action", Value{"add"}},
+        {"added", Value{true}},
+        {"board_dir", Value{board_dir.string()}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"worker", wrap_swarm_worker(rec)},
+    });
+  }
+
+  if (action == "sharded") {
+    validate_unused_string(arguments, "name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    const std::string base_name =
+        require_string(arguments, {.key = "base_name",
+                                   .max_bytes = kSwarmMaxWorkerNameLength,
+                                   .allow_empty = false});
+    const auto tasks =
+        optional_string_array(arguments, {.key = "tasks",
+                                          .max_items = kSwarmMaxShardedTasks,
+                                          .max_item_bytes = kPlatoonMaxFieldBytes});
+    if (tasks.empty())
+      throw Error{ErrorCode::invalid_range};
+    const std::string shared_brief =
+        optional_string(
+            arguments,
+            {.key = "brief", .max_bytes = kPlatoonMaxBriefBytes, .allow_empty = true})
+            .value_or("");
+    const std::size_t max_concurrency = static_cast<std::size_t>(
+        optional_uint64(arguments, {.key = "max_concurrency",
+                                    .min_value = 1,
+                                    .max_value = kSwarmMaxShardedTasks,
+                                    .zero_is_omitted = true})
+            .value_or(kSwarmDefaultShardedConcurrency));
+
+    SwarmWorkerSpec spec_template;
+    spec_template.role = optional_string(arguments, {.key = "role",
+                                                     .max_bytes = kPlatoonMaxFieldBytes,
+                                                     .allow_empty = false})
+                             .value_or("builder");
+    spec_template.provider =
+        optional_string(arguments, {.key = "provider",
+                                    .max_bytes = kPlatoonMaxFieldBytes,
+                                    .allow_empty = true})
+            .value_or("");
+    spec_template.model =
+        optional_string(
+            arguments,
+            {.key = "model", .max_bytes = kPlatoonMaxFieldBytes, .allow_empty = true})
+            .value_or("");
+    const std::string ws_mode =
+        optional_string(
+            arguments, {.key = "workspace_mode", .max_bytes = 32, .allow_empty = false})
+            .value_or("inherit");
+    spec_template.workspace_mode = unwrap_or_throw(parse_swarm_workspace_mode(ws_mode));
+
+    auto coord = unwrap_or_throw(
+        LocalSwarmCoordinator::open(build_swarm_config(board_dir, arguments)));
+    const auto spawned = unwrap_or_throw(coord.add_sharded_group(
+        base_name, tasks, shared_brief, spec_template, max_concurrency));
+    Value::Array wrapped;
+    wrapped.reserve(spawned.size());
+    for (const auto &worker : spawned)
+      wrapped.push_back(wrap_swarm_worker(worker));
+    return Value::object({
+        {"action", Value{"sharded"}},
+        {"spawned", Value{true}},
+        {"board_dir", Value{board_dir.string()}},
+        {"base_name", Value{base_name}},
+        {"count", Value{Number{static_cast<std::uint64_t>(wrapped.size())}}},
+        {"max_concurrency", Value{Number{static_cast<std::uint64_t>(max_concurrency)}}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"workers", Value{std::move(wrapped)}},
+    });
+  }
+
+  if (action == "dentist") {
+    validate_unused_string(arguments, "repo_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "lease_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "role", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "workspace_mode", 32);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string(arguments, "brief", kPlatoonMaxBriefBytes);
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    const std::string name =
+        optional_string(arguments, {.key = "name",
+                                    .max_bytes = kSwarmMaxWorkerNameLength,
+                                    .allow_empty = false})
+            .value_or("dentist");
+    const auto repo_checks =
+        optional_string_array(arguments, {.key = "repo_checks",
+                                          .max_items = kSwarmMaxRepoChecks,
+                                          .max_item_bytes = kPlatoonMaxFieldBytes});
+    SwarmDentistOptions opts;
+    opts.provider = optional_string(arguments, {.key = "provider",
+                                                .max_bytes = kPlatoonMaxFieldBytes,
+                                                .allow_empty = true})
+                        .value_or("");
+    opts.model = optional_string(arguments, {.key = "model",
+                                             .max_bytes = kPlatoonMaxFieldBytes,
+                                             .allow_empty = true})
+                     .value_or("");
+
+    LocalSwarmConfig cfg;
+    cfg.board_root = board_dir;
+    auto coord = unwrap_or_throw(LocalSwarmCoordinator::open(std::move(cfg)));
+    const auto rec =
+        unwrap_or_throw(coord.add_dentist_verifier(name, repo_checks, opts));
+    return Value::object({
+        {"action", Value{"dentist"}},
+        {"added", Value{true}},
+        {"board_dir", Value{board_dir.string()}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"worker", wrap_swarm_worker(rec)},
+    });
+  }
+
+  if (action == "wait") {
+    validate_unused_string(arguments, "repo_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "lease_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "name", kSwarmMaxWorkerNameLength);
+    validate_unused_string(arguments, "role", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "provider", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "model", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "workspace_mode", 32);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string(arguments, "brief", kPlatoonMaxBriefBytes);
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    const std::string agent =
+        optional_string(
+            arguments,
+            {.key = "agent", .max_bytes = kPlatoonMaxIdLength, .allow_empty = true})
+            .value_or("");
+    const std::uint64_t since_seq =
+        optional_uint64(arguments, {.key = "since_seq", .min_value = 0}).value_or(0);
+    const bool mentions_only = optional_bool(arguments, "mentions_only", true);
+    const std::uint64_t raw_timeout =
+        optional_uint64(arguments, {.key = "timeout_ms", .min_value = 0})
+            .value_or(kSwarmMaxToolWaitTimeoutMs);
+    const std::int64_t timeout_ms =
+        static_cast<std::int64_t>(std::min(raw_timeout, kSwarmMaxToolWaitTimeoutMs));
+
+    if (mentions_only && agent.empty())
+      throw Error{ErrorCode::invalid_identity};
+    if (!agent.empty() && !valid_platoon_member_id(agent))
+      throw Error{ErrorCode::invalid_identity};
+    if (context.cancelled && context.cancelled())
+      throw Error{ErrorCode::interrupted};
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
+    while (probe_existing_dir(board_dir) == DirPresence::absent) {
+      if (context.cancelled && context.cancelled())
+        throw Error{ErrorCode::interrupted};
+      const auto now = std::chrono::steady_clock::now();
+      if (timeout_ms == 0 || now >= deadline) {
+        return Value::object({
+            {"action", Value{"wait"}},
+            {"board_dir", Value{board_dir.string()}},
+            {"board_present", Value{false}},
+            {"woken", Value{false}},
+            {"timed_out", Value{true}},
+            {"cancelled", Value{false}},
+            {"latest_seq", Value{Number{since_seq}}},
+            {"count", Value{Number{std::uint64_t{0}}}},
+            {"untrusted_peer_data", Value{true}},
+            {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+            {"messages", Value{Value::Array{}}},
+        });
+      }
+      const auto rem_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+      const auto sleep_ms = std::clamp<std::int64_t>(rem_ms, 1, 25);
+      std::this_thread::sleep_for(std::chrono::milliseconds{sleep_ms});
+    }
+
+    auto board = unwrap_or_throw(PlatoonBoard::open(board_dir));
+    auto waiter = unwrap_or_throw(SwarmBoardWaiter::open(board.root()));
+    SwarmBoardWaitOptions opts;
+    opts.agent_name = agent;
+    opts.since_seq = since_seq;
+    opts.mentions_only = mentions_only;
+    const auto now_after_probe = std::chrono::steady_clock::now();
+    const std::int64_t remaining_budget_ms =
+        timeout_ms == 0 || now_after_probe >= deadline
+            ? std::int64_t{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                    now_after_probe)
+                  .count();
+    opts.timeout_ms = remaining_budget_ms;
+
+    SwarmBoardWaitResult wait_res;
+    if (!context.cancelled || remaining_budget_ms == 0) {
+      wait_res = unwrap_or_throw(waiter.wait(board, opts));
+    } else {
+      for (;;) {
+        if (context.cancelled())
+          throw Error{ErrorCode::interrupted};
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining_ms =
+            now >= deadline
+                ? std::int64_t{0}
+                : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                      .count();
+        opts.timeout_ms = std::min<std::int64_t>(remaining_ms, 50);
+        wait_res = unwrap_or_throw(waiter.wait(board, opts));
+        if (wait_res.woken || wait_res.cancelled || remaining_ms <= 0 ||
+            std::chrono::steady_clock::now() >= deadline) {
+          break;
+        }
+      }
+    }
+
+    Value::Array wrapped;
+    wrapped.reserve(wait_res.messages.size());
+    for (const auto &msg : wait_res.messages)
+      wrapped.push_back(wrap_platoon_message(msg));
+    return Value::object({
+        {"action", Value{"wait"}},
+        {"board_dir", Value{board_dir.string()}},
+        {"board_present", Value{true}},
+        {"woken", Value{wait_res.woken}},
+        {"timed_out", Value{wait_res.timed_out}},
+        {"cancelled", Value{wait_res.cancelled}},
+        {"latest_seq", Value{Number{wait_res.latest_seq}}},
+        {"count", Value{Number{static_cast<std::uint64_t>(wrapped.size())}}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"messages", Value{std::move(wrapped)}},
+    });
+  }
+
+  if (action == "switch_model") {
+    validate_unused_string(arguments, "repo_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "lease_root", kMaxPathArgBytes);
+    validate_unused_string(arguments, "role", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "workspace_mode", 32);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string(arguments, "brief", kPlatoonMaxBriefBytes);
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+
+    SwarmModelSwitchRequest req;
+    req.worker_name = require_string(
+        arguments,
+        {.key = "name", .max_bytes = kSwarmMaxWorkerNameLength, .allow_empty = false});
+    req.new_provider = optional_string(arguments, {.key = "provider",
+                                                   .max_bytes = kPlatoonMaxFieldBytes,
+                                                   .allow_empty = true})
+                           .value_or("");
+    req.new_model = require_string(
+        arguments,
+        {.key = "model", .max_bytes = kPlatoonMaxFieldBytes, .allow_empty = false});
+    req.reason = optional_string(arguments, {.key = "reason",
+                                             .max_bytes = kPlatoonMaxFieldBytes,
+                                             .allow_empty = true})
+                     .value_or("");
+
+    if (!swarm_state_present_readonly(board_dir))
+      throw Error{ErrorCode::stale_handle};
+
+    LocalSwarmConfig cfg;
+    cfg.board_root = board_dir;
+    auto coord = unwrap_or_throw(LocalSwarmCoordinator::open(std::move(cfg)));
+    const auto rec = unwrap_or_throw(coord.switch_worker_model(req));
+    return Value::object({
+        {"action", Value{"switch_model"}},
+        {"switched", Value{true}},
+        {"board_dir", Value{board_dir.string()}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"worker", wrap_swarm_worker(rec)},
+    });
+  }
+
+  if (action == "kill") {
+    validate_unused_string(arguments, "role", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "provider", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "model", kPlatoonMaxFieldBytes);
+    validate_unused_string(arguments, "workspace_mode", 32);
+    validate_unused_string_array(arguments,
+                                 {.key = "owned_files",
+                                  .max_items = kSwarmMaxOwnedFilesPerWorker,
+                                  .max_item_bytes = kSwarmMaxOwnedPathBytes});
+    validate_unused_string(arguments, "brief", kPlatoonMaxBriefBytes);
+    validate_unused_string(arguments, "base_name", kSwarmMaxWorkerNameLength);
+    validate_unused_string_array(arguments, {.key = "tasks",
+                                             .max_items = kSwarmMaxShardedTasks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_uint64(arguments, "max_concurrency", kSwarmMaxShardedTasks);
+    validate_unused_string_array(arguments, {.key = "repo_checks",
+                                             .max_items = kSwarmMaxRepoChecks,
+                                             .max_item_bytes = kPlatoonMaxFieldBytes});
+    validate_unused_string(arguments, "agent", kPlatoonMaxIdLength);
+    validate_unused_uint64(arguments, "since_seq",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_bool(arguments, "mentions_only");
+    validate_unused_uint64(arguments, "timeout_ms",
+                           std::numeric_limits<std::uint64_t>::max());
+    validate_unused_string(arguments, "reason", kPlatoonMaxFieldBytes);
+
+    const std::string name = require_string(
+        arguments,
+        {.key = "name", .max_bytes = kSwarmMaxWorkerNameLength, .allow_empty = false});
+    if (!swarm_state_present_readonly(board_dir))
+      throw Error{ErrorCode::stale_handle};
+    auto coord = unwrap_or_throw(
+        LocalSwarmCoordinator::open(build_swarm_config(board_dir, arguments)));
+    const auto rec = unwrap_or_throw(coord.kill_worker(name));
+    return Value::object({
+        {"action", Value{"kill"}},
+        {"killed", Value{true}},
+        {"board_dir", Value{board_dir.string()}},
+        {"untrusted_peer_data", Value{true}},
+        {"trust_boundary", Value{std::string{kTrustBoundaryLabel}}},
+        {"worker", wrap_swarm_worker(rec)},
+    });
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
 } // namespace
 
 bool is_command_post_tool(std::string_view name) noexcept {
   return name == "platoon_board" || name == "bridge_guard" ||
          name == "project_issues" || name == "project_memory" ||
-         name == "companion_timing";
+         name == "companion_timing" || name == "local_swarm";
 }
 
 Value command_post_tool_definitions() {
@@ -2073,6 +2683,80 @@ Value command_post_tool_definitions() {
                {"additionalProperties", Value{false}},
            })},
       }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"local_swarm"}},
+          {"description",
+           Value{
+               "Coordinate a native single-player local swarm over .blackbird/platoon "
+               "(LocalSwarmCoordinator + SwarmBoardWaiter). action: 'status' "
+               "(read-only "
+               "roster snapshot without creating directories when absent), 'add' "
+               "(spawn "
+               "named worker with disjoint owned_files), 'sharded' (Kimi-style dynamic "
+               "fan-out), 'dentist' (built-in read-only adversarial verifier), 'wait' "
+               "(zero-token reactive sleep up to 30000ms), 'switch_model' (in-place "
+               "model switch on waiting worker), or 'kill' (retire worker and release "
+               "worktree lease)."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{
+                                      Value{"status"}, Value{"add"}, Value{"sharded"},
+                                      Value{"dentist"}, Value{"wait"},
+                                      Value{"switch_model"}, Value{"kill"}}}},
+                     })},
+                    {"board_dir", Value::object({{"type", Value{"string"}}})},
+                    {"repo_root", Value::object({{"type", Value{"string"}}})},
+                    {"lease_root", Value::object({{"type", Value{"string"}}})},
+                    {"name", Value::object({{"type", Value{"string"}}})},
+                    {"role", Value::object({{"type", Value{"string"}}})},
+                    {"provider", Value::object({{"type", Value{"string"}}})},
+                    {"model", Value::object({{"type", Value{"string"}}})},
+                    {"workspace_mode",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{Value{"inherit"}, Value{"share"},
+                                                     Value{"branch"}}}},
+                     })},
+                    {"owned_files",
+                     Value::object({
+                         {"type", Value{"array"}},
+                         {"items", Value::object({{"type", Value{"string"}}})},
+                     })},
+                    {"brief", Value::object({{"type", Value{"string"}}})},
+                    {"base_name", Value::object({{"type", Value{"string"}}})},
+                    {"tasks", Value::object({
+                                  {"type", Value{"array"}},
+                                  {"items", Value::object({{"type", Value{"string"}}})},
+                              })},
+                    {"max_concurrency",
+                     Value::object({{"type", Value{"integer"}},
+                                    {"minimum", Value{Number{1}}},
+                                    {"maximum", Value{Number{32}}}})},
+                    {"repo_checks",
+                     Value::object({
+                         {"type", Value{"array"}},
+                         {"items", Value::object({{"type", Value{"string"}}})},
+                     })},
+                    {"agent", Value::object({{"type", Value{"string"}}})},
+                    {"since_seq", Value::object({{"type", Value{"integer"}},
+                                                 {"minimum", Value{Number{0}}}})},
+                    {"mentions_only", Value::object({{"type", Value{"boolean"}}})},
+                    {"timeout_ms", Value::object({{"type", Value{"integer"}},
+                                                  {"minimum", Value{Number{0}}},
+                                                  {"maximum", Value{Number{30000}}}})},
+                    {"reason", Value::object({{"type", Value{"string"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
   }};
 }
 
@@ -2088,6 +2772,8 @@ Value run_command_post_tool(std::string_view name, const Value &arguments,
     return handle_project_memory(arguments);
   if (name == "companion_timing")
     return handle_companion_timing(arguments, context);
+  if (name == "local_swarm")
+    return handle_local_swarm(arguments, context);
   throw Error{ErrorCode::unsupported};
 }
 

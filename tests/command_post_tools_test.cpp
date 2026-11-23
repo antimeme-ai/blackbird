@@ -1,9 +1,11 @@
 #include "blackbird/board_bridge.hpp"
 #include "blackbird/coding.hpp"
 #include "blackbird/command_post_tools.hpp"
+#include "blackbird/context_hygiene.hpp"
 #include "blackbird/decision_models.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/local_swarm.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/tools.hpp"
@@ -116,10 +118,10 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 5, "all 5 command-post tools must be registered");
+  require(found.size() == 6, "all 6 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
-              found.contains("companion_timing"),
+              found.contains("companion_timing") && found.contains("local_swarm"),
           "missing expected command-post tool names");
 }
 
@@ -186,6 +188,13 @@ void test_readonly_no_dir_creation(const fs::path &sandbox) {
   require(!std::get<bool>(field(mem_recent, "memory_present").value()) &&
               field(mem_recent, "count") == Value{Number{std::uint64_t{0}}},
           "project_memory recent absent failed");
+
+  const Value ls_status = run_command_post_tool(
+      "local_swarm", Value::object({{"action", Value{"status"}}}));
+  require(!std::get<bool>(field(ls_status, "swarm_present").value()) &&
+              field(ls_status, "count") == Value{Number{std::uint64_t{0}}} &&
+              std::get<bool>(field(ls_status, "untrusted_peer_data").value()),
+          "local_swarm status absent failed");
 
   require(!fs::exists(empty_ws / ".blackbird"),
           "read-only queries must NOT create .blackbird directory");
@@ -1194,6 +1203,199 @@ void test_openai_all_fields_shape(const fs::path &sandbox) {
                           }));
   require(string_field(ct_null_provider, "decision") == "stay_quiet",
           "companion_timing with null provider failed");
+
+  // 6. local_swarm: status, add, sharded, dentist, wait, switch_model, kill with ALL 20
+  //    schema keys populated (OpenAI strict mode).
+  const fs::path swarm_dir = root / "local_swarm";
+  const Value ls_status_absent =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"status"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"repo_root", Value{""}},
+                                               {"lease_root", Value{""}},
+                                               {"name", Value{""}},
+                                               {"role", Value{""}},
+                                               {"provider", Value{""}},
+                                               {"model", Value{""}},
+                                               {"workspace_mode", Value{"inherit"}},
+                                               {"owned_files", Value{Value::Array{}}},
+                                               {"brief", Value{""}},
+                                               {"base_name", Value{""}},
+                                               {"tasks", Value{Value::Array{}}},
+                                               {"max_concurrency", Value{Number{0}}},
+                                               {"repo_checks", Value{Value::Array{}}},
+                                               {"agent", Value{""}},
+                                               {"since_seq", Value{Number{0}}},
+                                               {"mentions_only", Value{false}},
+                                               {"timeout_ms", Value{Number{0}}},
+                                               {"reason", Value{""}},
+                                           }));
+  require(!std::get<bool>(field(ls_status_absent, "swarm_present").value()) &&
+              !fs::exists(swarm_dir),
+          "local_swarm status all-fields absent failed or created dir");
+
+  const Value ls_add = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"add"}},
+                         {"board_dir", Value{swarm_dir.string()}},
+                         {"repo_root", Value{""}},
+                         {"lease_root", Value{""}},
+                         {"name", Value{"alpha"}},
+                         {"role", Value{"builder"}},
+                         {"provider", Value{"openai"}},
+                         {"model", Value{"gpt-5.4"}},
+                         {"workspace_mode", Value{"inherit"}},
+                         {"owned_files", Value{Value::Array{Value{"src/alpha.cpp"}}}},
+                         {"brief", Value{"Implement alpha"}},
+                         {"base_name", Value{""}},
+                         {"tasks", Value{Value::Array{}}},
+                         {"max_concurrency", Value{Number{0}}},
+                         {"repo_checks", Value{Value::Array{}}},
+                         {"agent", Value{""}},
+                         {"since_seq", Value{Number{0}}},
+                         {"mentions_only", Value{false}},
+                         {"timeout_ms", Value{Number{0}}},
+                         {"reason", Value{""}},
+                     }));
+  require(std::get<bool>(field(ls_add, "added").value()) &&
+              string_field(field(ls_add, "worker"), "name") == "alpha",
+          "local_swarm add all-fields failed");
+
+  const Value ls_sharded = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"sharded"}},
+                         {"board_dir", Value{swarm_dir.string()}},
+                         {"repo_root", Value{""}},
+                         {"lease_root", Value{""}},
+                         {"name", Value{""}},
+                         {"role", Value{""}},
+                         {"provider", Value{""}},
+                         {"model", Value{"gpt-5.4"}},
+                         {"workspace_mode", Value{""}},
+                         {"owned_files", Value{Value::Array{}}},
+                         {"brief", Value{"Audit slice"}},
+                         {"base_name", Value{"slice"}},
+                         {"tasks", Value{Value::Array{Value{"a"}, Value{"b"}}}},
+                         {"max_concurrency", Value{Number{1}}},
+                         {"repo_checks", Value{Value::Array{}}},
+                         {"agent", Value{""}},
+                         {"since_seq", Value{Number{0}}},
+                         {"mentions_only", Value{false}},
+                         {"timeout_ms", Value{Number{0}}},
+                         {"reason", Value{""}},
+                     }));
+  require(std::get<bool>(field(ls_sharded, "spawned").value()) &&
+              field(ls_sharded, "count") == Value{Number{std::uint64_t{2}}},
+          "local_swarm sharded all-fields failed");
+
+  const Value ls_dentist = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"dentist"}},
+                         {"board_dir", Value{swarm_dir.string()}},
+                         {"repo_root", Value{""}},
+                         {"lease_root", Value{""}},
+                         {"name", Value{"dentist-1"}},
+                         {"role", Value{""}},
+                         {"provider", Value{"anthropic"}},
+                         {"model", Value{"claude-opus-4-6"}},
+                         {"workspace_mode", Value{"inherit"}},
+                         {"owned_files", Value{Value::Array{}}},
+                         {"brief", Value{""}},
+                         {"base_name", Value{""}},
+                         {"tasks", Value{Value::Array{}}},
+                         {"max_concurrency", Value{Number{0}}},
+                         {"repo_checks", Value{Value::Array{Value{"ctest"}}}},
+                         {"agent", Value{""}},
+                         {"since_seq", Value{Number{0}}},
+                         {"mentions_only", Value{false}},
+                         {"timeout_ms", Value{Number{0}}},
+                         {"reason", Value{""}},
+                     }));
+  require(std::get<bool>(field(ls_dentist, "added").value()) &&
+              std::get<bool>(field(field(ls_dentist, "worker"), "read_only").value()),
+          "local_swarm dentist all-fields failed");
+
+  const Value ls_wait =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"wait"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"repo_root", Value{""}},
+                                               {"lease_root", Value{""}},
+                                               {"name", Value{""}},
+                                               {"role", Value{""}},
+                                               {"provider", Value{""}},
+                                               {"model", Value{""}},
+                                               {"workspace_mode", Value{"inherit"}},
+                                               {"owned_files", Value{Value::Array{}}},
+                                               {"brief", Value{""}},
+                                               {"base_name", Value{""}},
+                                               {"tasks", Value{Value::Array{}}},
+                                               {"max_concurrency", Value{Number{0}}},
+                                               {"repo_checks", Value{Value::Array{}}},
+                                               {"agent", Value{"alpha"}},
+                                               {"since_seq", Value{Number{0}}},
+                                               {"mentions_only", Value{true}},
+                                               {"timeout_ms", Value{Number{50}}},
+                                               {"reason", Value{""}},
+                                           }));
+  require(std::get<bool>(field(ls_wait, "woken").value()) &&
+              field(ls_wait, "count") != Value{Number{std::uint64_t{0}}},
+          "local_swarm wait all-fields failed");
+
+  // slice-2 started in waiting state (max_concurrency=1), so switch_model succeeds.
+  const Value ls_switch =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"switch_model"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"repo_root", Value{""}},
+                                               {"lease_root", Value{""}},
+                                               {"name", Value{"slice-2"}},
+                                               {"role", Value{""}},
+                                               {"provider", Value{"google"}},
+                                               {"model", Value{"gemini-2.5-pro"}},
+                                               {"workspace_mode", Value{"inherit"}},
+                                               {"owned_files", Value{Value::Array{}}},
+                                               {"brief", Value{""}},
+                                               {"base_name", Value{""}},
+                                               {"tasks", Value{Value::Array{}}},
+                                               {"max_concurrency", Value{Number{0}}},
+                                               {"repo_checks", Value{Value::Array{}}},
+                                               {"agent", Value{""}},
+                                               {"since_seq", Value{Number{0}}},
+                                               {"mentions_only", Value{false}},
+                                               {"timeout_ms", Value{Number{0}}},
+                                               {"reason", Value{"quota handoff"}},
+                                           }));
+  require(std::get<bool>(field(ls_switch, "switched").value()) &&
+              string_field(field(ls_switch, "worker"), "model") == "gemini-2.5-pro",
+          "local_swarm switch_model all-fields failed");
+
+  const Value ls_kill =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"kill"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"repo_root", Value{""}},
+                                               {"lease_root", Value{""}},
+                                               {"name", Value{"alpha"}},
+                                               {"role", Value{""}},
+                                               {"provider", Value{""}},
+                                               {"model", Value{""}},
+                                               {"workspace_mode", Value{"inherit"}},
+                                               {"owned_files", Value{Value::Array{}}},
+                                               {"brief", Value{""}},
+                                               {"base_name", Value{""}},
+                                               {"tasks", Value{Value::Array{}}},
+                                               {"max_concurrency", Value{Number{0}}},
+                                               {"repo_checks", Value{Value::Array{}}},
+                                               {"agent", Value{""}},
+                                               {"since_seq", Value{Number{0}}},
+                                               {"mentions_only", Value{false}},
+                                               {"timeout_ms", Value{Number{0}}},
+                                               {"reason", Value{""}},
+                                           }));
+  require(std::get<bool>(field(ls_kill, "killed").value()) &&
+              string_field(field(ls_kill, "worker"), "state") == "killed",
+          "local_swarm kill all-fields failed");
 }
 
 void test_companion_timing_safety_floor(const fs::path &sandbox, const char *self_exe) {
@@ -1520,6 +1722,542 @@ void test_coding_engine_dispatch(const fs::path &sandbox) {
   (void)unsetenv("BLACKBIRD_AUTH_HOME");
 }
 
+void test_local_swarm_lifecycle(const fs::path &sandbox) {
+  const fs::path absent_dir = sandbox / "local_swarm_absent";
+  const Value empty_status = run_command_post_tool(
+      "local_swarm", Value::object({{"action", Value{"status"}},
+                                    {"board_dir", Value{absent_dir.string()}}}));
+  require(!std::get<bool>(field(empty_status, "swarm_present").value()) &&
+              field(empty_status, "count") == Value{Number{std::uint64_t{0}}} &&
+              !fs::exists(absent_dir),
+          "local_swarm status on absent dir must not create directory");
+
+  const fs::path swarm_dir = sandbox / "local_swarm_life";
+
+  // 1. Add worker with owned_files.
+  const Value w1 = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"add"}},
+                         {"board_dir", Value{swarm_dir.string()}},
+                         {"name", Value{"wire-a"}},
+                         {"role", Value{"builder"}},
+                         {"provider", Value{"openai"}},
+                         {"model", Value{"gpt-5.4"}},
+                         {"workspace_mode", Value{"inherit"}},
+                         {"owned_files", Value{Value::Array{Value{"src/mod_a.cpp"}}}},
+                         {"brief", Value{"Build mod_a \x1b[31mRED\x1b[0m"}},
+                     }));
+  require(std::get<bool>(field(w1, "added").value()) &&
+              string_field(field(w1, "worker"), "name") == "wire-a" &&
+              string_field(field(w1, "worker"), "state") == "working",
+          "local_swarm add failed");
+  const std::string &qbrief = string_field(field(w1, "worker"), "quoted_brief");
+  require(qbrief.find('\x1b') == std::string::npos &&
+              qbrief.find("\\x1b") != std::string::npos,
+          "local_swarm worker quoted_brief must escape control bytes");
+
+  // 2. Overlapping owned_files must fail with ErrorCode::conflict.
+  require_error(
+      [&] {
+        return run_command_post_tool(
+            "local_swarm",
+            Value::object({
+                {"action", Value{"add"}},
+                {"board_dir", Value{swarm_dir.string()}},
+                {"name", Value{"wire-b"}},
+                {"owned_files", Value{Value::Array{Value{"src/mod_a.cpp"}}}},
+                {"brief", Value{"Conflicting claim"}},
+            }));
+      },
+      ErrorCode::conflict, "overlapping owned_files must conflict");
+
+  // 3. Sharded fan-out with max_concurrency=1 -> shard-1 working, shard-2 waiting.
+  const Value sharded = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"sharded"}},
+                         {"board_dir", Value{swarm_dir.string()}},
+                         {"base_name", Value{"shard"}},
+                         {"tasks", Value{Value::Array{Value{"t1"}, Value{"t2"}}}},
+                         {"brief", Value{"Review target"}},
+                         {"max_concurrency", Value{Number{1}}},
+                     }));
+  require(std::get<bool>(field(sharded, "spawned").value()) &&
+              field(sharded, "count") == Value{Number{std::uint64_t{2}}},
+          "local_swarm sharded failed");
+  const auto &shard_workers = field(sharded, "workers").array();
+  require(string_field(shard_workers.at(0), "state") == "working" &&
+              string_field(shard_workers.at(1), "state") == "waiting",
+          "sharded max_concurrency state assignment mismatch");
+
+  // 4. Built-in read-only @dentist verifier.
+  const Value dentist = run_command_post_tool(
+      "local_swarm",
+      Value::object({
+          {"action", Value{"dentist"}},
+          {"board_dir", Value{swarm_dir.string()}},
+          {"name", Value{"dentist-v"}},
+          {"repo_checks", Value{Value::Array{Value{"clang-format"}, Value{"ctest"}}}},
+      }));
+  require(std::get<bool>(field(dentist, "added").value()) &&
+              std::get<bool>(field(field(dentist, "worker"), "read_only").value()) &&
+              field(field(dentist, "worker"), "owned_files").array().empty() &&
+              string_field(field(dentist, "worker"), "role") == "dentist",
+          "local_swarm dentist failed");
+
+  // 5. Wait wakes immediately on pre-existing mention with untrusted framing.
+  const Value waited =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"wait"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"agent", Value{"wire-a"}},
+                                               {"since_seq", Value{Number{0}}},
+                                               {"mentions_only", Value{true}},
+                                               {"timeout_ms", Value{Number{50}}},
+                                           }));
+  require(std::get<bool>(field(waited, "woken").value()) &&
+              !std::get<bool>(field(waited, "timed_out").value()) &&
+              field(waited, "count") != Value{Number{std::uint64_t{0}}},
+          "local_swarm wait should wake on pre-existing mention");
+  const Value &wmsg = field(waited, "messages").array().at(0);
+  require(std::get<bool>(field(wmsg, "untrusted_peer_data").value()) &&
+              wmsg.find("text") == nullptr,
+          "local_swarm wait messages must use untrusted framing");
+
+  // 6. switch_model rejects working worker (conflict), succeeds on waiting worker.
+  require_error(
+      [&] {
+        return run_command_post_tool("local_swarm",
+                                     Value::object({
+                                         {"action", Value{"switch_model"}},
+                                         {"board_dir", Value{swarm_dir.string()}},
+                                         {"name", Value{"wire-a"}},
+                                         {"model", Value{"claude-sonnet-4-6"}},
+                                     }));
+      },
+      ErrorCode::conflict, "switch_model on working worker must conflict");
+
+  const Value switched =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"switch_model"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"name", Value{"shard-2"}},
+                                               {"provider", Value{"anthropic"}},
+                                               {"model", Value{"claude-sonnet-4-6"}},
+                                               {"reason", Value{"capacity"}},
+                                           }));
+  require(std::get<bool>(field(switched, "switched").value()) &&
+              string_field(field(switched, "worker"), "provider") == "anthropic" &&
+              string_field(field(switched, "worker"), "model") == "claude-sonnet-4-6",
+          "local_swarm switch_model on waiting worker failed");
+
+  // 7. kill permanently retires worker; status reflects all workers.
+  const Value killed =
+      run_command_post_tool("local_swarm", Value::object({
+                                               {"action", Value{"kill"}},
+                                               {"board_dir", Value{swarm_dir.string()}},
+                                               {"name", Value{"wire-a"}},
+                                           }));
+  require(std::get<bool>(field(killed, "killed").value()) &&
+              string_field(field(killed, "worker"), "state") == "killed",
+          "local_swarm kill failed");
+
+  const Value status_after = run_command_post_tool(
+      "local_swarm", Value::object({{"action", Value{"status"}},
+                                    {"board_dir", Value{swarm_dir.string()}}}));
+  require(std::get<bool>(field(status_after, "swarm_present").value()) &&
+              field(status_after, "count") == Value{Number{std::uint64_t{4}}},
+          "local_swarm status count mismatch");
+
+  // Unknown key rejected cleanly.
+  require_error(
+      [&] {
+        return run_command_post_tool(
+            "local_swarm",
+            Value::object({{"action", Value{"status"}}, {"bogus", Value{true}}}));
+      },
+      ErrorCode::invalid_range, "local_swarm unknown key rejected");
+
+  // 8. Absent board_dir zero-dir-creation for wait (timeout_ms > 0), kill,
+  // switch_model.
+  const fs::path absent_ops = sandbox / "local_swarm_absent_ops";
+  const Value wait_absent = run_command_post_tool(
+      "local_swarm", Value::object({
+                         {"action", Value{"wait"}},
+                         {"board_dir", Value{absent_ops.string()}},
+                         {"agent", Value{"wire-a"}},
+                         {"since_seq", Value{Number{0}}},
+                         {"mentions_only", Value{true}},
+                         {"timeout_ms", Value{Number{20}}},
+                     }));
+  require(!std::get<bool>(field(wait_absent, "board_present").value()) &&
+              !std::get<bool>(field(wait_absent, "woken").value()) &&
+              std::get<bool>(field(wait_absent, "timed_out").value()) &&
+              !fs::exists(absent_ops),
+          "local_swarm wait with timeout_ms>0 on absent dir must not create directory");
+
+  require_error(
+      [&] {
+        return run_command_post_tool("local_swarm",
+                                     Value::object({
+                                         {"action", Value{"kill"}},
+                                         {"board_dir", Value{absent_ops.string()}},
+                                         {"name", Value{"wire-a"}},
+                                     }));
+      },
+      ErrorCode::stale_handle,
+      "local_swarm kill on absent dir must return stale_handle");
+  require(!fs::exists(absent_ops),
+          "local_swarm kill on absent dir must not create dir");
+
+  require_error(
+      [&] {
+        return run_command_post_tool("local_swarm",
+                                     Value::object({
+                                         {"action", Value{"switch_model"}},
+                                         {"board_dir", Value{absent_ops.string()}},
+                                         {"name", Value{"wire-a"}},
+                                         {"model", Value{"gpt-5.4"}},
+                                     }));
+      },
+      ErrorCode::stale_handle,
+      "local_swarm switch_model on absent dir must return stale_handle");
+  require(!fs::exists(absent_ops),
+          "local_swarm switch_model on absent dir must not create dir");
+
+  // 9. Trailing-slash symlink bypass rejected by probe_existing_dir().
+  const fs::path real_target = sandbox / "symlink_real_target";
+  const fs::path sym_dir = sandbox / "symlink_board_dir";
+  fs::create_directories(real_target);
+  fs::create_directory_symlink(real_target, sym_dir);
+  const std::string trailing_slash_symlink = sym_dir.string() + "/";
+  require_error(
+      [&] {
+        return run_command_post_tool(
+            "local_swarm",
+            Value::object({{"action", Value{"status"}},
+                           {"board_dir", Value{trailing_slash_symlink}}}));
+      },
+      ErrorCode::io, "trailing-slash symlink board_dir must be rejected");
+  require_error(
+      [&] {
+        return run_command_post_tool("platoon_board",
+                                     Value::object({
+                                         {"action", Value{"read"}},
+                                         {"board_dir", Value{trailing_slash_symlink}},
+                                     }));
+      },
+      ErrorCode::io, "platoon_board trailing-slash symlink must be rejected");
+}
+
+void test_context_hygiene_live_wiring(const fs::path &sandbox) {
+  // 1. Live turn-end lossless tool-result aging + /restore + pinned/error preservation.
+  {
+    const fs::path audit_dir = sandbox / "hygiene_aging_audit";
+    fs::create_directories(audit_dir);
+    fs::permissions(audit_dir, fs::perms::owner_all);
+
+    JournalHeader header{make_id<EnvironmentId>(81),
+                         make_id<AuditStreamId>(82),
+                         3,
+                         {1024 * 1024, 4 * 1024 * 1024},
+                         std::nullopt};
+    auto root = unwrap(
+        RetainedState::create(std::make_unique<NativeJournalDirectory>(unwrap(
+                                  NativeJournalDirectory::open(audit_dir.string()))),
+                              "audit", header, {64 * 1024 * 1024, 10000}));
+    AuditLog log{*root};
+    ContextStore context{log};
+    NoProvider provider;
+    CodingEngine engine{log, context, provider, "test-model"};
+
+    // Turn 1: append three large (>512 B) tool-result blocks: unpinned ok, pinned ok,
+    // and unpinned failed (exit_code=1).
+    const std::string ok_body = "VERBOSE_OK_TOOL_OUTPUT_" + std::string(900, 'X');
+    const std::string pin_body = "PINNED_TOOL_OUTPUT_" + std::string(900, 'P');
+    const std::string err_body = "FAILED_TOOL_OUTPUT_" + std::string(900, 'E');
+
+    context.append(
+        {Value::object({{"role", Value{"user"}}, {"content", Value{"turn 1"}}})},
+        "operator", BlockKind::instruction);
+    const auto ok_block = context.append(
+        {Value::object({{"type", Value{"function_call"}},
+                        {"call_id", Value{"c_ok"}},
+                        {"name", Value{"exec"}},
+                        {"arguments", Value{"{}"}}}),
+         Value::object({{"type", Value{"function_call_output"}},
+                        {"call_id", Value{"c_ok"}},
+                        {"output", Value::object({{"exit_code", Value{Number{0}}},
+                                                  {"output", Value{ok_body}}})}})},
+        "provider.turn1");
+    const auto pin_block = context.append(
+        {Value::object({{"type", Value{"function_call"}},
+                        {"call_id", Value{"c_pin"}},
+                        {"name", Value{"exec"}},
+                        {"arguments", Value{"{}"}}}),
+         Value::object({{"type", Value{"function_call_output"}},
+                        {"call_id", Value{"c_pin"}},
+                        {"output", Value::object({{"exit_code", Value{Number{0}}},
+                                                  {"output", Value{pin_body}}})}})},
+        "provider.turn1");
+    const auto err_block = context.append(
+        {Value::object({{"type", Value{"function_call"}},
+                        {"call_id", Value{"c_err"}},
+                        {"name", Value{"exec"}},
+                        {"arguments", Value{"{}"}}}),
+         Value::object({{"type", Value{"function_call_output"}},
+                        {"call_id", Value{"c_err"}},
+                        {"output", Value::object({{"exit_code", Value{Number{1}}},
+                                                  {"output", Value{err_body}}})}})},
+        "provider.turn1");
+    // Mixed exchange block carrying assistant prose + tool output must NEVER be aged.
+    const auto mixed_block = context.append(
+        {Value::object({{"type", Value{"message"}},
+                        {"role", Value{"assistant"}},
+                        {"content", Value{"Important assistant explanation prose."}}}),
+         Value::object({{"type", Value{"function_call"}},
+                        {"call_id", Value{"c_mix"}},
+                        {"name", Value{"exec"}},
+                        {"arguments", Value{"{}"}}}),
+         Value::object({{"type", Value{"function_call_output"}},
+                        {"call_id", Value{"c_mix"}},
+                        {"output", Value::object({{"exit_code", Value{Number{0}}},
+                                                  {"output", Value{ok_body}}})}})},
+        "provider.turn1");
+    // Split blocks: earlier closed block maps c_split_name -> read_file; separate
+    // function_call_output block must resolve real tool_name ("read_file") when aged.
+    (void)context.append({Value::object({{"type", Value{"function_call"}},
+                                         {"call_id", Value{"c_split_name"}},
+                                         {"name", Value{"read_file"}},
+                                         {"arguments", Value{"{}"}}}),
+                          Value::object({{"type", Value{"function_call_output"}},
+                                         {"call_id", Value{"c_split_name"}},
+                                         {"output", Value{"ok"}}})},
+                         "provider.turn1.split_call");
+    const auto split_out_block =
+        context.append({Value::object({{"type", Value{"function_call_output"}},
+                                       {"call_id", Value{"c_split_name"}},
+                                       {"output", Value{std::string(900, 'R')}}})},
+                       "provider.turn1.split_out", BlockKind::exchange);
+
+    // Pin pin_block.
+    (void)context.compact({.ids = {pin_block},
+                           .from = {},
+                           .to = {},
+                           .summary = {},
+                           .op = CompactOp::pin});
+
+    // Run turns 2..5 (by turn 5, age == 4 > 3 for ok_block, <= 6 for err_block).
+    for (int t = 2; t <= 5; ++t) {
+      engine.turn({"turn " + std::to_string(t), "return true"});
+    }
+
+    auto has_live = [&](std::uint64_t id) {
+      for (const auto &b : context.blocks()) {
+        if (b.id == id)
+          return true;
+      }
+      return false;
+    };
+    require(!has_live(ok_block),
+            "old unpinned ok tool block must be aged after turn 5");
+    require(has_live(pin_block), "pinned tool block must never be aged");
+    require(has_live(err_block), "failed tool block must be preserved for 6 turns");
+    require(has_live(mixed_block),
+            "mixed exchange block carrying assistant prose must NOT be aged");
+    require(!has_live(split_out_block),
+            "split function_call_output block must be aged after turn 5");
+
+    // Verify deterministic lossless 1-line stubs are present in live blocks (and
+    // split_out_block resolved its real tool_name "read_file").
+    bool saw_stub = false;
+    bool saw_split_tool_name = false;
+    for (const auto &b : context.blocks()) {
+      for (const auto &item : b.items) {
+        if (const auto *content = item.find("content");
+            content && std::holds_alternative<std::string>(content->value()) &&
+            is_aged_tool_stub(content->string())) {
+          if (content->string().find("/restore " + std::to_string(ok_block)) !=
+              std::string::npos) {
+            saw_stub = true;
+          }
+          if (content->string().find("read_file") != std::string::npos &&
+              content->string().find("/restore " + std::to_string(split_out_block)) !=
+                  std::string::npos) {
+            saw_split_tool_name = true;
+          }
+        }
+      }
+    }
+    require(saw_stub, "aged tool block must be replaced with lossless /restore stub");
+    require(saw_split_tool_name,
+            "split function_call_output stub must resolve call_id -> tool_name");
+
+    // Verify /restore recovers the exact verbatim original from AuditLog!
+    const Value restored = engine.operator_call(
+        "context_compact", Value::object({
+                               {"op", Value{"restore"}},
+                               {"ids", Value{Value::Array{Value{Number{ok_block}}}}},
+                           }));
+    require(field(restored, "ok") == Value{true} && has_live(ok_block),
+            "/restore must bring aged block back live without immediate re-aging");
+    const Value verbatim = context.read_block(ok_block);
+    require(string_field(verbatim, "content").find("VERBOSE_OK_TOOL_OUTPUT_") !=
+                std::string::npos,
+            "restored block must contain verbatim original from AuditLog");
+
+    // Run turns 6..8 (by turn 8, age == 7 > 6 -> failed block ages too).
+    for (int t = 6; t <= 8; ++t) {
+      engine.turn({"turn " + std::to_string(t), "return true"});
+    }
+    require(!has_live(err_block), "failed tool block must age once age > 6 turns");
+  }
+
+  // 2. Live project_tool_output_for_context() on verbose model exec call.
+  {
+    const fs::path audit_dir = sandbox / "hygiene_proj_audit";
+    fs::create_directories(audit_dir);
+    fs::permissions(audit_dir, fs::perms::owner_all);
+
+    JournalHeader header{make_id<EnvironmentId>(91),
+                         make_id<AuditStreamId>(92),
+                         3,
+                         {1024 * 1024, 4 * 1024 * 1024},
+                         std::nullopt};
+    auto root = unwrap(
+        RetainedState::create(std::make_unique<NativeJournalDirectory>(unwrap(
+                                  NativeJournalDirectory::open(audit_dir.string()))),
+                              "audit", header, {64 * 1024 * 1024, 10000}));
+    AuditLog log{*root};
+    ContextStore context{log};
+
+    class VerboseExecProvider final : public CodingProvider {
+    public:
+      int step = 0;
+      std::string call_id = "exec-verbose-1";
+      Value observed_exec_result;
+      Value respond(const Value &request,
+                    const std::function<void(std::string_view)> &capture) override {
+        ++step;
+        Value resp;
+        if (step == 1) {
+          const Value args = Value::object({
+              {"argv",
+               Value{Value::Array{
+                   Value{"/bin/sh"}, Value{"-c"},
+                   Value{
+                       "i=1; while [ $i -le 180 ]; do "
+                       "if [ $i -eq 90 ]; then "
+                       "echo 'src/mid.cpp:77: error: synthetic diagnostic needle'; "
+                       "else "
+                       "echo \"build step $i compiling verbose_translation_unit_$i.cpp "
+                       "with flags -Wall -Wextra\"; "
+                       "fi; i=$((i+1)); done"}}}},
+          });
+          resp = Value::object(
+              {{"output", Value{Value::Array{Value::object(
+                              {{"type", Value{"function_call"}},
+                               {"call_id", Value{call_id}},
+                               {"name", Value{"exec"}},
+                               {"arguments", Value{unwrap(dump_json(args))}}})}}}});
+        } else {
+          for (const auto &item : field(request, "input").array()) {
+            if (const auto *type = item.find("type");
+                type && *type == Value{"function_call_output"} &&
+                string_field(item, "call_id") == call_id) {
+              observed_exec_result = field(item, "output");
+            }
+          }
+          resp = Value::object({{"output", Value{Value::Array{}}}});
+        }
+        capture(unwrap(dump_json(resp)));
+        return resp;
+      }
+    } provider;
+
+    CodingEngine engine{log, context, provider, "test-model"};
+    const std::string turn_lua = R"lua(
+while true do
+  local response = blackbird.request()
+  local calls = 0
+  for _, item in ipairs(response.output) do
+    if item.type == "function_call" then
+      calls = calls + 1
+      local result = blackbird.call(item.name, item.arguments, { call_id = item.call_id })
+      blackbird.append({{ type = "function_call_output", call_id = item.call_id, output = result }})
+    end
+  end
+  if blackbird.restarting() or calls == 0 then
+    return
+  end
+end
+)lua";
+    engine.turn({"build", turn_lua});
+
+    require(provider.step == 2, "expected 2 provider steps");
+    const Value &res = provider.observed_exec_result;
+    require(std::holds_alternative<Value::Object>(res.value()),
+            "exec output must be object");
+    require(field(res, "context_projected") == Value{true},
+            "verbose model exec output must be context_projected");
+    require(field(res, "truncated") == Value{true},
+            "context-projected exec output must set truncated=true");
+    const std::string &shown = string_field(res, "output");
+    require(shown.find("src/mid.cpp:77: error: synthetic diagnostic needle") !=
+                std::string::npos,
+            "projected exec output must preserve middle diagnostic error line");
+    require(shown.find("retained in audit") != std::string::npos,
+            "projected exec output must carry lossless audit pointer footer");
+
+    // Full verbatim output must remain readable via read_process_output + output_ref.
+    const Value verbatim =
+        engine.operator_call("read_process_output",
+                             Value::object({{"output_ref", field(res, "output_ref")}}));
+    const std::string &full = string_field(verbatim, "output");
+    require(full.find("build step 1 compiling") != std::string::npos &&
+                full.find("build step 91 compiling") != std::string::npos &&
+                full.find("build step 180 compiling") != std::string::npos,
+            "verbatim process output must remain untouched in AuditLog");
+
+    // 3. Workflow-supplied tight output_max_bytes (2048) must never be exceeded by
+    //    context projection, and omitted_bytes / truncated must stay consistent.
+    provider.step = 0;
+    provider.call_id = "exec-verbose-2";
+    provider.observed_exec_result = Value{};
+    const std::string tight_budget_lua = R"lua(
+while true do
+  local response = blackbird.request()
+  local calls = 0
+  for _, item in ipairs(response.output) do
+    if item.type == "function_call" then
+      calls = calls + 1
+      local args = item.arguments
+      args.output_max_bytes = 2048
+      args.output_head_bytes = 512
+      local result = blackbird.call(item.name, args, { call_id = item.call_id })
+      blackbird.append({{ type = "function_call_output", call_id = item.call_id, output = result }})
+    end
+  end
+  if blackbird.restarting() or calls == 0 then
+    return
+  end
+end
+)lua";
+    engine.turn({"build tight", tight_budget_lua});
+    const Value &tight_res = provider.observed_exec_result;
+    require(field(tight_res, "context_projected") == Value{true} &&
+                field(tight_res, "truncated") == Value{true},
+            "tight-budget model exec must project and mark truncated=true");
+    const std::string &tight_shown = string_field(tight_res, "output");
+    require(tight_shown.size() <= 2048,
+            "context projection must strictly honor workflow output_budget");
+    require(tight_shown.find("src/mid.cpp:77: error: synthetic diagnostic needle") !=
+                std::string::npos,
+            "tight-budget projection must still preserve middle diagnostic error");
+    require(std::stoull(field(tight_res, "omitted_bytes").number().text()) > 0,
+            "compacted projection must report positive omitted_bytes");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1546,6 +2284,8 @@ int main(int argc, char **argv) {
     test_bridge_guard_receipt_fail_closed(sandbox);
     test_shared_stores_untrusted_sanitization(sandbox);
     test_coding_engine_dispatch(sandbox);
+    test_local_swarm_lifecycle(sandbox);
+    test_context_hygiene_live_wiring(sandbox);
   } catch (const std::exception &err) {
     std::cerr << "FAIL: " << err.what() << '\n';
     return 1;

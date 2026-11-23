@@ -1,6 +1,7 @@
 #include "blackbird/terminal.hpp"
 #include "blackbird/command_inspector.hpp"
 #include "blackbird/display_text.hpp"
+#include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
 #include "blackbird/packet.hpp"
@@ -75,6 +76,8 @@ const std::array builtin_commands{
     ChatCommand{"/effort", "LEVEL", "Set low, medium, high, xhigh or max (empty picks)",
                 "Session"},
     ChatCommand{"/session", "", "Current session and settings", "Session"},
+    ChatCommand{"/cwd", "[PATH]", "Show or change the current working directory",
+                "Session"},
     ChatCommand{"/new", "", "Start a fresh saved session; keep current settings",
                 "Session"},
     ChatCommand{"/sessions", "",
@@ -181,13 +184,13 @@ const std::array builtin_commands{
     ChatCommand{"/swarmboard", "[all|mentions|conflicts|watchers]",
                 "Live read-only swarm roster, mentions, conflicts and watchers",
                 "Command Post"},
-    ChatCommand{"/flightdeck", "[tick N]",
-                "SR-71 flight deck telemetry, token shower and sparklines",
+    ChatCommand{"/flightdeck", "[tick N|detach]",
+                "SR-71 flight deck telemetry, Kitty cockpit (Alt+F) and detach",
                 "Command Post"},
     ChatCommand{"/party",
-                "[status|all|operators|leaders|conflicts|say TEXT|create ROOM|join "
-                "URI|invite [URL]|leave|remove ALIAS]",
-                "Open/inspect Party Chat, filter, or message @all / @leader",
+                "[status|peers|add ALIAS|all|operators|leaders|conflicts|say TEXT|"
+                "create [ROOM]|join URI|invite [URL]|close|leave|remove ALIAS]",
+                "Open/inspect Party Chat, manage peers, or message @all / @leader",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>
@@ -604,7 +607,7 @@ std::string terminal_key_help() {
          "  Left / Right Move within the draft\n"
          "  Ctrl-A / E   Start / end of line (also Home / End)\n"
          "  Ctrl-Home/End Start / end of draft\n"
-         "  Alt-B / F    Back / forward word (also Ctrl-Left / Right)\n"
+         "  Alt-B/Right  Back / forward word (also Ctrl-Left / Right)\n"
          "  Ctrl-W       Delete previous word; Alt-D deletes next word\n"
          "  Ctrl-K / Y   Kill to line end / yank last deletion\n"
          "  Ctrl-U       Clear draft; Ctrl-Y restores it\n"
@@ -616,7 +619,7 @@ std::string terminal_key_help() {
          "  Ctrl-\\      View picker; switch views without replacing the draft\n"
          "  Ctrl-X       Current-session command center; preserve draft/cursor\n"
          "  Ctrl-]       Authored result lab; F6/F7 pin A/B; F8 request interrupt\n"
-         "  Alt+P / !cmd Alt+P party (Esc back, Alt+Shift+P hide); !cmd shell\n"
+         "  Alt+F/P !cmd Alt+F flightdeck; Alt+P party (Shift hide); !cmd shell\n"
          "  Inspector    Arrows/Home/End/Page navigate; Tab focus; Esc draft/close\n"
          "  Center       T tasks, P participants, J command runs; + means more\n"
          "               Ctrl-Left/Right: list pages or output pages by focus\n"
@@ -653,8 +656,8 @@ std::string terminal_help() {
   out +=
       "\nLocal TUI controls run immediately, even during work. Other commands queue\n"
       "behind the active turn; they do not mutate an in-flight provider request.\n\n";
-  return out + "Keyboard: /keys · Tab completes commands · PgUp/PgDn browse this "
-               "guide · Alt+P party · !cmd shell\n";
+  return out + "Keyboard: /keys · Tab completes commands · PgUp/PgDn browse · "
+               "Alt+F cockpit · Alt+P party · !cmd shell\n";
 }
 bool terminal_is_bang_shell_command(std::string_view draft) noexcept {
   return !draft.empty() && draft.front() == '!';
@@ -853,15 +856,34 @@ std::string terminal_party_status_pill(const PartyChatPane &pane, bool docked) {
   const std::size_t unread = pane.unread_count();
   if (terminal_party_is_active(snap)) {
     std::size_t online = 0;
+    std::size_t online_non_self = 0;
+    std::size_t configured_leaders = 0;
     for (const auto &p : snap.participants) {
-      if (p.state == PartyParticipantState::online ||
-          p.state == PartyParticipantState::working ||
-          p.state == PartyParticipantState::idle) {
+      const bool is_online = p.state == PartyParticipantState::online ||
+                             p.state == PartyParticipantState::working ||
+                             p.state == PartyParticipantState::idle;
+      if (is_online) {
         ++online;
+        if (!p.local_self)
+          ++online_non_self;
       }
+      if (p.role == PartyMemberRole::platoon_leader)
+        ++configured_leaders;
     }
-    std::string pill = "● PARTY " + party_chat_sanitize(snap.room_scope, 32) + " · " +
-                       std::to_string(online) + " online";
+    std::string count_label;
+    if (online > 0 && (online_non_self > 0 || configured_leaders == 0)) {
+      count_label = std::to_string(online) + " online";
+    } else if (configured_leaders > 0) {
+      count_label = std::to_string(configured_leaders) +
+                    (configured_leaders == 1U ? " leader" : " leaders");
+    } else if (!snap.participants.empty()) {
+      count_label = std::to_string(snap.participants.size()) +
+                    (snap.participants.size() == 1U ? " peer" : " peers");
+    } else {
+      count_label = "ready";
+    }
+    std::string pill =
+        "● PARTY " + party_chat_sanitize(snap.room_scope, 32) + " · " + count_label;
     if (unread > 0)
       pill += " (" + std::to_string(unread) + " unread)";
     pill += " · Alt+P";
@@ -1564,6 +1586,13 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       return {};
     }
     if (escape_ == "\x1b"
+                   "f" ||
+        escape_ == "\x1b[102;3u") {
+      palette_open_ = slash_open_ = false;
+      escape_.clear();
+      return {InputAction::flightdeck_toggle, {}};
+    }
+    if (escape_ == "\x1b"
                    "p" ||
         escape_ == "\x1b[112;3u") {
       palette_open_ = slash_open_ = false;
@@ -1723,9 +1752,7 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
                      "b" ||
           escape_ == "\x1b[1;5D" || escape_ == "\x1b[1;3D")
         cursor_ = word_left(text_, cursor_);
-      if (escape_ == "\x1b"
-                     "f" ||
-          escape_ == "\x1b[1;5C" || escape_ == "\x1b[1;3C")
+      if (escape_ == "\x1b[1;5C" || escape_ == "\x1b[1;3C")
         cursor_ = word_right(text_, cursor_);
       if (escape_ == "\x1b"
                      "d")
@@ -2709,8 +2736,53 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (hooks_panel && hooks_panel->open())
       hooks_panel->toggle();
   };
+  auto is_user_owned_regular_file = [](const std::filesystem::path &path) noexcept {
+    if (path.empty())
+      return false;
+    auto strip_trailing_slashes = [](std::string raw) {
+      while (raw.size() > 1U && raw.back() == '/')
+        raw.pop_back();
+      return raw;
+    };
+    const std::string leaf_str = strip_trailing_slashes(path.string());
+    struct stat st{};
+    if (::lstat(leaf_str.c_str(), &st) != 0)
+      return false;
+    if (!S_ISREG(st.st_mode))
+      return false;
+    if (st.st_uid != ::geteuid())
+      return false;
+    if ((st.st_mode & 0022U) != 0U)
+      return false;
+    const std::filesystem::path parent = std::filesystem::path{leaf_str}.parent_path();
+    if (!parent.empty()) {
+      const std::string parent_str = strip_trailing_slashes(parent.string());
+      struct stat parent_st{};
+      if (::lstat(parent_str.c_str(), &parent_st) != 0)
+        return false;
+      if (!S_ISDIR(parent_st.st_mode))
+        return false;
+      if (parent_st.st_uid != ::geteuid())
+        return false;
+      if ((parent_st.st_mode & 0022U) != 0U)
+        return false;
+    }
+    return true;
+  };
+  auto resolve_user_party_config_path = [&]() -> std::filesystem::path {
+    if (const char *bb_home = std::getenv("BLACKBIRD_HOME");
+        bb_home != nullptr && bb_home[0] != '\0') {
+      return std::filesystem::path{bb_home} / "party.json";
+    }
+    if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+      return std::filesystem::path{home} / ".blackbird" / "party.json";
+    }
+    return {};
+  };
   PartyChatPane party_pane;
   bool party_docked = false;
+  bool party_user_hidden = false;
+  bool party_auto_opened = false;
   bool party_snapshot_external = false;
   std::string party_escape;
   auto party_escape_deadline = std::chrono::steady_clock::time_point::max();
@@ -2722,12 +2794,33 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (ec || cwd.empty())
       return;
     PartyConfig cfg = PartyConfig::for_project(cwd);
+    const auto user_party_path = resolve_user_party_config_path();
+    // Never silently auto-load untrusted repo-local `.blackbird/party.json`;
+    // only load user-owned config under BLACKBIRD_HOME or ~/.blackbird/.
+    cfg.party_config_path = is_user_owned_regular_file(user_party_path)
+                                ? user_party_path
+                                : std::filesystem::path{};
     cfg.local_operator_id = "operator";
     auto snap = load_party_snapshot(cfg);
     if (snap.has_value())
       party_pane.update(std::move(snap).value());
   };
   refresh_party_passive();
+  const bool flightdeck_kitty_capable = kitty_graphics_capable();
+  bool flightdeck_open = false;
+  bool flightdeck_first_frame = true;
+  bool flightdeck_kitty_emitted = false;
+  bool flightdeck_pending_erase = false;
+  bool flightdeck_restore_cursor = false;
+  bool flightdeck_demo_gate_active = false;
+  std::optional<HeroFlightDeckEngine> flightdeck_engine;
+  HeroControlInput flightdeck_control{};
+  auto flightdeck_steer_until = std::chrono::steady_clock::time_point::min();
+  auto flightdeck_last_step = std::chrono::steady_clock::now();
+  auto flightdeck_next_frame = std::chrono::steady_clock::time_point::min();
+  std::string flightdeck_escape;
+  auto flightdeck_escape_deadline = std::chrono::steady_clock::time_point::max();
+  std::shared_ptr<const TerminalQuestion> flightdeck_synced_question;
   auto route = tui::ViewRoute::conversation;
   std::string_view route_notice;
   const auto select_view = [&](tui::ViewRoute requested, RawEventRef origin,
@@ -3660,6 +3753,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       if (busy)
         redraw = true;
     }
+    if (flightdeck_open) {
+      if (now >= flightdeck_steer_until)
+        flightdeck_control = {};
+      if (now >= flightdeck_next_frame)
+        redraw = true;
+    }
     if (rows != old_rows || columns != old_columns)
       redraw = true;
     if (context_blinking(std::chrono::steady_clock::now()))
@@ -3680,20 +3779,200 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         const auto width = static_cast<std::size_t>(columns);
         const auto &committed = output.geometry();
         // Foreground PTY input reaches the child verbatim, so reporting stays off.
-        const bool mouse_target = mouse_wanted && !foreground_pty;
+        const bool mouse_target = mouse_wanted && !foreground_pty && !flightdeck_open;
         const bool mouse_change = mouse_target != mouse_emitted;
         // A recovering frame is never empty, so a mode or clipboard update always
         // has a packet.
         const bool recover = viewport_invalidated || committed.tiny ||
                              committed.rows != rows || committed.columns != width ||
-                             mouse_change || !pending_osc52.empty();
+                             mouse_change || !pending_osc52.empty() ||
+                             flightdeck_pending_erase || flightdeck_restore_cursor;
         // A later resize wake must survive completion of this packet.
         viewport_invalidated = false;
+        if (flightdeck_open) {
+          if (!flightdeck_engine)
+            flightdeck_engine.emplace(HeroCanvasConfig{});
+          const std::uint32_t target_w =
+              std::clamp<std::uint32_t>(static_cast<std::uint32_t>(width) * 5U,
+                                        hero_min_width, hero_default_width);
+          const std::uint32_t target_h =
+              std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows) * 10U,
+                                        hero_min_height, hero_default_height);
+          if (flightdeck_engine->width() != target_w ||
+              flightdeck_engine->height() != target_h) {
+            flightdeck_engine->resize(HeroSize{.width = target_w, .height = target_h});
+          }
+          HeroTelemetryInput ht{};
+          ht.busy = busy;
+          ht.input_tokens = live_telemetry.total_input > 0 ? live_telemetry.total_input
+                                                           : live_telemetry.last_input;
+          ht.cached_tokens = live_telemetry.total_cached > 0
+                                 ? live_telemetry.total_cached
+                                 : live_telemetry.last_cached;
+          ht.reasoning_tokens = live_telemetry.last_reasoning;
+          ht.output_tokens = live_telemetry.total_output > 0
+                                 ? live_telemetry.total_output
+                                 : live_telemetry.last_output;
+          if (live_telemetry.last_input > 0) {
+            ht.cache_hit_ratio =
+                std::clamp(static_cast<double>(live_telemetry.last_cached) /
+                               static_cast<double>(live_telemetry.last_input),
+                           0.0, 1.0);
+          }
+          if (live_telemetry.last_duration_ms >= 50ULL) {
+            const double sec =
+                static_cast<double>(live_telemetry.last_duration_ms) / 1000.0;
+            ht.total_tok_per_sec = static_cast<double>(live_telemetry.last_input +
+                                                       live_telemetry.last_output) /
+                                   sec;
+            ht.out_rsn_tok_per_sec =
+                static_cast<double>(live_telemetry.last_output +
+                                    live_telemetry.last_reasoning) /
+                sec;
+          } else if (busy && stream_bytes > 0) {
+            const auto elapsed_ms = std::max<std::int64_t>(
+                100,
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - started)
+                    .count());
+            const double approx_tok_s = (static_cast<double>(stream_bytes) / 4.0) /
+                                        (static_cast<double>(elapsed_ms) / 1000.0);
+            ht.out_rsn_tok_per_sec = approx_tok_s;
+            ht.total_tok_per_sec = std::max(approx_tok_s * 3.0, 200.0);
+          }
+          if (live_telemetry.context_window && *live_telemetry.context_window > 0 &&
+              live_telemetry.last_input > 0) {
+            ht.main_context_fill =
+                std::clamp(static_cast<double>(live_telemetry.last_input) /
+                               static_cast<double>(*live_telemetry.context_window),
+                           0.0, 1.0);
+          }
+          const auto &psnap = party_pane.snapshot();
+          if (terminal_party_is_active(psnap)) {
+            ht.room_label = psnap.room_scope;
+            std::size_t active_p = 0;
+            for (const auto &p : psnap.participants) {
+              const bool is_act = p.state == PartyParticipantState::online ||
+                                  p.state == PartyParticipantState::working ||
+                                  p.state == PartyParticipantState::idle;
+              if (is_act)
+                ++active_p;
+              HeroPeerEntry pe{};
+              pe.name = p.id;
+              pe.active = is_act;
+              pe.tool_busy = p.state == PartyParticipantState::working;
+              pe.silent = p.state == PartyParticipantState::offline;
+              ht.peers.push_back(std::move(pe));
+            }
+            ht.active_agents = std::max<std::size_t>(1U, active_p);
+            ht.total_agents = std::max<std::size_t>(1U, psnap.participants.size());
+          } else {
+            ht.room_label = title_;
+            ht.active_agents = busy ? 1U : 0U;
+            ht.total_agents = 1U;
+          }
+          flightdeck_engine->set_telemetry(ht);
+          flightdeck_engine->steer_input(flightdeck_control);
+          if (question && question != flightdeck_synced_question) {
+            HeroQuestion hq{};
+            hq.from = "blackbird";
+            hq.text = question->heading;
+            const std::size_t max_opts =
+                std::min<std::size_t>(3U, question->choices.size());
+            for (std::size_t oi = 0; oi < max_opts; ++oi) {
+              const auto &ch = question->choices[oi];
+              hq.options.push_back(ch.label.empty() ? ch.name : ch.label);
+            }
+            if (hq.options.size() >= 2U)
+              flightdeck_engine->set_question(std::move(hq));
+            flightdeck_synced_question = question;
+            flightdeck_demo_gate_active = false;
+          } else if (!question && !flightdeck_demo_gate_active &&
+                     flightdeck_synced_question) {
+            flightdeck_engine->set_question(std::nullopt);
+            flightdeck_synced_question.reset();
+          }
+          const float dt = std::clamp(
+              std::chrono::duration<float>(now - flightdeck_last_step).count(), 0.01F,
+              0.10F);
+          flightdeck_last_step = now;
+          flightdeck_next_frame = now + std::chrono::milliseconds{60};
+          const auto &hero_frame = flightdeck_engine->step_and_render(dt);
+          if (const auto picked = flightdeck_engine->take_answered_index();
+              picked.has_value()) {
+            if (flightdeck_demo_gate_active) {
+              flightdeck_demo_gate_active = false;
+            } else if (question && !busy && *picked < question->choices.size()) {
+              const std::string chosen = question->choices[*picked].name;
+              const auto length = chosen.size();
+              RawUiTrace answer_original{
+                  raw_capture_,
+                  {4071, 4016},
+                  std::array{ByteView{keyboard_read.lane},
+                             detail::raw_native_field(keyboard_read.ordinal),
+                             detail::raw_native_field(length),
+                             detail::raw_string_field(chosen)},
+                  raw_ui_error_bytes,
+                  true};
+              answer_original.run([&] {
+                const RawUiSource source{answer_original.reference(), 0, length};
+                answer_original.finish();
+                (void)start(chosen, source);
+              });
+            }
+          }
+          std::string payload = "\x1b[?2026h\x1b[?25l";
+          if (mouse_change) {
+            payload += mouse_target ? mouse_on : mouse_off;
+            pending_mouse = mouse_target;
+          }
+          if (graphics_enabled && image_placement[2]) {
+            payload += blackbird_graphics_erase();
+            pending_image_placement = {};
+          }
+          if (flightdeck_first_frame || geometry_changed) {
+            payload += "\x1b[H\x1b[0m\x1b[2J";
+            pending_image_loaded = false;
+          }
+          if (flightdeck_kitty_capable) {
+            payload += encode_kitty_rgba_frame(
+                hero_frame, HeroKittyPlacement{.row = 0,
+                                               .column = 0,
+                                               .columns = width,
+                                               .rows = rows,
+                                               .image_id = hero_default_kitty_image_id,
+                                               .placement_id = 1});
+            flightdeck_kitty_emitted = true;
+          } else {
+            payload += "\x1b[H\x1b[0m";
+            const auto hb_rows = encode_truecolor_halfblock_frame(
+                hero_frame, HeroHalfBlockOptions{.columns = width, .rows = rows});
+            for (std::size_t r = 0; r < hb_rows.size(); ++r) {
+              payload += "\x1b[" + std::to_string(r + 1U) + ";1H";
+              payload += hb_rows[r];
+            }
+          }
+          payload += "\x1b[?2026l";
+          flightdeck_first_frame = false;
+          const auto bound =
+              raw_capture_ && raw_enabled() ? raw_ui_add(payload.size(), 64) : 0;
+          RawUiFrame captured{raw_capture_, bound};
+          captured.run([&] {
+            auto &fd_frame = output.prepare_tiny(rows, columns, 0, 0);
+            fd_frame = std::move(payload);
+            captured.capture(fd_frame);
+            output.start(captured.handoff());
+            (void)service_output();
+            render.outcome(output.pending() ? RawRegionOutcome::queued
+                                            : RawRegionOutcome::flushed);
+          });
+          layout.finish();
+          continue;
+        }
         if (rows < 8 || columns < 12) {
           const auto bound =
               raw_capture_ && raw_enabled()
                   ? raw_ui_add(raw_ui_multiply(composer.text().size() + 2, 4),
-                               256 + pending_osc52.size())
+                               320 + pending_osc52.size())
                   : 0;
           RawUiFrame captured{raw_capture_, bound};
           captured.run([&] {
@@ -3718,6 +3997,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               small_frame += blackbird_graphics_erase();
               pending_image_placement = {};
             }
+            if (flightdeck_pending_erase) {
+              small_frame += encode_kitty_erase(hero_default_kitty_image_id);
+              flightdeck_pending_erase = false;
+            }
+            if (flightdeck_restore_cursor) {
+              small_frame += "\x1b[?25h";
+              flightdeck_restore_cursor = false;
+            }
             small_frame += "\x1b[?2026l";
             captured.capture(small_frame);
             output.start(captured.handoff());
@@ -3729,6 +4016,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         }
         const bool inspecting = inspection_open();
         const auto party_layout = terminal_party_pane_layout({width, rows});
+        if (!party_auto_opened && !party_user_hidden && !party_pane.is_open() &&
+            party_layout.docked && terminal_party_is_active(party_pane.snapshot())) {
+          party_pane.set_open(true);
+          party_pane.set_focused(false);
+          party_docked = true;
+          party_auto_opened = true;
+        }
         if (party_pane.is_open() && !party_pane.is_focused() && party_docked &&
             !party_layout.docked) {
           party_pane.set_open(false);
@@ -4162,12 +4456,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           const bool graphics_update =
               graphics_enabled && (recover || placement != image_placement);
           const bool osc52_update = !pending_osc52.empty();
-          if (graphics_update || mouse_change || osc52_update) {
+          const bool flightdeck_cleanup =
+              flightdeck_pending_erase || flightdeck_restore_cursor;
+          if (graphics_update || mouse_change || osc52_update || flightdeck_cleanup) {
             layout.stage(4);
             constexpr auto digits = std::numeric_limits<std::size_t>::digits10 + 1;
             const auto image_bound =
                 raw_capture_ && raw_enabled()
-                    ? raw_ui_add(packet.size(), 4096 + 256 + 4 * digits +
+                    ? raw_ui_add(packet.size(), 4096 + 320 + 4 * digits +
                                                     mouse_on.size() +
                                                     pending_osc52.size())
                     : 0;
@@ -4183,6 +4479,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               if (osc52_update) {
                 packet += pending_osc52;
                 pending_osc52.clear();
+              }
+              if (flightdeck_pending_erase) {
+                packet += encode_kitty_erase(hero_default_kitty_image_id);
+                flightdeck_pending_erase = false;
+              }
+              if (flightdeck_restore_cursor) {
+                packet += "\x1b[?25h";
+                flightdeck_restore_cursor = false;
               }
               if (graphics_update) {
                 packet += blackbird_graphics_erase();
@@ -4225,8 +4529,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
          {resize_->read_fd(), POLLIN, 0}}};
     const auto ready = terminal_native_poll(
         &terminal_context, inputs,
-        composer.escape_pending() || !child_escape.empty() || !party_escape.empty() ? 50
-        : busy || commands                                                          ? 40
+        composer.escape_pending() || !child_escape.empty() || !party_escape.empty() ||
+                !flightdeck_escape.empty()
+            ? 50
+        : flightdeck_open                                    ? 55
+        : busy || commands                                   ? 40
         : context_blinking(std::chrono::steady_clock::now()) ? 125
                                                              : 1000);
     if (ready < 0) {
@@ -4242,7 +4549,36 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (inputs[1].revents & POLLIN)
       terminal_notification_drain(&terminal_context, notifications.read_fd());
     ui_capture.require();
+    auto close_flightdeck = [&] {
+      flightdeck_open = false;
+      flightdeck_escape.clear();
+      flightdeck_control = {};
+      if (flightdeck_kitty_emitted) {
+        flightdeck_pending_erase = true;
+        flightdeck_kitty_emitted = false;
+      }
+      flightdeck_restore_cursor = true;
+      viewport_invalidated = true;
+      redraw = true;
+    };
+    auto open_flightdeck = [&] {
+      flightdeck_open = true;
+      flightdeck_first_frame = true;
+      flightdeck_escape.clear();
+      flightdeck_control = {};
+      flightdeck_last_step = std::chrono::steady_clock::now();
+      flightdeck_next_frame = std::chrono::steady_clock::time_point::min();
+      viewport_invalidated = true;
+      redraw = true;
+    };
     // Service the same deadline policy before either ready-input or idle dispatch.
+    if (flightdeck_open && !flightdeck_escape.empty() &&
+        std::chrono::steady_clock::now() >= flightdeck_escape_deadline) {
+      if (flightdeck_escape == "\x1b")
+        close_flightdeck();
+      else
+        flightdeck_escape.clear();
+    }
     if (party_pane.is_focused() && !party_escape.empty() &&
         std::chrono::steady_clock::now() >= party_escape_deadline) {
       if (party_escape == "\x1b") {
@@ -4408,6 +4744,111 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         keyboard_process.progress(static_cast<std::size_t>(i) + 1);
         continue;
       }
+      if (flightdeck_open) {
+        const char byte = bytes[i];
+        const auto u = static_cast<unsigned char>(byte);
+        const auto input_now = std::chrono::steady_clock::now();
+        redraw = true;
+        auto steer = [&](HeroControlInput ctl) {
+          flightdeck_control = ctl;
+          flightdeck_steer_until = input_now + std::chrono::milliseconds{220};
+        };
+        if (!flightdeck_escape.empty()) {
+          if (u == 27U) {
+            flightdeck_escape = byte;
+            flightdeck_escape_deadline = input_now + std::chrono::milliseconds{50};
+            keyboard_process.progress(static_cast<std::size_t>(i) + 1);
+            continue;
+          }
+          flightdeck_escape += byte;
+          const bool sgr_mouse =
+              flightdeck_escape.starts_with("\x1b[<") && (byte == 'M' || byte == 'm');
+          if (flightdeck_escape == "\x1b"
+                                   "f" ||
+              flightdeck_escape == "\x1b[102;3u") {
+            close_flightdeck();
+          } else if (flightdeck_escape == "\x1b[A" || flightdeck_escape == "\x1bOA") {
+            steer(HeroControlInput{.up = true, .stick_y = -1.0F});
+            flightdeck_escape.clear();
+          } else if (flightdeck_escape == "\x1b[B" || flightdeck_escape == "\x1bOB") {
+            steer(HeroControlInput{.down = true, .stick_y = 1.0F});
+            flightdeck_escape.clear();
+          } else if (flightdeck_escape == "\x1b[D" || flightdeck_escape == "\x1bOD") {
+            steer(HeroControlInput{.left = true, .stick_x = -1.0F});
+            flightdeck_escape.clear();
+          } else if (flightdeck_escape == "\x1b[C" || flightdeck_escape == "\x1bOC") {
+            steer(HeroControlInput{.right = true, .stick_x = 1.0F});
+            flightdeck_escape.clear();
+          } else if (sgr_mouse) {
+            flightdeck_escape.clear();
+          } else if (flightdeck_escape.size() == 2 && (byte == '[' || byte == 'O')) {
+            // Wait for CSI / SS3 parameters and final byte.
+          } else if (flightdeck_escape.starts_with("\x1b[") &&
+                     flightdeck_escape.size() >= 3U && flightdeck_escape.size() < 64U &&
+                     u >= 0x20U && u <= 0x3fU) {
+            // Accumulate bounded CSI parameter (0x30..0x3f) & intermediate (0x20..0x2f)
+            // bytes until the final byte (0x40..0x7e).
+          } else {
+            flightdeck_escape.clear();
+          }
+          keyboard_process.progress(static_cast<std::size_t>(i) + 1);
+          continue;
+        }
+        if (u == 27U) {
+          flightdeck_escape = byte;
+          flightdeck_escape_deadline = input_now + std::chrono::milliseconds{50};
+        } else if (byte == 'q' || byte == 'Q' || u == 3U) {
+          close_flightdeck();
+        } else if (u == 17U) {
+          close_flightdeck();
+          quitting = true;
+          cancel_turn();
+        } else if (byte == 'w' || byte == 'W') {
+          steer(HeroControlInput{.up = true, .stick_y = -1.0F});
+        } else if (byte == 's' || byte == 'S') {
+          steer(HeroControlInput{.down = true, .stick_y = 1.0F});
+        } else if (byte == 'a' || byte == 'A') {
+          steer(HeroControlInput{.left = true, .stick_x = -1.0F});
+        } else if (byte == 'd' || byte == 'D') {
+          steer(HeroControlInput{.right = true, .stick_x = 1.0F});
+        } else if (byte == 't' || byte == 'T') {
+          if (!flightdeck_engine)
+            flightdeck_engine.emplace(HeroCanvasConfig{});
+          flightdeck_engine->cycle_theme();
+        } else if (byte == 'g' || byte == 'G') {
+          if (!flightdeck_engine)
+            flightdeck_engine.emplace(HeroCanvasConfig{});
+          if (!question) {
+            if (flightdeck_demo_gate_active) {
+              flightdeck_engine->set_question(std::nullopt);
+              flightdeck_demo_gate_active = false;
+            } else {
+              HeroQuestion demo{};
+              demo.from = "flight-ops";
+              demo.text = "Select flight profile";
+              demo.detail = "Fly into gate for 1.5s or press 1/2/3";
+              demo.options = {"MACH 3.2", "CRUISE", "STEALTH"};
+              flightdeck_engine->set_question(std::move(demo));
+              flightdeck_demo_gate_active = true;
+            }
+          }
+        } else if (byte == '1' || byte == '2' || byte == '3') {
+          if (flightdeck_engine &&
+              flightdeck_engine->answer_by_key(static_cast<std::size_t>(byte - '1'))) {
+            if (const auto picked = flightdeck_engine->take_answered_index();
+                picked.has_value()) {
+              if (flightdeck_demo_gate_active) {
+                flightdeck_demo_gate_active = false;
+              } else if (question && !busy && *picked < question->choices.size()) {
+                dispatch_synthetic_command(question->choices[*picked].name,
+                                           keyboard_read);
+              }
+            }
+          }
+        }
+        keyboard_process.progress(static_cast<std::size_t>(i) + 1);
+        continue;
+      }
       if (party_pane.is_open() && party_pane.is_focused()) {
         const char byte = bytes[i];
         const auto u = static_cast<unsigned char>(byte);
@@ -4418,8 +4859,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           const bool sgr_mouse =
               party_escape.starts_with("\x1b[<") && (byte == 'M' || byte == 'm');
           if (party_escape == "\x1b"
-                              "p" ||
-              party_escape == "\x1b[112;3u") {
+                              "f" ||
+              party_escape == "\x1b[102;3u") {
+            party_pane.set_focused(false);
+            party_escape.clear();
+            open_flightdeck();
+          } else if (party_escape == "\x1b"
+                                     "p" ||
+                     party_escape == "\x1b[112;3u") {
             party_pane.set_focused(false);
             if (columns < kTerminalPartyDockedMinCols || !party_docked) {
               party_pane.set_open(false);
@@ -4432,6 +4879,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             party_pane.set_focused(false);
             party_pane.set_open(false);
             party_docked = false;
+            party_user_hidden = true;
             party_escape.clear();
           } else if (party_escape == "\x1b[A" || party_escape == "\x1bOA") {
             party_pane.scroll_up(1);
@@ -4553,8 +5001,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           escape_deadline =
               std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
         redraw = true;
+        if (result.action == InputAction::flightdeck_toggle) {
+          open_flightdeck();
+        }
         if (result.action == InputAction::party_toggle) {
           refresh_party_passive();
+          party_user_hidden = false;
           party_pane.set_open(true);
           party_pane.set_focused(true);
           party_docked = columns >= kTerminalPartyDockedMinCols;
@@ -4563,6 +5015,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           party_pane.set_focused(false);
           party_pane.set_open(false);
           party_docked = false;
+          party_user_hidden = true;
         }
         if (result.action == InputAction::select_view) {
           if (result.view) {
@@ -4955,6 +5408,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   transcript += "\nFold requires a top-level task ID.\n";
               }
               tasks_dirty_ = true;
+            } else if (result.text == "/party close" || result.text == "/party hide") {
+              party_pane.set_focused(false);
+              party_pane.set_open(false);
+              party_docked = false;
+              party_user_hidden = true;
+              transcript.append(ChatKind::notice, "Party Chat hidden (Alt+P reopens).");
+              scroll = 0;
             } else if (result.text == "/commands") {
               (void)composer.feed(0);
             } else if (result.text == "/edit") {
@@ -5157,6 +5617,15 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (!saved_last_input && !(composer.pasted() && more_stdin))
       persist();
     keyboard_process.finish();
+  }
+  if (flightdeck_kitty_emitted || flightdeck_pending_erase ||
+      flightdeck_restore_cursor) {
+    output.detach();
+    std::string cleanup;
+    if (flightdeck_kitty_emitted || flightdeck_pending_erase)
+      cleanup += encode_kitty_erase(hero_default_kitty_image_id);
+    cleanup += "\x1b[?25h";
+    (void)::write(STDOUT_FILENO, cleanup.data(), cleanup.size());
   }
   persist();
 }

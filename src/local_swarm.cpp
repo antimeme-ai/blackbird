@@ -30,7 +30,10 @@
 namespace blackbird {
 namespace {
 
+#if defined(__APPLE__)
 constexpr const char *kBoardFileName = "board.jsonl";
+constexpr std::uintptr_t kWakeEventIdent = 1;
+#endif
 constexpr const char *kSwarmStateFile = "local_swarm.json";
 constexpr const char *kSwarmStateLockFile = "local_swarm.lock";
 constexpr std::uint64_t kSwarmStateSchemaVersion = 1;
@@ -39,7 +42,6 @@ constexpr std::size_t kReadChunkBytes = 64 * 1024;
 constexpr std::int64_t kCancelSliceMs = 15;
 constexpr std::int64_t kMissingDirPollMs = 25;
 constexpr std::int64_t kMaxBoundedWaitTimeoutMs = 365LL * 24LL * 60LL * 60LL * 1000LL;
-constexpr std::uintptr_t kWakeEventIdent = 1;
 
 std::atomic<std::uint64_t> g_swarm_tmp_counter{0};
 

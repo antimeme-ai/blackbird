@@ -183,8 +183,7 @@ int main() {
     for (const char byte : std::string_view{"\x1bOH"})
       check(fragmented.feed(byte).action == InputAction::none);
     check(!fragmented.escape_pending() && fragmented.cursor() == 0);
-    feed(fragmented, "\x1b"
-                     "f");
+    feed(fragmented, "\x1b[1;3C");
     check(fragmented.cursor() == 3);
     check(feed(fragmented, "\x1b[6~").action == InputAction::page_down);
     Composer paste_timeout;
@@ -785,6 +784,72 @@ int main() {
       PartyChatPane solo_pane{solo_snap};
       check(!terminal_party_is_active(solo_snap));
       check(terminal_party_status_pill(solo_pane, false).empty());
+
+      // Wave 9B-2: Alt+F Hero v24 Flight Deck toggle decoding, /cwd & /resume
+      // palette registration, and configured-leader ambient status pill.
+      {
+        Composer fd_keys;
+        fd_keys.draft("cockpit draft");
+        feed(fd_keys, "\x1b[D\x1b[D");
+        const auto saved_fd_cursor = fd_keys.cursor();
+        check(feed(fd_keys, "\x1b"
+                            "f")
+                  .action == InputAction::flightdeck_toggle);
+        check(fd_keys.text() == "cockpit draft" && fd_keys.cursor() == saved_fd_cursor);
+        check(feed(fd_keys, "\x1b[102;3u").action == InputAction::flightdeck_toggle);
+        check(fd_keys.text() == "cockpit draft" && fd_keys.cursor() == saved_fd_cursor);
+
+        // /cwd and /resume are registered in builtin_commands for help, hints,
+        // Tab-completion, and searchable palette.
+        check(terminal_help().find("/cwd") != std::string::npos);
+        check(terminal_help().find("/resume") != std::string::npos);
+        check(terminal_help().find("Alt+F cockpit") != std::string::npos);
+        check(terminal_key_help().find("Alt+F") != std::string::npos);
+        check(terminal_command_hint("/cwd").starts_with("/cwd"));
+        check(terminal_command_hint("/resume").starts_with("/resume"));
+
+        Composer cwd_palette;
+        for (const char ch : std::string_view{"\0cwd", 4})
+          (void)cwd_palette.feed(ch);
+        const auto cwd_lines = cwd_palette.palette_lines(6);
+        check(cwd_lines.size() >= 2 && cwd_lines[1].find("/cwd") != std::string::npos);
+
+        Composer resume_palette;
+        for (const char ch : std::string_view{"\0resume", 7})
+          (void)resume_palette.feed(ch);
+        const auto resume_lines = resume_palette.palette_lines(6);
+        check(resume_lines.size() >= 2 &&
+              resume_lines[1].find("/resume") != std::string::npos);
+
+        Composer cwd_tab;
+        feed(cwd_tab, "/cw\t");
+        check(cwd_tab.text() == "/cwd ");
+
+        // Ambient status pill counts configured leaders clearly before first
+        // presence heartbeat (never misleading "0 online").
+        PartySnapshot offline_leaders;
+        offline_leaders.room_scope = "ops/alpha";
+        offline_leaders.party_config_present = true;
+        PartyParticipant l1;
+        l1.id = "wintermute";
+        l1.role = PartyMemberRole::platoon_leader;
+        l1.state = PartyParticipantState::offline;
+        PartyParticipant l2;
+        l2.id = "neuromancer";
+        l2.role = PartyMemberRole::platoon_leader;
+        l2.state = PartyParticipantState::offline;
+        offline_leaders.participants = {l1, l2};
+        PartyChatPane offline_pane{offline_leaders};
+        check(terminal_party_status_pill(offline_pane, false) ==
+              "● PARTY ops/alpha · 2 leaders · Alt+P");
+
+        // Even when local_self is online while configured leaders haven't
+        // heartbeated yet, show configured leaders clearly.
+        offline_leaders.participants.insert(offline_leaders.participants.begin(), op);
+        PartyChatPane self_plus_offline_pane{offline_leaders};
+        check(terminal_party_status_pill(self_plus_offline_pane, false) ==
+              "● PARTY ops/alpha · 2 leaders · Alt+P");
+      }
 
       // TerminalUI::party_chat queues snapshot cleanly.
       task_ui.party_chat(snap);

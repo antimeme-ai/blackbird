@@ -9,6 +9,7 @@
 #include "blackbird/local_timing.hpp"
 #include "blackbird/openrouter.hpp"
 #include "blackbird/packet.hpp"
+#include "blackbird/party_dispatch.hpp"
 #include "blackbird/provider_auth.hpp"
 #include "blackbird/raw_auth.hpp"
 #include "blackbird/raw_command.hpp"
@@ -272,6 +273,470 @@ ApplicationCli parse_application_cli(int argc, char **argv) {
   }
   return cli;
 }
+
+std::string_view trim_ascii_ws(std::string_view text) noexcept {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' ||
+                           text.front() == '\r' || text.front() == '\n'))
+    text.remove_prefix(1);
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
+                           text.back() == '\r' || text.back() == '\n'))
+    text.remove_suffix(1);
+  return text;
+}
+
+std::string safe_single_line(std::string_view text, std::size_t max_bytes = 512) {
+  return party_chat_sanitize(text, max_bytes);
+}
+
+std::filesystem::path strip_trailing_slashes(const std::filesystem::path &path) {
+  std::string text = path.string();
+  while (text.size() > 1 && text.back() == '/')
+    text.pop_back();
+  return std::filesystem::path{std::move(text)};
+}
+
+struct CiSubstringQuery {
+  std::string_view haystack;
+  std::string_view needle;
+};
+
+bool contains_ci(CiSubstringQuery query) noexcept {
+  if (query.needle.empty())
+    return false;
+  if (query.needle.size() > query.haystack.size())
+    return false;
+  auto lower = [](char ch) noexcept -> char {
+    return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+  };
+  const std::size_t limit = query.haystack.size() - query.needle.size();
+  for (std::size_t i = 0; i <= limit; ++i) {
+    bool match = true;
+    for (std::size_t j = 0; j < query.needle.size(); ++j) {
+      if (lower(query.haystack[i + j]) != lower(query.needle[j])) {
+        match = false;
+        break;
+      }
+    }
+    if (match)
+      return true;
+  }
+  return false;
+}
+
+bool is_all_ascii_digits(std::string_view text) noexcept {
+  if (text.empty())
+    return false;
+  for (const char ch : text) {
+    if (ch < '0' || ch > '9')
+      return false;
+  }
+  return true;
+}
+
+std::optional<std::size_t> parse_positive_index(std::string_view text) noexcept {
+  if (!is_all_ascii_digits(text))
+    return std::nullopt;
+  std::size_t val = 0;
+  const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), val);
+  if (ec != std::errc{} || ptr != text.data() + text.size() || val == 0)
+    return std::nullopt;
+  return val;
+}
+
+struct SessionAgeWindow {
+  std::int64_t activity_unix_sec = 0;
+  std::int64_t now_unix_sec = 0;
+};
+
+std::string format_relative_age(SessionAgeWindow window) {
+  if (window.activity_unix_sec <= 0)
+    return "unknown";
+  const std::int64_t delta = window.now_unix_sec > window.activity_unix_sec
+                                 ? (window.now_unix_sec - window.activity_unix_sec)
+                                 : 0;
+  if (delta < 60)
+    return "just now";
+  if (delta < 3600)
+    return std::to_string(delta / 60) + "m ago";
+  if (delta < 86400)
+    return std::to_string(delta / 3600) + "h ago";
+  return std::to_string(delta / 86400) + "d ago";
+}
+
+struct ResumeSessionEntry {
+  std::string path;
+  std::string name;
+  std::string route;
+  std::int64_t last_activity = 0;
+};
+
+std::vector<ResumeSessionEntry>
+collect_resume_sessions(const std::filesystem::path &root) {
+  std::vector<ResumeSessionEntry> entries;
+  const Value listing = list_sessions(root);
+  const Value *sessions_field = listing.find("sessions");
+  if (!sessions_field)
+    return entries;
+  const auto *arr = std::get_if<Value::Array>(&sessions_field->value());
+  if (!arr)
+    return entries;
+
+  entries.reserve(arr->size());
+  for (const Value &item : *arr) {
+    const std::string path = string_field(item, "path");
+    if (path.empty())
+      continue;
+    ResumeSessionEntry entry{};
+    entry.path = path;
+    entry.name = std::filesystem::path{path}.filename().string();
+    if (const Value *cfg = item.find("configuration");
+        cfg != nullptr && std::holds_alternative<Value::Object>(cfg->value())) {
+      if (const Value *n = cfg->find("name");
+          n != nullptr && std::holds_alternative<std::string>(n->value()) &&
+          !n->string().empty()) {
+        entry.name = n->string();
+      }
+      std::string prov;
+      std::string mdl;
+      if (const Value *p = cfg->find("provider");
+          p != nullptr && std::holds_alternative<std::string>(p->value())) {
+        prov = p->string();
+      }
+      if (const Value *m = cfg->find("model");
+          m != nullptr && std::holds_alternative<std::string>(m->value())) {
+        mdl = m->string();
+      }
+      if (!prov.empty() && !mdl.empty())
+        entry.route = prov + "/" + mdl;
+      else if (!mdl.empty())
+        entry.route = mdl;
+    }
+    if (const Value *act = item.find("last_activity_unix_seconds");
+        act != nullptr && std::holds_alternative<Number>(act->value())) {
+      std::int64_t parsed = 0;
+      const auto &txt = act->number().text();
+      const auto [ptr, ec] =
+          std::from_chars(txt.data(), txt.data() + txt.size(), parsed);
+      if (ec == std::errc{} && ptr == txt.data() + txt.size() && parsed > 0)
+        entry.last_activity = parsed;
+    }
+    if (entry.last_activity == 0) {
+      const auto clean_path = strip_trailing_slashes(std::filesystem::path{path});
+      struct stat st{};
+      if (::lstat(clean_path.c_str(), &st) == 0 && !S_ISLNK(st.st_mode) &&
+          st.st_mtime > 0) {
+        entry.last_activity = static_cast<std::int64_t>(st.st_mtime);
+      }
+    }
+    entries.push_back(std::move(entry));
+  }
+
+  std::sort(entries.begin(), entries.end(),
+            [](const ResumeSessionEntry &a, const ResumeSessionEntry &b) {
+              if (a.last_activity != b.last_activity)
+                return a.last_activity > b.last_activity;
+              return a.path > b.path;
+            });
+  return entries;
+}
+
+void print_resume_session_list(const std::vector<ResumeSessionEntry> &entries) {
+  const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto &e = entries[i];
+    std::cout << (i + 1) << ") " << safe_single_line(e.name, 160) << "  ("
+              << format_relative_age(
+                     {.activity_unix_sec = e.last_activity,
+                      .now_unix_sec = static_cast<std::int64_t>(now_sec)})
+              << ")";
+    if (!e.route.empty())
+      std::cout << "  [" << safe_single_line(e.route, 128) << "]";
+    std::cout << "  " << safe_single_line(e.path, 512) << '\n';
+  }
+}
+
+std::optional<std::size_t>
+select_resume_entry(const std::vector<ResumeSessionEntry> &entries,
+                    std::string_view selector) {
+  if (entries.empty() || selector.empty())
+    return std::nullopt;
+  if (selector == "last")
+    return 0;
+  if (is_all_ascii_digits(selector)) {
+    const auto idx = parse_positive_index(selector);
+    if (idx.has_value() && *idx >= 1 && *idx <= entries.size())
+      return *idx - 1;
+    return std::nullopt;
+  }
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (contains_ci({.haystack = entries[i].name, .needle = selector}) ||
+        contains_ci({.haystack = entries[i].path, .needle = selector}) ||
+        contains_ci({.haystack = entries[i].route, .needle = selector})) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+struct ResumeCliOutcome {
+  bool launch = false;
+  int exit_code = 0;
+  std::vector<std::string> launch_args;
+};
+
+ResumeCliOutcome resolve_resume_cli(int argc, char **argv) {
+  ResumeCliOutcome out{};
+  const char *home = std::getenv("HOME");
+  std::optional<std::filesystem::path> root_override;
+  std::optional<std::string> selector;
+  bool plain = false;
+
+  for (int i = 2; i < argc; ++i) {
+    const std::string_view arg{argv[i]};
+    if (arg == "--help" || arg == "-h") {
+      std::cout << "usage: blackbird resume [last|N|query] [--root DIR] [--plain]\n"
+                   "       blackbird --resume [last|N|query] [--root DIR] [--plain]\n";
+      out.exit_code = 0;
+      return out;
+    }
+    if (arg == "--root") {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+        std::cerr << "blackbird resume: --root requires a non-empty directory\n";
+        out.exit_code = 2;
+        return out;
+      }
+      root_override = std::filesystem::path{argv[++i]};
+    } else if (arg == "--plain") {
+      plain = true;
+    } else if (arg.starts_with('-')) {
+      std::cerr << "blackbird resume: unknown option: " << safe_single_line(arg, 128)
+                << '\n';
+      out.exit_code = 2;
+      return out;
+    } else if (!selector.has_value()) {
+      if (arg.empty()) {
+        std::cerr << "blackbird resume: selector must not be empty\n";
+        out.exit_code = 2;
+        return out;
+      }
+      selector = std::string{arg};
+    } else {
+      std::cerr << "blackbird resume: unexpected extra argument: "
+                << safe_single_line(arg, 128) << '\n';
+      out.exit_code = 2;
+      return out;
+    }
+  }
+
+  std::filesystem::path root;
+  if (root_override.has_value()) {
+    root = *root_override;
+  } else {
+    if (home == nullptr || home[0] == '\0') {
+      std::cerr << "blackbird resume: HOME is unset; pass --root DIR\n";
+      out.exit_code = 1;
+      return out;
+    }
+    root = std::filesystem::path{home} / ".local/state/blackbird";
+  }
+
+  const auto entries = collect_resume_sessions(root);
+  if (!selector.has_value()) {
+    const bool interactive =
+        ::isatty(STDIN_FILENO) != 0 && ::isatty(STDOUT_FILENO) != 0;
+    if (entries.empty()) {
+      if (interactive) {
+        std::cerr << "No saved Blackbird sessions found in "
+                  << safe_single_line(root.string(), 512) << '\n';
+        out.exit_code = 1;
+      } else {
+        std::cout << "No saved Blackbird sessions found in "
+                  << safe_single_line(root.string(), 512) << '\n';
+        out.exit_code = 0;
+      }
+      return out;
+    }
+    print_resume_session_list(entries);
+    if (!interactive) {
+      out.exit_code = 0;
+      return out;
+    }
+    std::cout << "Select session [1.." << entries.size()
+              << "] (Enter=1, q=cancel): " << std::flush;
+    std::string response;
+    if (!std::getline(std::cin, response)) {
+      out.exit_code = 0;
+      return out;
+    }
+    const std::string_view choice = trim_ascii_ws(response);
+    if (choice == "q" || choice == "Q" || choice == "quit") {
+      out.exit_code = 0;
+      return out;
+    }
+    const std::string_view effective = choice.empty() ? std::string_view{"1"} : choice;
+    const auto picked = select_resume_entry(entries, effective);
+    if (!picked.has_value()) {
+      std::cerr << "blackbird resume: no matching session for '"
+                << safe_single_line(effective, 128) << "'\n";
+      out.exit_code = 1;
+      return out;
+    }
+    out.launch = true;
+    out.launch_args = {argv[0], "--session", entries[*picked].path,
+                       "--new-session-instance"};
+    if (plain)
+      out.launch_args.emplace_back("--plain");
+    return out;
+  }
+
+  if (entries.empty()) {
+    std::cerr << "blackbird resume: no saved sessions found in "
+              << safe_single_line(root.string(), 512) << '\n';
+    out.exit_code = 1;
+    return out;
+  }
+
+  const auto picked = select_resume_entry(entries, *selector);
+  if (!picked.has_value()) {
+    if (is_all_ascii_digits(*selector)) {
+      std::cerr << "blackbird resume: session index out of range (1.." << entries.size()
+                << ")\n";
+    } else {
+      std::cerr << "blackbird resume: no session matching '"
+                << safe_single_line(*selector, 128) << "'\n";
+    }
+    out.exit_code = 1;
+    return out;
+  }
+
+  out.launch = true;
+  out.launch_args = {argv[0], "--session", entries[*picked].path,
+                     "--new-session-instance"};
+  if (plain)
+    out.launch_args.emplace_back("--plain");
+  return out;
+}
+
+std::optional<std::string_view>
+extract_party_say_body(std::string_view prompt) noexcept {
+  const std::string_view trimmed = trim_ascii_ws(prompt);
+  if (!trimmed.starts_with("/party"))
+    return std::nullopt;
+  std::string_view rest = trimmed.substr(6);
+  if (rest.empty() || (rest.front() != ' ' && rest.front() != '\t'))
+    return std::nullopt;
+  rest = trim_ascii_ws(rest);
+  if (!rest.starts_with("say"))
+    return std::nullopt;
+  rest.remove_prefix(3);
+  if (rest.empty() || (rest.front() != ' ' && rest.front() != '\t'))
+    return std::nullopt;
+  rest = trim_ascii_ws(rest);
+  if (rest.empty())
+    return std::nullopt;
+  return rest;
+}
+
+std::optional<std::filesystem::path>
+find_remote_party_config(const std::filesystem::path &cwd, const char *home) {
+  const uid_t self_uid = ::geteuid();
+  auto has_remote_peers = [self_uid](const std::filesystem::path &candidate) -> bool {
+    const auto clean_candidate = strip_trailing_slashes(candidate);
+    const auto parent = strip_trailing_slashes(clean_candidate.parent_path());
+    if (!parent.empty()) {
+      struct stat pst{};
+      if (::lstat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode) ||
+          pst.st_uid != self_uid) {
+        return false;
+      }
+    }
+    struct stat st{};
+    if (::lstat(clean_candidate.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != self_uid) {
+      return false;
+    }
+    auto loaded = load_party_roster_config(clean_candidate);
+    if (!loaded.has_value())
+      return false;
+    for (const auto &peer : loaded.value().peers) {
+      if (peer.ssh_target.has_value() && !peer.ssh_target->empty())
+        return true;
+    }
+    return false;
+  };
+
+  if (!cwd.empty()) {
+    const auto clean_cwd = strip_trailing_slashes(cwd);
+    const auto project_party = clean_cwd / ".blackbird" / "party.json";
+    if (has_remote_peers(project_party))
+      return project_party;
+  }
+  if (home != nullptr && home[0] != '\0') {
+    const auto clean_home = strip_trailing_slashes(std::filesystem::path{home});
+    const auto home_party = clean_home / ".blackbird" / "party.json";
+    if (has_remote_peers(home_party))
+      return home_party;
+  }
+  return std::nullopt;
+}
+
+std::string format_party_dispatch_report(const PartyDispatchReport &report,
+                                         std::string_view local_actor) {
+  std::string out = "Party posted #" + std::to_string(report.operator_board_seq) +
+                    " [" + party_chat_sanitize(local_actor, 48) + " -> " +
+                    party_chat_sanitize(report.target_label, 64) +
+                    "]: " + party_chat_sanitize(report.body, 240) + "\n";
+  for (const auto &outcome : report.outcomes) {
+    out += "  @" + party_chat_sanitize(outcome.target_id, 48);
+    if (outcome.status == PartyDeliveryStatus::replied) {
+      out += outcome.reply_verified ? " [verified]" : " [remote]";
+      out += " (" + std::to_string(outcome.elapsed_ms) +
+             "ms): " + party_chat_sanitize(outcome.reply_text, 1024) + "\n";
+    } else if (outcome.status == PartyDeliveryStatus::delivered) {
+      out += " [delivered] (" + std::to_string(outcome.elapsed_ms) + "ms)\n";
+    } else {
+      out += " [" + std::string{party_delivery_status_name(outcome.status)} + "]";
+      if (!outcome.error_detail.empty())
+        out += ": " + party_chat_sanitize(outcome.error_detail, 240);
+      out += "\n";
+    }
+  }
+  if (report.has_unknown_targets()) {
+    out += "  Unknown target(s): ";
+    for (std::size_t i = 0; i < report.unknown_targets.size(); ++i) {
+      if (i > 0)
+        out += ", ";
+      out += "@" + party_chat_sanitize(report.unknown_targets[i], 48);
+    }
+    out += "\n";
+  }
+  return out;
+}
+
+struct PartyPaneRefreshTarget {
+  std::filesystem::path party_root;
+  std::filesystem::path party_file;
+};
+
+void refresh_tui_party_pane(TerminalUI &ui, const PartyPaneRefreshTarget &target) {
+  PartyConfig pcfg = PartyConfig::for_project(target.party_root);
+  if (!target.party_file.empty())
+    pcfg.party_config_path = target.party_file;
+  pcfg.local_operator_id = "operator";
+  auto snap_res = load_party_snapshot(pcfg);
+  if (snap_res.has_value())
+    ui.party_chat(std::move(snap_res).value());
+}
+
+std::filesystem::path expand_cwd_argument(std::string_view raw_arg, const char *home) {
+  if (raw_arg == "~" && home != nullptr && home[0] != '\0')
+    return std::filesystem::path{home};
+  if (raw_arg.starts_with("~/") && home != nullptr && home[0] != '\0')
+    return std::filesystem::path{home} / std::filesystem::path{raw_arg.substr(2)};
+  return std::filesystem::path{raw_arg};
+}
 } // namespace
 int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 RawSuccessorHandoff *selected_handoff = nullptr,
@@ -311,23 +776,27 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         return 0;
       }
       if (arg == "--help") {
-        std::cout << "blackbird --application (native framed BBM2 interface)\n"
-                     "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
-                     "[--model NAME] [--workflow FILE] "
-                     "[--once "
-                     "PROMPT] [--audit-last] [--effort low|medium|high|xhigh|max] "
-                     "[--plain] [--list-sessions [ROOT]] [--seed-session JSON] "
-                     "[--backstop MISSION_JSON (requires --once)] "
-                     "[--resume-continue|--resume-once] [--rebuild-session] "
-                     "[--expire-diagnostics] [--recover-unknown-effects] "
-                     "[--profile-digests]\n"
-                     "Without --session, start a fresh conversation. Reopen an "
-                     "existing conversation with --session DIRECTORY.\nInteractive: "
-                     "/context, "
-                     "/originals, /restore "
-                     "ENTRY, /lua CODE, /model NAME, /effort LEVEL, /workflow FILE, "
-                     "/session, /profile, /new, "
-                     "/restart NOTE, /paste (until /send), /quit or /exit\n";
+        std::cout
+            << "blackbird --application (native framed BBM2 interface)\n"
+               "blackbird resume [last|N|query] [--root DIR] [--plain]\n"
+               "blackbird flightdeck [--session DIR] [--theme NAME] [--fps 1..30] "
+               "[--once] [--halfblock]\n"
+               "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
+               "[--model NAME] [--workflow FILE] "
+               "[--once "
+               "PROMPT] [--audit-last] [--effort low|medium|high|xhigh|max] "
+               "[--plain] [--list-sessions [ROOT]] [--seed-session JSON] "
+               "[--backstop MISSION_JSON (requires --once)] "
+               "[--resume-continue|--resume-once] [--rebuild-session] "
+               "[--expire-diagnostics] [--recover-unknown-effects] "
+               "[--profile-digests]\n"
+               "Without --session, start a fresh conversation. Reopen an "
+               "existing conversation with --session DIRECTORY.\nInteractive: "
+               "/context, "
+               "/originals, /restore "
+               "ENTRY, /lua CODE, /model NAME, /effort LEVEL, /workflow FILE, "
+               "/session, /sessions, /resume, /cwd [PATH], /profile, /new, "
+               "/restart NOTE, /paste (until /send), /quit or /exit\n";
         return 0;
       }
       if (arg == "--list-sessions") {
@@ -1611,7 +2080,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 !prompt.starts_with("/effort ") && prompt != "/model" &&
                 !prompt.starts_with("/model ") && prompt != "/provider" &&
                 !prompt.starts_with("/provider ") && prompt != "/session" &&
-                prompt != "/help" && prompt != "/context" && prompt != "/profile") {
+                prompt != "/sessions" && prompt != "/resume" && prompt != "/cwd" &&
+                !prompt.starts_with("/cwd ") && prompt != "/help" &&
+                prompt != "/context" && prompt != "/profile") {
               ask_effort(session_store.settings(),
                          route_efforts(session_store.settings(), command_context));
               return;
@@ -2078,7 +2549,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 }
                 ui.notice(out);
               }
-            } else if (prompt == "/sessions") {
+            } else if (prompt == "/sessions" || prompt == "/resume") {
               raw_main_branch(dispatch, 28);
               RawEventRef listing_source;
               const auto listing = list_sessions(session.parent_path(),
@@ -2087,6 +2558,82 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 ui.sessions(listing, {1, listing_source, {}, {}});
               else
                 emit(unwrap(dump_json(listing)) + "\n");
+            } else if (prompt == "/cwd" || prompt.starts_with("/cwd ")) {
+              raw_main_branch(dispatch, 45);
+              const std::string_view arg = prompt == "/cwd"
+                                               ? std::string_view{}
+                                               : trim_ascii_ws(prompt.substr(5));
+              if (arg.empty()) {
+                std::error_code ec;
+                const auto current = std::filesystem::current_path(ec);
+                const std::string msg =
+                    ec ? ("Unable to read working directory: " +
+                          safe_single_line(ec.message(), 256) + "\n")
+                       : ("Working directory: " + safe_single_line(current.string()) +
+                          "\n");
+                if (tui)
+                  ui.notice("\n" + msg);
+                else
+                  emit(msg);
+              } else if (arg.find('\0') != std::string_view::npos) {
+                const std::string msg = "Invalid working directory path.\n";
+                if (tui)
+                  ui.notice("\n" + msg);
+                else
+                  emit(msg);
+              } else {
+                const auto expanded = expand_cwd_argument(arg, home);
+                std::error_code ec;
+                const auto abs_target = std::filesystem::absolute(expanded, ec);
+                const auto st = ec ? std::filesystem::file_status{}
+                                   : std::filesystem::status(abs_target, ec);
+                if (ec || !std::filesystem::exists(st)) {
+                  const std::string msg =
+                      "Directory not found: " + safe_single_line(arg, 256) + "\n";
+                  if (tui)
+                    ui.notice("\n" + msg);
+                  else
+                    emit(msg);
+                } else if (!std::filesystem::is_directory(st)) {
+                  const std::string msg =
+                      "Not a directory: " + safe_single_line(arg, 256) + "\n";
+                  if (tui)
+                    ui.notice("\n" + msg);
+                  else
+                    emit(msg);
+                } else {
+                  std::error_code canon_ec;
+                  const auto canonical =
+                      std::filesystem::weakly_canonical(abs_target, canon_ec);
+                  const auto &resolved =
+                      canon_ec ? abs_target.lexically_normal() : canonical;
+                  std::error_code chdir_ec;
+                  std::filesystem::current_path(resolved, chdir_ec);
+                  if (chdir_ec) {
+                    const std::string msg = "Unable to change working directory to " +
+                                            safe_single_line(resolved.string()) + ": " +
+                                            safe_single_line(chdir_ec.message(), 256) +
+                                            "\n";
+                    if (tui)
+                      ui.notice("\n" + msg);
+                    else
+                      emit(msg);
+                  } else {
+                    std::error_code cur_ec;
+                    const auto next_cwd = std::filesystem::current_path(cur_ec);
+                    const std::string display_path = safe_single_line(
+                        cur_ec ? resolved.string() : next_cwd.string());
+                    const std::string notice_line =
+                        "Working directory: " + display_path + "\n";
+                    if (tui) {
+                      ui.status("Working directory: " + display_path);
+                      ui.notice("\n" + notice_line);
+                    } else {
+                      emit(notice_line);
+                    }
+                  }
+                }
+              }
             } else if (prompt == "/checkpoint") {
               raw_main_branch(dispatch, 29);
               unwrap(context.checkpoint());
@@ -2402,25 +2949,77 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                           : read_file(workflow, 16 * 1024 * 1024, &command_context))) {
                 publish_workflows(engine.workflows());
               } else if (prompt.starts_with("/")) {
-                CommandPostTuiContext cp_ctx;
-                cp_ctx.session_dir = session;
-                cp_ctx.audit_log = &log;
-                cp_ctx.session_id = session.filename().string();
-                cp_ctx.tui = tui;
-                if (const auto out = handle_command_post_slash(prompt, cp_ctx)) {
-                  if (tui)
-                    ui.notice("\n" + *out);
-                  else
-                    emit(*out);
-                } else {
-                  emit("Unknown command: " + std::string{prompt} +
-                       ". /help lists commands; /quit or /exit closes Blackbird.\n");
+                bool handled_remote_party = false;
+                if (const auto say_body = extract_party_say_body(prompt);
+                    say_body.has_value()) {
+                  std::error_code cwd_ec;
+                  const auto cwd = std::filesystem::current_path(cwd_ec);
+                  if (const auto remote_party_file = find_remote_party_config(
+                          cwd_ec ? std::filesystem::path{} : cwd, home);
+                      remote_party_file.has_value()) {
+                    handled_remote_party = true;
+                    const auto party_root =
+                        remote_party_file->parent_path().parent_path();
+                    PartyDispatchConfig dcfg =
+                        PartyDispatchConfig::for_project(party_root);
+                    dcfg.party_config_path = *remote_party_file;
+                    dcfg.local_actor = "operator";
+                    if (!cwd_ec && !cwd.empty())
+                      dcfg.working_dir = cwd;
+                    dcfg.cancelled = engine.cancelled;
+                    if (tui)
+                      ui.status("Dispatching party message to remote peers...");
+                    auto dispatched = dispatch_party_message(*say_body, dcfg);
+                    if (!dispatched.has_value()) {
+                      const std::string err_msg =
+                          "Party dispatch failed: " +
+                          std::string{error_name(dispatched.error().code)} + "\n";
+                      if (tui)
+                        ui.notice("\n" + err_msg);
+                      else
+                        emit(err_msg);
+                    } else {
+                      const std::string formatted = format_party_dispatch_report(
+                          dispatched.value(), dcfg.local_actor);
+                      if (tui) {
+                        ui.notice("\n" + formatted);
+                        refresh_tui_party_pane(ui, {.party_root = party_root,
+                                                    .party_file = *remote_party_file});
+                      } else {
+                        emit(formatted);
+                      }
+                    }
+                  }
+                }
+                if (!handled_remote_party) {
+                  CommandPostTuiContext cp_ctx;
+                  cp_ctx.session_dir = session;
+                  cp_ctx.audit_log = &log;
+                  cp_ctx.session_id = session.filename().string();
+                  cp_ctx.tui = tui;
+                  if (const auto out = handle_command_post_slash(prompt, cp_ctx)) {
+                    if (tui) {
+                      ui.notice("\n" + *out);
+                      if (prompt == "/party" || prompt.starts_with("/party ")) {
+                        std::error_code cwd_ec;
+                        const auto cwd = std::filesystem::current_path(cwd_ec);
+                        if (!cwd_ec && !cwd.empty())
+                          refresh_tui_party_pane(ui,
+                                                 {.party_root = cwd, .party_file = {}});
+                      }
+                    } else {
+                      emit(*out);
+                    }
+                  } else {
+                    emit("Unknown command: " + std::string{prompt} +
+                         ". /help lists commands; /quit or /exit closes Blackbird.\n");
+                  }
                 }
               }
             }
 
             publish_workflows(engine.workflows());
-            if (prompt != "/sessions")
+            if (prompt != "/sessions" && prompt != "/resume")
               refresh_info(command_context);
             if (auto note = engine.take_restart_note(&command_context);
                 note && !restart_pending.load()) {
@@ -2432,14 +3031,24 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             if (tui) {
               publish_context_workbench();
               publish_hooks_view();
+              std::error_code title_cwd_ec;
+              const auto title_cwd =
+                  strip_trailing_slashes(std::filesystem::current_path(title_cwd_ec));
+              const std::string cwd_label =
+                  (!title_cwd_ec && !title_cwd.empty())
+                      ? (" · " + safe_single_line(title_cwd.filename().string().empty()
+                                                      ? title_cwd.string()
+                                                      : title_cwd.filename().string(),
+                                                  128))
+                      : std::string{};
               ui.title(
                   "Blackbird · " +
                   (session_store.settings().name.empty()
                        ? ""
-                       : session_store.settings().name + " · ") +
+                       : safe_single_line(session_store.settings().name, 128) + " · ") +
                   provider_name + "/" + model + " · " + effort +
                   (session_store.settings().effort_pending ? " (choose effort)" : "") +
-                  " · " + session.string());
+                  cwd_label + " · " + safe_single_line(session.string(), 256));
             }
           });
         } catch (const Error &e) {
@@ -3170,6 +3779,19 @@ int main(int argc, char **argv) {
   try {
     std::vector<std::string> current_arguments, return_session;
     std::vector<char *> arguments;
+    if (argc > 1 && (std::string_view{argv[1]} == "resume" ||
+                     std::string_view{argv[1]} == "--resume")) {
+      auto resumed = resolve_resume_cli(argc, argv);
+      if (!resumed.launch)
+        return resumed.exit_code;
+      current_arguments = std::move(resumed.launch_args);
+      arguments.reserve(current_arguments.size() + 1);
+      for (auto &argument : current_arguments)
+        arguments.push_back(argument.data());
+      arguments.push_back(nullptr);
+      argc = static_cast<int>(current_arguments.size());
+      argv = arguments.data();
+    }
     for (;;) {
       std::vector<std::string> next_session, fallback_session;
       RawSuccessorHandoff handoff;

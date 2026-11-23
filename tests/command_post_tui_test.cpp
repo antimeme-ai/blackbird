@@ -1245,6 +1245,248 @@ void test_party_passive_say_and_lifecycle() {
           "/party leave preserves pinned peer keys");
 }
 
+struct ScopedEnvVar {
+  std::string name;
+  std::optional<std::string> prior;
+  ScopedEnvVar(std::string var_name, std::optional<std::string> value)
+      : name(std::move(var_name)) {
+    if (const char *cur = std::getenv(name.c_str()); cur != nullptr)
+      prior = std::string{cur};
+    if (value.has_value())
+      require(::setenv(name.c_str(), value->c_str(), 1) == 0, "setenv failed");
+    else
+      require(::unsetenv(name.c_str()) == 0, "unsetenv failed");
+  }
+  ~ScopedEnvVar() {
+    if (prior.has_value())
+      (void)::setenv(name.c_str(), prior->c_str(), 1);
+    else
+      (void)::unsetenv(name.c_str());
+  }
+  ScopedEnvVar(const ScopedEnvVar &) = delete;
+  ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+};
+
+void test_wave9b2_flightdeck_detach_and_party_zero_ceremony() {
+  TempDir home_dir("bb-cptui-w9b2-home");
+  ScopedHomeEnv env_home{home_dir.path};
+  ScopedEnvVar clear_relay{"BLACKBIRD_RELAY_URL", std::nullopt};
+  ScopedEnvVar set_user{"USER", std::string{"pilot"}};
+
+  // 1. /flightdeck detach (with and without session_dir) + 1-line Alt+F hint.
+  {
+    TempDir work_dir("bb-cptui-w9b2-fd");
+    CommandPostTuiContext ctx;
+    ctx.project_root = work_dir.path;
+    ctx.session_dir = work_dir.path / "sess-42";
+
+    const auto detach = handle_command_post_slash("/flightdeck detach", ctx);
+    require(detach.has_value() &&
+                detach->find("blackbird flightdeck --session ") != std::string::npos &&
+                detach->find("sess-42") != std::string::npos &&
+                detach->find("Alt+F") != std::string::npos,
+            "/flightdeck detach prints second-window Ghostty & Alt+F instructions");
+
+    const auto bad_detach = handle_command_post_slash("/flightdeck detach extra", ctx);
+    require(bad_detach.has_value() &&
+                bad_detach->find("Usage: /flightdeck") != std::string::npos,
+            "/flightdeck detach rejects extra args");
+
+    const auto snapshot = handle_command_post_slash("/flightdeck", ctx);
+    require(snapshot.has_value() &&
+                snapshot->find("Tip: press Alt+F for live Ghostty Kitty Flight Deck") !=
+                    std::string::npos,
+            "/flightdeck snapshot includes Alt+F live cockpit tip");
+  }
+
+  // 2. /party peers and bare /party add on empty home: ZERO directory creation!
+  {
+    TempDir empty_dir("bb-cptui-w9b2-empty");
+    CommandPostTuiContext ctx;
+    ctx.project_root = empty_dir.path;
+    ctx.actor = "pilot";
+
+    const auto peers_empty = handle_command_post_slash("/party peers", ctx);
+    require(peers_empty.has_value() &&
+                peers_empty->find("Pinned peers: none") != std::string::npos &&
+                peers_empty->find("/party add <alias>") != std::string::npos,
+            "/party peers handles absent KnownPeersStore cleanly");
+    const auto add_empty = handle_command_post_slash("/party add", ctx);
+    require(add_empty.has_value() &&
+                add_empty->find("Usage: /party add") != std::string::npos &&
+                add_empty->find("Pinned peers: none") != std::string::npos,
+            "bare /party add lists peers and usage cleanly");
+    require(!std::filesystem::exists(home_dir.path / ".local"),
+            "/party peers & bare /party add must NOT create ~/.local");
+    require(!std::filesystem::exists(empty_dir.path / ".blackbird"),
+            "/party peers & bare /party add must NOT create .blackbird");
+  }
+
+  // 3. Pin two peers (one active, one revoked), test /party peers, zero-ceremony
+  //    /party create, /party add <pinned_alias>, /party invite (zero args), and
+  //    /party join <bbjoin1:...> (zero extra flags -> auto-alias peer-<fp_prefix>).
+  const auto peers_dir = home_dir.path / ".local" / "share" / "blackbird" / "peers";
+  auto local_id = unwrap(PeerIdentityStore::open_or_create(peers_dir));
+
+  TempDir work_dir("bb-cptui-w9b2-party");
+  auto wm_id = unwrap(PeerIdentityStore::open_or_create(work_dir.path / "id-wm"));
+  auto rev_id = unwrap(PeerIdentityStore::open_or_create(work_dir.path / "id-rev"));
+  auto bob_id = unwrap(PeerIdentityStore::open_or_create(work_dir.path / "id-bob"));
+
+  {
+    auto known = unwrap(KnownPeersStore::open(peers_dir));
+    unwrap(known.pin_peer(PinPeerRequest{
+        .alias = "wintermute",
+        .public_key = wm_id.identity().public_key,
+        .trust_note = "gpu box",
+    }));
+    unwrap(known.pin_peer(PinPeerRequest{
+        .alias = "revoked-peer",
+        .public_key = rev_id.identity().public_key,
+        .trust_note = "old box",
+    }));
+    unwrap(known.revoke_peer(PeerRevocationRequest{
+        .fingerprint = rev_id.identity().fingerprint,
+        .reason = "retired",
+    }));
+  }
+
+  CommandPostTuiContext ctx;
+  ctx.project_root = work_dir.path;
+  ctx.actor = "pilot";
+
+  const auto peers_out = handle_command_post_slash("/party peers", ctx);
+  require(peers_out.has_value() && peers_out->find("wintermute") != std::string::npos &&
+              peers_out->find(wm_id.identity().fingerprint) != std::string::npos &&
+              peers_out->find("/party add wintermute") != std::string::npos &&
+              peers_out->find("revoked-peer") == std::string::npos,
+          "/party peers lists only non-revoked pinned peers with /party add hint");
+
+  // /party create (zero args) defaults room name to directory basename!
+  const auto created = handle_command_post_slash("/party create", ctx);
+  const std::string expected_room = work_dir.path.filename().string();
+  require(created.has_value() && created->find(expected_room) != std::string::npos,
+          "/party create with zero args defaults room to project directory basename");
+
+  // /party add <pinned_alias> requires ONLY <alias>, auto-fills pinned fingerprint,
+  // defaults host=<alias>, ssh=<USER>@<alias>, role=platoon_leader, empty
+  // provider/model!
+  const auto added_wm = handle_command_post_slash("/party add wintermute", ctx);
+  require(added_wm.has_value() && added_wm->find("@wintermute") != std::string::npos &&
+              added_wm->find(wm_id.identity().fingerprint) != std::string::npos &&
+              added_wm->find("pilot@wintermute") != std::string::npos,
+          "/party add <pinned_alias> auto-fills fingerprint and ssh default");
+
+  const auto added_op = handle_command_post_slash(
+      "/party add neuromancer role=operator ssh=ops@neuro.local", ctx);
+  require(added_op.has_value() && added_op->find("@neuromancer") != std::string::npos &&
+              added_op->find("operator_human") != std::string::npos &&
+              added_op->find("ops@neuro.local") != std::string::npos,
+          "/party add honors optional role= and ssh= overrides");
+
+  const auto party_json = work_dir.path / ".blackbird" / "party.json";
+  const auto cfg = unwrap(load_party_roster_config(party_json));
+  require(cfg.room_scope == expected_room && cfg.peers.size() == 2,
+          "party.json persisted room basename and both added peers");
+  require(cfg.peers[0].alias == "wintermute" &&
+              cfg.peers[0].role == PartyMemberRole::platoon_leader &&
+              cfg.peers[0].host == "wintermute" &&
+              cfg.peers[0].ssh_target ==
+                  std::optional<std::string>{"pilot@wintermute"} &&
+              cfg.peers[0].fingerprint ==
+                  std::optional<std::string>{wm_id.identity().fingerprint} &&
+              !cfg.peers[0].provider.has_value() && !cfg.peers[0].model.has_value(),
+          "/party add sets smart defaults and leaves provider/model empty");
+
+  // /party add rejects control/C1 bytes and leading-hyphen option injection in ssh= and
+  // host= parameters.
+  const auto bad_ssh = handle_command_post_slash("/party add badbox ssh=a\xc2\x9b"
+                                                 "6n",
+                                                 ctx);
+  require(bad_ssh.has_value() && bad_ssh->find("Invalid ssh") != std::string::npos &&
+              !contains_raw_control_or_c1(*bad_ssh),
+          "/party add rejects C1 bytes in ssh=");
+  const auto hyphen_ssh =
+      handle_command_post_slash("/party add badbox ssh=-oProxyCommand=id", ctx);
+  require(hyphen_ssh.has_value() &&
+              hyphen_ssh->find("Invalid ssh") != std::string::npos,
+          "/party add rejects leading-hyphen ssh= option injection");
+  const auto hyphen_host =
+      handle_command_post_slash("/party add badbox host=-bad", ctx);
+  require(hyphen_host.has_value() &&
+              hyphen_host->find("Invalid host") != std::string::npos,
+          "/party add rejects leading-hyphen host= option injection");
+
+  // /party invite (zero required args) immediately mints ready-to-paste bbjoin1:...
+  // link!
+  const auto invite_out = handle_command_post_slash("/party invite", ctx);
+  if (!invite_out.has_value())
+    throw std::runtime_error("/party invite with zero args returns output");
+  const std::string &invite_text = *invite_out;
+  require(
+      invite_text.find("bbjoin1:") != std::string::npos &&
+          invite_text.find("SSH:   ssh://pilot@") != std::string::npos,
+      "/party invite with zero args prints ready-to-paste bbjoin1 URI and SSH hint");
+  const auto uri_pos = invite_text.find("bbjoin1:");
+  const auto uri_end = invite_text.find('\n', uri_pos);
+  const std::string minted_uri = invite_text.substr(uri_pos, uri_end - uri_pos);
+  const auto parsed_minted = unwrap(parse_room_invite(minted_uri, wall_now_ns()));
+  require(parsed_minted.room_id == expected_room &&
+              parsed_minted.creator_fingerprint == local_id.identity().fingerprint,
+          "zero-arg /party invite URI parses cleanly with 24h TTL");
+
+  // /party join <bbjoin1:...> with ZERO extra flags auto-derives peer-<fp_prefix>!
+  RoomInvite bob_inv;
+  bob_inv.room_id = "squad-zero";
+  bob_inv.relay_url = "https://bob.example.test/party";
+  bob_inv.creator_fingerprint = bob_id.identity().fingerprint;
+  bob_inv.creator_public_key = bob_id.identity().public_key;
+  bob_inv.invite_code = "fedcba9876543210fedcba9876543210";
+  bob_inv.expires_ns = wall_now_ns() + 3'600'000'000'000LL;
+  const std::string bob_uri = unwrap(encode_room_invite(bob_inv));
+
+  const std::string expected_bob_alias =
+      "peer-" + bob_id.identity().fingerprint.substr(4, 12);
+  const auto joined_auto = handle_command_post_slash("/party join " + bob_uri, ctx);
+  require(joined_auto.has_value() &&
+              joined_auto->find("squad-zero") != std::string::npos &&
+              joined_auto->find("@" + expected_bob_alias) != std::string::npos,
+          "/party join <bbjoin1:...> auto-derives peer-<fp_prefix> alias");
+  {
+    auto known = unwrap(KnownPeersStore::open(peers_dir));
+    const auto pinned_bob = unwrap(known.find_by_alias(expected_bob_alias));
+    require(pinned_bob.has_value() &&
+                pinned_bob->fingerprint == bob_id.identity().fingerprint,
+            "zero-flag /party join pinned creator under auto-derived alias");
+  }
+
+  // 4. BLACKBIRD_HOME preference when ctx.project_root is empty (does NOT silently
+  //    read untrusted repo-local .blackbird/party.json!).
+  {
+    TempDir bb_home("bb-cptui-w9b2-bbhome");
+    ScopedEnvVar set_bb_home{"BLACKBIRD_HOME", bb_home.path.string()};
+    CommandPostTuiContext runtime_ctx;
+    runtime_ctx.actor = "pilot";
+    const auto c_out = handle_command_post_slash("/party create home-ops", runtime_ctx);
+    require(c_out.has_value() && c_out->find("home-ops") != std::string::npos,
+            "/party create writes to BLACKBIRD_HOME when project_root is empty");
+    require(std::filesystem::exists(bb_home.path / "party.json"),
+            "party.json created under BLACKBIRD_HOME");
+    const auto s_out = handle_command_post_slash("/party status", runtime_ctx);
+    require(s_out.has_value() && s_out->find("home-ops") != std::string::npos,
+            "/party status reads user-owned BLACKBIRD_HOME/party.json");
+
+    // Symlink parent directory for party.json MUST be rejected cleanly (not followed).
+    TempDir sym_holder("bb-cptui-w9b2-sym");
+    const auto sym_home = sym_holder.path / "link-home";
+    std::filesystem::create_directory_symlink(bb_home.path, sym_home);
+    ScopedEnvVar set_sym_home{"BLACKBIRD_HOME", sym_home.string()};
+    const auto sym_status = handle_command_post_slash("/party status", runtime_ctx);
+    require(sym_status.has_value() && sym_status->find("home-ops") == std::string::npos,
+            "/party status rejects symlink parent directory for party.json");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1260,6 +1502,7 @@ int main() {
     test_swarmboard_empty_populated_filters_and_readonly();
     test_flightdeck_empty_populated_ticks_and_hostile_labels();
     test_party_passive_say_and_lifecycle();
+    test_wave9b2_flightdeck_detach_and_party_zero_ceremony();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {

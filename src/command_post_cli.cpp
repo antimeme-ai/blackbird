@@ -3,6 +3,7 @@
 #include "blackbird/board_bridge.hpp"
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
+#include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/mcp_server.hpp"
@@ -31,11 +32,14 @@
 #include <map>
 #include <optional>
 #include <ostream>
+#include <poll.h>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/ioctl.h>
 #include <sys/random.h>
+#include <termios.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -5343,12 +5347,694 @@ int run_party_cli(std::span<char *> args, CliIo io) {
   return fail_usage(io, "party: unknown action: " + std::string{action});
 }
 
+// ============================================================================
+// 11. blackbird flightdeck (Detachable Second-Window Hero v24 Cockpit)
+// ============================================================================
+
+volatile std::sig_atomic_t g_flightdeck_stop = 0;
+
+void flightdeck_signal_handler(int /*signum*/) noexcept { g_flightdeck_stop = 1; }
+
+void write_fd_all(int fd, std::string_view data) noexcept {
+  std::size_t offset = 0;
+  int retry_budget = 8;
+  while (offset < data.size()) {
+    const ssize_t n = ::write(fd, data.data() + offset, data.size() - offset);
+    if (n > 0) {
+      offset += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && retry_budget > 0) {
+      --retry_budget;
+      struct pollfd pfd{fd, POLLOUT, 0};
+      (void)::poll(&pfd, 1, 25);
+      continue;
+    }
+    break;
+  }
+}
+
+struct FlightDeckViewportCells {
+  std::size_t columns = 80;
+  std::size_t rows = 24;
+};
+
+FlightDeckViewportCells query_flightdeck_viewport() noexcept {
+  FlightDeckViewportCells cells{};
+  struct winsize ws{};
+  if (::ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+    if (ws.ws_col >= 20)
+      cells.columns = std::clamp<std::size_t>(ws.ws_col, 20, 400);
+    if (ws.ws_row >= 8)
+      cells.rows = std::clamp<std::size_t>(ws.ws_row, 8, 200);
+  }
+  return cells;
+}
+
+class FlightDeckSignalGuard {
+public:
+  FlightDeckSignalGuard() noexcept {
+    g_flightdeck_stop = 0;
+    struct sigaction sa{};
+    sa.sa_handler = flightdeck_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    if (::sigaction(SIGINT, &sa, &prev_int_) == 0)
+      installed_int_ = true;
+    if (::sigaction(SIGTERM, &sa, &prev_term_) == 0)
+      installed_term_ = true;
+  }
+
+  FlightDeckSignalGuard(const FlightDeckSignalGuard &) = delete;
+  FlightDeckSignalGuard &operator=(const FlightDeckSignalGuard &) = delete;
+
+  ~FlightDeckSignalGuard() {
+    if (installed_int_)
+      (void)::sigaction(SIGINT, &prev_int_, nullptr);
+    if (installed_term_)
+      (void)::sigaction(SIGTERM, &prev_term_, nullptr);
+  }
+
+private:
+  struct sigaction prev_int_{};
+  struct sigaction prev_term_{};
+  bool installed_int_ = false;
+  bool installed_term_ = false;
+};
+
+class FlightDeckTerminalGuard {
+public:
+  explicit FlightDeckTerminalGuard(bool kitty_mode) noexcept : use_kitty_(kitty_mode) {
+    if (::tcgetattr(STDIN_FILENO, &original_) != 0)
+      return;
+    struct termios raw = original_;
+    raw.c_iflag &= static_cast<tcflag_t>(
+        ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON));
+    raw.c_lflag &= static_cast<tcflag_t>(~(ECHO | ECHONL | ICANON | ISIG | IEXTEN));
+    raw.c_cflag &= static_cast<tcflag_t>(~(CSIZE | PARENB));
+    raw.c_cflag |= static_cast<tcflag_t>(CS8);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (::tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0)
+      return;
+    active_ = true;
+    write_fd_all(STDOUT_FILENO, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+  }
+
+  FlightDeckTerminalGuard(const FlightDeckTerminalGuard &) = delete;
+  FlightDeckTerminalGuard &operator=(const FlightDeckTerminalGuard &) = delete;
+
+  ~FlightDeckTerminalGuard() {
+    if (!active_)
+      return;
+    if (use_kitty_) {
+      const std::string erase = encode_kitty_erase(hero_default_kitty_image_id);
+      write_fd_all(STDOUT_FILENO, erase);
+    }
+    write_fd_all(STDOUT_FILENO, "\x1b[0m\x1b[?25h\x1b[?1049l");
+    (void)::tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_);
+  }
+
+  bool active() const noexcept { return active_; }
+
+private:
+  bool active_ = false;
+  bool use_kitty_ = false;
+  struct termios original_{};
+};
+
+std::optional<fs::path> find_newest_flightdeck_session() {
+  const char *home = std::getenv("HOME");
+  if (home == nullptr || home[0] == '\0')
+    return std::nullopt;
+  const fs::path state_dir = fs::path{home} / ".local" / "state" / "blackbird";
+  std::error_code ec;
+  const fs::file_status st = fs::symlink_status(state_dir, ec);
+  if (ec || fs::is_symlink(st) || !fs::is_directory(st))
+    return std::nullopt;
+
+  std::optional<fs::path> best;
+  fs::file_time_type best_time{};
+  bool has_best = false;
+  for (fs::directory_iterator it{state_dir, ec}; !ec && it != fs::directory_iterator{};
+       it.increment(ec)) {
+    const fs::path candidate = it->path();
+    const std::string name = candidate.filename().string();
+    if (!name.starts_with("session-"))
+      continue;
+    std::error_code entry_ec;
+    const fs::file_status est = fs::symlink_status(candidate, entry_ec);
+    if (entry_ec || fs::is_symlink(est) || !fs::is_directory(est))
+      continue;
+    fs::file_time_type mtime{};
+    const fs::path audit_path = candidate / "audit";
+    std::error_code mtime_ec;
+    const fs::file_status ast = fs::symlink_status(audit_path, mtime_ec);
+    if (!mtime_ec && !fs::is_symlink(ast) && fs::is_regular_file(ast)) {
+      mtime = fs::last_write_time(audit_path, mtime_ec);
+    } else {
+      mtime_ec.clear();
+      mtime = fs::last_write_time(candidate, mtime_ec);
+    }
+    if (mtime_ec)
+      continue;
+    if (!has_best || mtime > best_time) {
+      has_best = true;
+      best_time = mtime;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+struct FlightDeckRateTracker {
+  bool initialized = false;
+  std::chrono::steady_clock::time_point last_time{};
+  std::uint64_t last_total_tokens = 0;
+  std::uint64_t last_out_rsn_tokens = 0;
+  double total_tok_per_sec = 0.0;
+  double out_rsn_tok_per_sec = 0.0;
+};
+
+fs::path strip_trailing_slashes(const fs::path &path) {
+  std::string text = path.string();
+  while (text.size() > 1 && text.back() == '/')
+    text.pop_back();
+  return fs::path{std::move(text)};
+}
+
+HeroTelemetryInput observe_flightdeck_telemetry(const std::optional<fs::path> &session,
+                                                FlightDeckRateTracker &tracker) {
+  HeroTelemetryInput telemetry{};
+  telemetry.cache_hit_ratio = 0.85;
+  telemetry.active_agents = 1;
+  telemetry.total_agents = 1;
+
+  if (!session.has_value()) {
+    std::error_code ec;
+    const fs::path cwd = strip_trailing_slashes(fs::current_path(ec));
+    if (!ec && !cwd.empty()) {
+      const std::string base = cwd.filename().string();
+      telemetry.room_label = sanitize_hero_text(base.empty() ? cwd.string() : base, 32);
+    }
+    return telemetry;
+  }
+
+  const fs::path clean_session = strip_trailing_slashes(*session);
+  const std::string base = clean_session.filename().string();
+  telemetry.room_label =
+      sanitize_hero_text(base.empty() ? clean_session.string() : base, 32);
+
+  std::error_code ec;
+  const fs::file_status st = fs::symlink_status(clean_session, ec);
+  if (ec || fs::is_symlink(st) || !fs::is_directory(st))
+    return telemetry;
+
+  MetricsConsumer consumer = MetricsConsumer::from_token_usage_directory(clean_session);
+  if (!consumer.refresh().has_value())
+    return telemetry;
+
+  const MetricsSnapshot &snap = consumer.snapshot();
+  telemetry.input_tokens = snap.usage.total_input_tokens.value.value_or(0);
+  telemetry.cached_tokens = snap.usage.total_cached_tokens.value.value_or(0);
+  telemetry.reasoning_tokens = snap.usage.total_reasoning_tokens.value.value_or(0);
+  telemetry.output_tokens = snap.usage.total_output_tokens.value.value_or(0);
+  telemetry.cache_hit_ratio = snap.usage.cache_hit_ratio.value.value_or(0.85);
+  telemetry.jev_calls = snap.decision_companion.batch_count.value.value_or(0);
+
+  const std::uint64_t total_tokens = telemetry.input_tokens + telemetry.cached_tokens +
+                                     telemetry.reasoning_tokens +
+                                     telemetry.output_tokens;
+  const std::uint64_t out_rsn_tokens =
+      telemetry.reasoning_tokens + telemetry.output_tokens;
+
+  const auto now = std::chrono::steady_clock::now();
+  if (tracker.initialized) {
+    const double dt = std::chrono::duration<double>(now - tracker.last_time).count();
+    if (dt >= 0.05) {
+      const std::uint64_t d_total = total_tokens > tracker.last_total_tokens
+                                        ? (total_tokens - tracker.last_total_tokens)
+                                        : 0;
+      const std::uint64_t d_out = out_rsn_tokens > tracker.last_out_rsn_tokens
+                                      ? (out_rsn_tokens - tracker.last_out_rsn_tokens)
+                                      : 0;
+      if (d_total > 0) {
+        tracker.total_tok_per_sec = static_cast<double>(d_total) / dt;
+        tracker.out_rsn_tok_per_sec = static_cast<double>(d_out) / dt;
+        telemetry.busy = true;
+      } else {
+        tracker.total_tok_per_sec *= 0.65;
+        tracker.out_rsn_tok_per_sec *= 0.65;
+      }
+      tracker.last_time = now;
+      tracker.last_total_tokens = total_tokens;
+      tracker.last_out_rsn_tokens = out_rsn_tokens;
+    }
+  } else {
+    tracker.initialized = true;
+    tracker.last_time = now;
+    tracker.last_total_tokens = total_tokens;
+    tracker.last_out_rsn_tokens = out_rsn_tokens;
+  }
+
+  telemetry.total_tok_per_sec = tracker.total_tok_per_sec;
+  telemetry.out_rsn_tok_per_sec = tracker.out_rsn_tok_per_sec;
+
+  for (const auto &prov : snap.usage.by_provider) {
+    HeroPeerEntry entry{};
+    entry.name = sanitize_hero_text(prov.provider, 20);
+    entry.tokens = prov.input_tokens.value.value_or(0) +
+                   prov.output_tokens.value.value_or(0) +
+                   prov.reasoning_tokens.value.value_or(0);
+    entry.active = telemetry.busy;
+    telemetry.peers.push_back(std::move(entry));
+  }
+  if (telemetry.jev_calls > 0) {
+    HeroPeerEntry jev_entry{};
+    jev_entry.name = "jev";
+    jev_entry.jev_calls = telemetry.jev_calls;
+    jev_entry.is_jev = true;
+    jev_entry.active = telemetry.busy;
+    telemetry.peers.push_back(std::move(jev_entry));
+  }
+  if (!telemetry.peers.empty()) {
+    telemetry.total_agents = telemetry.peers.size();
+    telemetry.active_agents = telemetry.busy ? telemetry.peers.size() : 1;
+  }
+  return telemetry;
+}
+
+HeroQuestion sample_flightdeck_question() {
+  return HeroQuestion{
+      .from = "flightdeck",
+      .text = "SELECT FLIGHT VECTOR",
+      .detail = "Fly through gate or press 1-3 (g to dismiss)",
+      .options = {"CRUISE", "AFTERBURNER", "STEALTH"},
+  };
+}
+
+int emit_flightdeck_once(const HeroFrame &frame, bool use_kitty, CliIo io) {
+  const FlightDeckViewportCells cells = ::isatty(STDOUT_FILENO) != 0
+                                            ? query_flightdeck_viewport()
+                                            : FlightDeckViewportCells{};
+  if (use_kitty) {
+    const std::string encoded = encode_kitty_rgba_frame(
+        frame, HeroKittyPlacement{.row = 0,
+                                  .column = 0,
+                                  .columns = cells.columns,
+                                  .rows = cells.rows,
+                                  .image_id = hero_default_kitty_image_id,
+                                  .placement_id = 1});
+    io.out << encoded << '\n' << std::flush;
+  } else {
+    const auto lines = encode_truecolor_halfblock_frame(
+        frame, HeroHalfBlockOptions{.columns = cells.columns, .rows = cells.rows});
+    for (const auto &line : lines)
+      io.out << line << '\n';
+    io.out.flush();
+  }
+  if (!io.out)
+    return fail_message(io, "flightdeck: failed to write frame to stdout");
+  return 0;
+}
+
+int run_flightdeck_cli(std::span<char *> args, CliIo io) {
+  std::optional<fs::path> explicit_session;
+  HeroThemeId theme = HeroThemeId::synthwave;
+  std::uint32_t fps = 24;
+  std::uint32_t width = hero_default_width;
+  std::uint32_t height = hero_default_height;
+  bool once = false;
+  bool halfblock = false;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird flightdeck [--session DIR] "
+                "[--theme synthwave|tokyonight|gotham|kanagawa|nord|hackerman|"
+                "retro82|dyingearth] [--fps 1..30] [--width PX] [--height PX] "
+                "[--once] [--halfblock] [--help]\n";
+      return 0;
+    }
+    if (arg == "--session") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "flightdeck: --session must not be empty");
+      explicit_session = strip_trailing_slashes(fs::path{*v});
+    } else if (arg == "--theme") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_hero_theme(*v);
+      if (!parsed.has_value())
+        return fail_usage(io, "flightdeck: invalid --theme: " + *v);
+      theme = *parsed;
+    } else if (arg == "--fps") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_u64(*v);
+      if (!parsed.has_value() || *parsed < 1 || *parsed > 30)
+        return fail_usage(io, "flightdeck: --fps must be between 1 and 30");
+      fps = static_cast<std::uint32_t>(*parsed);
+    } else if (arg == "--width") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_u64(*v);
+      if (!parsed.has_value() || *parsed < hero_min_width || *parsed > hero_max_width) {
+        return fail_usage(io, "flightdeck: --width must be between " +
+                                  std::to_string(hero_min_width) + " and " +
+                                  std::to_string(hero_max_width));
+      }
+      width = static_cast<std::uint32_t>(*parsed);
+    } else if (arg == "--height") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_u64(*v);
+      if (!parsed.has_value() || *parsed < hero_min_height ||
+          *parsed > hero_max_height) {
+        return fail_usage(io, "flightdeck: --height must be between " +
+                                  std::to_string(hero_min_height) + " and " +
+                                  std::to_string(hero_max_height));
+      }
+      height = static_cast<std::uint32_t>(*parsed);
+    } else if (arg == "--once") {
+      once = true;
+    } else if (arg == "--halfblock") {
+      halfblock = true;
+    } else {
+      return fail_usage(io, "flightdeck: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (explicit_session.has_value()) {
+    std::error_code sym_ec;
+    const fs::file_status sym_st = fs::symlink_status(*explicit_session, sym_ec);
+    if (!sym_ec && fs::is_symlink(sym_st))
+      return fail_error(io, "flightdeck", {ErrorCode::io, ELOOP});
+  }
+
+  const std::optional<fs::path> observed_session =
+      explicit_session.has_value() ? explicit_session
+                                   : find_newest_flightdeck_session();
+
+  HeroFlightDeckEngine engine{HeroCanvasConfig{
+      .size = HeroSize{.width = width, .height = height},
+      .theme = theme,
+      .seed = 11,
+  }};
+
+  FlightDeckRateTracker rate_tracker{};
+  engine.set_telemetry(observe_flightdeck_telemetry(observed_session, rate_tracker));
+
+  const bool use_kitty = !halfblock && kitty_graphics_capable();
+  const float nominal_dt = 1.0F / static_cast<float>(fps);
+
+  const bool interactive_tty =
+      !once && ::isatty(STDIN_FILENO) != 0 && ::isatty(STDOUT_FILENO) != 0;
+  if (!interactive_tty) {
+    const HeroFrame &frame = engine.step_and_render(nominal_dt);
+    return emit_flightdeck_once(frame, use_kitty, io);
+  }
+
+  FlightDeckSignalGuard signal_guard{};
+  FlightDeckTerminalGuard terminal_guard{use_kitty};
+  if (!terminal_guard.active())
+    return fail_message(io, "flightdeck: failed to initialize raw terminal");
+
+  using SteadyClock = std::chrono::steady_clock;
+  const auto frame_period =
+      std::chrono::microseconds{1'000'000LL / static_cast<std::int64_t>(fps)};
+  constexpr auto kKeyHoldDuration = std::chrono::milliseconds{180};
+  constexpr auto kTelemetryRefreshInterval = std::chrono::milliseconds{500};
+  constexpr auto kBareEscTimeout = std::chrono::milliseconds{25};
+  constexpr std::size_t kMaxPendingInputBytes = 256U;
+
+  auto last_frame_time = SteadyClock::now();
+  auto next_frame_time = last_frame_time;
+  auto last_telemetry_time = last_frame_time;
+
+  SteadyClock::time_point left_until{};
+  SteadyClock::time_point right_until{};
+  SteadyClock::time_point up_until{};
+  SteadyClock::time_point down_until{};
+
+  std::optional<FlightDeckViewportCells> prev_cells;
+  std::string pending_input;
+  std::optional<SteadyClock::time_point> esc_deadline;
+
+  auto apply_arrow_code = [&](char code, SteadyClock::time_point ts) noexcept {
+    if (code == 'A') {
+      up_until = ts + kKeyHoldDuration;
+      down_until = {};
+    } else if (code == 'B') {
+      down_until = ts + kKeyHoldDuration;
+      up_until = {};
+    } else if (code == 'C') {
+      right_until = ts + kKeyHoldDuration;
+      left_until = {};
+    } else if (code == 'D') {
+      left_until = ts + kKeyHoldDuration;
+      right_until = {};
+    }
+  };
+
+  bool quit = false;
+  while (!quit && g_flightdeck_stop == 0) {
+    const auto now = SteadyClock::now();
+
+    if (now - last_telemetry_time >= kTelemetryRefreshInterval) {
+      const std::optional<fs::path> target_session =
+          explicit_session.has_value() ? explicit_session
+                                       : find_newest_flightdeck_session();
+      engine.set_telemetry(observe_flightdeck_telemetry(target_session, rate_tracker));
+      last_telemetry_time = now;
+    }
+
+    HeroControlInput ctrl{};
+    ctrl.left = now < left_until;
+    ctrl.right = now < right_until;
+    ctrl.up = now < up_until;
+    ctrl.down = now < down_until;
+    engine.steer_input(ctrl);
+
+    const float dt = std::clamp(
+        std::chrono::duration<float>(now - last_frame_time).count(), 0.005F, 0.1F);
+    last_frame_time = now;
+
+    const HeroFrame &frame = engine.step_and_render(dt);
+    const FlightDeckViewportCells cells = query_flightdeck_viewport();
+    const bool resized = !prev_cells.has_value() ||
+                         prev_cells->columns != cells.columns ||
+                         prev_cells->rows != cells.rows;
+    prev_cells = cells;
+
+    if (use_kitty) {
+      const std::string encoded = encode_kitty_rgba_frame(
+          frame, HeroKittyPlacement{.row = 0,
+                                    .column = 0,
+                                    .columns = cells.columns,
+                                    .rows = cells.rows,
+                                    .image_id = hero_default_kitty_image_id,
+                                    .placement_id = 1});
+      std::string out;
+      out.reserve(encoded.size() + 64U);
+      out += "\x1b[?2026h";
+      if (resized) {
+        out += encode_kitty_erase(hero_default_kitty_image_id);
+        out += "\x1b[2J";
+      }
+      out += encoded;
+      out += "\x1b[?2026l";
+      write_fd_all(STDOUT_FILENO, out);
+    } else {
+      const auto lines = encode_truecolor_halfblock_frame(
+          frame, HeroHalfBlockOptions{.columns = cells.columns, .rows = cells.rows});
+      std::string out;
+      out.reserve(lines.size() * cells.columns * 12U + 96U);
+      out += "\x1b[?2026h";
+      if (resized)
+        out += "\x1b[2J";
+      for (std::size_t r = 0; r < lines.size(); ++r) {
+        out += "\x1b[";
+        out += std::to_string(r + 1);
+        out += ";1H";
+        out += lines[r];
+      }
+      out += "\x1b[0m\x1b[J\x1b[?2026l";
+      write_fd_all(STDOUT_FILENO, out);
+    }
+
+    next_frame_time += frame_period;
+    const auto after_render = SteadyClock::now();
+    if (next_frame_time < after_render)
+      next_frame_time = after_render;
+
+    while (!quit && g_flightdeck_stop == 0) {
+      const auto poll_now = SteadyClock::now();
+      if (esc_deadline.has_value() && poll_now >= *esc_deadline) {
+        esc_deadline.reset();
+        if (pending_input == "\x1b") {
+          pending_input.clear();
+          quit = true;
+          break;
+        }
+        // Discard a truncated incomplete escape sequence without quitting.
+        pending_input.clear();
+      }
+      if (poll_now >= next_frame_time)
+        break;
+      const auto target_wake = esc_deadline.has_value()
+                                   ? std::min(next_frame_time, *esc_deadline)
+                                   : next_frame_time;
+      const auto remain_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(target_wake - poll_now)
+              .count();
+      const int timeout_ms =
+          static_cast<int>(std::clamp<std::int64_t>(remain_ms, 1, 50));
+      struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
+      const int prc = ::poll(&pfd, 1, timeout_ms);
+      if (prc <= 0) {
+        if (prc < 0 && errno != EINTR)
+          quit = true;
+        continue;
+      }
+      if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+        quit = true;
+        break;
+      }
+      std::array<char, 64> buf{};
+      const ssize_t got = ::read(STDIN_FILENO, buf.data(), buf.size());
+      if (got < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+          continue;
+        quit = true;
+        break;
+      }
+      if (got == 0) {
+        quit = true;
+        break;
+      }
+      const auto input_now = SteadyClock::now();
+      const auto got_len = static_cast<std::size_t>(got);
+      if (pending_input.size() + got_len > kMaxPendingInputBytes) {
+        pending_input.clear();
+        esc_deadline.reset();
+      }
+      pending_input.append(buf.data(), got_len);
+
+      while (!pending_input.empty() && !quit) {
+        const unsigned char ch = static_cast<unsigned char>(pending_input[0]);
+        if (ch == 0x1bU) {
+          if (pending_input.size() == 1U) {
+            if (!esc_deadline.has_value())
+              esc_deadline = input_now + kBareEscTimeout;
+            break;
+          }
+          const char next = pending_input[1];
+          if (next == '[') {
+            std::size_t pos = 2;
+            bool embedded_esc = false;
+            while (pos < pending_input.size()) {
+              const auto sb = static_cast<unsigned char>(pending_input[pos]);
+              if (sb == 0x1bU) {
+                embedded_esc = true;
+                break;
+              }
+              if (sb >= 0x40U && sb <= 0x7eU)
+                break;
+              ++pos;
+            }
+            if (embedded_esc) {
+              esc_deadline.reset();
+              pending_input.erase(0, pos);
+              continue;
+            }
+            if (pos >= pending_input.size()) {
+              if (pending_input.size() >= 32U) {
+                pending_input.clear();
+                esc_deadline.reset();
+              } else {
+                esc_deadline = input_now + kBareEscTimeout;
+              }
+              break;
+            }
+            esc_deadline.reset();
+            apply_arrow_code(pending_input[pos], input_now);
+            pending_input.erase(0, pos + 1U);
+            continue;
+          }
+          if (next == 'O') {
+            if (pending_input.size() < 3U) {
+              esc_deadline = input_now + kBareEscTimeout;
+              break;
+            }
+            esc_deadline.reset();
+            apply_arrow_code(pending_input[2], input_now);
+            pending_input.erase(0, 3U);
+            continue;
+          }
+          esc_deadline.reset();
+          if (next == 0x1b) {
+            pending_input.erase(0, 2U);
+            quit = true;
+            break;
+          }
+          // Non-arrow Alt+key sequence (e.g. Alt+t): consume cleanly without quitting.
+          pending_input.erase(0, 2U);
+          continue;
+        }
+
+        esc_deadline.reset();
+        pending_input.erase(0, 1U);
+        if (ch == 0x03U || ch == 'q' || ch == 'Q') {
+          quit = true;
+          break;
+        }
+        if (ch == 'w' || ch == 'W') {
+          up_until = input_now + kKeyHoldDuration;
+          down_until = {};
+        } else if (ch == 's' || ch == 'S') {
+          down_until = input_now + kKeyHoldDuration;
+          up_until = {};
+        } else if (ch == 'a' || ch == 'A') {
+          left_until = input_now + kKeyHoldDuration;
+          right_until = {};
+        } else if (ch == 'd' || ch == 'D') {
+          right_until = input_now + kKeyHoldDuration;
+          left_until = {};
+        } else if (ch == 't' || ch == 'T') {
+          engine.cycle_theme();
+        } else if (ch == 'g' || ch == 'G') {
+          if (engine.has_question())
+            engine.set_question(std::nullopt);
+          else
+            engine.set_question(sample_flightdeck_question());
+        } else if (ch == '1') {
+          (void)engine.answer_by_key(0);
+        } else if (ch == '2') {
+          (void)engine.answer_by_key(1);
+        } else if (ch == '3') {
+          (void)engine.answer_by_key(2);
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
-         arg == "bridge" || arg == "join" || arg == "party";
+         arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -5381,6 +6067,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_join_cli(args, io);
     if (subcommand == "party")
       return run_party_cli(args, io);
+    if (subcommand == "flightdeck")
+      return run_flightdeck_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

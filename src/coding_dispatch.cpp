@@ -1,4 +1,5 @@
 #include "blackbird/command_post_tools.hpp"
+#include "blackbird/context_hygiene.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/raw_command.hpp"
@@ -9,6 +10,7 @@
 #include "coding_internal.hpp"
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <set>
 
 namespace blackbird {
@@ -678,9 +680,196 @@ Value CodingEngine::context_read(const Value &arguments) const {
   return context_.read_block(id, opts);
 }
 
+namespace {
+bool tool_result_aging_disabled() noexcept {
+  const char *env = std::getenv("BLACKBIRD_DISABLE_TOOL_AGING");
+  return env != nullptr && std::string_view{env} == "1";
+}
+
+bool is_failed_tool_output_value(const Value &out) noexcept {
+  if (coding_detail::failed_tool_output(out))
+    return true;
+  if (const auto *str = std::get_if<std::string>(&out.value());
+      str != nullptr && str->size() <= 65536 && !str->empty() && str->front() == '{') {
+    if (auto parsed = parse_json(*str); parsed.has_value())
+      return coding_detail::failed_tool_output(parsed.value());
+  }
+  return false;
+}
+
+std::string extract_tool_output_preview(const Value &out) {
+  constexpr std::size_t kPreviewCap = 256;
+  if (const auto *str = std::get_if<std::string>(&out.value()))
+    return str->substr(0, std::min(str->size(), kPreviewCap));
+  if (std::holds_alternative<Value::Object>(out.value())) {
+    for (const std::string_view key : {"error", "output", "content", "message"}) {
+      if (const auto *val = out.find(key)) {
+        if (const auto *str = std::get_if<std::string>(&val->value());
+            str != nullptr && !str->empty()) {
+          return str->substr(0, std::min(str->size(), kPreviewCap));
+        }
+      }
+    }
+  }
+  if (auto dumped = dump_json(out, {65536, 4096, 16}); dumped.has_value())
+    return dumped.value().substr(0, std::min(dumped.value().size(), kPreviewCap));
+  return "(structured tool output)";
+}
+
+bool has_nonempty_assistant_message(const Value &item) noexcept {
+  const auto *role = item.find("role");
+  const auto *type = item.find("type");
+  const bool is_assistant_role = role != nullptr &&
+                                 std::holds_alternative<std::string>(role->value()) &&
+                                 role->string() == "assistant";
+  const bool is_message_type = type != nullptr &&
+                               std::holds_alternative<std::string>(type->value()) &&
+                               type->string() == "message";
+  if (!is_assistant_role &&
+      !(is_message_type && (role == nullptr || is_assistant_role))) {
+    return false;
+  }
+  const auto *content = item.find("content");
+  if (!content)
+    return false;
+  if (const auto *text = std::get_if<std::string>(&content->value()))
+    return !text->empty();
+  if (const auto *parts = std::get_if<Value::Array>(&content->value())) {
+    for (const auto &part : *parts) {
+      if (const auto *t = part.find("text");
+          t && std::holds_alternative<std::string>(t->value()) &&
+          !t->string().empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::optional<std::uint64_t> parse_optional_u64_field(const Value &obj,
+                                                      std::string_view key) noexcept {
+  const auto *item = obj.find(key);
+  if (!item)
+    return std::nullopt;
+  const auto *num = std::get_if<Number>(&item->value());
+  if (!num)
+    return std::nullopt;
+  const std::string text = num->text();
+  if (text.empty())
+    return std::nullopt;
+  std::uint64_t parsed = 0;
+  const auto res = std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (res.ec != std::errc{} || res.ptr != text.data() + text.size())
+    return std::nullopt;
+  return parsed;
+}
+
+std::vector<CompactRequest> build_tool_aging_requests(const ContextStore &context) {
+  std::vector<ContextEntryView> entries;
+  std::map<std::string, std::string> call_id_to_tool;
+  std::uint64_t turn_counter = 0;
+
+  for (const auto &block : context.blocks()) {
+    // Always record call_id -> tool_name mappings across blocks so split
+    // function_call_output blocks resolve their actual tool name.
+    for (const auto &item : block.items) {
+      const auto *type = item.find("type");
+      if (!type || !std::holds_alternative<std::string>(type->value()) ||
+          type->string() != "function_call") {
+        continue;
+      }
+      const auto *cid = item.find("call_id");
+      const auto *n = item.find("name");
+      if (cid && n && std::holds_alternative<std::string>(cid->value()) &&
+          std::holds_alternative<std::string>(n->value()) && !cid->string().empty() &&
+          !n->string().empty()) {
+        call_id_to_tool[cid->string()] = n->string();
+      }
+    }
+
+    if (block.kind == BlockKind::instruction) {
+      bool is_user_turn = (block.label == "operator");
+      if (!is_user_turn) {
+        for (const auto &item : block.items) {
+          if (const auto *role = item.find("role");
+              role && std::holds_alternative<std::string>(role->value()) &&
+              role->string() == "user") {
+            is_user_turn = true;
+            break;
+          }
+        }
+      }
+      if (is_user_turn)
+        ++turn_counter;
+      continue;
+    }
+    if (block.open || block.kind == BlockKind::note)
+      continue;
+
+    bool has_tool_output = false;
+    bool has_assistant_prose = false;
+    bool has_failed_output = false;
+    std::string tool_name;
+    std::string preview;
+    for (const auto &item : block.items) {
+      if (has_nonempty_assistant_message(item))
+        has_assistant_prose = true;
+      const auto *type = item.find("type");
+      if (!type || !std::holds_alternative<std::string>(type->value()))
+        continue;
+      if (type->string() == "function_call" && tool_name.empty()) {
+        if (const auto *n = item.find("name");
+            n && std::holds_alternative<std::string>(n->value())) {
+          tool_name = n->string();
+        }
+      } else if (type->string() == "function_call_output") {
+        has_tool_output = true;
+        if (tool_name.empty()) {
+          if (const auto *cid = item.find("call_id");
+              cid && std::holds_alternative<std::string>(cid->value())) {
+            if (const auto it = call_id_to_tool.find(cid->string());
+                it != call_id_to_tool.end()) {
+              tool_name = it->second;
+            }
+          }
+        }
+        if (const auto *out = item.find("output")) {
+          if (is_failed_tool_output_value(*out))
+            has_failed_output = true;
+          if (preview.empty())
+            preview = extract_tool_output_preview(*out);
+        }
+      }
+    }
+    if (!has_tool_output || has_assistant_prose)
+      continue;
+
+    const std::uint64_t entry_turn =
+        turn_counter > 0 ? turn_counter
+                         : static_cast<std::uint64_t>(entries.size() + 1);
+    ContextEntryView view;
+    view.entry_id = std::to_string(block.id);
+    view.kind = "function_call_output";
+    view.tool_name = tool_name.empty() ? "tool" : std::move(tool_name);
+    view.turn_index = entry_turn;
+    view.bytes = static_cast<std::size_t>(block.bytes);
+    view.pinned = block.pinned;
+    view.already_stubbed = is_aged_tool_stub(preview);
+    view.failed = has_failed_output;
+    view.preview = std::move(preview);
+    entries.push_back(std::move(view));
+  }
+
+  if (entries.empty())
+    return {};
+  const std::uint64_t current_turn =
+      turn_counter > 0 ? turn_counter : static_cast<std::uint64_t>(entries.size());
+  const ToolAgingPlan plan = plan_tool_result_aging(entries, current_turn);
+  return plan.compact_requests();
+}
+} // namespace
+
 std::size_t CodingEngine::flush_pending_compactions(std::string_view reason) {
-  if (pending_compactions_.empty())
-    return 0;
   auto queued = std::move(pending_compactions_);
   pending_compactions_.clear();
   std::size_t applied = 0;
@@ -689,13 +878,36 @@ std::size_t CodingEngine::flush_pending_compactions(std::string_view reason) {
     if (res.find("ok") && field(res, "ok") == Value{true})
       ++applied;
   }
+
+  // Lossless turn-end / overflow tool-result aging: replaces old unpinned tool-result
+  // blocks with deterministic 1-line stubs while originals stay verbatim in AuditLog.
+  std::size_t aged_applied = 0;
+  if (!operator_call_ && (reason == "turn end" || reason == "overflow") &&
+      !tool_result_aging_disabled()) {
+    const auto aging_requests = build_tool_aging_requests(context_);
+    for (const auto &req : aging_requests) {
+      const auto res = context_.compact(req);
+      if (res.find("ok") && field(res, "ok") == Value{true}) {
+        ++applied;
+        ++aged_applied;
+      }
+    }
+  }
+
   if (applied > 0) {
     ++upstream_epoch_;
     if (!reason.empty() && (notice || display)) {
-      (notice ? notice : display)("\n[applied " + std::to_string(applied) +
-                                  " deferred compaction(s) on " + std::string{reason} +
-                                  "; upstream epoch " +
-                                  std::to_string(upstream_epoch_) + "]\n");
+      std::string summary;
+      if (aged_applied > 0 && aged_applied == applied) {
+        summary = "\n[aged " + std::to_string(aged_applied) +
+                  " old tool result(s) on " + std::string{reason} +
+                  "; upstream epoch " + std::to_string(upstream_epoch_) + "]\n";
+      } else {
+        summary = "\n[applied " + std::to_string(applied) +
+                  " deferred compaction(s) on " + std::string{reason} +
+                  "; upstream epoch " + std::to_string(upstream_epoch_) + "]\n";
+      }
+      (notice ? notice : display)(summary);
     }
     if (hooks_ && !hooks_->definitions().empty()) {
       const HookMatchSample sample{
@@ -704,6 +916,7 @@ std::size_t CodingEngine::flush_pending_compactions(std::string_view reason) {
           Value::object({{"event", Value{"context_compact"}},
                          {"op", Value{"flush"}},
                          {"flushed", Value{Number{applied}}},
+                         {"aged", Value{Number{aged_applied}}},
                          {"reason", Value{std::string{reason}}},
                          {"upstream_epoch", Value{Number{upstream_epoch_}}},
                          {"live_blocks", Value{Number{context_.blocks().size()}}},
@@ -1204,6 +1417,7 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
   std::optional<ResultShape> shape;
   std::string call_id, refusal, declared_id;
   bool shape_refused = false;
+  bool model_explicit_budget = false;
   if (options != Value{}) {
     // A relay declares the model call it answers: a recorded call no output has
     // answered yet. Anything else is refused and recorded with its reason.
@@ -1218,6 +1432,10 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
     if (const auto found = model_calls_.find(id); found != model_calls_.end()) {
       found->second.dispatched = true;
       call_id = id;
+      model_explicit_budget =
+          std::holds_alternative<Value::Object>(found->second.arguments.value()) &&
+          (found->second.arguments.find("output_max_bytes") != nullptr ||
+           found->second.arguments.find("output_head_bytes") != nullptr);
     } else
       refusal = answered_calls_.contains(id) ? "call_id_answered" : "call_id_unknown";
   } else if (!exact && !declared_turn_) {
@@ -1235,6 +1453,10 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
     if (claimed != model_calls_.end()) {
       claimed->second.dispatched = true;
       call_id = claimed->first;
+      model_explicit_budget =
+          std::holds_alternative<Value::Object>(claimed->second.arguments.value()) &&
+          (claimed->second.arguments.find("output_max_bytes") != nullptr ||
+           claimed->second.arguments.find("output_head_bytes") != nullptr);
     }
   }
   const bool model_call = !call_id.empty();
@@ -1282,8 +1504,8 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
   }
   const auto continuation_shape = shape;
   // Shape a job's result from its retained originals within the selected budget.
-  const auto shaped = [this](Value result, const std::string &id,
-                             const Value &arguments) {
+  const auto shaped = [this, model_call, exact, model_explicit_budget, &name](
+                          Value result, const std::string &id, const Value &arguments) {
     const auto output_budget = static_cast<std::size_t>(
         arguments.find("output_max_bytes")
             ? command_number(arguments, "output_max_bytes", 16 * 1024 * 1024)
@@ -1301,6 +1523,89 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
         old->second = std::move(value);
       else
         result.object().emplace_back(std::move(key), std::move(value));
+    }
+
+    // For model-invoked exec/foreground calls without an explicit model byte budget,
+    // apply lossless diagnostic-preserving context projection on oversized verbose
+    // UTF-8 outputs while full verbatim bytes remain untouched under output_ref.
+    if (model_call && !exact && !model_explicit_budget &&
+        output_budget > kToolProjectionFooterHeadroomBytes) {
+      constexpr std::uint64_t kMaxProjectionScanBytes = 4ULL * 1024ULL * 1024ULL;
+      const std::uint64_t output_bytes =
+          parse_optional_u64_field(result, "output_bytes").value_or(0);
+      const std::uint64_t omitted_bytes =
+          parse_optional_u64_field(result, "omitted_bytes").value_or(0);
+      std::string raw_for_projection;
+      if (omitted_bytes == 0 && output_bytes <= kMaxProjectionScanBytes) {
+        if (const auto *out_val = result.find("output")) {
+          if (const auto *out_str = std::get_if<std::string>(&out_val->value()))
+            raw_for_projection = *out_str;
+        }
+      } else if (output_bytes > 0 && output_bytes <= kMaxProjectionScanBytes) {
+        if (const auto found = process_originals_.find(id);
+            found != process_originals_.end()) {
+          raw_for_projection.reserve(static_cast<std::size_t>(output_bytes));
+          for (const auto &[_, dependency] : found->second.chunks) {
+            const auto bytes = unwrap(log_.root().source(dependency));
+            if (bytes.size() > static_cast<std::size_t>(kMaxProjectionScanBytes) -
+                                   raw_for_projection.size()) {
+              raw_for_projection.clear();
+              break;
+            }
+            raw_for_projection.append(reinterpret_cast<const char *>(bytes.data()),
+                                      bytes.size());
+          }
+        }
+      }
+
+      if (!raw_for_projection.empty() && valid_utf8(raw_for_projection)) {
+        std::optional<int> exit_code;
+        if (const auto *code_val = result.find("exit_code")) {
+          if (const auto *num = std::get_if<Number>(&code_val->value())) {
+            int parsed = 0;
+            const std::string text = num->text();
+            const auto res =
+                std::from_chars(text.data(), text.data() + text.size(), parsed);
+            if (res.ec == std::errc{} && res.ptr == text.data() + text.size())
+              exit_code = parsed;
+          }
+        }
+        ToolProjectionPolicy policy;
+        policy.max_inline_bytes =
+            std::min(policy.max_inline_bytes,
+                     output_budget - kToolProjectionFooterHeadroomBytes);
+        const auto projected = project_tool_output_for_context(
+            {.tool_name = name,
+             .raw_output = std::move(raw_for_projection),
+             .exit_code = exit_code},
+            policy);
+        if (projected.was_compacted &&
+            projected.projected_text.size() <= output_budget &&
+            ((omitted_bytes == 0 &&
+              projected.projected_bytes < projected.original_bytes) ||
+             (omitted_bytes > 0 && projected.diagnostic_lines_extracted > 0))) {
+          auto upsert_field = [&result](std::string key, Value value) {
+            auto old =
+                std::find_if(result.object().begin(), result.object().end(),
+                             [&](const auto &entry) { return entry.first == key; });
+            if (old != result.object().end())
+              old->second = std::move(value);
+            else
+              result.object().emplace_back(std::move(key), std::move(value));
+          };
+          const std::size_t compacted_omitted =
+              projected.original_bytes > projected.projected_bytes
+                  ? projected.original_bytes - projected.projected_bytes
+                  : std::size_t{0};
+          upsert_field("output", Value{projected.projected_text});
+          upsert_field("truncated", Value{true});
+          upsert_field("returned_bytes", Value{Number{projected.projected_bytes}});
+          upsert_field("omitted_bytes", Value{Number{compacted_omitted}});
+          upsert_field("context_projected", Value{true});
+          upsert_field("diagnostic_lines_extracted",
+                       Value{Number{projected.diagnostic_lines_extracted}});
+        }
+      }
     }
     return result;
   };

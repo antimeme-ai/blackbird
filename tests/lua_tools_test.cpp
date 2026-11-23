@@ -28,6 +28,8 @@ void test_lua_command_post_bridge(const std::filesystem::path &sandbox) {
   const std::filesystem::path issues_dir = sandbox / "cp-issues";
   const std::filesystem::path absent_memory = sandbox / "cp-absent-memory";
   const std::filesystem::path memory_dir = sandbox / "cp-memory";
+  const std::filesystem::path absent_swarm = sandbox / "cp-absent-swarm";
+  const std::filesystem::path swarm_dir = sandbox / "cp-local-swarm";
   const std::filesystem::path repo_root = sandbox / "cp-repo";
   const std::filesystem::path blocked_file = sandbox / "cp-blocked-write";
   std::filesystem::create_directories(audit_dir);
@@ -217,6 +219,61 @@ void test_lua_command_post_bridge(const std::filesystem::path &sandbox) {
         assert(extra.error == "invalid_range")
       )lua"});
 
+  // 5b. local_swarm via blackbird.local_swarm(...) and blackbird.command_post(...).
+  engine.turn({"", "local absent_s = " + lua_json_string(absent_swarm) +
+                       "\nlocal sdir = " + lua_json_string(swarm_dir) +
+                       R"lua(
+        local empty = blackbird.local_swarm({action = "status", board_dir = absent_s})
+        assert(empty.swarm_present == false and empty.count == 0)
+
+        local added = blackbird.local_swarm({
+          action = "add",
+          board_dir = sdir,
+          name = "lua-worker",
+          role = "builder",
+          owned_files = {"src/lua_slice.cpp"},
+          brief = "Build lua slice"
+        })
+        assert(added.added == true and added.worker.name == "lua-worker")
+
+        local conflict = blackbird.local_swarm({
+          action = "add",
+          board_dir = sdir,
+          name = "lua-clash",
+          owned_files = {"src/lua_slice.cpp"},
+          brief = "Should conflict"
+        })
+        assert(conflict.error == "conflict")
+
+        local dentist = blackbird.local_swarm({
+          action = "dentist",
+          board_dir = sdir,
+          name = "lua-dentist",
+          repo_checks = {"ctest"}
+        })
+        assert(dentist.added == true and dentist.worker.read_only == true)
+
+        local waited = blackbird.command_post("local_swarm", {
+          action = "wait",
+          board_dir = sdir,
+          agent = "lua-worker",
+          since_seq = 0,
+          mentions_only = true,
+          timeout_ms = 50
+        })
+        assert(waited.woken == true and waited.count >= 1)
+        assert(waited.messages[1].untrusted_peer_data == true)
+        assert(waited.messages[1].text == nil)
+
+        local killed = blackbird.local_swarm({
+          action = "kill",
+          board_dir = sdir,
+          name = "lua-worker"
+        })
+        assert(killed.killed == true and killed.worker.state == "killed")
+      )lua"});
+  require(!std::filesystem::exists(absent_swarm));
+
   // 6. Unknown tool rejection, malformed arguments, alias coercion/arity, and
   // effect_policy enforcement.
   engine.turn({"", "local blocked = " + lua_json_string(blocked_file) +
@@ -270,11 +327,11 @@ void test_lua_command_post_bridge(const std::filesystem::path &sandbox) {
       break;
     cursor = next;
   }
-  require(audited_ops.contains("platoon_board") &&
-          audited_ops.contains("bridge_guard") &&
-          audited_ops.contains("project_issues") &&
-          audited_ops.contains("project_memory") &&
-          audited_ops.contains("companion_timing"));
+  require(
+      audited_ops.contains("platoon_board") && audited_ops.contains("bridge_guard") &&
+      audited_ops.contains("project_issues") &&
+      audited_ops.contains("project_memory") &&
+      audited_ops.contains("companion_timing") && audited_ops.contains("local_swarm"));
 
   engine.effect_policy = [](std::string_view tool_name, const Value &) {
     if (tool_name == "platoon_board")

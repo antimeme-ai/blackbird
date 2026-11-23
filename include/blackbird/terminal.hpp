@@ -56,7 +56,8 @@ enum class InputAction {
   mouse_release,
   party_toggle,
   party_hide,
-  party_send
+  party_send,
+  flightdeck_toggle
 };
 struct InputResult {
   InputAction action = InputAction::none;

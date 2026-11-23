@@ -282,7 +282,7 @@ void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
 
 void test_subcommand_dispatch_table() {
   for (const char *name : {"mcp", "platoon", "issues", "memory", "peer", "capabilities",
-                           "metrics", "bridge", "join", "party"}) {
+                           "metrics", "bridge", "join", "party", "flightdeck"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -1710,6 +1710,76 @@ void test_party_cli_roster_add_leader_and_say(const fs::path &base) {
   }
 }
 
+void test_flightdeck_cli_once_and_themes(const fs::path &base) {
+  const fs::path absent_session = base / "flightdeck-absent-session";
+
+  // 1. `--help` exits 0 with usage on stderr and empty stdout.
+  const auto help_res = run_cli({"flightdeck", "--help"});
+  check(help_res.exit_code == 0 && help_res.out.empty() &&
+            help_res.err.find("flightdeck") != std::string::npos,
+        "flightdeck --help must exit 0 with usage on stderr");
+
+  // 2. `--once --halfblock --theme synthwave` on absent session exits 0, outputs a
+  //    24-bit ANSI half-block (`▀`) frame, and creates ZERO directories.
+  const auto synth = run_cli({"flightdeck", "--once", "--halfblock", "--theme",
+                              "synthwave", "--session", absent_session.string()});
+  check(synth.exit_code == 0 && synth.err.empty(),
+        "flightdeck --once --halfblock --theme synthwave must exit 0 cleanly");
+  check(synth.out.find("\x1b[38;2;") != std::string::npos &&
+            synth.out.find("\x1b[48;2;") != std::string::npos &&
+            synth.out.find("\xE2\x96\x80") != std::string::npos,
+        "flightdeck --once --halfblock must emit 24-bit ANSI half-block frame");
+  check(!fs::exists(absent_session),
+        "flightdeck must NEVER create absent --session directory");
+
+  // 3. `--once --halfblock --theme tokyonight` exits 0 and renders a distinct theme.
+  const auto tokyo = run_cli({"flightdeck", "--once", "--halfblock", "--theme",
+                              "tokyonight", "--session", absent_session.string()});
+  check(tokyo.exit_code == 0 && tokyo.err.empty(),
+        "flightdeck --once --halfblock --theme tokyonight must exit 0 cleanly");
+  check(tokyo.out.find("\xE2\x96\x80") != std::string::npos && tokyo.out != synth.out,
+        "tokyonight frame must render distinct 24-bit half-block output");
+  check(!fs::exists(absent_session),
+        "flightdeck tokyonight must NEVER create absent --session directory");
+
+  // 4. Invalid `--theme`, `--fps`, `--width`, `--height` fail cleanly with exit 2.
+  const auto bad_theme =
+      run_cli({"flightdeck", "--once", "--halfblock", "--theme", "not-a-theme"});
+  check(bad_theme.exit_code == 2 && bad_theme.out.empty() && !bad_theme.err.empty(),
+        "invalid --theme must exit 2 with error on stderr");
+
+  for (const char *bad_fps : {"0", "31", "abc"}) {
+    const auto bad = run_cli({"flightdeck", "--once", "--fps", bad_fps});
+    check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+          "invalid --fps must exit 2");
+  }
+
+  const auto bad_width = run_cli({"flightdeck", "--once", "--width", "50"});
+  check(bad_width.exit_code == 2 && bad_width.out.empty() && !bad_width.err.empty(),
+        "out-of-range --width must exit 2");
+
+  for (const char *bad_height : {"50", "999", "abc"}) {
+    const auto bad = run_cli({"flightdeck", "--once", "--height", bad_height});
+    check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+          "out-of-range --height must exit 2");
+  }
+
+  const auto empty_session = run_cli({"flightdeck", "--once", "--session", ""});
+  check(empty_session.exit_code == 2 && empty_session.out.empty() &&
+            !empty_session.err.empty(),
+        "empty --session must exit 2");
+
+  // 5. Trailing-slash symlink `--session` must be rejected (no POSIX lstat bypass).
+  const fs::path real_session = base / "flightdeck-real-session";
+  const fs::path sym_session = base / "flightdeck-sym-session";
+  fs::create_directories(real_session);
+  fs::create_directory_symlink(real_session, sym_session);
+  const auto sym_slash = run_cli(
+      {"flightdeck", "--once", "--halfblock", "--session", sym_session.string() + "/"});
+  check(sym_slash.exit_code != 0 && sym_slash.out.empty() && !sym_slash.err.empty(),
+        "trailing-slash symlink --session must be rejected");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1733,6 +1803,7 @@ int main(int argc, char **argv) {
     test_bridge_subcommand(temp.path());
     test_bridge_checkpoint_and_join(temp.path());
     test_party_cli_roster_add_leader_and_say(temp.path());
+    test_flightdeck_cli_once_and_themes(temp.path());
 
     std::cout << "PASS command_post_cli\n";
     return 0;

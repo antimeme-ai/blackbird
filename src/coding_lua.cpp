@@ -919,7 +919,7 @@ struct CodingEngine::Runtime::Impl {
         "{definition=d}) end "
         "for _,cp in "
         "ipairs({'platoon_board','bridge_guard','project_issues','project_memory','"
-        "companion_timing'}) do "
+        "companion_timing','local_swarm'}) do "
         "local tool=cp; blackbird[tool]=function(...) return "
         "blackbird.command_post(tool,...) end end "
         "do local cache,loading={},{};local "
