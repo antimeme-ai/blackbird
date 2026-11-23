@@ -1,6 +1,7 @@
 #pragma once
 
 #include "blackbird/foundation.hpp"
+#include "blackbird/value.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,19 @@ enum class PlatoonPeerState : std::uint8_t { running, completed, failed, stopped
 
 const char *platoon_peer_state_name(PlatoonPeerState state) noexcept;
 
+enum class PlatoonPeerDriver : std::uint8_t {
+  blackbird,
+  claude_code,
+  codex,
+  pi,
+  antigravity,
+  acp,
+};
+
+const char *platoon_driver_name(PlatoonPeerDriver driver) noexcept;
+Result<PlatoonPeerDriver> parse_platoon_driver(std::string_view name) noexcept;
+bool valid_platoon_peer_id(std::string_view id) noexcept;
+
 struct PlatoonPeerSpec {
   std::string peer_id;
   std::string role;
@@ -30,6 +44,11 @@ struct PlatoonPeerSpec {
   std::filesystem::path executable;
   std::vector<std::pair<std::string, std::string>> extra_env;
   std::size_t max_output_bytes = 256U * 1024U;
+  PlatoonPeerDriver driver = PlatoonPeerDriver::blackbird;
+  std::string owner_actor = "local";
+  std::string command_room;
+  std::string tool_allowlist;
+  std::vector<std::string> extra_args;
 };
 
 struct PlatoonPeerSnapshot {
@@ -46,16 +65,25 @@ struct PlatoonPeerSnapshot {
   std::size_t output_bytes = 0;
   std::int64_t started_ns = 0;
   std::int64_t finished_ns = 0;
+  PlatoonPeerDriver driver = PlatoonPeerDriver::blackbird;
+  std::string owner_actor = "local";
+  std::string command_room;
+  std::string tool_allowlist;
 };
 
-// Launches and supervises bounded concurrent Blackbird peer processes in isolated
-// process groups with non-blocking output tail capture and guaranteed teardown.
+Value to_value(const PlatoonPeerSnapshot &snapshot);
+
+// Launches and supervises bounded concurrent Blackbird and external harness peer
+// processes in isolated process groups with non-blocking output tail capture and
+// guaranteed teardown.
 class PlatoonRunner {
 public:
   static constexpr std::size_t default_max_peers = 8;
   static constexpr std::size_t max_peers_limit = 16;
   static constexpr std::size_t default_max_output_bytes = 256U * 1024U;
   static constexpr std::size_t max_output_bytes_limit = 4U * 1024U * 1024U;
+  static constexpr std::size_t max_extra_args = 32;
+  static constexpr std::size_t max_extra_arg_bytes = 4U * 1024U;
 
   explicit PlatoonRunner(std::size_t max_peers = default_max_peers);
   ~PlatoonRunner();

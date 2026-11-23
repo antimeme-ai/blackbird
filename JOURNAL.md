@@ -13838,3 +13838,15 @@ Blackbird must not present itself as another product.
   candidates atomically with monotonic generation IDs, pins callers via RAII
   `ModuleGenerationLease` refcounts, defers `dlclose` until retired generations drain to
   zero in-flight leases, and supports clean atomic rollback.
+
+## 2026-11-23 — Rock 1.5: External Harness Drivers, ACP JSON-RPC, Rung 3 C2 & Ambient-Secret Isolation
+
+- Extended `PlatoonRunner` (`include/blackbird/platoon_runner.hpp`,
+  `src/platoon_runner.cpp`, `tests/platoon_runner_test.cpp`) with 6 peer drivers:
+  `blackbird`, `claude_code`, `codex`, `pi`, `antigravity`, and `acp` (native JSON-RPC 2.0
+  `initialize` / `session/new` / `session/prompt` framing over stdin/stdout).
+- Added Rung 3 temporary-attachment metadata (`owner_actor`, `command_room`,
+  `tool_allowlist`) separating owner sovereignty/kill-switch from command room control.
+- Hardened peer environment construction to strip ambient secret/provider/loader variables
+  from the parent environment for external harness peers (remediating Opus's §5
+  ambient-secret leakage finding before exposure).

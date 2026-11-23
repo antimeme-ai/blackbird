@@ -51,8 +51,129 @@ std::string current_working_dir() {
   return std::filesystem::canonical(buffer.c_str()).string();
 }
 
+int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
+  auto send_json = [](const Value &v) -> bool {
+    const auto dumped = dump_json(v);
+    if (!dumped.has_value())
+      return false;
+    std::cout << dumped.value() << '\n' << std::flush;
+    return true;
+  };
+
+  if (mode == "acp_early_exit") {
+    std::cerr << "ACP_EARLY_EXIT\n" << std::flush;
+    return 0;
+  }
+
+  std::string line;
+  if (!std::getline(std::cin, line))
+    return 11;
+  const auto init_req = parse_json(line);
+  if (!init_req.has_value())
+    return 12;
+  if (require_string(init_req.value(), "jsonrpc") != "2.0" ||
+      require_string(init_req.value(), "method") != "initialize")
+    return 13;
+
+  std::cerr << "ACP_STDERR_DIAG\n" << std::flush;
+  if (!send_json(Value::object(
+          {{"jsonrpc", Value{"2.0"}},
+           {"id", require_field(init_req.value(), "id")},
+           {"result",
+            Value::object(
+                {{"protocolVersion", Value{Number{std::int64_t{1}}}},
+                 {"agentInfo", Value::object({{"name", Value{"fake-acp"}}})}})}})))
+    return 14;
+
+  if (!std::getline(std::cin, line))
+    return 21;
+  const auto sess_req = parse_json(line);
+  if (!sess_req.has_value())
+    return 22;
+  if (require_string(sess_req.value(), "method") != "session/new")
+    return 23;
+  const auto &sess_params = require_field(sess_req.value(), "params");
+  const auto &cwd = require_string(sess_params, "cwd");
+  if (cwd != current_working_dir())
+    return 24;
+
+  if (mode == "acp_error") {
+    if (!send_json(Value::object(
+            {{"jsonrpc", Value{"2.0"}},
+             {"id", require_field(sess_req.value(), "id")},
+             {"error", Value::object({{"code", Value{Number{std::int64_t{-32000}}}},
+                                      {"message", Value{"session denied"}}})}})))
+      return 25;
+    // Wait for parent to close stdin on protocol failure.
+    while (std::getline(std::cin, line)) {
+    }
+    std::cerr << "ACP_ERROR_EOF\n" << std::flush;
+    return 0;
+  }
+
+  if (!send_json(Value::object(
+          {{"jsonrpc", Value{"2.0"}},
+           {"id", require_field(sess_req.value(), "id")},
+           {"result", Value::object({{"sessionId", Value{"acp-sess-99"}}})}})))
+    return 26;
+
+  if (!std::getline(std::cin, line))
+    return 31;
+  const auto prompt_req = parse_json(line);
+  if (!prompt_req.has_value())
+    return 32;
+  if (require_string(prompt_req.value(), "method") != "session/prompt")
+    return 33;
+  const auto &prompt_params = require_field(prompt_req.value(), "params");
+  if (require_string(prompt_params, "sessionId") != "acp-sess-99")
+    return 34;
+  const auto &blocks = require_field(prompt_params, "prompt").array();
+  if (blocks.empty())
+    return 35;
+  const auto &prompt_text = require_string(blocks[0], "text");
+
+  Value::Array args;
+  for (int i = 1; i < argc; ++i)
+    args.emplace_back(std::string{argv[i]});
+
+  Value::Array leaked;
+  for (const char *secret_key :
+       {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SECRET_TOKEN", "GEMINI_API_KEY",
+        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT"}) {
+    if (std::getenv(secret_key) != nullptr)
+      leaked.emplace_back(secret_key);
+  }
+
+  if (!send_json(Value::object(
+          {{"jsonrpc", Value{"2.0"}},
+           {"method", Value{"session/update"}},
+           {"params",
+            Value::object({{"sessionId", Value{"acp-sess-99"}},
+                           {"echo", Value{"acp:" + prompt_text}},
+                           {"cwd", Value{cwd}},
+                           {"argv", Value{std::move(args)}},
+                           {"leaked_env", Value{std::move(leaked)}},
+                           {"has_path", Value{std::getenv("PATH") != nullptr}},
+                           {"xdg_config", Value{env_or_empty("XDG_CONFIG_HOME")}}})}})))
+    return 36;
+
+  if (!send_json(Value::object(
+          {{"jsonrpc", Value{"2.0"}},
+           {"id", require_field(prompt_req.value(), "id")},
+           {"result", Value::object({{"stopReason", Value{"end_turn"}}})}})))
+    return 37;
+
+  // Expect clean stdin EOF from parent after prompt completion.
+  if (std::getline(std::cin, line))
+    return 38;
+  std::cerr << "ACP_EOF_CLEAN\n" << std::flush;
+  return 0;
+}
+
 int run_fake_peer(int argc, char **argv) {
   const std::string mode = env_or_empty("BLACKBIRD_PLATOON_TEST_MODE");
+  if (mode == "acp" || mode == "acp_error" || mode == "acp_early_exit")
+    return run_fake_acp_peer(argc, argv, mode);
   if (mode == "sleep") {
     std::cout << "READY\n" << std::flush;
     for (int i = 0; i < 300; ++i)
@@ -99,6 +220,14 @@ int run_fake_peer(int argc, char **argv) {
   for (int i = 1; i < argc; ++i)
     args.emplace_back(std::string{argv[i]});
 
+  Value::Array leaked_env;
+  for (const char *secret_key :
+       {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SECRET_TOKEN", "GEMINI_API_KEY",
+        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT"}) {
+    if (std::getenv(secret_key) != nullptr)
+      leaked_env.emplace_back(secret_key);
+  }
+
   Value::Object report;
   report.emplace_back("argv", Value{std::move(args)});
   report.emplace_back("cwd", Value{current_working_dir()});
@@ -107,6 +236,9 @@ int run_fake_peer(int argc, char **argv) {
   report.emplace_back("board", Value{env_or_empty("BLACKBIRD_PLATOON_BOARD")});
   report.emplace_back("peer_id", Value{env_or_empty("BLACKBIRD_PLATOON_PEER_ID")});
   report.emplace_back("role", Value{env_or_empty("BLACKBIRD_PLATOON_ROLE")});
+  report.emplace_back("xdg_config", Value{env_or_empty("XDG_CONFIG_HOME")});
+  report.emplace_back("has_path", Value{std::getenv("PATH") != nullptr});
+  report.emplace_back("leaked_env", Value{std::move(leaked_env)});
 
   const auto json = dump_json(Value{std::move(report)});
   if (!json.has_value())
@@ -162,7 +294,8 @@ struct TempDir {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc > 1 && std::string_view{argv[1]} == "--session")
+  if (env_or_empty("BLACKBIRD_PLATOON_FAKE_PEER") == "1" ||
+      (argc > 1 && std::string_view{argv[1]} == "--session"))
     return run_fake_peer(argc, argv);
 
   try {
@@ -492,7 +625,7 @@ int main(int argc, char **argv) {
       valid.executable = self_exe;
 
       for (const char *bad_id :
-           {"", "BadUpper", "../escape", "has space",
+           {"", "-leading-dash", "BadUpper", "../escape", "has space",
             "01234567890123456789012345678901234567890123456789"}) {
         auto s = valid;
         s.peer_id = bad_id;
@@ -594,6 +727,498 @@ int main(int argc, char **argv) {
             "dtor-2 survived destructor");
       check(detail::owned_children.load() == 0,
             "owned_children leaked after PlatoonRunner destruction");
+    }
+
+    // 8. Driver name/parse helpers, valid_platoon_peer_id, and to_value().
+    {
+      for (const PlatoonPeerDriver driver :
+           {PlatoonPeerDriver::blackbird, PlatoonPeerDriver::claude_code,
+            PlatoonPeerDriver::codex, PlatoonPeerDriver::pi,
+            PlatoonPeerDriver::antigravity, PlatoonPeerDriver::acp}) {
+        const std::string_view name = platoon_driver_name(driver);
+        const auto parsed = parse_platoon_driver(name);
+        check(parsed.has_value() && parsed.value() == driver,
+              "driver name/parse round-trip failed");
+      }
+      const auto dashed_claude = parse_platoon_driver("claude-code");
+      check(dashed_claude.has_value() &&
+                dashed_claude.value() == PlatoonPeerDriver::claude_code,
+            "claude-code alias did not parse");
+      for (const char *bad : {"", "unknown", "CLAUDE_CODE", "bash", "shell"}) {
+        const auto parsed = parse_platoon_driver(bad);
+        check(!parsed.has_value() && parsed.error().code == ErrorCode::invalid_range,
+              "invalid driver name accepted");
+      }
+
+      check(valid_platoon_peer_id("peer-1_ok"), "valid peer id rejected");
+      check(!valid_platoon_peer_id("-bad"), "leading dash peer id accepted");
+      check(!valid_platoon_peer_id(""), "empty peer id accepted");
+      check(!valid_platoon_peer_id("Bad"), "uppercase peer id accepted");
+
+      PlatoonPeerSnapshot snap;
+      snap.peer_id = "peer-val";
+      snap.driver = PlatoonPeerDriver::pi;
+      snap.role = "coder";
+      snap.provider = "anthropic";
+      snap.model = "claude-sonnet-4-5";
+      snap.owner_actor = "alice@node-1";
+      snap.command_room = "ops:room-7";
+      snap.tool_allowlist = "read,bash,edit";
+      snap.working_dir = work_a;
+      snap.session_dir = sess_a;
+      snap.state = PlatoonPeerState::completed;
+      snap.pid = 12345;
+      snap.exit_code = 0;
+      snap.output_tail = "done";
+      snap.output_bytes = 4;
+      snap.started_ns = 100;
+      snap.finished_ns = 200;
+
+      const Value val = to_value(snap);
+      check(require_string(val, "peer_id") == "peer-val", "to_value peer_id mismatch");
+      check(require_string(val, "driver") == "pi", "to_value driver mismatch");
+      check(require_string(val, "role") == "coder", "to_value role mismatch");
+      check(require_string(val, "owner_actor") == "alice@node-1",
+            "to_value owner_actor mismatch");
+      check(require_string(val, "command_room") == "ops:room-7",
+            "to_value command_room mismatch");
+      check(require_string(val, "tool_allowlist") == "read,bash,edit",
+            "to_value tool_allowlist mismatch");
+      check(require_string(val, "state") == "completed", "to_value state mismatch");
+      check(require_field(val, "exit_code") == Value{Number{std::int64_t{0}}},
+            "to_value exit_code mismatch");
+      snap.exit_code.reset();
+      const Value running_val = to_value(snap);
+      check(std::holds_alternative<std::nullptr_t>(
+                require_field(running_val, "exit_code").value()),
+            "to_value null exit_code mismatch");
+    }
+
+    // 9. External CLI drivers (claude_code, codex, pi, antigravity) + C2 propagation.
+    {
+      PlatoonRunner runner{4};
+      auto parse_first_line = [](const std::string &output) -> Value {
+        const auto nl = output.find('\n');
+        check(nl != std::string::npos, "missing json line in external peer output");
+        const auto parsed = parse_json(std::string_view{output.data(), nl});
+        check(parsed.has_value(), "invalid json from external peer");
+        return parsed.value();
+      };
+      auto assert_argv = [](const Value &report,
+                            const std::vector<std::string> &expected) {
+        const auto &actual = require_field(report, "argv").array();
+        check(actual.size() == expected.size(), "external driver argv length mismatch");
+        for (std::size_t i = 0; i < expected.size(); ++i)
+          check(actual[i].string() == expected[i],
+                "external driver argv element mismatch");
+      };
+
+      // claude_code with model and C2 metadata.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-claude";
+        spec.driver = PlatoonPeerDriver::claude_code;
+        spec.role = "implementer";
+        spec.model = "claude-opus-4-6";
+        spec.owner_actor = "patrick@macbook";
+        spec.command_room = "platoon:alpha";
+        spec.working_dir = work_a;
+        spec.prompt = "refactor parser";
+        spec.executable = self_exe;
+        spec.extra_args = {"--max-turns", "4"};
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "claude_code spawn failed");
+        const auto done = runner.wait("peer-claude", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "claude_code did not complete");
+        check(done.value().driver == PlatoonPeerDriver::claude_code,
+              "claude_code snapshot driver mismatch");
+        check(done.value().owner_actor == "patrick@macbook",
+              "claude_code owner_actor mismatch");
+        check(done.value().command_room == "platoon:alpha",
+              "claude_code command_room mismatch");
+        const Value report = parse_first_line(done.value().output_tail);
+        assert_argv(report,
+                    {"-p", "refactor parser", "--output-format", "stream-json",
+                     "--verbose", "--model", "claude-opus-4-6", "--max-turns", "4"});
+        const Value snap_val = to_value(done.value());
+        check(require_string(snap_val, "driver") == "claude_code",
+              "claude_code to_value driver mismatch");
+      }
+
+      // codex without model (omits -m) and empty owner_actor normalized to "local".
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-codex";
+        spec.driver = PlatoonPeerDriver::codex;
+        spec.role = "reviewer";
+        spec.owner_actor = "";
+        spec.working_dir = work_b;
+        spec.prompt = "audit diff";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "codex spawn failed");
+        const auto done = runner.wait("peer-codex", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "codex did not complete");
+        check(done.value().owner_actor == "local",
+              "empty owner_actor did not normalize to local");
+        const Value report = parse_first_line(done.value().output_tail);
+        assert_argv(report, {"exec", "--json", "audit diff"});
+        check(require_string(report, "cwd") == work_b.string(), "codex wrong cwd");
+      }
+
+      // codex with model and extra_args.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-codex-m";
+        spec.driver = PlatoonPeerDriver::codex;
+        spec.role = "reviewer";
+        spec.model = "o4-mini";
+        spec.working_dir = work_a;
+        spec.prompt = "check tests";
+        spec.executable = self_exe;
+        spec.extra_args = {"--full-auto"};
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        check(runner.spawn(spec).has_value(), "codex-m spawn failed");
+        const auto done = runner.wait("peer-codex-m", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "codex-m did not complete");
+        const Value report = parse_first_line(done.value().output_tail);
+        assert_argv(report,
+                    {"exec", "--json", "-m", "o4-mini", "--full-auto", "check tests"});
+      }
+
+      // pi with provider, model, session_dir, and tool_allowlist.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-pi";
+        spec.driver = PlatoonPeerDriver::pi;
+        spec.role = "scout";
+        spec.provider = "anthropic";
+        spec.model = "claude-sonnet-4-5";
+        spec.session_dir = sess_a;
+        spec.tool_allowlist = "read,grep,find,ls";
+        spec.owner_actor = "bob@wintermute";
+        spec.command_room = "lend-lease-1";
+        spec.working_dir = work_a;
+        spec.prompt = "scan headers";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        check(runner.spawn(spec).has_value(), "pi spawn failed");
+        const auto done = runner.wait("peer-pi", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "pi did not complete");
+        check(done.value().tool_allowlist == "read,grep,find,ls",
+              "pi tool_allowlist not propagated");
+        const Value report = parse_first_line(done.value().output_tail);
+        assert_argv(report,
+                    {"--mode", "json", "-p", "--provider", "anthropic", "--model",
+                     "claude-sonnet-4-5", "--session-dir", sess_a.string(), "--tools",
+                     "read,grep,find,ls", "scan headers"});
+      }
+
+      // antigravity with model and extra_args.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-agy";
+        spec.driver = PlatoonPeerDriver::antigravity;
+        spec.role = "architect";
+        spec.model = "gemini-3-pro";
+        spec.working_dir = work_b;
+        spec.prompt = "summarize architecture";
+        spec.executable = self_exe;
+        spec.extra_args = {"--yolo"};
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        check(runner.spawn(spec).has_value(), "antigravity spawn failed");
+        const auto done = runner.wait("peer-agy", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "antigravity did not complete");
+        const Value report = parse_first_line(done.value().output_tail);
+        assert_argv(report, {"--non-interactive", "--model", "gemini-3-pro", "--yolo",
+                             "summarize architecture"});
+      }
+    }
+
+    // 10. Real stdio JSON-RPC ACP driver exchange (happy path + error + early exit).
+    {
+      PlatoonRunner runner{4};
+
+      // Happy path: initialize -> session/new -> session/prompt -> clean stdin EOF.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-acp";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp-agent";
+        spec.owner_actor = "alice@tailnet";
+        spec.command_room = "opcon-room";
+        spec.working_dir = work_a;
+        spec.prompt = "run acp task";
+        spec.executable = self_exe;
+        spec.extra_args = {"--acp-stdio", "--profile", "strict"};
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp"}};
+
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "acp spawn failed");
+        const auto done = runner.wait("peer-acp", 5000);
+        check(done.has_value(), "acp wait failed");
+        check(done.value().state == PlatoonPeerState::completed,
+              "acp peer did not complete");
+        check(done.value().exit_code.has_value() && *done.value().exit_code == 0,
+              "acp peer exit code != 0");
+        check(done.value().driver == PlatoonPeerDriver::acp,
+              "acp snapshot driver mismatch");
+        check(done.value().owner_actor == "alice@tailnet", "acp owner_actor mismatch");
+        check(done.value().command_room == "opcon-room", "acp command_room mismatch");
+        const std::string &out = done.value().output_tail;
+        check(out.find("fake-acp") != std::string::npos,
+              "acp initialize response missing from output_tail");
+        check(out.find("acp-sess-99") != std::string::npos,
+              "acp session/new response missing from output_tail");
+        check(out.find("acp:run acp task") != std::string::npos,
+              "acp session/update notification missing from output_tail");
+        check(out.find("--acp-stdio") != std::string::npos,
+              "acp extra_args not passed to executable");
+        check(out.find("end_turn") != std::string::npos,
+              "acp session/prompt response missing from output_tail");
+        check(out.find("ACP_STDERR_DIAG") != std::string::npos,
+              "acp stderr missing from output_tail");
+        check(out.find("ACP_EOF_CLEAN") != std::string::npos,
+              "acp did not receive clean stdin EOF");
+      }
+
+      // JSON-RPC error during session/new marks peer failed and still closes stdin.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-acp-err";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp-agent";
+        spec.working_dir = work_a;
+        spec.prompt = "should fail";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_error"}};
+
+        check(runner.spawn(spec).has_value(), "acp_error spawn failed");
+        const auto done = runner.wait("peer-acp-err", 5000);
+        check(done.has_value(), "acp_error wait failed");
+        check(done.value().state == PlatoonPeerState::failed,
+              "acp JSON-RPC error did not mark peer failed");
+        check(done.value().output_tail.find("session denied") != std::string::npos,
+              "acp error response missing from output_tail");
+        check(done.value().output_tail.find("ACP_ERROR_EOF") != std::string::npos,
+              "acp error path did not close stdin cleanly");
+      }
+
+      // Premature exit 0 before handshake completion marks peer failed.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "peer-acp-early";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp-agent";
+        spec.working_dir = work_a;
+        spec.prompt = "early exit";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_early_exit"}};
+
+        check(runner.spawn(spec).has_value(), "acp_early_exit spawn failed");
+        const auto done = runner.wait("peer-acp-early", 5000);
+        check(done.has_value(), "acp_early_exit wait failed");
+        check(done.value().state == PlatoonPeerState::failed,
+              "acp premature exit 0 did not mark peer failed");
+      }
+    }
+
+    // 11. Validation rejections for C2 metadata, tool_allowlist, extra_args, and acp.
+    {
+      PlatoonRunner runner{2};
+      PlatoonPeerSpec base;
+      base.peer_id = "val-1";
+      base.driver = PlatoonPeerDriver::pi;
+      base.role = "worker";
+      base.working_dir = work_a;
+      base.prompt = "hi";
+      base.executable = self_exe;
+
+      for (const char *bad_actor :
+           {"-bad", ".hidden", "../escape", "has space", "a/b",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}) {
+        auto s = base;
+        s.owner_actor = bad_actor;
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "invalid owner_actor accepted");
+      }
+
+      for (const char *bad_room : {"-room", ".room", "a..b", "bad room", "room/1"}) {
+        auto s = base;
+        s.command_room = bad_room;
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "invalid command_room accepted");
+      }
+
+      for (const char *bad_tools :
+           {"-bash", "read, bash", "read;rm", ",read", "read,", "read,,edit",
+            "read,-edit", "read\tbash", "read/file"}) {
+        auto s = base;
+        s.tool_allowlist = bad_tools;
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "invalid tool_allowlist accepted");
+      }
+      {
+        auto s = base;
+        s.tool_allowlist = std::string(1025, 'a');
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "oversized tool_allowlist accepted");
+      }
+
+      {
+        auto s = base;
+        s.extra_args.assign(PlatoonRunner::max_extra_args + 1U, "--flag");
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "too many extra_args accepted");
+      }
+      {
+        auto s = base;
+        s.extra_args = {std::string(PlatoonRunner::max_extra_arg_bytes + 1U, 'x')};
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "oversized extra_arg accepted");
+      }
+      {
+        auto s = base;
+        s.extra_args = {std::string{"abc\0def", 7}};
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "NUL in extra_arg accepted");
+      }
+      {
+        auto s = base;
+        s.driver = PlatoonPeerDriver::acp;
+        s.executable.clear();
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "acp with empty executable accepted");
+      }
+      {
+        auto s = base;
+        s.model = "-leading";
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "leading dash model accepted");
+      }
+      {
+        auto s = base;
+        s.provider = "-leading";
+        const auto r = runner.spawn(s);
+        check(!r.has_value() && r.error().code == ErrorCode::invalid_range,
+              "leading dash provider accepted");
+      }
+    }
+
+    // 12. Ambient secret isolation for outside-agent drivers (allowlisted baseline
+    // env).
+    {
+      struct ScopedEnv {
+        std::string key;
+        std::optional<std::string> previous;
+        ScopedEnv(std::string env_key, const char *value) : key(std::move(env_key)) {
+          if (const char *old = std::getenv(key.c_str()))
+            previous = std::string{old};
+          (void)::setenv(key.c_str(), value, 1);
+        }
+        ~ScopedEnv() {
+          if (previous.has_value())
+            (void)::setenv(key.c_str(), previous->c_str(), 1);
+          else
+            (void)::unsetenv(key.c_str());
+        }
+      };
+
+      ScopedEnv env_ant{"ANTHROPIC_API_KEY", "sk-ant-do-not-leak"};
+      ScopedEnv env_oai{"OPENAI_API_KEY", "sk-oai-do-not-leak"};
+      ScopedEnv env_tok{"SECRET_TOKEN", "tok-do-not-leak"};
+      ScopedEnv env_gem{"GEMINI_API_KEY", "gem-do-not-leak"};
+      ScopedEnv env_key{"CUSTOM_KEY", "custom-do-not-leak"};
+      ScopedEnv env_xdg_sec{"XDG_SECRET_TOKEN", "xdg-secret-do-not-leak"};
+      ScopedEnv env_unrel{"UNRELATED_AMBIENT", "ambient-do-not-leak"};
+      ScopedEnv env_xdg{"XDG_CONFIG_HOME", "/tmp/blackbird-xdg-test"};
+      ScopedEnv env_board{"BLACKBIRD_PLATOON_BOARD", "/tmp/blackbird-board-allow"};
+
+      PlatoonRunner runner{6};
+      auto parse_first_line = [](const std::string &output) -> Value {
+        const auto nl = output.find('\n');
+        check(nl != std::string::npos, "missing json line in env-isolation peer");
+        const auto parsed = parse_json(std::string_view{output.data(), nl});
+        check(parsed.has_value(), "invalid json from env-isolation peer");
+        return parsed.value();
+      };
+
+      for (const auto driver :
+           {PlatoonPeerDriver::claude_code, PlatoonPeerDriver::codex,
+            PlatoonPeerDriver::pi, PlatoonPeerDriver::antigravity}) {
+        PlatoonPeerSpec spec;
+        spec.peer_id = std::string{"env-"} + platoon_driver_name(driver);
+        spec.driver = driver;
+        spec.role = "external";
+        spec.working_dir = work_a;
+        spec.prompt = "check env isolation";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"}};
+
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "env-isolation external peer spawn failed");
+        const auto done = runner.wait(spec.peer_id, 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "env-isolation external peer did not complete");
+        const Value report = parse_first_line(done.value().output_tail);
+        check(require_field(report, "leaked_env").array().empty(),
+              "ambient secret or non-allowlisted env leaked into external peer");
+        check(require_field(report, "has_path") == Value{true},
+              "allowlisted PATH missing in external peer");
+        check(require_string(report, "xdg_config") == "/tmp/blackbird-xdg-test",
+              "allowlisted XDG_CONFIG_HOME missing in external peer");
+        check(require_string(report, "board") == "/tmp/blackbird-board-allow",
+              "allowlisted BLACKBIRD_PLATOON_BOARD missing in external peer");
+      }
+
+      // Verify ACP driver also receives clean allowlisted baseline env with zero leaks.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "env-acp";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp-external";
+        spec.working_dir = work_a;
+        spec.prompt = "check acp env isolation";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp"}};
+
+        check(runner.spawn(spec).has_value(), "env-acp spawn failed");
+        const auto done = runner.wait("env-acp", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "env-acp did not complete");
+        const std::string &out = done.value().output_tail;
+        check(out.find("\"leaked_env\":[]") != std::string::npos,
+              "ambient secret leaked into acp peer");
+        check(out.find("\"has_path\":true") != std::string::npos,
+              "allowlisted PATH missing in acp peer");
+        check(out.find("/tmp/blackbird-xdg-test") != std::string::npos,
+              "allowlisted XDG_CONFIG_HOME missing in acp peer");
+      }
     }
 
     std::cout << "platoon_runner passed\n";
