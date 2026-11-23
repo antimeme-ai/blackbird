@@ -1,0 +1,687 @@
+{
+  "survey": "Multiplayer Agentic Systems Literature Survey",
+  "date": "2026-11-23",
+  "verified_count": 42,
+  "citations": [
+    {
+      "id": "paliskara2026worse_arxiv",
+      "theme": "multi_principal_coordination",
+      "title": "Worse Together: How Performance Breaks Down in Multi-User Multi-Agent Teams",
+      "authors": [
+        "Sahan Paliskara",
+        "Nattaput Namchittai",
+        "Andrew Lampinen"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2610.00583",
+      "url": "https://arxiv.org/abs/2610.00583",
+      "verified_live": true
+    },
+    {
+      "id": "paliskara2026worse_blog",
+      "theme": "multi_principal_coordination",
+      "title": "Worse Together: How Performance Breaks Down in Multi-User Multi-Agent Teams (Alignment Science Blog)",
+      "authors": [
+        "Sahan Paliskara",
+        "Nattaput Namchittai",
+        "Jacqueline Tay",
+        "Avery Griffin",
+        "Andrew Lampinen"
+      ],
+      "year": 2026,
+      "venue": "Anthropic Alignment Science Blog",
+      "url": "https://alignment.anthropic.com/2026/worse-together/",
+      "verified_live": true
+    },
+    {
+      "id": "hammond2025multiagent_risks",
+      "theme": "multi_principal_coordination",
+      "title": "Multi-Agent Risks from Advanced AI",
+      "authors": [
+        "Lewis Hammond",
+        "Alan Chan",
+        "Jesse Clifton",
+        "Jason Hoelscher-Obermaier",
+        "Akbir Khan",
+        "Euan McLean",
+        "Chandler Smith",
+        "Wolfram Barfuss",
+        "Jakob Foerster",
+        "Tomáš Gavenčiak",
+        "The Anh Han",
+        "Edward Hughes",
+        "Vojtěch Kovařík",
+        "Jan Kulveit",
+        "Joel Z. Leibo",
+        "Caspar Oesterheld",
+        "Christian Schroeder de Witt",
+        "Nisarg Shah",
+        "Michael Wellman",
+        "Paolo Bova",
+        "Theodor Cimpeanu",
+        "Carson Ezell",
+        "Quentin Feuillade-Montixi",
+        "Matija Franklin",
+        "Esben Kran",
+        "Igor Krawczuk",
+        "Max Lamparth",
+        "Niklas Lauffer",
+        "Alexander Meinke",
+        "Sumeet Motwani",
+        "Anka Reuel",
+        "Vincent Conitzer",
+        "Michael Dennis",
+        "Iason Gabriel",
+        "Adam Gleave",
+        "Gillian Hadfield",
+        "Nika Haghtalab",
+        "Atoosa Kasirzadeh",
+        "Sébastien Krier",
+        "Kate Larson",
+        "Joel Lehman",
+        "David C. Parkes",
+        "Georgios Piliouras",
+        "Iyad Rahwan"
+      ],
+      "year": 2025,
+      "venue": "arXiv:2502.14143",
+      "url": "https://arxiv.org/abs/2502.14143",
+      "verified_live": true
+    },
+    {
+      "id": "cemri2025mast",
+      "theme": "multi_principal_coordination",
+      "title": "Why Do Multi-Agent LLM Systems Fail?",
+      "authors": [
+        "Mert Cemri",
+        "Melissa Z. Pan",
+        "Shuyi Yang",
+        "Lakshya A. Agrawal",
+        "Bhavya Chopra",
+        "Rishabh Tiwari",
+        "Kurt Keutzer",
+        "Aditya Parameswaran",
+        "Dan Klein",
+        "Kannan Ramchandran",
+        "Matei Zaharia",
+        "Joseph E. Gonzalez",
+        "Ion Stoica"
+      ],
+      "year": 2025,
+      "venue": "arXiv:2503.13657",
+      "url": "https://arxiv.org/abs/2503.13657",
+      "verified_live": true
+    },
+    {
+      "id": "ying2026delegated_misalignment",
+      "theme": "multi_principal_coordination",
+      "title": "Delegated Misalignment: How Multi-Agent Structures Amplify LLM Safety Risks",
+      "authors": [
+        "Zonghao Ying",
+        "Jiaqi Yan",
+        "Huize Luo",
+        "Quanchen Zou",
+        "Aishan Liu",
+        "Xianglong Liu"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2609.27900",
+      "url": "https://arxiv.org/abs/2609.27900",
+      "verified_live": true
+    },
+    {
+      "id": "hao2026game_theoretic_mas",
+      "theme": "multi_principal_coordination",
+      "title": "Game-Theoretic Lens on LLM-based Multi-Agent Systems",
+      "authors": [
+        "Jianing Hao",
+        "Han Ding",
+        "Yuanjian Xu",
+        "Tianze Sun",
+        "Ran Chen",
+        "Wanbo Zhang",
+        "Guang Zhang",
+        "Siguang Li"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2601.15047",
+      "url": "https://arxiv.org/abs/2601.15047",
+      "verified_live": true
+    },
+    {
+      "id": "nechepurenko2026coordination_layer",
+      "theme": "multi_principal_coordination",
+      "title": "Coordination as an Architectural Layer for LLM-Based Multi-Agent Systems",
+      "authors": [
+        "Maksym Nechepurenko",
+        "Pavel Shuvalov"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2605.03310",
+      "url": "https://arxiv.org/abs/2605.03310",
+      "verified_live": true
+    },
+    {
+      "id": "choi2026explore_each_other",
+      "theme": "multi_principal_coordination",
+      "title": "Do Multi-Agent LLMs Explore Each Other?",
+      "authors": [
+        "Hyeong Kyu Choi",
+        "Jiatong Li",
+        "Wendi Li",
+        "Xin Eric Wang",
+        "Sharon Li"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2607.11250",
+      "url": "https://arxiv.org/abs/2607.11250",
+      "verified_live": true
+    },
+    {
+      "id": "clark1991grounding",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "Grounding in communication",
+      "authors": [
+        "Herbert H. Clark",
+        "Susan E. Brennan"
+      ],
+      "year": 1991,
+      "venue": "Perspectives on Socially Shared Cognition, American Psychological Association",
+      "url": "https://doi.org/10.1037/10096-006",
+      "verified_live": true
+    },
+    {
+      "id": "horvitz1999mixed_initiative",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "Principles of mixed-initiative user interfaces",
+      "authors": [
+        "Eric Horvitz"
+      ],
+      "year": 1999,
+      "venue": "Proceedings of the SIGCHI Conference on Human Factors in Computing Systems (CHI '99)",
+      "url": "https://doi.org/10.1145/302979.303030",
+      "verified_live": true
+    },
+    {
+      "id": "gutwin2002workspace_awareness",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "A Descriptive Framework of Workspace Awareness for Real-Time Groupware",
+      "authors": [
+        "Carl Gutwin",
+        "Saul Greenberg"
+      ],
+      "year": 2002,
+      "venue": "Computer Supported Cooperative Work (CSCW)",
+      "url": "https://doi.org/10.1023/A:1021271517844",
+      "verified_live": true
+    },
+    {
+      "id": "song2024social_groups",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "Multi-Agents are Social Groups: Investigating Social Influence of Multiple Agents in Human-Agent Interactions",
+      "authors": [
+        "Tianqi Song",
+        "Yugin Tan",
+        "Zicheng Zhu",
+        "Yibin Feng",
+        "Yi-Chieh Lee"
+      ],
+      "year": 2024,
+      "venue": "arXiv:2411.04578 (ACM CSCW)",
+      "url": "https://arxiv.org/abs/2411.04578",
+      "verified_live": true
+    },
+    {
+      "id": "li2025aidev",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "The Rise of AI Teammates in Software Engineering (SE) 3.0: How Autonomous Coding Agents Are Reshaping Software Engineering",
+      "authors": [
+        "Hao Li",
+        "Haoxiang Zhang",
+        "Ahmed E. Hassan"
+      ],
+      "year": 2025,
+      "venue": "arXiv:2507.15003",
+      "url": "https://arxiv.org/abs/2507.15003",
+      "verified_live": true
+    },
+    {
+      "id": "chen2026collabsim",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "CollabSim: A CSCW-Grounded Methodology for Investigating Collaborative Competence of LLM Agents through Controlled Multi-Agent Experiments",
+      "authors": [
+        "Jiaju Chen",
+        "Bo Sun",
+        "Yuxuan Lu",
+        "Yun Wang",
+        "Dakuo Wang",
+        "Bingsheng Yao"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2606.06399",
+      "url": "https://arxiv.org/abs/2606.06399",
+      "verified_live": true
+    },
+    {
+      "id": "abujadallah2026rejection_aidev",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "Understanding the Rejection of Fixes Generated by Agentic Pull Requests -- Insights from the AIDev Dataset",
+      "authors": [
+        "Mahmoud Abujadallah",
+        "Ali Arabat",
+        "Mohammed Sayagh"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2606.13468",
+      "url": "https://arxiv.org/abs/2606.13468",
+      "verified_live": true
+    },
+    {
+      "id": "ma2026cpe",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "Communication Policy Evolution for Proactive LLM Agents",
+      "authors": [
+        "Xinbei Ma",
+        "Jiyang Qiu",
+        "Yao Yao",
+        "Zheng Wu",
+        "Yijie Lu",
+        "Xiangmou Qu",
+        "Jiaxin Yin",
+        "Xingyu Lou",
+        "Jun Wang",
+        "Weiwen Liu",
+        "Weinan Zhang",
+        "Zhuosheng Zhang",
+        "Hai Zhao"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2606.14314",
+      "url": "https://arxiv.org/abs/2606.14314",
+      "verified_live": true
+    },
+    {
+      "id": "yang2026proact",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "ProACT: Towards Breakdown-Aware Proactive Agent in Multi-User Collaboration",
+      "authors": [
+        "Shu Yang",
+        "Difei Xu",
+        "Jiaxin Pei",
+        "Di Wang"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2607.03730",
+      "url": "https://arxiv.org/abs/2607.03730",
+      "verified_live": true
+    },
+    {
+      "id": "wang2026pitch",
+      "theme": "cscw_hci_collaborative_se",
+      "title": "When Should AI Chime In? Benchmarking Timely Contribution of Proactive Agents in Multi-Party Chat",
+      "authors": [
+        "Ruotong Wang",
+        "Brian S. Yu",
+        "Xinyi Zhou",
+        "Joseph Chee Chang",
+        "Pao Siangliulue",
+        "Jonathan Bragg",
+        "Liwei Jiang",
+        "Amy X Zhang"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2610.25896",
+      "url": "https://arxiv.org/abs/2610.25896",
+      "verified_live": true
+    },
+    {
+      "id": "dennis1966capabilities",
+      "theme": "identity_capabilities_security",
+      "title": "Programming semantics for multiprogrammed computations",
+      "authors": [
+        "Jack B. Dennis",
+        "Earl C. Van Horn"
+      ],
+      "year": 1966,
+      "venue": "Communications of the ACM",
+      "url": "https://doi.org/10.1145/365230.365252",
+      "verified_live": true
+    },
+    {
+      "id": "hardy1988confused_deputy",
+      "theme": "identity_capabilities_security",
+      "title": "The Confused Deputy",
+      "authors": [
+        "Norm Hardy"
+      ],
+      "year": 1988,
+      "venue": "ACM SIGOPS Operating Systems Review",
+      "url": "https://doi.org/10.1145/54289.871709",
+      "verified_live": true
+    },
+    {
+      "id": "miller2003capability_myths",
+      "theme": "identity_capabilities_security",
+      "title": "Capability Myths Demolished",
+      "authors": [
+        "Mark S. Miller",
+        "Ka-Ping Yee",
+        "Jonathan Shapiro"
+      ],
+      "year": 2003,
+      "venue": "Technical Report SRL2003-02, Systems Research Laboratory, Johns Hopkins University",
+      "url": "https://papers.agoric.com/assets/pdf/papers/capability-myths-demolished.pdf",
+      "verified_live": true
+    },
+    {
+      "id": "birgisson2014macaroons",
+      "theme": "identity_capabilities_security",
+      "title": "Macaroons: Cookies with Contextual Caveats for Decentralized Authorization in the Cloud",
+      "authors": [
+        "Arnar Birgisson",
+        "Joe Gibbs Politz",
+        "Úlfar Erlingsson",
+        "Ankur Taly",
+        "Michael Vrable",
+        "Mark Lentczner"
+      ],
+      "year": 2014,
+      "venue": "Network and Distributed System Security Symposium (NDSS 2014)",
+      "url": "https://doi.org/10.14722/ndss.2014.23212",
+      "verified_live": true
+    },
+    {
+      "id": "barnes2023rfc9420",
+      "theme": "identity_capabilities_security",
+      "title": "The Messaging Layer Security (MLS) Protocol",
+      "authors": [
+        "Richard Barnes",
+        "Benjamin Beurdouche",
+        "Raphael Robert",
+        "Jon Millican",
+        "Emad Omara",
+        "Katriel Cohn-Gordon"
+      ],
+      "year": 2023,
+      "venue": "IETF RFC 9420",
+      "url": "https://www.rfc-editor.org/rfc/rfc9420",
+      "verified_live": true
+    },
+    {
+      "id": "ucan_spec_v1",
+      "theme": "identity_capabilities_security",
+      "title": "User Controlled Authorization Network (UCAN) Specification v1.0.0",
+      "authors": [
+        "Brooklyn Zelenka",
+        "Irakli Gozalishvili",
+        "Daniel Holmgren",
+        "Philipp Krüger"
+      ],
+      "year": 2025,
+      "venue": "UCAN Working Group Specification",
+      "url": "https://github.com/ucan-wg/spec",
+      "verified_live": true
+    },
+    {
+      "id": "biscuit_spec",
+      "theme": "identity_capabilities_security",
+      "title": "Biscuit: A Bearer Token with Offline Attenuation and Decentralized Verification",
+      "authors": [
+        "Eclipse Biscuit Contributors"
+      ],
+      "year": 2025,
+      "venue": "Eclipse Biscuit Specification",
+      "url": "https://github.com/eclipse-biscuit/biscuit",
+      "verified_live": true
+    },
+    {
+      "id": "spiffe_spec",
+      "theme": "identity_capabilities_security",
+      "title": "Secure Production Identity Framework for Everyone (SPIFFE) Specification",
+      "authors": [
+        "CNCF SPIFFE Contributors"
+      ],
+      "year": 2025,
+      "venue": "Cloud Native Computing Foundation (CNCF) Standard",
+      "url": "https://github.com/spiffe/spiffe",
+      "verified_live": true
+    },
+    {
+      "id": "debenedetti2024agentdojo",
+      "theme": "identity_capabilities_security",
+      "title": "AgentDojo: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents",
+      "authors": [
+        "Edoardo Debenedetti",
+        "Jie Zhang",
+        "Mislav Balunović",
+        "Luca Beurer-Kellner",
+        "Marc Fischer",
+        "Florian Tramèr"
+      ],
+      "year": 2024,
+      "venue": "arXiv:2406.13352",
+      "url": "https://arxiv.org/abs/2406.13352",
+      "verified_live": true
+    },
+    {
+      "id": "roychowdhury2024confusedpilot",
+      "theme": "identity_capabilities_security",
+      "title": "ConfusedPilot: Confused Deputy Risks in RAG-based LLMs",
+      "authors": [
+        "Ayush RoyChowdhury",
+        "Mulong Luo",
+        "Prateek Sahu",
+        "Sarbartha Banerjee",
+        "Mohit Tiwari"
+      ],
+      "year": 2024,
+      "venue": "arXiv:2408.04870",
+      "url": "https://arxiv.org/abs/2408.04870",
+      "verified_live": true
+    },
+    {
+      "id": "lee2024prompt_infection",
+      "theme": "identity_capabilities_security",
+      "title": "Prompt Infection: LLM-to-LLM Prompt Injection within Multi-Agent Systems",
+      "authors": [
+        "Donghyun Lee",
+        "Mo Tiwari"
+      ],
+      "year": 2024,
+      "venue": "arXiv:2410.07283",
+      "url": "https://arxiv.org/abs/2410.07283",
+      "verified_live": true
+    },
+    {
+      "id": "debenedetti2025camel",
+      "theme": "identity_capabilities_security",
+      "title": "Defeating Prompt Injections by Design",
+      "authors": [
+        "Edoardo Debenedetti",
+        "Ilia Shumailov",
+        "Tianqi Fan",
+        "Jamie Hayes",
+        "Nicholas Carlini",
+        "Daniel Fabian",
+        "Christoph Kern",
+        "Chongyang Shi",
+        "Andreas Terzis",
+        "Florian Tramèr"
+      ],
+      "year": 2025,
+      "venue": "arXiv:2503.18813",
+      "url": "https://arxiv.org/abs/2503.18813",
+      "verified_live": true
+    },
+    {
+      "id": "zhou2026infaguard",
+      "theme": "identity_capabilities_security",
+      "title": "INFA-Guard: Mitigating Malicious Propagation via Infection-Aware Safeguarding in LLM-Based Multi-Agent Systems",
+      "authors": [
+        "Yijin Zhou",
+        "Xiaoya Lu",
+        "Dongrui Liu",
+        "Junchi Yan",
+        "Jing Shao"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2601.14667",
+      "url": "https://arxiv.org/abs/2601.14667",
+      "verified_live": true
+    },
+    {
+      "id": "petersgill2026multicamel",
+      "theme": "identity_capabilities_security",
+      "title": "Can CaMeLs Talk? Securing Multi-Agent Systems Against Indirect Prompt Injection Attacks",
+      "authors": [
+        "James Peters-Gill",
+        "Avi Semler",
+        "Henning Bartsch",
+        "Ilia Shumailov",
+        "Christian Schroeder de Witt"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2610.05640",
+      "url": "https://arxiv.org/abs/2610.05640",
+      "verified_live": true
+    },
+    {
+      "id": "lamport1978clocks",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Time, clocks, and the ordering of events in a distributed system",
+      "authors": [
+        "Leslie Lamport"
+      ],
+      "year": 1978,
+      "venue": "Communications of the ACM",
+      "url": "https://doi.org/10.1145/359545.359563",
+      "verified_live": true
+    },
+    {
+      "id": "kleppmann2019localfirst",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Local-first software: you own your data, in spite of the cloud",
+      "authors": [
+        "Martin Kleppmann",
+        "Adam Wiggins",
+        "Peter van Hardenberg",
+        "Mark McGranaghan"
+      ],
+      "year": 2019,
+      "venue": "ACM SIGPLAN International Symposium on New Ideas, New Paradigms, and Reflections on Programming and Software (Onward! 2019)",
+      "url": "https://doi.org/10.1145/3359591.3359737",
+      "verified_live": true
+    },
+    {
+      "id": "kleppmann2020bec",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Byzantine Eventual Consistency and the Fundamental Limits of Peer-to-Peer Databases",
+      "authors": [
+        "Martin Kleppmann",
+        "Heidi Howard"
+      ],
+      "year": 2020,
+      "venue": "arXiv:2012.00472",
+      "url": "https://arxiv.org/abs/2012.00472",
+      "verified_live": true
+    },
+    {
+      "id": "weidner2021dcgka",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Key Agreement for Decentralized Secure Group Messaging with Strong Security Guarantees",
+      "authors": [
+        "Matthew Weidner",
+        "Martin Kleppmann",
+        "Daniel Hugenroth",
+        "Alastair R. Beresford"
+      ],
+      "year": 2021,
+      "venue": "ACM SIGSAC Conference on Computer and Communications Security (CCS 2021)",
+      "url": "https://doi.org/10.1145/3460120.3484542",
+      "verified_live": true
+    },
+    {
+      "id": "kleppmann2022bft_crdt",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Making CRDTs Byzantine fault tolerant",
+      "authors": [
+        "Martin Kleppmann"
+      ],
+      "year": 2022,
+      "venue": "9th Workshop on Principles and Practice of Consistency for Distributed Data (PaPoC '22)",
+      "url": "https://doi.org/10.1145/3517209.3524042",
+      "verified_live": true
+    },
+    {
+      "id": "inkandswitch2025keyhive",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Keyhive & BeeKEM: Local-First Access Control and Concurrent Continuous Group Key Agreement",
+      "authors": [
+        "Ink & Switch Keyhive Contributors"
+      ],
+      "year": 2025,
+      "venue": "Ink & Switch Research Prototype / GitHub",
+      "url": "https://github.com/inkandswitch/keyhive",
+      "verified_live": true
+    },
+    {
+      "id": "ogenrwot2026agenticflict",
+      "theme": "distributed_crdt_concurrency",
+      "title": "AgenticFlict: A Large-Scale Dataset of Merge Conflicts in AI Coding Agent Pull Requests on GitHub",
+      "authors": [
+        "Daniel Ogenrwot",
+        "John Businge"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2604.03551",
+      "url": "https://arxiv.org/abs/2604.03551",
+      "verified_live": true
+    },
+    {
+      "id": "liu2026storm",
+      "theme": "distributed_crdt_concurrency",
+      "title": "Multi-agent Collaboration with State Management",
+      "authors": [
+        "Mengyang Liu",
+        "Taozhi Chen",
+        "Zhenhua Xu",
+        "Xue Jiang",
+        "Yihong Dong"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2605.20563",
+      "url": "https://arxiv.org/abs/2605.20563",
+      "verified_live": true
+    },
+    {
+      "id": "lyu2026coagent",
+      "theme": "distributed_crdt_concurrency",
+      "title": "CoAgent: Concurrency Control for Multi-Agent Systems",
+      "authors": [
+        "Hongtao Lyu",
+        "Dingyan Zhang",
+        "Mingyu Wu",
+        "Xingda Wei",
+        "Haibo Chen"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2606.15376",
+      "url": "https://arxiv.org/abs/2606.15376",
+      "verified_live": true
+    },
+    {
+      "id": "xu2026concurrent_prs",
+      "theme": "distributed_crdt_concurrency",
+      "title": "AI Agent Pull Requests on GitHub: Frequency, Structure, and Merge Conflict Rates",
+      "authors": [
+        "George Xu",
+        "Arjun Subramanian",
+        "Nithilan Karthik"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2607.04697",
+      "url": "https://arxiv.org/abs/2607.04697",
+      "verified_live": true
+    }
+  ]
+}
