@@ -281,7 +281,7 @@ void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
 
 void test_subcommand_dispatch_table() {
   for (const char *name : {"mcp", "platoon", "issues", "memory", "peer", "capabilities",
-                           "metrics", "bridge"}) {
+                           "metrics", "bridge", "join"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -1149,6 +1149,292 @@ void test_bridge_subcommand(const fs::path &base) {
         "grant-check after revoke-grant must deny with conflict");
 }
 
+void test_bridge_checkpoint_and_join(const fs::path &base) {
+  const fs::path alice_peers = base / "relay-peers-alice";
+  const fs::path bob_peers = base / "relay-peers-bob";
+  const fs::path charlie_peers = base / "relay-peers-charlie";
+  const fs::path dave_peers = base / "relay-peers-dave";
+  const fs::path mallory_peers = base / "relay-peers-mallory";
+  const fs::path alice_bridge = base / "relay-bridge-alice";
+
+  const Value alice_id = parse_stdout_json(
+      run_cli({"peer", "id", "--root", alice_peers.string()}), "relay peer id alice");
+  const Value bob_id = parse_stdout_json(
+      run_cli({"peer", "id", "--root", bob_peers.string()}), "relay peer id bob");
+  const Value mallory_id =
+      parse_stdout_json(run_cli({"peer", "id", "--root", mallory_peers.string()}),
+                        "relay peer id mallory");
+  const std::string alice_fp = req_str(alice_id, "fingerprint");
+  const std::string alice_pub = req_str(alice_id, "public_key");
+  const std::string bob_pub = req_str(bob_id, "public_key");
+  const std::string mallory_fp = req_str(mallory_id, "fingerprint");
+  check(alice_fp != mallory_fp, "alice and mallory must have distinct fingerprints");
+
+  // Alice pins Bob so she can emit local causal events; Bob pins Alice.
+  (void)parse_stdout_json(
+      run_cli({"peer", "pin", "--root", alice_peers.string(), "--alias", "bob",
+               "--public-key", bob_pub, "--trust-note", "alice->bob"}),
+      "relay alice pins bob");
+  (void)parse_stdout_json(
+      run_cli({"peer", "pin", "--root", bob_peers.string(), "--alias", "alice",
+               "--public-key", alice_pub, "--trust-note", "bob->alice"}),
+      "relay bob pins alice");
+
+  // Emit 2 chained causal events + 1 revoked grant on Alice's side.
+  const auto ev1_send = run_cli({"bridge", "send", "--bridge", alice_bridge.string(),
+                                 "--peers", alice_peers.string(), "--to", "bob",
+                                 "--scope", "src/relay.cpp", "--body", "step 1"});
+  const Value ev1_env = parse_stdout_json(ev1_send, "relay bridge send 1");
+  const std::string ev1_hash =
+      req_str(req_field(req_field(ev1_env, "payload"), "causal_event"), "event_hash");
+
+  const auto ev2_send =
+      run_cli({"bridge", "send", "--bridge", alice_bridge.string(), "--peers",
+               alice_peers.string(), "--to", "bob", "--scope", "src/relay.cpp",
+               "--body", "step 2", "--parent", ev1_hash});
+  const Value ev2_env = parse_stdout_json(ev2_send, "relay bridge send 2");
+  const std::string ev2_hash =
+      req_str(req_field(req_field(ev2_env, "payload"), "causal_event"), "event_hash");
+
+  (void)parse_stdout_json(
+      run_cli({"peer", "revoke-grant", "--root", alice_peers.string(), "--grant-id",
+               "grant-cp-revoked", "--reason", "superseded"}),
+      "relay alice revoke-grant");
+
+  // 1. `bridge checkpoint` signs a checkpoint with watermarks, frontier & revocations.
+  const auto cp_res =
+      run_cli({"bridge", "checkpoint", "--room", "room-6b", "--checkpoint-seq", "3",
+               "--bridge", alice_bridge.string(), "--peers", alice_peers.string()});
+  const Value cp_val = parse_stdout_json(cp_res, "alice bridge checkpoint");
+  check(req_str(cp_val, "room_id") == "room-6b" &&
+            req_int(cp_val, "checkpoint_seq") == 3 &&
+            req_str(cp_val, "signer_fingerprint") == alice_fp &&
+            !req_str(cp_val, "signature").empty(),
+        "bridge checkpoint core fields mismatch");
+  const Value &watermarks = req_field(cp_val, "actor_watermarks");
+  check(req_int(watermarks, alice_fp) == 2,
+        "bridge checkpoint actor watermark for alice must be 2");
+  const auto &frontier = req_field(cp_val, "causal_frontier_hashes").array();
+  check(frontier.size() == 1 && frontier[0].string() == ev2_hash,
+        "bridge checkpoint causal frontier must contain leaf ev2_hash");
+  const auto &revoked_grants = req_field(cp_val, "revoked_grant_ids").array();
+  check(revoked_grants.size() == 1 && revoked_grants[0].string() == "grant-cp-revoked",
+        "bridge checkpoint revoked_grant_ids mismatch");
+
+  // 2. `bridge checkpoint-verify` via stdin and via --file (valid -> exit 0).
+  const auto cp_verify_stdin = run_cli(
+      {"bridge", "checkpoint-verify", "--peers", bob_peers.string()}, cp_res.out);
+  check(cp_verify_stdin.exit_code == 0,
+        "checkpoint-verify valid stdin failed: " + cp_verify_stdin.err);
+  const Value cp_verify_val =
+      parse_stdout_json(cp_verify_stdin, "bob checkpoint-verify stdin");
+  check(std::get<bool>(req_field(cp_verify_val, "valid").value()) &&
+            req_str(cp_verify_val, "room_id") == "room-6b" &&
+            req_int(cp_verify_val, "checkpoint_seq") == 3 &&
+            req_str(cp_verify_val, "signer_fingerprint") == alice_fp &&
+            req_int(cp_verify_val, "watermarks_count") == 1,
+        "checkpoint-verify valid output fields mismatch");
+
+  const fs::path cp_file = base / "checkpoint-6b.json";
+  write_text_file(cp_file, cp_res.out);
+  const auto cp_verify_file =
+      run_cli({"bridge", "checkpoint-verify", "--file", cp_file.string(), "--peers",
+               bob_peers.string()});
+  check(cp_verify_file.exit_code == 0,
+        "checkpoint-verify valid --file failed: " + cp_verify_file.err);
+  const Value cp_verify_file_val =
+      parse_stdout_json(cp_verify_file, "bob checkpoint-verify file");
+  check(std::get<bool>(req_field(cp_verify_file_val, "valid").value()),
+        "checkpoint-verify --file valid must be true");
+
+  // 3. Tampered checkpoint -> exit 2 with valid=false.
+  {
+    const auto *obj = std::get_if<Value::Object>(&cp_val.value());
+    check(obj != nullptr, "expected object for checkpoint");
+    Value::Object tampered = *obj;
+    for (auto &[k, v] : tampered) {
+      if (k == "checkpoint_seq")
+        v = Value{Number{std::uint64_t{99}}};
+    }
+    auto dumped = dump_json(Value::object(std::move(tampered)));
+    check(dumped.has_value(), "dump_json failed for tampered checkpoint");
+
+    const auto cp_bad = run_cli(
+        {"bridge", "checkpoint-verify", "--peers", bob_peers.string()}, dumped.value());
+    check(cp_bad.exit_code == 2, "tampered checkpoint must exit 2");
+    const auto cp_bad_val = parse_json(cp_bad.out);
+    check(cp_bad_val.has_value() &&
+              !std::get<bool>(req_field(cp_bad_val.value(), "valid").value()),
+          "tampered checkpoint must emit valid=false");
+  }
+
+  // Corrupt JSON checkpoint -> exit 2 with valid=false.
+  {
+    const auto cp_corrupt = run_cli(
+        {"bridge", "checkpoint-verify", "--peers", bob_peers.string()}, "{not-json");
+    check(cp_corrupt.exit_code == 2, "corrupt checkpoint JSON must exit 2");
+    const auto cp_corrupt_val = parse_json(cp_corrupt.out);
+    check(cp_corrupt_val.has_value() &&
+              !std::get<bool>(req_field(cp_corrupt_val.value(), "valid").value()),
+          "corrupt checkpoint JSON must emit valid=false");
+  }
+
+  // 4. `bridge invite` -> `blackbird join bbjoin1:... --alias alice`.
+  const Value invite_val =
+      parse_stdout_json(run_cli({"bridge", "invite", "--room", "room-6b", "--relay",
+                                 "wss://relay.blackbird.local/v1", "--ttl", "3600",
+                                 "--code", "code-6b", "--peers", alice_peers.string()}),
+                        "alice bridge invite");
+  const std::string invite_uri = req_str(invite_val, "invite_uri");
+  check(invite_uri.starts_with("bbjoin1:") &&
+            req_str(invite_val, "room_id") == "room-6b" &&
+            req_str(invite_val, "relay_url") == "wss://relay.blackbird.local/v1" &&
+            req_str(invite_val, "creator_fingerprint") == alice_fp &&
+            req_int(invite_val, "expires_ns") > 0,
+        "bridge invite output mismatch");
+
+  // Also check auto-generated code when --code is omitted.
+  const Value invite_auto = parse_stdout_json(
+      run_cli({"bridge", "invite", "--room", "room-auto", "--relay",
+               "https://relay.blackbird.local/v1", "--peers", alice_peers.string()}),
+      "alice bridge invite auto-code");
+  check(req_str(invite_auto, "invite_uri").starts_with("bbjoin1:"),
+        "bridge invite without --code must emit bbjoin1: URI");
+
+  // Charlie tests `--dry-run` first: validates without pinning.
+  const Value dry_join =
+      parse_stdout_json(run_cli({"join", invite_uri, "--alias", "alice", "--peers",
+                                 charlie_peers.string(), "--dry-run"}),
+                        "charlie join --dry-run");
+  check(!std::get<bool>(req_field(dry_join, "joined").value()) &&
+            !std::get<bool>(req_field(dry_join, "pinned").value()) &&
+            req_str(dry_join, "room_id") == "room-6b" &&
+            req_str(dry_join, "relay_url") == "wss://relay.blackbird.local/v1" &&
+            req_str(dry_join, "creator_alias") == "alice" &&
+            req_str(dry_join, "creator_fingerprint") == alice_fp,
+        "join --dry-run output mismatch");
+
+  // Charlie joins for real -> pins Alice's verified Ed25519 key cleanly.
+  const Value real_join =
+      parse_stdout_json(run_cli({"join", invite_uri, "--alias", "alice", "--peers",
+                                 charlie_peers.string()}),
+                        "charlie join");
+  check(std::get<bool>(req_field(real_join, "joined").value()) &&
+            std::get<bool>(req_field(real_join, "pinned").value()) &&
+            req_str(real_join, "room_id") == "room-6b" &&
+            req_str(real_join, "relay_url") == "wss://relay.blackbird.local/v1" &&
+            req_str(real_join, "creator_alias") == "alice" &&
+            req_str(real_join, "creator_fingerprint") == alice_fp,
+        "join output mismatch");
+
+  const Value charlie_list = parse_stdout_json(
+      run_cli({"peer", "list", "--root", charlie_peers.string()}), "charlie peer list");
+  check(req_int(charlie_list, "peer_count") == 1,
+        "charlie should have exactly 1 pinned peer after join");
+
+  // Charlie can immediately verify Alice's signed checkpoint using the pinned key!
+  const auto charlie_cp_ok = run_cli(
+      {"bridge", "checkpoint-verify", "--peers", charlie_peers.string()}, cp_res.out);
+  check(charlie_cp_ok.exit_code == 0,
+        "charlie checkpoint-verify after join failed: " + charlie_cp_ok.err);
+
+  // 5. Reject expired invite by default; permit with --allow-expired.
+  const Value expired_invite =
+      parse_stdout_json(run_cli({"bridge", "invite", "--room", "room-old", "--relay",
+                                 "wss://relay.blackbird.local/v1", "--expires-ns",
+                                 "1000", "--peers", alice_peers.string()}),
+                        "alice expired bridge invite");
+  const std::string expired_uri = req_str(expired_invite, "invite_uri");
+
+  const auto join_expired = run_cli(
+      {"join", expired_uri, "--alias", "alice", "--peers", dave_peers.string()});
+  check(join_expired.exit_code != 0 && join_expired.out.empty() &&
+            !join_expired.err.empty(),
+        "expired invite must be rejected by blackbird join");
+
+  const Value join_expired_ok =
+      parse_stdout_json(run_cli({"join", expired_uri, "--alias", "alice", "--peers",
+                                 dave_peers.string(), "--allow-expired"}),
+                        "dave join --allow-expired");
+  check(std::get<bool>(req_field(join_expired_ok, "joined").value()) &&
+            std::get<bool>(req_field(join_expired_ok, "pinned").value()),
+        "join --allow-expired must succeed");
+
+  // 6. Reject silent key swap for an already-pinned alias with ErrorCode::conflict!
+  const Value mallory_invite = parse_stdout_json(
+      run_cli({"bridge", "invite", "--room", "room-evil", "--relay",
+               "wss://relay.blackbird.local/v1", "--peers", mallory_peers.string()}),
+      "mallory bridge invite");
+  const auto key_swap =
+      run_cli({"join", req_str(mallory_invite, "invite_uri"), "--alias", "alice",
+               "--peers", charlie_peers.string()});
+  check(key_swap.exit_code != 0 && key_swap.out.empty() &&
+            key_swap.err.find("conflict") != std::string::npos,
+        "silent key swap for existing alias must be rejected with conflict");
+
+  // Confirm Charlie's pinned `alice` key is still Alice's fingerprint.
+  const Value charlie_after =
+      parse_stdout_json(run_cli({"peer", "list", "--root", charlie_peers.string()}),
+                        "charlie peer list after key swap");
+  const auto &peers_arr = req_field(charlie_after, "peers").array();
+  check(peers_arr.size() == 1 && req_str(peers_arr[0], "fingerprint") == alice_fp,
+        "pinned alice fingerprint must remain unchanged after rejected key swap");
+
+  // 7. Regression tests (#140): read-only absent-dir zero-creation invariants &
+  //    explicit empty `--code ""` rejection.
+  {
+    const fs::path absent_peers = base / "absent-peers-verify";
+    const auto verify_absent = run_cli(
+        {"bridge", "checkpoint-verify", "--peers", absent_peers.string()}, cp_res.out);
+    check(verify_absent.exit_code == 2,
+          "checkpoint-verify with absent --peers must exit 2");
+    const auto verify_absent_val = parse_json(verify_absent.out);
+    check(verify_absent_val.has_value() &&
+              !std::get<bool>(req_field(verify_absent_val.value(), "valid").value()),
+          "checkpoint-verify with absent --peers must emit valid=false");
+    check(!fs::exists(absent_peers),
+          "checkpoint-verify must NEVER create absent --peers directory");
+  }
+
+  {
+    const fs::path absent_bridge = base / "absent-bridge-dir";
+    const Value empty_cp = parse_stdout_json(
+        run_cli({"bridge", "checkpoint", "--room", "room-empty", "--checkpoint-seq",
+                 "1", "--bridge", absent_bridge.string(), "--peers",
+                 alice_peers.string()}),
+        "bridge checkpoint absent bridge");
+    const auto *wm_obj =
+        std::get_if<Value::Object>(&req_field(empty_cp, "actor_watermarks").value());
+    check(wm_obj != nullptr && wm_obj->empty() &&
+              req_field(empty_cp, "causal_frontier_hashes").array().empty(),
+          "checkpoint with absent bridge must have empty watermarks and frontier");
+    check(!fs::exists(absent_bridge),
+          "bridge checkpoint must NEVER create absent --bridge directory");
+  }
+
+  {
+    const fs::path absent_dry_peers = base / "absent-peers-dry-run";
+    const Value dry_absent =
+        parse_stdout_json(run_cli({"join", invite_uri, "--alias", "alice", "--peers",
+                                   absent_dry_peers.string(), "--dry-run"}),
+                          "join --dry-run absent peers");
+    check(!std::get<bool>(req_field(dry_absent, "joined").value()) &&
+              !std::get<bool>(req_field(dry_absent, "pinned").value()),
+          "join --dry-run absent peers output mismatch");
+    check(!fs::exists(absent_dry_peers),
+          "join --dry-run must NEVER create absent --peers directory");
+  }
+
+  {
+    const auto empty_code = run_cli({"bridge", "invite", "--room", "room-bad",
+                                     "--relay", "wss://relay.blackbird.local/v1",
+                                     "--code", "", "--peers", alice_peers.string()});
+    check(empty_code.exit_code == 2 && empty_code.out.empty() &&
+              !empty_code.err.empty(),
+          "bridge invite --code \"\" must fail with usage exit 2");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1170,6 +1456,7 @@ int main(int argc, char **argv) {
     test_capabilities_subcommand(temp.path());
     test_metrics_subcommand(temp.path());
     test_bridge_subcommand(temp.path());
+    test_bridge_checkpoint_and_join(temp.path());
 
     std::cout << "PASS command_post_cli\n";
     return 0;

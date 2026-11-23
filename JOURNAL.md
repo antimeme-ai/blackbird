@@ -14026,3 +14026,24 @@ Blackbird must not present itself as another product.
 - **Linux check bundle (`scripts/check-linux`):** bundled cited profile doc
   `papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md` so `provider_profile_shipped`
   passes cleanly on remote Linux hosts.
+
+## 2026-11-23 — Wave 6 (Checkpoint #19): Reachable `/swarmboard`, `/flightdeck`, `blackbird join` & Checkpoint CLI, Audited Lua `blackbird.command_post`
+
+- **Wave 6A — Live TUI Dashboards (`src/command_post_tui.cpp`, `src/terminal.cpp`, `tests/command_post_tui_test.cpp`):**
+  wired passive read-only `/swarmboard [all|mentions|conflicts|watchers]` and `/flightdeck [tick N]`
+  into interactive slash-command dispatch and the `Command Post` TUI palette; preserves zero
+  directory creation on absent `.blackbird` / `~/.local/share/blackbird/peers`, zero receipt/guard
+  mutations, `UNKNOWN` honesty for absent metrics, and strict ESC/C0/DEL/C1/bidi escaping.
+- **Wave 6B — Stage 1->2 Checkpoint & Invite CLI (`src/command_post_cli.cpp`, `tests/command_post_cli_test.cpp`, `scripts/blackbird`):**
+  wired `blackbird bridge checkpoint`, `blackbird bridge checkpoint-verify`, `blackbird bridge invite`,
+  and top-level `blackbird join bbjoin1:...` (plus `scripts/blackbird` direct passthrough), with
+  zero-disk-mutation read-only paths, CSPRNG invite codes, MITM key-swap (`conflict`) rejection, and
+  tampered/corrupt checkpoint exit code `2`.
+- **Wave 6C — Lua 5.5.1 Command Post Bridge (`src/coding_lua.cpp`, `tests/lua_tools_test.cpp`):**
+  exposed `blackbird.command_post(tool_name, args)` plus 5 aliases (`platoon_board`, `bridge_guard`,
+  `project_issues`, `project_memory`, `companion_timing`) routed strictly through
+  `CodingEngine::dispatch()` (`AuditLog` retention, `before_tool`/`after_tool` hooks, `effect_policy`,
+  and `RawOperationTrace` preserved).
+- **Hygiene & Audit Trail:** added `/.blackbird/` to `.gitignore` so live local Command Post state
+  never dirties `git status`; archived `@dentist-2`'s independent Wave 6 verification report in
+  `papers/2026-11-23-wave6-dentist-review.md`.

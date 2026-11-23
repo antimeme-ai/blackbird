@@ -1,3 +1,4 @@
+#include "blackbird/command_post_tools.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/raw_authored.hpp"
@@ -746,7 +747,8 @@ struct CodingEngine::Runtime::Impl {
     now_op,
     pin_op,
     flush_context_op,
-    hooks_op
+    hooks_op,
+    command_post_op
   };
   std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
   static int lua_os_time(lua_State *L) {
@@ -851,7 +853,7 @@ struct CodingEngine::Runtime::Impl {
         "set_blocks",    "append",  "decode",           "encode",  "display",
         "array",         "present", "restarting",       "stats",   "decode_packet",
         "encode_packet", "format",  "live_instruction", "now",     "pin",
-        "flush_context", "hooks"};
+        "flush_context", "hooks",   "command_post"};
     for (std::size_t i = 0; i < std::size(names); ++i) {
       lua_pushlightuserdata(L, self);
       lua_pushinteger(L, static_cast<lua_Integer>(i));
@@ -915,6 +917,11 @@ struct CodingEngine::Runtime::Impl {
         "function blackbird.tasks.edit(q) return blackbird.call('tasks_edit',q) end "
         "function blackbird.define_tool(d) return blackbird.call('tool_define',"
         "{definition=d}) end "
+        "for _,cp in "
+        "ipairs({'platoon_board','bridge_guard','project_issues','project_memory','"
+        "companion_timing'}) do "
+        "local tool=cp; blackbird[tool]=function(...) return "
+        "blackbird.command_post(tool,...) end end "
         "do local cache,loading={},{};local "
         "load_module,call_module,begin,observe,finish,current,protected,running="
         "blackbird._module_load,blackbird._module_call,blackbird._module_begin,"
@@ -1484,6 +1491,20 @@ struct CodingEngine::Runtime::Impl {
                                 ? Value::object({{"op", Value{"list"}}})
                                 : read_value(L, 1, {0, &nodes});
           frame.value = self->engine.hooks_tool(args);
+          break;
+        }
+        case command_post_op: {
+          if (lua_gettop(L) < 1 || lua_gettop(L) > 2)
+            throw Error{ErrorCode::invalid_range};
+          auto name = bridge_string(L, 1, frame, 1);
+          if (!is_command_post_tool(name))
+            throw Error{ErrorCode::invalid_range};
+          auto args =
+              lua_isnoneornil(L, 2) ? Value::object({}) : read_value(L, 2, {0, &nodes});
+          if (!std::holds_alternative<Value::Object>(args.value()))
+            throw Error{ErrorCode::invalid_range};
+          frame.value =
+              self->engine.dispatch(std::move(name), std::move(args), Value{});
           break;
         }
         case restarting_op:

@@ -1,19 +1,24 @@
+#include "blackbird/board_bridge.hpp"
 #include "blackbird/capabilities.hpp"
 #include "blackbird/command_post_tui.hpp"
 #include "blackbird/context.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
 #include "blackbird/terminal.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace blackbird;
@@ -70,10 +75,11 @@ void test_dispatch_unknown_and_palette_discovery() {
   require(!handle_command_post_slash("/stats", ctx).has_value(),
           "existing /stats command returns nullopt");
 
-  // All 6 new commands appear in terminal_help() and command hint / palette.
+  // All 8 Command Post slash commands appear in terminal_help() and command hint /
+  // palette.
   const std::string help = terminal_help();
-  for (const auto *cmd :
-       {"/platoon", "/issues", "/memory", "/capabilities", "/metrics", "/companion"}) {
+  for (const auto *cmd : {"/platoon", "/issues", "/memory", "/capabilities", "/metrics",
+                          "/companion", "/swarmboard", "/flightdeck"}) {
     require(help.find(cmd) != std::string::npos, "terminal_help lists new command");
     const std::string hint = terminal_command_hint(cmd);
     require(hint.starts_with(cmd), "terminal_command_hint matches new command");
@@ -86,6 +92,24 @@ void test_dispatch_unknown_and_palette_discovery() {
   const auto lines = palette.palette_lines(6);
   require(lines.size() >= 2 && lines[1].find("/platoon") != std::string::npos,
           "command palette discovers /platoon");
+
+  Composer swarm_palette;
+  swarm_palette.draft("keep draft");
+  for (const char ch : std::string_view{"\0swarmboard", 11})
+    (void)swarm_palette.feed(ch);
+  const auto swarm_lines = swarm_palette.palette_lines(6);
+  require(swarm_lines.size() >= 2 &&
+              swarm_lines[1].find("/swarmboard") != std::string::npos,
+          "command palette discovers /swarmboard");
+
+  Composer deck_palette;
+  deck_palette.draft("keep draft");
+  for (const char ch : std::string_view{"\0flightdeck", 11})
+    (void)deck_palette.feed(ch);
+  const auto deck_lines = deck_palette.palette_lines(6);
+  require(deck_lines.size() >= 2 &&
+              deck_lines[1].find("/flightdeck") != std::string::npos,
+          "command palette discovers /flightdeck");
 }
 
 void test_platoon_quoted_untrusted_framing() {
@@ -488,6 +512,484 @@ void test_c1_raw_and_utf8_sanitization_regression() {
           "platoon board preserves valid UTF-8 and escapes C1 controls");
 }
 
+struct ScopedHomeEnv {
+  std::optional<std::string> prior;
+  explicit ScopedHomeEnv(const std::filesystem::path &new_home) {
+    if (const char *cur = std::getenv("HOME"); cur != nullptr)
+      prior = std::string{cur};
+    require(::setenv("HOME", new_home.c_str(), 1) == 0, "setenv HOME failed");
+  }
+  ~ScopedHomeEnv() {
+    if (prior.has_value())
+      (void)::setenv("HOME", prior->c_str(), 1);
+    else
+      (void)::unsetenv("HOME");
+  }
+  ScopedHomeEnv(const ScopedHomeEnv &) = delete;
+  ScopedHomeEnv &operator=(const ScopedHomeEnv &) = delete;
+};
+
+struct StatRecord {
+  off_t size = 0;
+  std::int64_t mtime_sec = 0;
+  std::int64_t mtime_nsec = 0;
+  bool operator==(const StatRecord &) const = default;
+};
+
+std::map<std::string, StatRecord>
+snapshot_tree_stats(const std::filesystem::path &root) {
+  std::map<std::string, StatRecord> out;
+  auto record_one = [&](const std::filesystem::path &p) {
+    struct stat st{};
+    require(::lstat(p.c_str(), &st) == 0, "lstat failed");
+#ifdef __APPLE__
+    const auto sec = static_cast<std::int64_t>(st.st_mtimespec.tv_sec);
+    const auto nsec = static_cast<std::int64_t>(st.st_mtimespec.tv_nsec);
+#else
+    const auto sec = static_cast<std::int64_t>(st.st_mtim.tv_sec);
+    const auto nsec = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+#endif
+    out.emplace(p.string(), StatRecord{st.st_size, sec, nsec});
+  };
+  record_one(root);
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(root))
+    record_one(entry.path());
+  return out;
+}
+
+std::int64_t wall_now_ns() noexcept {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+  return ns <= 0 ? 1 : static_cast<std::int64_t>(ns);
+}
+
+bool contains_raw_control_or_c1(std::string_view text) {
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    const auto b = static_cast<unsigned char>(text[i]);
+    if (b == '\n')
+      continue;
+    if (b < 0x20U || b == 0x7fU)
+      return true;
+    if (b >= 0x80U && b <= 0x9fU)
+      return true;
+    if (b == 0xc2U && i + 1 < text.size()) {
+      const auto next = static_cast<unsigned char>(text[i + 1]);
+      if (next >= 0x80U && next <= 0x9fU)
+        return true;
+      ++i;
+      continue;
+    }
+    if ((b & 0xe0U) == 0xc0U && i + 1 < text.size()) {
+      i += 1;
+    } else if ((b & 0xf0U) == 0xe0U && i + 2 < text.size()) {
+      i += 2;
+    } else if ((b & 0xf8U) == 0xf0U && i + 3 < text.size()) {
+      i += 3;
+    }
+  }
+  return false;
+}
+
+void test_swarmboard_empty_populated_filters_and_readonly() {
+  TempDir home_dir("bb-cptui-sb-home");
+  ScopedHomeEnv env_home{home_dir.path};
+
+  // 1. Empty workspace: renders cleanly with zero directories created.
+  {
+    TempDir empty_dir("bb-cptui-sb-empty");
+    CommandPostTuiContext ctx;
+    ctx.project_root = empty_dir.path;
+    ctx.actor = "coder-alpha";
+
+    const auto out = handle_command_post_slash("/swarmboard", ctx);
+    require(out.has_value() && out->find("SWARMBOARD") != std::string::npos &&
+                out->find("GUARD: CLEAR") != std::string::npos &&
+                out->find("Watchers: 0") != std::string::npos &&
+                out->find("(no peers registered)") != std::string::npos &&
+                out->find("(board empty)") != std::string::npos,
+            "empty /swarmboard renders cleanly");
+    require(!std::filesystem::exists(empty_dir.path / ".blackbird"),
+            "empty /swarmboard must NOT create .blackbird");
+    require(!std::filesystem::exists(home_dir.path / ".local"),
+            "empty /swarmboard must NOT create ~/.local/share/blackbird/peers");
+
+    const auto bad_filter = handle_command_post_slash("/swarmboard bogus", ctx);
+    require(bad_filter.has_value() &&
+                bad_filter->find("Usage: /swarmboard") != std::string::npos,
+            "unknown /swarmboard filter prints usage");
+    const auto extra_arg = handle_command_post_slash("/swarmboard all extra", ctx);
+    require(extra_arg.has_value() &&
+                extra_arg->find("Usage: /swarmboard") != std::string::npos,
+            "extra /swarmboard arg prints usage");
+  }
+
+  // 2. Populated platoon + lease + bridge + watchers + conflicts + local peer identity.
+  TempDir dir("bb-cptui-sb-full");
+  const auto platoon_dir = dir.path / ".blackbird" / "platoon";
+  const auto leases_dir = dir.path / ".blackbird" / "worktrees" / ".leases";
+  const auto bridge_dir = dir.path / ".blackbird" / "bridge";
+  const auto peers_dir = home_dir.path / ".local" / "share" / "blackbird" / "peers";
+
+  auto alice_id = unwrap(PeerIdentityStore::open_or_create(peers_dir));
+  auto bob_id = unwrap(PeerIdentityStore::open_or_create(dir.path / "id-bob"));
+  const std::string alice_fp = alice_id.identity().fingerprint;
+  const std::string bob_fp = bob_id.identity().fingerprint;
+
+  auto platoon = unwrap(PlatoonBoard::open(platoon_dir));
+  {
+    PlatoonMember m1;
+    m1.id = "coder-alpha";
+    m1.role = "implementer";
+    m1.provider = "claude_code";
+    m1.model = "sonnet";
+    m1.state = PlatoonMemberState::working;
+    m1.updated_ns = 1000;
+    unwrap(platoon.upsert_member(m1));
+
+    PlatoonMember m2;
+    m2.id = "verifier-beta";
+    m2.role = "reviewer";
+    m2.provider = "codex";
+    m2.model = "o3";
+    m2.branch = "feat/verify";
+    m2.state = PlatoonMemberState::waiting;
+    m2.updated_ns = 2000;
+    unwrap(platoon.upsert_member(m2));
+  }
+
+  write_text_file(
+      leases_dir / "lease-alpha.json",
+      "{\"version\":1,\"lease_id\":\"lease-alpha\","
+      "\"branch\":\"swarm/coder-alpha\",\"base_ref\":\"HEAD\","
+      "\"base_sha\":\"0123456789abcdef0123456789abcdef01234567\","
+      "\"owner_id\":\"coder-alpha\",\"owner_pid\":4242,\"created_ns\":1000}\n");
+
+  {
+    PlatoonPost p1;
+    p1.from = "verifier-beta";
+    p1.to = "coder-alpha";
+    p1.kind = PlatoonMessageKind::message;
+    p1.text = "@coder-alpha [done] parser ok";
+    unwrap(platoon.post(std::move(p1)));
+
+    PlatoonPost p2;
+    p2.from = "verifier-beta";
+    p2.to = "all";
+    p2.kind = PlatoonMessageKind::message;
+    p2.text = "routine heartbeat update";
+    unwrap(platoon.post(std::move(p2)));
+  }
+
+  auto bridge = unwrap(BoardBridge::open(bridge_dir));
+  const std::int64_t now_ns = wall_now_ns();
+  constexpr std::int64_t kTtlNs = 300'000'000'000LL;
+
+  // Alice and Bob concurrently claim src/parser.cpp -> conflict + unread guard block!
+  (void)unwrap(bridge.emit_causal_event(CausalEventDraft{
+      alice_fp,
+      0,
+      {},
+      now_ns - 5'000'000'000LL,
+      "src/parser.cpp",
+      "claim",
+      Value::object({{"text", Value{"Alice claim on src/parser.cpp"}}}),
+  }));
+  (void)unwrap(bridge.emit_causal_event(CausalEventDraft{
+      bob_fp,
+      0,
+      {},
+      now_ns - 4'000'000'000LL,
+      "src/parser.cpp",
+      "claim",
+      Value::object({{"text", Value{"Bob concurrent claim on src/parser.cpp"}}}),
+  }));
+  unwrap(bridge.record_presence(PresenceRecord{
+      bob_fp,
+      "Bob Reviewer",
+      "src/parser.cpp",
+      "inspecting diff",
+      now_ns - 1'000'000'000LL,
+      kTtlNs,
+  }));
+
+  const auto receipts_before = unwrap(bridge.receipts());
+  const auto guard_before = unwrap(bridge.check_action_guard(alice_fp, "*"));
+  require(!guard_before.allowed && guard_before.blocking_event_hashes.size() == 1,
+          "guard initially blocks on Bob's unread claim");
+  const auto tree_before = snapshot_tree_stats(dir.path / ".blackbird");
+
+  CommandPostTuiContext ctx;
+  ctx.project_root = dir.path;
+  ctx.actor = "coder-alpha";
+
+  const auto all_out = handle_command_post_slash("/swarmboard", ctx);
+  require(all_out.has_value() && all_out->find("SWARMBOARD") != std::string::npos &&
+              all_out->find("Watchers: 1") != std::string::npos &&
+              all_out->find("GUARD: BLOCKED(1)") != std::string::npos &&
+              all_out->find("Conflicts: 1") != std::string::npos &&
+              all_out->find("coder-alpha") != std::string::npos &&
+              all_out->find("verifier-beta") != std::string::npos &&
+              all_out->find("swarm/coder-alpha") != std::string::npos &&
+              all_out->find("working=1 waiting=1") != std::string::npos,
+          "populated /swarmboard renders roster, lease, watchers, guard and conflicts");
+
+  const auto mentions_out = handle_command_post_slash("/swarmboard mentions", ctx);
+  require(mentions_out.has_value() &&
+              mentions_out->find("Filter: mentions") != std::string::npos &&
+              mentions_out->find("parser ok") != std::string::npos &&
+              mentions_out->find("routine heartbeat update") == std::string::npos,
+          "/swarmboard mentions filters to @coder-alpha mentions");
+
+  const auto conflicts_out = handle_command_post_slash("/swarmboard conflicts", ctx);
+  require(conflicts_out.has_value() &&
+              conflicts_out->find("Filter: conflicts") != std::string::npos &&
+              conflicts_out->find("[conflict]") != std::string::npos &&
+              conflicts_out->find("[blocked]") != std::string::npos &&
+              conflicts_out->find("routine heartbeat update") == std::string::npos,
+          "/swarmboard conflicts filters to conflict/blocked items");
+
+  const auto watchers_out = handle_command_post_slash("/swarmboard watchers", ctx);
+  require(watchers_out.has_value() &&
+              watchers_out->find("Filter: watchers") != std::string::npos &&
+              watchers_out->find("WATCHERS (1 active)") != std::string::npos &&
+              watchers_out->find("Bob Reviewer") != std::string::npos,
+          "/swarmboard watchers lists active watchers");
+
+  // Strict passive read-only check: receipts, action guard, and disk tree are
+  // untouched.
+  const auto receipts_after = unwrap(bridge.receipts());
+  const auto guard_after = unwrap(bridge.check_action_guard(alice_fp, "*"));
+  const auto tree_after = snapshot_tree_stats(dir.path / ".blackbird");
+  require(receipts_after == receipts_before,
+          "/swarmboard must NEVER advance or add bridge receipts");
+  require(guard_after.allowed == guard_before.allowed &&
+              guard_after.blocking_event_hashes == guard_before.blocking_event_hashes,
+          "/swarmboard must NEVER clear or mutate action guard state");
+  require(tree_after == tree_before,
+          "/swarmboard must NEVER mutate any file under .blackbird");
+}
+
+void test_flightdeck_empty_populated_ticks_and_hostile_labels() {
+  TempDir home_dir("bb-cptui-fd-home");
+  ScopedHomeEnv env_home{home_dir.path};
+
+  // 1. Empty workspace: UNKNOWN everywhere (never fake 0), zero dirs created.
+  {
+    TempDir empty_dir("bb-cptui-fd-empty");
+    CommandPostTuiContext ctx;
+    ctx.project_root = empty_dir.path;
+
+    const auto out = handle_command_post_slash("/flightdeck", ctx);
+    if (!out.has_value())
+      throw std::runtime_error("empty /flightdeck returns output");
+    const std::string &empty_frame = *out;
+    require(empty_frame.find("SR-71 FLIGHT DECK") != std::string::npos &&
+                empty_frame.find("[IDLE]") != std::string::npos &&
+                empty_frame.find("WING UNKNOWN") != std::string::npos &&
+                empty_frame.find("CACHE UNKNOWN") != std::string::npos &&
+                empty_frame.find("OBSERVED=UNKNOWN") != std::string::npos &&
+                empty_frame.find("ESTIMATED=UNKNOWN") != std::string::npos &&
+                empty_frame.find("UNKNOWN") != std::string::npos,
+            "empty /flightdeck displays UNKNOWN (never fake 0)");
+    require(!contains_raw_control_or_c1(empty_frame),
+            "empty /flightdeck emits zero raw control/ANSI bytes");
+    require(!std::filesystem::exists(empty_dir.path / ".blackbird"),
+            "empty /flightdeck must NOT create .blackbird");
+    require(!std::filesystem::exists(home_dir.path / ".local"),
+            "empty /flightdeck must NOT create ~/.local");
+
+    for (const auto *bad :
+         {"/flightdeck tick", "/flightdeck tick -1", "/flightdeck tick abc",
+          "/flightdeck tick 2 extra", "/flightdeck bogus"}) {
+      const auto res = handle_command_post_slash(bad, ctx);
+      require(res.has_value() && res->find("Usage: /flightdeck") != std::string::npos,
+              "invalid /flightdeck argument prints usage");
+    }
+  }
+
+  // 2. Populated metrics + peers + watchers + deterministic tick animation.
+  {
+    TempDir dir("bb-cptui-fd-pop");
+    TempDir session_dir("bb-cptui-fd-sess");
+    auto root = unwrap(RetainedState::create(
+        std::make_unique<NativeJournalDirectory>(
+            unwrap(NativeJournalDirectory::open(session_dir.path.string()))),
+        "audit",
+        {make_id<EnvironmentId>(11),
+         make_id<AuditStreamId>(12),
+         3,
+         {1024 * 1024, 4 * 1024 * 1024},
+         std::nullopt},
+        {64 * 1024 * 1024, 10000}));
+    AuditLog log{*root};
+
+    // Append deterministic provider_response metrics.sample records + context bytes.
+    const std::array<std::uint64_t, 4> in_toks{12000, 18000, 15000, 24000};
+    const std::array<std::uint64_t, 4> cached_toks{9000, 14000, 12000, 20000};
+    const std::array<std::uint64_t, 4> reason_toks{1500, 2200, 1800, 3100};
+    const std::array<std::uint64_t, 4> out_toks{900, 1400, 1100, 1900};
+    const std::array<double, 4> ttfts{110.0, 180.0, 145.0, 210.0};
+    for (std::size_t i = 0; i < 4; ++i) {
+      log.record(ApplicationChannel::log,
+                 Value::object(
+                     {{"label", Value{"metrics.sample"}},
+                      {"kind", Value{"provider_response"}},
+                      {"timestamp_ns",
+                       Value{Number{static_cast<std::uint64_t>(1000000 + i * 1000)}}},
+                      {"provider", Value{"anthropic"}},
+                      {"model", Value{"claude-opus"}},
+                      {"input_tokens", Value{Number{in_toks[i]}}},
+                      {"cached_tokens", Value{Number{cached_toks[i]}}},
+                      {"reasoning_tokens", Value{Number{reason_toks[i]}}},
+                      {"output_tokens", Value{Number{out_toks[i]}}},
+                      {"ttft_ms", Value{Number{ttfts[i]}}},
+                      {"total_latency_ms", Value{Number{ttfts[i] * 4.0}}},
+                      {"observed_charge_usd", Value{Number{0.025}}},
+                      {"estimated_usd", Value{Number{0.027}}},
+                      {"pricing_version", Value{"v2026-11"}},
+                      {"succeeded", Value{true}}}));
+      log.record(
+          ApplicationChannel::log,
+          Value::object(
+              {{"label", Value{"variable.sample"}},
+               {"variable", Value{"context.live_bytes"}},
+               {"value", Value{Number{static_cast<std::uint64_t>(32768 + i * 16384)}}},
+               {"time", Value::object({{"utc_ns", Value{Number{2000000 + i}}}})}}));
+    }
+
+    auto platoon = unwrap(PlatoonBoard::open(dir.path / ".blackbird" / "platoon"));
+    for (const auto &[id, state] :
+         std::array<std::pair<const char *, PlatoonMemberState>, 3>{
+             {{"w-1", PlatoonMemberState::working},
+              {"w-2", PlatoonMemberState::working},
+              {"w-3", PlatoonMemberState::waiting}}}) {
+      PlatoonMember m;
+      m.id = id;
+      m.role = "builder";
+      m.state = state;
+      unwrap(platoon.upsert_member(m));
+    }
+
+    auto watcher_id = unwrap(PeerIdentityStore::open_or_create(dir.path / "id-watch"));
+    auto bridge = unwrap(BoardBridge::open(dir.path / ".blackbird" / "bridge"));
+    unwrap(bridge.record_presence(PresenceRecord{
+        watcher_id.identity().fingerprint,
+        "Ops Watcher",
+        "*",
+        "watching",
+        wall_now_ns() - 1'000'000'000LL,
+        300'000'000'000LL,
+    }));
+
+    const auto tree_before = snapshot_tree_stats(dir.path / ".blackbird");
+
+    CommandPostTuiContext ctx;
+    ctx.project_root = dir.path;
+    ctx.session_dir = session_dir.path;
+    ctx.audit_log = &log;
+
+    const auto t0 = handle_command_post_slash("/flightdeck", ctx);
+    const auto t3a = handle_command_post_slash("/flightdeck tick 3", ctx);
+    const auto t3b = handle_command_post_slash("/flightdeck tick 3", ctx);
+    if (!t0.has_value() || !t3a.has_value() || !t3b.has_value())
+      throw std::runtime_error("populated /flightdeck returns output");
+
+    const std::string &frame0 = *t0;
+    const std::string &frame3a = *t3a;
+    const std::string &frame3b = *t3b;
+    require(frame0.find("SR-71 FLIGHT DECK") != std::string::npos &&
+                frame0.find("[ACTIVE]") != std::string::npos &&
+                frame0.find("AFTERBURNER") != std::string::npos &&
+                frame0.find("T:0") != std::string::npos &&
+                frame0.find("MD:claude-opus") != std::string::npos &&
+                frame0.find("TOKEN SHOWER") != std::string::npos &&
+                frame0.find("INPUT") != std::string::npos &&
+                frame0.find("CACHED") != std::string::npos &&
+                frame0.find("REASON") != std::string::npos &&
+                frame0.find("OUTPUT") != std::string::npos &&
+                frame0.find("A:2 W:1") != std::string::npos &&
+                frame0.find("◎1") != std::string::npos &&
+                frame0.find("OBSERVED=$0.1000") != std::string::npos &&
+                frame0.find("ESTIMATED=$0.1080") != std::string::npos,
+            "populated /flightdeck shows active SR-71, 4-lane shower, peers, watchers, "
+            "and separated observed/estimated costs");
+
+    const bool has_contrail = frame0.find("◈") != std::string::npos ||
+                              frame0.find("═") != std::string::npos ||
+                              frame0.find("⣿") != std::string::npos;
+    require(has_contrail, "populated /flightdeck renders SR-71 contrail glyphs");
+
+    const bool has_spark = frame0.find("▁") != std::string::npos ||
+                           frame0.find("▂") != std::string::npos ||
+                           frame0.find("▃") != std::string::npos ||
+                           frame0.find("▄") != std::string::npos ||
+                           frame0.find("▅") != std::string::npos ||
+                           frame0.find("▆") != std::string::npos ||
+                           frame0.find("▇") != std::string::npos ||
+                           frame0.find("█") != std::string::npos;
+    require(has_spark, "populated /flightdeck renders Unicode sparklines");
+
+    require(frame3a.find("T:3") != std::string::npos,
+            "/flightdeck tick 3 advances header tick counter");
+    require(frame3a == frame3b, "/flightdeck tick animation is 100% deterministic");
+    require(frame3a != frame0,
+            "/flightdeck tick 3 animates contrail/shower deterministically vs tick 0");
+    require(!contains_raw_control_or_c1(frame0) && !contains_raw_control_or_c1(frame3a),
+            "populated /flightdeck (color=false) emits zero raw control/ANSI bytes");
+
+    const auto tree_after = snapshot_tree_stats(dir.path / ".blackbird");
+    require(tree_after == tree_before,
+            "/flightdeck must NEVER mutate any file under .blackbird");
+  }
+
+  // 3. Hostile label escaping (room directory basename + model label from AuditLog).
+  {
+    TempDir parent("bb-cptui-fd-hostile");
+    const auto hostile_root = parent.path / "rm\x1b[31m\xc2\x9b"
+                                            "6n";
+    std::filesystem::create_directories(hostile_root);
+    TempDir session_dir("bb-cptui-fd-hsess");
+
+    auto root = unwrap(RetainedState::create(
+        std::make_unique<NativeJournalDirectory>(
+            unwrap(NativeJournalDirectory::open(session_dir.path.string()))),
+        "audit",
+        {make_id<EnvironmentId>(13),
+         make_id<AuditStreamId>(14),
+         3,
+         {1024 * 1024, 4 * 1024 * 1024},
+         std::nullopt},
+        {64 * 1024 * 1024, 10000}));
+    AuditLog log{*root};
+    log.record(ApplicationChannel::log,
+               Value::object({{"label", Value{"metrics.sample"}},
+                              {"kind", Value{"provider_response"}},
+                              {"timestamp_ns", Value{Number{1000000}}},
+                              {"provider", Value{"anthropic"}},
+                              {"model", Value{"mdl\x1b[31m\xc2\x9b"
+                                              "6n\xe2\x80\xae\x7f"}},
+                              {"input_tokens", Value{Number{1000}}},
+                              {"output_tokens", Value{Number{200}}},
+                              {"succeeded", Value{true}}}));
+
+    CommandPostTuiContext ctx;
+    ctx.project_root = hostile_root;
+    ctx.session_dir = session_dir.path;
+    ctx.audit_log = &log;
+
+    const auto out = handle_command_post_slash("/flightdeck", ctx);
+    if (!out.has_value())
+      throw std::runtime_error("hostile-label /flightdeck renders");
+    const std::string &hostile_frame = *out;
+    require(!contains_raw_control_or_c1(hostile_frame),
+            "hostile labels must NEVER leak raw ESC, C0, DEL, or C1 bytes");
+    require(hostile_frame.find("\xe2\x80\xae") == std::string::npos,
+            "hostile model label must NEVER leak raw Unicode bidi override U+202E");
+    require(hostile_frame.find("\\x1b") != std::string::npos,
+            "hostile labels must be visibly hex-escaped");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -500,6 +1002,8 @@ int main() {
     test_metrics_readonly_tristate_and_sparklines();
     test_companion_status_and_bounded_ask();
     test_c1_raw_and_utf8_sanitization_regression();
+    test_swarmboard_empty_populated_filters_and_readonly();
+    test_flightdeck_empty_populated_ticks_and_hostile_labels();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {

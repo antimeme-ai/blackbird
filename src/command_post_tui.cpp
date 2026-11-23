@@ -1,9 +1,12 @@
 #include "blackbird/command_post_tui.hpp"
+#include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/swarmboard_view.hpp"
 #include "blackbird/token_usage.hpp"
 #include "blackbird/worktree_lease.hpp"
 #include <algorithm>
@@ -1407,6 +1410,174 @@ std::string handle_companion(std::string_view args, const CommandPostTuiContext 
   return "Usage: /companion [status|ask <question>]\n";
 }
 
+// --- /swarmboard & /flightdeck helpers ---
+std::optional<std::string> try_load_local_peer_fingerprint() {
+  const char *home = std::getenv("HOME");
+  if (home == nullptr || home[0] == '\0')
+    return std::nullopt;
+  const std::filesystem::path peers_dir =
+      std::filesystem::path{home} / ".local" / "share" / "blackbird" / "peers";
+  std::error_code ec;
+  const auto st = std::filesystem::symlink_status(peers_dir, ec);
+  if (ec || std::filesystem::is_symlink(st) || !std::filesystem::is_directory(st))
+    return std::nullopt;
+  auto store = PeerIdentityStore::open_existing(peers_dir);
+  if (!store.has_value())
+    return std::nullopt;
+  return store.value().identity().fingerprint;
+}
+
+SwarmboardConfig make_passive_swarmboard_config(const CommandPostTuiContext &ctx) {
+  const auto root = resolve_project_root(ctx);
+  SwarmboardConfig cfg = SwarmboardConfig::for_project(root);
+  if (ctx.worktree_lease_root.has_value())
+    cfg.leases_dir = *ctx.worktree_lease_root / ".leases";
+  cfg.local_actor_fp = try_load_local_peer_fingerprint();
+  if (!ctx.actor.empty())
+    cfg.local_actor_id = ctx.actor;
+  return cfg;
+}
+
+std::optional<std::uint64_t> parse_u64_strict(std::string_view token) noexcept {
+  if (token.empty())
+    return std::nullopt;
+  for (const char ch : token) {
+    if (ch < '0' || ch > '9')
+      return std::nullopt;
+  }
+  std::uint64_t value = 0;
+  const auto [ptr, ec] =
+      std::from_chars(token.data(), token.data() + token.size(), value);
+  if (ec != std::errc{} || ptr != token.data() + token.size())
+    return std::nullopt;
+  return value;
+}
+
+std::string derive_flight_deck_model_label(const MetricsSnapshot &snap) {
+  const MetricsSourceRecord *best = nullptr;
+  for (const auto &rec : snap.source_records) {
+    if (rec.model.empty())
+      continue;
+    const bool rec_provider = (rec.kind == MetricsSampleKind::provider_response);
+    if (best == nullptr) {
+      best = &rec;
+      continue;
+    }
+    const bool best_provider = (best->kind == MetricsSampleKind::provider_response);
+    if (rec_provider != best_provider) {
+      if (rec_provider)
+        best = &rec;
+    } else if (rec.timestamp_ns >= best->timestamp_ns) {
+      best = &rec;
+    }
+  }
+  if (best != nullptr)
+    return best->model;
+  if (!snap.usage.by_provider.empty())
+    return snap.usage.by_provider.back().provider;
+  return {};
+}
+
+// --- /swarmboard ---
+std::string handle_swarmboard(std::string_view args, const CommandPostTuiContext &ctx) {
+  const auto [sub, rest] = split_first_token(args);
+  if (!rest.empty())
+    return "Usage: /swarmboard [all|mentions|conflicts|watchers]\n";
+
+  SwarmboardFilter filter = SwarmboardFilter::all;
+  if (sub.empty() || sub == "all") {
+    filter = SwarmboardFilter::all;
+  } else if (sub == "mentions") {
+    filter = SwarmboardFilter::mentions;
+  } else if (sub == "conflicts") {
+    filter = SwarmboardFilter::conflicts;
+  } else if (sub == "watchers") {
+    filter = SwarmboardFilter::watchers;
+  } else {
+    return "Usage: /swarmboard [all|mentions|conflicts|watchers]\n";
+  }
+
+  const SwarmboardConfig cfg = make_passive_swarmboard_config(ctx);
+  auto snap_res = load_swarmboard_snapshot(cfg);
+  if (!snap_res.has_value()) {
+    return "Swarmboard unavailable: " + std::string{error_name(snap_res.error().code)} +
+           "\n";
+  }
+
+  SwarmboardView view{std::move(snap_res).value()};
+  view.set_filter(filter);
+  return view.render(100, 24);
+}
+
+// --- /flightdeck ---
+std::string handle_flightdeck(std::string_view args, const CommandPostTuiContext &ctx) {
+  std::uint64_t tick = 0;
+  const auto [sub, rest] = split_first_token(args);
+  if (!sub.empty()) {
+    if (sub == "tick") {
+      const auto [tick_tok, extra] = split_first_token(rest);
+      const auto parsed = parse_u64_strict(tick_tok);
+      if (!parsed.has_value() || !extra.empty())
+        return "Usage: /flightdeck [tick <N>]\n";
+      tick = *parsed;
+    } else if (rest.empty()) {
+      const auto parsed = parse_u64_strict(sub);
+      if (!parsed.has_value())
+        return "Usage: /flightdeck [tick <N>]\n";
+      tick = *parsed;
+    } else {
+      return "Usage: /flightdeck [tick <N>]\n";
+    }
+  }
+
+  // Strictly read-only tertiary MetricsConsumer: zero producer hot-path interference.
+  MetricsConsumer consumer;
+  if (!ctx.session_dir.empty()) {
+    std::error_code ec;
+    if (std::filesystem::exists(ctx.session_dir, ec) && !ec) {
+      auto report = read_token_usage(ctx.session_dir.string());
+      if (report.has_value()) {
+        (void)consumer.ingest_token_usage(report.value());
+      } else {
+        consumer.mark_stale("token_usage unavailable", report.error());
+      }
+    }
+  }
+  if (ctx.audit_log != nullptr) {
+    auto res = consumer.ingest_audit_log(*ctx.audit_log);
+    if (!res.has_value())
+      consumer.mark_stale("audit_log unavailable", res.error());
+  }
+
+  const auto root = resolve_project_root(ctx);
+  FlightDeckTelemetry telemetry;
+  telemetry.snapshot = consumer.snapshot();
+  telemetry.room_label = root.filename().string();
+  telemetry.model_label = derive_flight_deck_model_label(telemetry.snapshot);
+  telemetry.tick = tick;
+
+  // Passive read-only swarm counts (only populate when backing store exists so
+  // absent stores stay UNKNOWN rather than showing a fake 0).
+  const SwarmboardConfig swarm_cfg = make_passive_swarmboard_config(ctx);
+  auto swarm_res = load_swarmboard_snapshot(swarm_cfg);
+  if (swarm_res.has_value()) {
+    const auto &swarm = swarm_res.value();
+    if (swarm.platoon_present) {
+      telemetry.active_peers = swarm.working_peers();
+      telemetry.waiting_peers = swarm.waiting_peers();
+    }
+    if (swarm.bridge_present) {
+      telemetry.active_watchers = swarm.watchers.size();
+      telemetry.guard_blocked = swarm.guard_checked && !swarm.guard_verdict.allowed;
+    }
+  }
+
+  const FlightDeckView view;
+  const FlightDeckRenderOptions opts{
+      .width = 96, .height = 24, .color = false, .honor_no_color_env = true};
+  return view.render(telemetry, opts).text();
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -1428,6 +1599,10 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_metrics(args, ctx));
     if (cmd == "/companion")
       return bound_output(handle_companion(args, ctx));
+    if (cmd == "/swarmboard")
+      return bound_output(handle_swarmboard(args, ctx));
+    if (cmd == "/flightdeck")
+      return bound_output(handle_flightdeck(args, ctx));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

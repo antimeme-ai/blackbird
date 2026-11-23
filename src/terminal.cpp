@@ -177,6 +177,12 @@ const std::array builtin_commands{
                 "Command Post"},
     ChatCommand{"/companion", "[status|ask QUESTION]",
                 "System One decision companions (jev/clef) status and advisory",
+                "Command Post"},
+    ChatCommand{"/swarmboard", "[all|mentions|conflicts|watchers]",
+                "Live read-only swarm roster, mentions, conflicts and watchers",
+                "Command Post"},
+    ChatCommand{"/flightdeck", "[tick N]",
+                "SR-71 flight deck telemetry, token shower and sparklines",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>

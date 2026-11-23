@@ -1,8 +1,12 @@
 #include "blackbird/coding.hpp"
 #include "blackbird/json.hpp"
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <set>
 #include <unistd.h>
 using namespace blackbird;
+namespace {
 void require(bool b) {
   if (!b)
     throw std::runtime_error("Lua tool oracle failed");
@@ -12,6 +16,279 @@ template <class T> T id(unsigned char n) {
   b[0] = std::byte{n};
   return unwrap(T::from_bytes(b));
 }
+std::string lua_json_string(const std::filesystem::path &p) {
+  return unwrap(dump_json(Value{p.string()}));
+}
+void test_lua_command_post_bridge(const std::filesystem::path &sandbox) {
+  const std::filesystem::path audit_dir = sandbox / "cp-audit";
+  const std::filesystem::path auth_dir = sandbox / "cp-empty-auth";
+  const std::filesystem::path board_dir = sandbox / "cp-platoon";
+  const std::filesystem::path absent_bridge = sandbox / "cp-absent-bridge";
+  const std::filesystem::path absent_peers = sandbox / "cp-absent-peers";
+  const std::filesystem::path issues_dir = sandbox / "cp-issues";
+  const std::filesystem::path absent_memory = sandbox / "cp-absent-memory";
+  const std::filesystem::path memory_dir = sandbox / "cp-memory";
+  const std::filesystem::path repo_root = sandbox / "cp-repo";
+  const std::filesystem::path blocked_file = sandbox / "cp-blocked-write";
+  std::filesystem::create_directories(audit_dir);
+  std::filesystem::permissions(audit_dir, std::filesystem::perms::owner_all);
+  std::filesystem::create_directories(auth_dir);
+  std::filesystem::create_directories(repo_root / "src");
+  write_file(repo_root / "src" / "note.cpp", "int note() { return 7; }\n");
+
+  (void)setenv("BLACKBIRD_AUTH_HOME", auth_dir.c_str(), 1);
+  (void)unsetenv("TYPESAFE_API_KEY");
+  (void)unsetenv("jev");
+  (void)unsetenv("BLACKBIRD_JEV_ENV_FILE");
+  (void)unsetenv("BLACKBIRD_CLEF_URL");
+
+  auto root = unwrap(
+      RetainedState::create(std::make_unique<NativeJournalDirectory>(unwrap(
+                                NativeJournalDirectory::open(audit_dir.string()))),
+                            "audit",
+                            {id<EnvironmentId>(11),
+                             id<AuditStreamId>(12),
+                             7,
+                             {1024 * 1024, 4 * 1024 * 1024},
+                             std::nullopt},
+                            {64 * 1024 * 1024, 20000}));
+  AuditLog log{*root};
+  ContextStore context{log};
+  class IdleProvider final : public CodingProvider {
+  public:
+    Value respond(const Value &,
+                  const std::function<void(std::string_view)> &) override {
+      throw std::runtime_error("unexpected provider call in command_post bridge test");
+    }
+  } provider;
+  DecisionModelConfig offline_decisions;
+  offline_decisions.credential_file = sandbox / "no-decision-creds";
+  CodingEngine engine{log, context, provider, "test", offline_decisions};
+
+  // 1. platoon_board post + read with untrusted framing & ESC/C1 escaping.
+  engine.turn({"", "local board = " + lua_json_string(board_dir) +
+                       R"lua(
+        local posted = blackbird.command_post("platoon_board", {
+          action = "post",
+          board_dir = board,
+          from = "lua-lead",
+          text = "hello \x1b[31mRED\x1b[0m \xc2\x9b2J"
+        })
+        assert(posted.posted == true)
+        assert(posted.message.untrusted_peer_data == true)
+        assert(posted.message.text == nil)
+
+        local read = blackbird.command_post("platoon_board", {
+          action = "read",
+          board_dir = board,
+          since_seq = 0,
+          limit = 10
+        })
+        assert(read.board_present == true)
+        assert(read.count == 1)
+        assert(read.untrusted_peer_data == true)
+        local msg = read.messages[1]
+        assert(msg.untrusted_peer_data == true)
+        assert(msg.text == nil)
+        assert(msg.quoted_text:find("\\x1b", 1, true) ~= nil)
+        assert(msg.quoted_text:find("\\xc2\\x9b", 1, true) ~= nil)
+        assert(msg.quoted_text:find("\x1b", 1, true) == nil)
+        assert(msg.quoted_text:find("\xc2\x9b", 1, true) == nil)
+        assert(msg.quoted_frame:find("<<<BEGIN_UNTRUSTED_PEER_DATA>>>\n", 1, true) == 1)
+        assert(msg.quoted_frame:find("\x1b", 1, true) == nil)
+
+        local alias_read = blackbird.platoon_board({action = "read", board_dir = board})
+        assert(alias_read.count == 1 and alias_read.untrusted_peer_data == true)
+      )lua"});
+
+  // 2. bridge_guard check on absent bridge dir (zero directory creation).
+  engine.turn({"", "local bdir = " + lua_json_string(absent_bridge) +
+                       "\nlocal pdir = " + lua_json_string(absent_peers) +
+                       R"lua(
+        local check = blackbird.command_post("bridge_guard", {
+          action = "check",
+          bridge_dir = bdir,
+          peers_dir = pdir,
+          scope = "src/a.cpp"
+        })
+        assert(check.bridge_present == false)
+        assert(check.allowed == true)
+        assert(check.blocking_count == 0)
+        assert(check.scope == "src/a.cpp")
+
+        local events = blackbird.bridge_guard({action = "events", bridge_dir = bdir})
+        assert(events.bridge_present == false and events.count == 0)
+      )lua"});
+  require(!std::filesystem::exists(absent_bridge));
+  require(!std::filesystem::exists(absent_peers));
+
+  // 3. project_issues create + ready + alias list.
+  engine.turn({"", "local idir = " + lua_json_string(issues_dir) +
+                       R"lua(
+        local created = blackbird.command_post("project_issues", {
+          action = "create",
+          issues_dir = idir,
+          title = "Wire Lua command post",
+          description = "Expose blackbird.command_post",
+          priority = 1
+        })
+        assert(created.created == true)
+        assert(type(created.issue.id) == "string" and #created.issue.id > 0)
+
+        local ready = blackbird.command_post("project_issues", {
+          action = "ready",
+          issues_dir = idir
+        })
+        assert(ready.issues_present == true)
+        assert(ready.count == 1)
+        assert(ready.issues[1].id == created.issue.id)
+        assert(ready.issues[1].title == "Wire Lua command post")
+
+        local listed = blackbird.project_issues({action = "list", issues_dir = idir})
+        assert(listed.count == 1)
+      )lua"});
+
+  // 4. project_memory absent read (zero dir creation) + record/recall freshness.
+  engine.turn({"", "local absent_mem = " + lua_json_string(absent_memory) +
+                       "\nlocal mdir = " + lua_json_string(memory_dir) +
+                       "\nlocal root = " + lua_json_string(repo_root) +
+                       R"lua(
+        local empty = blackbird.project_memory({action = "recent", memory_dir = absent_mem})
+        assert(empty.memory_present == false and empty.count == 0)
+
+        local rec = blackbird.command_post("project_memory", {
+          action = "record",
+          memory_dir = mdir,
+          kind = "invariant",
+          title = "Note return contract",
+          body = "note() returns 7",
+          tags = {"lua"},
+          sources = {"src/note.cpp"},
+          verify_root = root
+        })
+        assert(rec.freshness_badge == "[fresh]")
+
+        local hit = blackbird.command_post("project_memory", {
+          action = "recall",
+          memory_dir = mdir,
+          query = "note contract",
+          verify_root = root
+        })
+        assert(hit.memory_present == true and hit.count == 1)
+        assert(hit.hits[1].freshness_badge == "[fresh]")
+      )lua"});
+  require(!std::filesystem::exists(absent_memory));
+
+  // 5. companion_timing silence-by-default & strict schema enforcement.
+  engine.turn({"", R"lua(
+        local timing = blackbird.command_post("companion_timing", {
+          context_summary = "idle",
+          candidate_message = "fyi",
+          room_state = "quiet",
+          unread_peer_count = 0,
+          conflict_count = 0
+        })
+        assert(timing.decision == "stay_quiet")
+        assert(timing.basis == "deterministic_heuristic")
+
+        local alias_timing = blackbird.companion_timing({
+          context_summary = "idle",
+          candidate_message = "fyi",
+          room_state = "quiet",
+          unread_peer_count = 0,
+          conflict_count = 0
+        })
+        assert(alias_timing.decision == "stay_quiet")
+
+        local missing = blackbird.command_post("companion_timing", {
+          context_summary = "idle",
+          candidate_message = "fyi"
+        })
+        assert(missing.error == "invalid_range")
+
+        local extra = blackbird.command_post("companion_timing", {
+          context_summary = "idle",
+          candidate_message = "fyi",
+          room_state = "quiet",
+          unread_peer_count = 0,
+          conflict_count = 0,
+          api_key = "forbidden"
+        })
+        assert(extra.error == "invalid_range")
+      )lua"});
+
+  // 6. Unknown tool rejection, malformed arguments, alias coercion/arity, and
+  // effect_policy enforcement.
+  engine.turn({"", "local blocked = " + lua_json_string(blocked_file) +
+                       R"lua(
+        local ok_exec, err_exec = pcall(blackbird.command_post, "exec", {})
+        assert(not ok_exec and err_exec == "invalid_range")
+
+        local ok_write, err_write = pcall(blackbird.command_post, "write_file", {
+          path = blocked,
+          content = "should never exist"
+        })
+        assert(not ok_write and err_write == "invalid_range")
+
+        local ok_unknown, err_unknown = pcall(blackbird.command_post, "not_a_tool", {})
+        assert(not ok_unknown and err_unknown == "invalid_range")
+
+        local ok_num, err_num = pcall(blackbird.command_post, 42, {})
+        assert(not ok_num and err_num == "invalid_range")
+
+        local ok_args, err_args = pcall(blackbird.command_post, "platoon_board", "bad")
+        assert(not ok_args and err_args == "invalid_range")
+
+        local ok_arity, err_arity = pcall(blackbird.command_post, "platoon_board",
+                                          {action = "read"}, "extra")
+        assert(not ok_arity and err_arity == "invalid_range")
+
+        local ok_alias_false, err_alias_false = pcall(blackbird.platoon_board, false)
+        assert(not ok_alias_false and err_alias_false == "invalid_range")
+
+        local ok_alias_extra, err_alias_extra =
+          pcall(blackbird.platoon_board, {}, "extra")
+        assert(not ok_alias_extra and err_alias_extra == "invalid_range")
+      )lua"});
+  require(!std::filesystem::exists(blocked_file));
+
+  // 7. Verify all 5 command-post calls are recorded through the AuditLog boundary.
+  std::set<std::string> audited_ops;
+  std::uint64_t cursor = 0;
+  for (;;) {
+    const Value page = log.inspect(Value::object(
+        {{"cursor", Value{Number{cursor}}}, {"count", Value{Number{64}}}}));
+    for (const auto &rec : field(page, "records").array()) {
+      if (const auto *op = rec.find("operation");
+          op && std::holds_alternative<std::string>(op->value())) {
+        audited_ops.insert(op->string());
+      }
+    }
+    const auto next = std::stoull(field(page, "next").number().text());
+    const auto end = std::stoull(field(page, "end").number().text());
+    if (next >= end || next == cursor)
+      break;
+    cursor = next;
+  }
+  require(audited_ops.contains("platoon_board") &&
+          audited_ops.contains("bridge_guard") &&
+          audited_ops.contains("project_issues") &&
+          audited_ops.contains("project_memory") &&
+          audited_ops.contains("companion_timing"));
+
+  engine.effect_policy = [](std::string_view tool_name, const Value &) {
+    if (tool_name == "platoon_board")
+      throw Error{ErrorCode::conflict};
+  };
+  engine.turn({"", "local ok, err = pcall(blackbird.command_post, 'platoon_board', "
+                   "{action = 'read', board_dir = " +
+                       lua_json_string(board_dir) +
+                       "}); assert(not ok and err == 'conflict')"});
+  engine.effect_policy = {};
+
+  (void)unsetenv("BLACKBIRD_AUTH_HOME");
+}
+} // namespace
 class Observer final : public CodingProvider {
 public:
   bool expected = false;
@@ -192,6 +469,7 @@ int main() {
       require(read_file(path / "disk-reopen") ==
               "Use retained outputs; never replay unknown effects.\n");
     }
+    test_lua_command_post_bridge(path);
     std::filesystem::remove_all(path);
     std::cout << "Lua tools oracle passed\n";
     return 0;

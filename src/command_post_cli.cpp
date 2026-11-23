@@ -1,6 +1,7 @@
 #include "blackbird/command_post_cli.hpp"
 
 #include "blackbird/board_bridge.hpp"
+#include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
@@ -33,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/random.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -63,6 +65,8 @@ constexpr std::int64_t kNanosecondsPerSecond = 1'000'000'000LL;
 constexpr std::int64_t kDefaultPresenceTtlSec = 300;
 constexpr std::int64_t kDefaultGrantTtlSec = 3600;
 constexpr std::int64_t kMaxGrantTtlSec = 365LL * 24LL * 3600LL;
+constexpr std::int64_t kDefaultInviteTtlSec = 3600;
+constexpr std::int64_t kMaxInviteTtlSec = 365LL * 24LL * 3600LL;
 constexpr std::uint32_t kDefaultGrantMaxTurns = 8;
 constexpr std::uint64_t kDefaultGrantMaxTokens = 100000;
 
@@ -4088,16 +4092,374 @@ int run_bridge_grant_check(std::span<char *> args, CliIo io) {
   return verdict.allowed ? 0 : 2;
 }
 
+Result<std::string> generate_invite_code() {
+  std::array<std::uint8_t, 16> bytes{};
+  if (::getentropy(bytes.data(), bytes.size()) != 0)
+    return Result<std::string>::failure({ErrorCode::io, errno});
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (const std::uint8_t byte : bytes) {
+    out.push_back(kHex[(byte >> 4U) & 0x0fU]);
+    out.push_back(kHex[byte & 0x0fU]);
+  }
+  return Result<std::string>::success(std::move(out));
+}
+
+int run_bridge_checkpoint(std::span<char *> args, CliIo io) {
+  fs::path bridge_dir = fs::path{".blackbird"} / "bridge";
+  std::optional<fs::path> peers_dir;
+  PeerIdentityConfig cfg;
+  std::string room_id = "default";
+  std::uint64_t checkpoint_seq = 0;
+  std::int64_t created_ns = 0;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird bridge checkpoint [--room ID] [--checkpoint-seq N] "
+                "[--bridge DIR] [--peers DIR] [--created-ns N]\n";
+      return 0;
+    }
+    if (arg == "--room") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      room_id = *v;
+    } else if (arg == "--checkpoint-seq") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_u64(*v);
+      if (!parsed.has_value())
+        return fail_usage(io, "bridge checkpoint: invalid --checkpoint-seq");
+      checkpoint_seq = *parsed;
+    } else if (arg == "--bridge") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      bridge_dir = fs::path{*v};
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      peers_dir = fs::path{*v};
+    } else if (arg == "--created-ns") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_i64(*v);
+      if (!parsed.has_value() || *parsed <= 0)
+        return fail_usage(io, "bridge checkpoint: invalid --created-ns");
+      created_ns = *parsed;
+    } else if (arg == "--namespace") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.signature_namespace = *v;
+    } else if (arg == "--ssh-keygen") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.ssh_keygen_executable = *v;
+    } else {
+      return fail_usage(io, "bridge checkpoint: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (!peers_dir.has_value()) {
+    peers_dir = default_peers_dir(io);
+    if (!peers_dir.has_value())
+      return 1;
+  }
+
+  auto identity = PeerIdentityStore::open_or_create(*peers_dir, cfg);
+  if (!identity.has_value())
+    return fail_error(io, "bridge checkpoint", identity.error());
+  auto known_peers = KnownPeersStore::open(*peers_dir, cfg);
+  if (!known_peers.has_value())
+    return fail_error(io, "bridge checkpoint", known_peers.error());
+
+  std::vector<CausalEvent> all_events;
+  std::error_code bridge_ec;
+  const fs::file_status bridge_st = fs::symlink_status(bridge_dir, bridge_ec);
+  const bool bridge_absent =
+      bridge_ec == std::errc::no_such_file_or_directory ||
+      (!bridge_ec && bridge_st.type() == fs::file_type::not_found);
+  if (!bridge_absent) {
+    auto bridge = BoardBridge::open(bridge_dir);
+    if (!bridge.has_value())
+      return fail_error(io, "bridge checkpoint", bridge.error());
+    auto loaded_events = bridge.value().events();
+    if (!loaded_events.has_value())
+      return fail_error(io, "bridge checkpoint", loaded_events.error());
+    all_events = std::move(loaded_events).value();
+  }
+
+  auto revoked = known_peers.value().list_revoked_grants();
+  if (!revoked.has_value())
+    return fail_error(io, "bridge checkpoint", revoked.error());
+
+  BridgeCheckpointDraft draft;
+  draft.room_id = std::move(room_id);
+  draft.checkpoint_seq = checkpoint_seq;
+  draft.created_ns = created_ns;
+  draft.actor_watermarks = compute_actor_watermarks(all_events);
+  draft.causal_frontier_hashes = compute_causal_frontier(all_events);
+  draft.revoked_grant_ids.reserve(revoked.value().size());
+  for (const auto &rec : revoked.value())
+    draft.revoked_grant_ids.push_back(rec.grant_id);
+
+  auto signed_cp = sign_checkpoint(identity.value(), std::move(draft));
+  if (!signed_cp.has_value())
+    return fail_error(io, "bridge checkpoint", signed_cp.error());
+  return emit_json(io, checkpoint_to_value(signed_cp.value()));
+}
+
+int run_bridge_checkpoint_verify(std::span<char *> args, CliIo io) {
+  std::optional<fs::path> file_path;
+  std::optional<fs::path> peers_dir;
+  PeerIdentityConfig cfg;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err
+          << "usage: blackbird bridge checkpoint-verify [--file PATH] [--peers DIR]\n";
+      return 0;
+    }
+    if (arg == "--file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      file_path = fs::path{*v};
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      peers_dir = fs::path{*v};
+    } else if (arg == "--namespace") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.signature_namespace = *v;
+    } else if (arg == "--ssh-keygen") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.ssh_keygen_executable = *v;
+    } else {
+      return fail_usage(io, "bridge checkpoint-verify: unknown option: " +
+                                std::string{arg});
+    }
+  }
+
+  std::string raw_json;
+  if (file_path.has_value() && file_path->string() != "-") {
+    auto loaded = read_file_bounded(*file_path, kMaxCliInputBytes, io);
+    if (!loaded.has_value())
+      return 1;
+    raw_json = std::move(*loaded);
+  } else {
+    auto loaded = read_stream_bounded(io.in, kMaxCliInputBytes, io);
+    if (!loaded.has_value())
+      return 1;
+    raw_json = std::move(*loaded);
+  }
+
+  auto emit_invalid = [&](ErrorCode code, const BridgeCheckpoint *cp) -> int {
+    const Value out_val = Value::object({
+        {"valid", Value{false}},
+        {"room_id", Value{cp != nullptr ? cp->room_id : std::string{}}},
+        {"checkpoint_seq",
+         Value{Number{cp != nullptr ? cp->checkpoint_seq : std::uint64_t{0}}}},
+        {"signer_fingerprint",
+         Value{cp != nullptr ? cp->signer_fingerprint : std::string{}}},
+        {"watermarks_count",
+         Value{Number{cp != nullptr
+                          ? static_cast<std::uint64_t>(cp->actor_watermarks.size())
+                          : std::uint64_t{0}}}},
+        {"error", Value{std::string{error_name(code)}}},
+    });
+    if (emit_json(io, out_val) != 0)
+      return 1;
+    return 2;
+  };
+
+  auto parsed = parse_json(raw_json);
+  if (!parsed.has_value())
+    return emit_invalid(parsed.error().code, nullptr);
+  auto cp = checkpoint_from_value(parsed.value());
+  if (!cp.has_value())
+    return emit_invalid(cp.error().code, nullptr);
+
+  if (!peers_dir.has_value()) {
+    peers_dir = default_peers_dir(io);
+    if (!peers_dir.has_value())
+      return 1;
+  }
+
+  std::error_code peers_ec;
+  const fs::file_status peers_st = fs::symlink_status(*peers_dir, peers_ec);
+  if (peers_ec == std::errc::no_such_file_or_directory ||
+      (!peers_ec && peers_st.type() == fs::file_type::not_found)) {
+    return emit_invalid(ErrorCode::invalid_identity, &cp.value());
+  }
+
+  auto known_peers = KnownPeersStore::open(*peers_dir, cfg);
+  if (!known_peers.has_value())
+    return fail_error(io, "bridge checkpoint-verify", known_peers.error());
+
+  auto verified = verify_checkpoint(known_peers.value(), cp.value(), cfg);
+  if (!verified.has_value())
+    return emit_invalid(verified.error().code, &cp.value());
+
+  return emit_json(io,
+                   Value::object({
+                       {"valid", Value{true}},
+                       {"room_id", Value{cp.value().room_id}},
+                       {"checkpoint_seq", Value{Number{cp.value().checkpoint_seq}}},
+                       {"signer_fingerprint", Value{cp.value().signer_fingerprint}},
+                       {"watermarks_count", Value{Number{static_cast<std::uint64_t>(
+                                                cp.value().actor_watermarks.size())}}},
+                   }));
+}
+
+int run_bridge_invite(std::span<char *> args, CliIo io) {
+  std::optional<fs::path> peers_dir;
+  PeerIdentityConfig cfg;
+  std::string room_id;
+  std::string relay_url;
+  std::int64_t ttl_secs = kDefaultInviteTtlSec;
+  std::optional<std::int64_t> explicit_expires_ns;
+  std::optional<std::string> explicit_code;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird bridge invite --room ID --relay URL [--ttl SECS] "
+                "[--expires-ns N] [--code CODE] [--peers DIR]\n";
+      return 0;
+    }
+    if (arg == "--room") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      room_id = *v;
+    } else if (arg == "--relay") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      relay_url = *v;
+    } else if (arg == "--ttl") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_i64(*v);
+      if (!parsed.has_value() || *parsed <= 0 || *parsed > kMaxInviteTtlSec)
+        return fail_usage(io, "bridge invite: invalid --ttl");
+      ttl_secs = *parsed;
+    } else if (arg == "--expires-ns") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_i64(*v);
+      if (!parsed.has_value() || *parsed <= 0)
+        return fail_usage(io, "bridge invite: invalid --expires-ns");
+      explicit_expires_ns = *parsed;
+    } else if (arg == "--code") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "bridge invite: --code must not be empty");
+      explicit_code = std::move(*v);
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      peers_dir = fs::path{*v};
+    } else if (arg == "--namespace") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.signature_namespace = *v;
+    } else if (arg == "--ssh-keygen") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.ssh_keygen_executable = *v;
+    } else {
+      return fail_usage(io, "bridge invite: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (room_id.empty() || relay_url.empty())
+    return fail_usage(io, "bridge invite: --room and --relay are required");
+
+  if (!peers_dir.has_value()) {
+    peers_dir = default_peers_dir(io);
+    if (!peers_dir.has_value())
+      return 1;
+  }
+
+  auto identity = PeerIdentityStore::open_or_create(*peers_dir, cfg);
+  if (!identity.has_value())
+    return fail_error(io, "bridge invite", identity.error());
+
+  std::string invite_code;
+  if (explicit_code.has_value()) {
+    invite_code = std::move(*explicit_code);
+  } else {
+    auto generated = generate_invite_code();
+    if (!generated.has_value())
+      return fail_error(io, "bridge invite", generated.error());
+    invite_code = std::move(generated).value();
+  }
+
+  std::int64_t expires_ns = 0;
+  if (explicit_expires_ns.has_value()) {
+    expires_ns = *explicit_expires_ns;
+  } else {
+    const std::int64_t ttl_ns = ttl_secs * kNanosecondsPerSecond;
+    const std::int64_t now_ns = wall_now_ns();
+    if (now_ns > std::numeric_limits<std::int64_t>::max() - ttl_ns)
+      return fail_error(io, "bridge invite", {ErrorCode::overflow});
+    expires_ns = now_ns + ttl_ns;
+  }
+
+  RoomInvite invite;
+  invite.room_id = std::move(room_id);
+  invite.relay_url = std::move(relay_url);
+  invite.creator_fingerprint = identity.value().identity().fingerprint;
+  invite.creator_public_key = identity.value().identity().public_key;
+  invite.invite_code = std::move(invite_code);
+  invite.expires_ns = expires_ns;
+
+  auto encoded = encode_room_invite(invite);
+  if (!encoded.has_value())
+    return fail_error(io, "bridge invite", encoded.error());
+
+  return emit_json(io, Value::object({
+                           {"invite_uri", Value{std::move(encoded).value()}},
+                           {"room_id", Value{invite.room_id}},
+                           {"relay_url", Value{invite.relay_url}},
+                           {"creator_fingerprint", Value{invite.creator_fingerprint}},
+                           {"expires_ns", Value{Number{invite.expires_ns}}},
+                       }));
+}
+
 int run_bridge_cli(std::span<char *> args, CliIo io) {
   if (args.size() < 2) {
     return fail_usage(
         io, "bridge: expected action (send|receive|serve|events|receipt|guard|"
-            "presence|grant-issue|grant-check)");
+            "presence|grant-issue|grant-check|checkpoint|checkpoint-verify|invite)");
   }
   const std::string_view action{args[1]};
   if (action == "--help" || action == "-h") {
     io.err << "usage: blackbird bridge {send|receive|serve|events|receipt|guard|"
-              "presence|grant-issue|grant-check} [options]\n";
+              "presence|grant-issue|grant-check|checkpoint|checkpoint-verify|invite} "
+              "[options]\n";
     return 0;
   }
   if (action == "send")
@@ -4118,14 +4480,131 @@ int run_bridge_cli(std::span<char *> args, CliIo io) {
     return run_bridge_grant_issue(args, io);
   if (action == "grant-check")
     return run_bridge_grant_check(args, io);
+  if (action == "checkpoint")
+    return run_bridge_checkpoint(args, io);
+  if (action == "checkpoint-verify")
+    return run_bridge_checkpoint_verify(args, io);
+  if (action == "invite")
+    return run_bridge_invite(args, io);
   return fail_usage(io, "bridge: unknown action: " + std::string{action});
+}
+
+// ============================================================================
+// 9. blackbird join
+// ============================================================================
+
+int run_join_cli(std::span<char *> args, CliIo io) {
+  std::string invite_uri;
+  std::string creator_alias;
+  std::optional<fs::path> peers_dir;
+  std::optional<std::string> trust_note;
+  std::optional<std::int64_t> now_ns;
+  bool dry_run = false;
+  bool allow_expired = false;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird join <bbjoin1:...> --alias NAME [--peers DIR] "
+                "[--dry-run] [--allow-expired] [--trust-note TEXT] [--now-ns N]\n";
+      return 0;
+    }
+    if (arg == "--alias") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      creator_alias = *v;
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      peers_dir = fs::path{*v};
+    } else if (arg == "--dry-run") {
+      dry_run = true;
+    } else if (arg == "--allow-expired") {
+      allow_expired = true;
+    } else if (arg == "--trust-note") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      trust_note = *v;
+    } else if (arg == "--now-ns") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_i64(*v);
+      if (!parsed.has_value() || *parsed < 0)
+        return fail_usage(io, "join: invalid --now-ns");
+      now_ns = *parsed;
+    } else if (arg == "--uri") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      invite_uri = *v;
+    } else if (!arg.starts_with('-') && invite_uri.empty()) {
+      invite_uri = std::string{arg};
+    } else {
+      return fail_usage(io, "join: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (invite_uri.empty() || creator_alias.empty())
+    return fail_usage(io, "join: <bbjoin1:...> URI and --alias are required");
+  if (!valid_peer_alias(creator_alias))
+    return fail_usage(io, "join: invalid --alias");
+
+  auto parsed = parse_room_invite(invite_uri);
+  if (!parsed.has_value())
+    return fail_error(io, "join", parsed.error());
+  const RoomInvite &invite = parsed.value();
+
+  const std::int64_t check_time_ns = now_ns.has_value() ? *now_ns : wall_now_ns();
+  if (!allow_expired && invite.expires_ns <= check_time_ns) {
+    io.err << "blackbird join: invite expired (" << error_name(ErrorCode::invalid_range)
+           << ")\n";
+    return 1;
+  }
+
+  bool pinned = false;
+  if (!dry_run) {
+    if (!peers_dir.has_value()) {
+      peers_dir = default_peers_dir(io);
+      if (!peers_dir.has_value())
+        return 1;
+    }
+    auto known_peers = KnownPeersStore::open(*peers_dir);
+    if (!known_peers.has_value())
+      return fail_error(io, "join", known_peers.error());
+
+    PinPeerRequest req;
+    req.alias = creator_alias;
+    req.public_key = invite.creator_public_key;
+    req.trust_note =
+        trust_note.has_value()
+            ? *trust_note
+            : ("Joined room " + invite.room_id + " via " + invite.relay_url);
+    auto pin_res = known_peers.value().pin_peer(req);
+    if (!pin_res.has_value())
+      return fail_error(io, "join", pin_res.error());
+    pinned = true;
+  }
+
+  return emit_json(io, Value::object({
+                           {"joined", Value{!dry_run}},
+                           {"room_id", Value{invite.room_id}},
+                           {"relay_url", Value{invite.relay_url}},
+                           {"creator_alias", Value{creator_alias}},
+                           {"creator_fingerprint", Value{invite.creator_fingerprint}},
+                           {"pinned", Value{pinned}},
+                       }));
 }
 
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
-         arg == "peer" || arg == "capabilities" || arg == "metrics" || arg == "bridge";
+         arg == "peer" || arg == "capabilities" || arg == "metrics" ||
+         arg == "bridge" || arg == "join";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -4154,6 +4633,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_metrics_cli(args, io);
     if (subcommand == "bridge")
       return run_bridge_cli(args, io);
+    if (subcommand == "join")
+      return run_join_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);
