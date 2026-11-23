@@ -13752,3 +13752,16 @@ Addressed six operator field notes from live TUI use:
 - Aligned `route_query()` in `src/provider_profile.cpp` to accept `chat` and non-Anthropic
   `messages` bindings while keeping non-coding `decision` protocols refused; updated
   shipped profile digests and direct resolution/packaging checks.
+
+## 2026-11-23 — Rock 2.1: Generalized System One Decision Companion (`jev`, `clef`, Custom) & Blind-Sealed Trials
+
+- Registered built-in `clef` (`http://127.0.0.1:11435/v1`, `protocol = "decision"`,
+  `CLEF_API_KEY`) alongside `jev` in `ProviderAuth` and allowed custom `decision`
+  providers in `add_provider()`.
+- Generalized `DecisionModels` (`decision_request`, `validate_decision_response`) to
+  support `jev`, `clef` (`BLACKBIRD_CLEF_URL` override), and custom `decision` endpoints
+  with strict transport policy (HTTPS-only remotely; plain HTTP strictly limited to
+  loopback and Tailscale CGNAT `100.64.0.0/10`) and optional Bearer auth.
+- Added FIPS 180-4 SHA-256 `decision_blind_seal` / `decision_blind_verify` helpers for
+  tamper-evident blind decision trials and generalized `decision_model.provider` schema
+  in `src/tools.cpp`.

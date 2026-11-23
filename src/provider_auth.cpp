@@ -74,6 +74,15 @@ void https_url(std::string_view s) {
       s.find('@') != std::string_view::npos)
     throw Error{ErrorCode::invalid_range};
 }
+void decision_base_url(std::string_view s) {
+  const std::size_t prefix = s.starts_with("https://")  ? 8
+                             : s.starts_with("http://") ? 7
+                                                        : 0;
+  if (prefix == 0 || s.size() > 2048 || s.size() <= prefix ||
+      s.find_first_of(" \t\r\n\0?#\\", 0, 9) != std::string_view::npos ||
+      s.find('@') != std::string_view::npos)
+    throw Error{ErrorCode::invalid_range};
+}
 std::string quote(std::string_view s) {
   std::string out = "\"";
   for (char c : s) {
@@ -318,6 +327,8 @@ Value builtin(std::string_view id) {
     return make("https://openrouter.ai/api/v1", "chat", "OPENROUTER_API_KEY");
   if (id == "jev")
     return make("https://api.typesafe.ai/v1", "decision", "TYPESAFE_API_KEY");
+  if (id == "clef")
+    return make("http://127.0.0.1:11435/v1", "decision", "CLEF_API_KEY");
   throw Error{ErrorCode::unsupported};
 }
 Value descriptor(Store &s, std::string_view id) {
@@ -733,7 +744,7 @@ Value ProviderAuth::catalog() const {
     Store s{config_, false};
     Value::Array out;
     for (const auto id : {"kimi", "gemini", "grok", "deepseek", "openai", "anthropic",
-                          "mimo", "moonshot", "openrouter", "jev"})
+                          "mimo", "moonshot", "openrouter", "jev", "clef"})
       out.push_back(builtin(id));
     for (const auto &[k, v] : s.field("providers").object()) {
       (void)k;
@@ -1080,10 +1091,13 @@ void ProviderAuth::add_provider(const std::string &id, std::string base,
 
     identifier(id);
     identifier(env);
-    https_url(base);
     if (protocol != "responses" && protocol != "responses-portable" &&
-        protocol != "chat" && protocol != "messages")
+        protocol != "chat" && protocol != "messages" && protocol != "decision")
       throw Error{ErrorCode::invalid_range};
+    if (protocol == "decision")
+      decision_base_url(base);
+    else
+      https_url(base);
     trace.descriptor_strings(std::array<std::string_view, 4>{id, base, protocol, env});
     try {
       (void)builtin(id);

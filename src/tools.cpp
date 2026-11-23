@@ -1133,8 +1133,9 @@ Value tool_definitions() {
           {{"type", Value{"function"}},
            {"name", Value{"decision_model"}},
            {"description",
-            Value{"Native decision-model evaluation; Jev is the first adapter. Batch "
-                  "independent Choice/Score/Noul questions over shared state. Returns "
+            Value{"Native decision-model evaluation (default jev; built-in clef or "
+                  "custom protocol=decision providers). Batch independent "
+                  "Choice/Score/Noul questions over shared state. Returns "
                   "response.model, answers, raw probabilities/confidence and usage "
                   "with audit_ref. Choice criteria: map (up to255 options); Score:2–10 "
                   "structured levels; Noul criteria optional true/false. Instructions "
@@ -1147,8 +1148,13 @@ Value tool_definitions() {
                  {"properties",
                   Value::object(
                       {{"provider",
-                        Value::object({{"type", Value{"string"}},
-                                       {"enum", Value{Value::Array{Value{"jev"}}}}})},
+                        Value::object(
+                            {{"type", Value{"string"}},
+                             {"minLength", Value{Number{1}}},
+                             {"description",
+                              Value{"Configured decision provider ID (default jev; "
+                                    "built-in clef or custom protocol=decision "
+                                    "provider)."}}})},
                        {"model", Value::object({{"type", Value{"string"}}})},
                        {"state", Value::object({})},
                        {"questions", Value::object({{"type", Value{"object"}}})},

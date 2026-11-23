@@ -2,6 +2,7 @@
 #include "blackbird/value.hpp"
 #include <filesystem>
 #include <functional>
+#include <string_view>
 
 namespace blackbird {
 struct RawAdapterContext;
@@ -26,4 +27,11 @@ private:
 // Pure validators also serve native callers and deterministic service fixtures.
 Value jev_request(const Value &arguments);
 void validate_jev_response(const Value &request, const Value &response);
+Value decision_request(const Value &arguments);
+void validate_decision_response(const Value &request, const Value &response,
+                                std::string_view provider = "jev");
+// Deterministic blind-sealed trial helpers (SHA-256 over canonical JSON bytes).
+Value decision_blind_seal(const Value &request, const Value &result);
+Result<Value> decision_blind_verify(const Value &seal, const Value &request,
+                                    const Value &first_pass);
 } // namespace blackbird

@@ -18,8 +18,8 @@ Value request() {
     "failure":{"type":"noul","instructions":{"question":"Does message report failure?"}},
     "severity":{"type":"score","instructions":"Rate severity","criteria":["None","Moderate","Severe"]}}})");
 }
-std::string response() {
-  return R"({"model":"jev-1.13.0","answers":{
+std::string response(std::string_view model = "jev-1.13.0") {
+  return std::string{R"({"model":")"} + std::string{model} + R"(","answers":{
     "route":{"type":"choice","choice":"compiler","probabilities":{"compiler":0.8,"other":0.2},"confidence":0.7},
     "failure":{"type":"noul","noul":0.9},
     "severity":{"type":"score","score":1.5,"probabilities":{"0":0,"1":0.5,"2":0.5},"legend":{"0":"None","1":"Moderate","2":"Severe"},"confidence":0.5}},
@@ -50,10 +50,31 @@ int fake(int argc, char **argv) {
   write_file(base / "argv", unwrap(dump_json(Value{args})));
   std::string input{std::istreambuf_iterator<char>{std::cin},
                     std::istreambuf_iterator<char>{}};
+  const auto mode = read_file(base / "mode");
+  if (mode == "clef") {
+    if (input.find("http://127.0.0.1:11435/v1/systemone") == std::string::npos ||
+        input.find("Authorization:") != std::string::npos)
+      return 12;
+    std::cout << response("clef-8b-v1") << "\n200";
+    return 0;
+  }
+  if (mode == "tailscale_clef") {
+    if (input.find("http://100.64.12.34:11435/v1/systemone") == std::string::npos ||
+        input.find("Authorization:") != std::string::npos)
+      return 13;
+    std::cout << response("clef-8b-v1") << "\n200";
+    return 0;
+  }
+  if (mode == "custom_decision") {
+    if (input.find("https://decision.example.test/v1/systemone") == std::string::npos ||
+        input.find("Authorization: Bearer custom-decision-secret") == std::string::npos)
+      return 14;
+    std::cout << response("oracle-v2") << "\n200";
+    return 0;
+  }
   if (input.find("Authorization: Bearer native-test-secret") == std::string::npos ||
       input.find("https://api.typesafe.ai/v1/systemone") == std::string::npos)
     return 11;
-  const auto mode = read_file(base / "mode");
   if (mode == "curl")
     return 56;
   if (mode == "http") {
@@ -257,11 +278,169 @@ int main(int argc, char **argv) {
               std::string::npos,
           "raw response absent from audit");
     bool registered = false;
+    bool open_provider_schema = false;
     const auto definitions = tool_definitions();
     for (const auto &tool : definitions.array())
-      if (string_field(tool, "name") == "decision_model")
+      if (string_field(tool, "name") == "decision_model") {
         registered = true;
+        const auto &props = field(field(tool, "parameters"), "properties");
+        const auto &prov = field(props, "provider");
+        open_provider_schema =
+            string_field(prov, "type") == "string" && !prov.find("enum");
+      }
     check(registered, "model tool missing");
+    check(open_provider_schema,
+          "decision_model provider schema still hardcoded to enum");
+
+    // Generalized decision companion: built-in clef (loopback HTTP, no API key),
+    // Tailscale CGNAT HTTP, remote plain HTTP rejection, custom ProviderAuth provider,
+    // and blind-sealed decision trials.
+    {
+      const auto auth_dir = base / "companion-auth";
+      (void)setenv("BLACKBIRD_AUTH_HOME", auth_dir.c_str(), 1);
+      (void)unsetenv("CLEF_API_KEY");
+      (void)unsetenv("BLACKBIRD_CLEF_URL");
+      ProviderAuth auth;
+      const auto clef_desc = auth.descriptor("clef");
+      check(string_field(clef_desc, "protocol") == "decision" &&
+                string_field(clef_desc, "base_url") == "http://127.0.0.1:11435/v1" &&
+                string_field(clef_desc, "environment") == "CLEF_API_KEY",
+            "built-in clef descriptor mismatch");
+      bool catalog_has_clef = false;
+      for (const auto &entry : field(auth.catalog(), "providers").array())
+        if (string_field(entry, "id") == "clef")
+          catalog_has_clef = true;
+      check(catalog_has_clef, "built-in clef missing from catalog");
+
+      auto non_decision = q;
+      set(non_decision, "provider", Value{"openai"});
+      rejects([&] { (void)decision_request(non_decision); }, ErrorCode::unsupported);
+
+      auto clef_req = q;
+      set(clef_req, "provider", Value{"clef"});
+      const auto clef_default_wire = decision_request(clef_req);
+      check(string_field(clef_default_wire, "model") == "clef-latest",
+            "clef default model not clef-latest");
+      validate_decision_response(clef_default_wire, parse(response("clef-8b-v1")),
+                                 "clef");
+
+      set(clef_req, "model", Value{"clef-8b-v1"});
+      const auto clef_pinned_wire = decision_request(clef_req);
+      validate_decision_response(clef_pinned_wire, parse(response("clef-8b-v1")),
+                                 "clef");
+      rejects(
+          [&] {
+            validate_decision_response(clef_pinned_wire, parse(response("clef-8b-v2")),
+                                       "clef");
+          },
+          ErrorCode::corrupt);
+
+      write_file(base / "mode", "clef");
+      DecisionModelConfig local_cfg;
+      local_cfg.curl_executable = config.curl_executable;
+      local_cfg.response_limit = 8192;
+      DecisionModels local_adapter{local_cfg};
+      const auto clef_out = local_adapter.evaluate(clef_req);
+      check(string_field(clef_out, "status") == "ok" &&
+                string_field(clef_out, "provider") == "clef" &&
+                string_field(clef_out, "requested_model") == "clef-8b-v1" &&
+                field(clef_out, "response") == parse(response("clef-8b-v1")),
+            "clef loopback evaluation failed");
+      const auto clef_argv = read_file(base / "argv");
+      check(clef_argv.find("\"=http\"") != std::string::npos &&
+                clef_argv.find("\"=https\"") == std::string::npos,
+            "clef loopback did not enforce --proto =http");
+
+      // Tailscale CGNAT (100.64.0.0/10) allows plain HTTP.
+      (void)setenv("BLACKBIRD_CLEF_URL", "http://100.64.12.34:11435/v1", 1);
+      write_file(base / "mode", "tailscale_clef");
+      const auto ts_out = local_adapter.evaluate(clef_req);
+      check(string_field(ts_out, "status") == "ok", "Tailscale CGNAT HTTP failed");
+      check(read_file(base / "argv").find("\"=http\"") != std::string::npos,
+            "Tailscale CGNAT did not use --proto =http");
+
+      // Plain HTTP to non-local remote hosts must reject before dispatch.
+      const auto argv_before_remote = read_file(base / "argv");
+      for (const char *bad_url :
+           {"http://example.com/v1/systemone", "http://100.128.0.1:11435/v1",
+            "http://100.63.255.255:11435/v1", "http://localhost.evil.com/v1"}) {
+        (void)setenv("BLACKBIRD_CLEF_URL", bad_url, 1);
+        rejects([&] { (void)local_adapter.evaluate(clef_req); },
+                ErrorCode::unsupported);
+        check(read_file(base / "argv") == argv_before_remote,
+              "rejected remote plain HTTP dispatched curl");
+      }
+      (void)unsetenv("BLACKBIRD_CLEF_URL");
+
+      // Custom registered protocol=decision provider with stored key over HTTPS.
+      auth.add_provider("oracle", "https://decision.example.test/v1", "decision",
+                        "ORACLE_DECISION_KEY");
+      auth.set_key("oracle", "default", "custom-decision-secret");
+      (void)unsetenv("ORACLE_DECISION_KEY");
+      auto custom_req = q;
+      set(custom_req, "provider", Value{"oracle"});
+      rejects([&] { (void)decision_request(custom_req); }, ErrorCode::invalid_range);
+      set(custom_req, "model", Value{"oracle-v2"});
+      write_file(base / "mode", "custom_decision");
+      const auto custom_out = local_adapter.evaluate(custom_req);
+      check(string_field(custom_out, "status") == "ok" &&
+                string_field(custom_out, "provider") == "oracle" &&
+                string_field(custom_out, "requested_model") == "oracle-v2" &&
+                field(custom_out, "response") == parse(response("oracle-v2")),
+            "custom decision provider evaluation failed");
+      check(read_file(base / "argv").find("\"=https\"") != std::string::npos,
+            "custom HTTPS provider did not enforce --proto =https");
+
+      // Blind-sealed decision trial verification.
+      const auto seal = decision_blind_seal(clef_pinned_wire, clef_out);
+      const auto first_pass =
+          parse(R"({"decision":"compiler","confidence":"high","notes":"independent"})");
+      const auto verified = decision_blind_verify(seal, clef_pinned_wire, first_pass);
+      check(verified.has_value(), "intact blind seal failed verification");
+      check(std::get<bool>(field(verified.value(), "verified").value()) &&
+                field(verified.value(), "first_pass") == first_pass &&
+                field(verified.value(), "result") == clef_out &&
+                string_field(verified.value(), "seal_sha256") ==
+                    string_field(seal, "seal_sha256"),
+            "blind verify payload mismatch");
+
+      // Canonical key ordering: logically identical request with reordered keys
+      // verifies.
+      const auto reordered =
+          Value::object({{"questions", field(clef_pinned_wire, "questions")},
+                         {"state", field(clef_pinned_wire, "state")},
+                         {"model", field(clef_pinned_wire, "model")}});
+      check(decision_blind_verify(seal, reordered, first_pass).has_value(),
+            "canonical JSON key reordering broke blind verification");
+
+      // Tampered request must fail verification.
+      auto tampered_req = clef_pinned_wire;
+      set(tampered_req, "state", Value{"tampered state"});
+      const auto bad_req = decision_blind_verify(seal, tampered_req, first_pass);
+      check(!bad_req.has_value() && bad_req.error().code == ErrorCode::corrupt,
+            "tampered request passed blind verification");
+
+      // Tampered sealed result must fail verification.
+      auto tampered_seal_result = seal;
+      auto altered_result = clef_out;
+      set(altered_result, "provider", Value{"tampered"});
+      set(tampered_seal_result, "result", altered_result);
+      const auto bad_res =
+          decision_blind_verify(tampered_seal_result, clef_pinned_wire, first_pass);
+      check(!bad_res.has_value() && bad_res.error().code == ErrorCode::corrupt,
+            "tampered sealed result passed blind verification");
+
+      // Tampered seal hash must fail verification.
+      auto tampered_seal_hash = seal;
+      set(tampered_seal_hash, "seal_sha256", Value{"sha256:" + std::string(64, '0')});
+      const auto bad_hash =
+          decision_blind_verify(tampered_seal_hash, clef_pinned_wire, first_pass);
+      check(!bad_hash.has_value() && bad_hash.error().code == ErrorCode::corrupt,
+            "tampered seal digest passed blind verification");
+
+      (void)unsetenv("BLACKBIRD_AUTH_HOME");
+    }
+
     std::filesystem::remove_all(base);
     std::cout << "decision models passed\n";
     return 0;
