@@ -1682,6 +1682,89 @@ void test_official_multiplayer_site_test_vectors() {
           "party_invite_sha256_hex bit-exact");
 }
 
+void test_safety_number() {
+  g_stage = "safety_number";
+
+  static constexpr std::string_view kCrockfordAlphabet =
+      "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const auto require_valid_safety_number_format = [](std::string_view sn) {
+    require(sn.size() == kSafetyNumberFormattedLength,
+            "safety number exact 39-char length");
+    for (std::size_t i = 0U; i < sn.size(); ++i) {
+      if ((i % 5U) == 4U) {
+        require(sn[i] == '-', "hyphen at every 5th slot");
+      } else {
+        require(kCrockfordAlphabet.find(sn[i]) != std::string_view::npos,
+                "strict uppercase Crockford Base32 character");
+        require(sn[i] != 'I' && sn[i] != 'L' && sn[i] != 'O' && sn[i] != 'U',
+                "zero ambiguous I/L/O/U characters");
+      }
+    }
+  };
+
+  // Official TEST_VECTORS.json root_pubkey + account_id = 1001 golden vector.
+  static constexpr std::string_view kRootPubkeyHex =
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+  static constexpr std::string_view kExpectedGolden =
+      "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV";
+
+  const auto root_pk_vec = from_hex(kRootPubkeyHex);
+  require(root_pk_vec.size() == 32U, "root_pubkey_hex 32 bytes");
+  Ed25519PubKey root_pk{};
+  std::memcpy(root_pk.data(), root_pk_vec.data(), root_pk.size());
+
+  const auto acct_1001 = must(AccountId::create(1001U), "acct 1001");
+  const auto sn_golden =
+      must(compute_safety_number(acct_1001, root_pk), "golden safety number");
+  require_valid_safety_number_format(sn_golden);
+  require(sn_golden == kExpectedGolden, "golden safety number bit-exact");
+  require(must(compute_safety_number(acct_1001, root_pk), "repeat golden") == sn_golden,
+          "safety number deterministic");
+
+  // Changing account_id by 1 changes the Safety Number completely.
+  const auto acct_1002 = must(AccountId::create(1002U), "acct 1002");
+  const auto sn_next_acct =
+      must(compute_safety_number(acct_1002, root_pk), "acct+1 safety number");
+  require_valid_safety_number_format(sn_next_acct);
+  require(sn_next_acct != sn_golden, "account_id + 1 produces distinct safety number");
+
+  // Flipping 1 bit (sign bit: A -> -A, still valid prime-order point) changes output.
+  Ed25519PubKey flipped_pk = root_pk;
+  flipped_pk[31] ^= 0x80U;
+  const auto sn_flipped_pk =
+      must(compute_safety_number(acct_1001, flipped_pk), "1-bit flipped pubkey");
+  require_valid_safety_number_format(sn_flipped_pk);
+  require(sn_flipped_pk != sn_golden,
+          "1-bit root_pubkey flip produces distinct safety number");
+
+  // Off-curve, non-canonical, small-order, and mixed-order root_pubkeys fail closed.
+  Ed25519PubKey off_curve_y2{};
+  off_curve_y2[0] = 2U;
+  expect_err(compute_safety_number(acct_1001, off_curve_y2),
+             MpError::invalid_public_key, "off-curve y=2 rejected");
+
+  Ed25519PubKey non_canon_p{};
+  non_canon_p.fill(0xffU);
+  non_canon_p[0] = 0xedU;
+  non_canon_p[31] = 0x7fU;
+  expect_err(compute_safety_number(acct_1001, non_canon_p), MpError::invalid_public_key,
+             "non-canonical Y=p rejected");
+
+  Ed25519PubKey weak_identity{};
+  weak_identity[0] = 1U;
+  expect_err(compute_safety_number(acct_1001, weak_identity), MpError::weak_public_key,
+             "small-order identity point rejected");
+
+  Ed25519PubKey weak_ord4{};
+  expect_err(compute_safety_number(acct_1001, weak_ord4), MpError::weak_public_key,
+             "small-order all-zero point rejected");
+
+  Ed25519PubKey mixed_order_y3{};
+  mixed_order_y3[0] = 3U;
+  expect_err(compute_safety_number(acct_1001, mixed_order_y3), MpError::weak_public_key,
+             "mixed-order y=3 point rejected");
+}
+
 } // namespace
 
 int main() {
@@ -1694,6 +1777,7 @@ int main() {
     test_cbor_cose_sign1_and_device_cwt();
     test_rust_mp_protocol_bit_exact_parity();
     test_official_multiplayer_site_test_vectors();
+    test_safety_number();
     std::cout << "mp_protocol_test: ALL PASSED\n";
     return 0;
   } catch (const std::exception &ex) {

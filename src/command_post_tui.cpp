@@ -4,6 +4,8 @@
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/mp_client.hpp"
+#include "blackbird/mp_protocol.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
@@ -1607,8 +1609,8 @@ std::string handle_flightdeck(std::string_view args, const CommandPostTuiContext
 constexpr std::string_view kPartyUsage =
     "Usage: /party [status|peers|add <alias> [role=leader|operator] [ssh=user@host]|"
     "all|operators|leaders|conflicts|say <text>|create [room]|start [room]|"
-    "join <room|bbjoin1:...> [--alias <name>]|invite [relay_url]|close|leave|"
-    "remove <alias>]\n";
+    "join <room|bbjoin1:...> [--alias <name>]|invite [relay_url]|online <args...>|"
+    "close|leave|remove <alias>]\n";
 
 std::int64_t party_wall_now_ns() noexcept {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -2148,11 +2150,920 @@ KnownPeersReadResult read_lobby_friends_if_available(PartyLobbyClient &lobby) {
   return out;
 }
 
+// --- /online (and /party online ...) ---
+constexpr std::string_view kDefaultOnlineRelayUrl = "https://relay.multiplayer.tech";
+constexpr std::size_t kMaxOnlinePathBytes = 4096U;
+constexpr std::size_t kMaxOnlineHostBytes = 255U;
+
+constexpr std::string_view kOnlineHelpText =
+    "Online control plane (/online or /party online):\n"
+    "  /online [status]                                   Local identity & CWT status\n"
+    "  /online health                                     Live control-plane health\n"
+    "  /online whoami                                     Account, devices & active "
+    "parties\n"
+    "  /online resolve <handle>                           Resolve handle & root "
+    "fingerprint\n"
+    "  /online friends                                    List friends, pending & "
+    "blocked\n"
+    "  /online friend add <handle|account_id>             Send or accept friend "
+    "request\n"
+    "  /online friend remove <account_id>                 Remove friend\n"
+    "  /online friend block <account_id>                  Block account\n"
+    "  /online party create [private|friends] [force|allow|no]\n"
+    "                                                     Create online party\n"
+    "  /online party info <party_id>                      Inspect party summary\n"
+    "  /online party invite <party_id>                    Create party invite link\n"
+    "  /online party join <party_id|mppi1_...>            Join party by ID or invite\n"
+    "  /online party leave <party_id>                     Leave party\n"
+    "  /online party disband <party_id> [epoch]           Disband party\n"
+    "  /online help                                       Show this usage summary\n";
+
+bool valid_online_path_env(std::string_view raw, bool require_file_leaf) noexcept {
+  if (raw.empty() || raw.size() > kMaxOnlinePathBytes || !valid_utf8(raw))
+    return false;
+  std::size_t i = 0;
+  while (i < raw.size()) {
+    const char32_t cp = decode_utf8_scalar_tui(raw, i);
+    if (is_forbidden_socket_scalar_tui(cp))
+      return false;
+  }
+  const std::filesystem::path candidate{raw};
+  if (require_file_leaf &&
+      (candidate.filename().empty() || candidate.filename() == ".")) {
+    return false;
+  }
+  for (const auto &comp : candidate) {
+    if (comp == "..")
+      return false;
+  }
+  return true;
+}
+
+bool valid_online_host_env(std::string_view raw) noexcept {
+  if (raw.empty() || raw.size() > kMaxOnlineHostBytes || raw.front() == '-' ||
+      !valid_utf8(raw)) {
+    return false;
+  }
+  for (const char ch : raw) {
+    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == ':' ||
+                    ch == '[' || ch == ']';
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+std::string format_mp_error_detail(const Error &err) {
+  if (err.detail >= 1000) {
+    return std::string{mp::mp_client_error_name(mp::mp_client_error_of(err))};
+  }
+  if (err.detail >= 100) {
+    return std::string{mp::mp_error_name(mp::mp_error_of(err))};
+  }
+  return std::string{error_name(err.code)};
+}
+
+std::string format_online_onboarding_hint(std::string_view authority) {
+  return "Online status: unregistered (no local identity found)\n"
+         "  Authority: " +
+         sanitize_inline(authority, 128) +
+         "\n"
+         "  Run: blackbird online register --invite <mpinv1_...> --handle <name>\n";
+}
+
+struct OnlineEnvConfig {
+  mp::MpClientConfig client_cfg;
+  bool authority_from_env = false;
+  std::optional<std::filesystem::path> state_dir;
+  std::string state_dir_error;
+  std::string fatal_error;
+};
+
+OnlineEnvConfig load_online_env_config() {
+  OnlineEnvConfig out{};
+  out.client_cfg.authority = std::string{mp::kDefaultMpAuthority};
+  out.client_cfg.port = mp::kDefaultMpPort;
+
+  if (const char *env_dir = std::getenv("BLACKBIRD_ONLINE_DIR");
+      env_dir != nullptr && env_dir[0] != '\0') {
+    if (!valid_online_path_env(env_dir, false)) {
+      out.fatal_error =
+          "Online command failed: invalid BLACKBIRD_ONLINE_DIR (traversal or forbidden "
+          "control/BiDi characters rejected)\n";
+      return out;
+    }
+    out.state_dir = std::filesystem::path{env_dir};
+  } else if (const char *xdg = std::getenv("XDG_CONFIG_HOME");
+             xdg != nullptr && xdg[0] != '\0') {
+    if (!valid_online_path_env(xdg, false)) {
+      out.state_dir_error =
+          "Online command failed: invalid XDG_CONFIG_HOME (traversal or forbidden "
+          "control/BiDi characters rejected)\n";
+    } else {
+      out.state_dir = std::filesystem::path{xdg} / "blackbird" / "online";
+    }
+  } else if (const char *home = std::getenv("HOME");
+             home != nullptr && home[0] != '\0') {
+    if (!valid_online_path_env(home, false)) {
+      out.state_dir_error =
+          "Online command failed: invalid HOME (traversal or forbidden control/BiDi "
+          "characters rejected)\n";
+    } else {
+      out.state_dir = std::filesystem::path{home} / ".config" / "blackbird" / "online";
+    }
+  } else {
+    out.state_dir_error =
+        "Online command failed: unable to resolve online state directory "
+        "(set BLACKBIRD_ONLINE_DIR, XDG_CONFIG_HOME, or HOME)\n";
+  }
+
+  if (const char *env_ca = std::getenv("BLACKBIRD_ONLINE_CA_BUNDLE");
+      env_ca != nullptr && env_ca[0] != '\0') {
+    if (!valid_online_path_env(env_ca, true)) {
+      out.fatal_error = "Online command failed: invalid BLACKBIRD_ONLINE_CA_BUNDLE "
+                        "(traversal or forbidden control/BiDi characters rejected)\n";
+      return out;
+    }
+    out.client_cfg.ca_bundle_path = std::filesystem::path{env_ca};
+  }
+
+  if (const char *env_auth = std::getenv("BLACKBIRD_ONLINE_AUTHORITY");
+      env_auth != nullptr && env_auth[0] != '\0') {
+    if (!valid_online_host_env(env_auth)) {
+      out.fatal_error = "Online command failed: invalid BLACKBIRD_ONLINE_AUTHORITY\n";
+      return out;
+    }
+    out.client_cfg.authority = env_auth;
+    out.authority_from_env = true;
+  }
+
+  if (const char *env_host = std::getenv("BLACKBIRD_ONLINE_CONNECT_HOST");
+      env_host != nullptr && env_host[0] != '\0') {
+    if (!valid_online_host_env(env_host)) {
+      out.fatal_error =
+          "Online command failed: invalid BLACKBIRD_ONLINE_CONNECT_HOST\n";
+      return out;
+    }
+    out.client_cfg.connect_host = env_host;
+  }
+
+  if (const char *env_port = std::getenv("BLACKBIRD_ONLINE_PORT");
+      env_port != nullptr && env_port[0] != '\0') {
+    const std::string_view port_sv{env_port};
+    if (!valid_port_str(port_sv)) {
+      out.fatal_error = "Online command failed: invalid BLACKBIRD_ONLINE_PORT "
+                        "(expected 1..65535)\n";
+      return out;
+    }
+    std::uint16_t port_num = 0;
+    const auto [ptr, ec] =
+        std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port_num);
+    if (ec != std::errc{} || ptr != port_sv.data() + port_sv.size() || port_num == 0U) {
+      out.fatal_error = "Online command failed: invalid BLACKBIRD_ONLINE_PORT "
+                        "(expected 1..65535)\n";
+      return out;
+    }
+    out.client_cfg.port = port_num;
+  }
+
+  return out;
+}
+
+std::string_view friend_edge_state_name(mp::FriendEdgeState state) noexcept {
+  switch (state) {
+  case mp::FriendEdgeState::friend_edge:
+    return "friend";
+  case mp::FriendEdgeState::invite_sent:
+    return "invite_sent";
+  case mp::FriendEdgeState::invite_received:
+    return "invite_received";
+  case mp::FriendEdgeState::blocked:
+    return "blocked";
+  }
+  return "unknown";
+}
+
+std::string_view party_visibility_name(mp::PartyVisibility vis) noexcept {
+  switch (vis) {
+  case mp::PartyVisibility::private_party:
+    return "private";
+  case mp::PartyVisibility::friends:
+    return "friends";
+  }
+  return "unknown";
+}
+
+std::string_view party_join_mode_name(mp::PartyJoinMode mode) noexcept {
+  switch (mode) {
+  case mp::PartyJoinMode::invite_only:
+    return "invite_only";
+  case mp::PartyJoinMode::approval_required:
+    return "approval_required";
+  }
+  return "unknown";
+}
+
+std::string_view relay_policy_name(mp::RelayPolicy policy) noexcept {
+  switch (policy) {
+  case mp::RelayPolicy::allow_relays:
+    return "allow_relays";
+  case mp::RelayPolicy::force_relays:
+    return "force_relays";
+  case mp::RelayPolicy::no_relays:
+    return "no_relays";
+  }
+  return "unknown";
+}
+
+std::string format_duration_seconds(std::int64_t seconds) {
+  if (seconds <= 0)
+    return "0s";
+  const std::int64_t days = seconds / 86400;
+  const std::int64_t hours = (seconds % 86400) / 3600;
+  const std::int64_t mins = (seconds % 3600) / 60;
+  if (days > 0)
+    return std::to_string(days) + "d " + std::to_string(hours) + "h";
+  if (hours > 0)
+    return std::to_string(hours) + "h " + std::to_string(mins) + "m";
+  if (mins > 0)
+    return std::to_string(mins) + "m " + std::to_string(seconds % 60) + "s";
+  return std::to_string(seconds) + "s";
+}
+
+std::string format_pubkey_sha256_hex(const mp::Ed25519PubKey &pubkey) {
+  const auto digest = mp::sha256(pubkey);
+  if (!digest.has_value())
+    return "(hash_error)";
+  return mp::hex_lower(digest.value());
+}
+
+struct OpenedOnlineClient {
+  std::optional<mp::MpControlClient> client;
+  std::string error_output;
+};
+
+OpenedOnlineClient open_authenticated_online_client(const OnlineEnvConfig &env) {
+  OpenedOnlineClient out{};
+  if (!env.state_dir.has_value()) {
+    out.error_output = env.state_dir_error;
+    return out;
+  }
+  auto store_res = mp::MpIdentityStore::open_existing(*env.state_dir);
+  if (!store_res.has_value()) {
+    if (mp::mp_client_error_of(store_res.error()) ==
+        mp::MpClientError::keystore_not_found) {
+      out.error_output = format_online_onboarding_hint(env.client_cfg.authority);
+      return out;
+    }
+    out.error_output =
+        "Online identity unavailable: " + format_mp_error_detail(store_res.error()) +
+        "\n";
+    return out;
+  }
+  mp::MpClientConfig cfg = env.client_cfg;
+  const mp::MpIdentityState &st = store_res.value().state();
+  if (!env.authority_from_env && !st.authority.empty()) {
+    cfg.authority = st.authority;
+  }
+  out.client.emplace(std::move(cfg), st);
+  return out;
+}
+
+bool is_all_ascii_digits(std::string_view text) noexcept {
+  if (text.empty())
+    return false;
+  for (const char ch : text) {
+    if (ch < '0' || ch > '9')
+      return false;
+  }
+  return true;
+}
+
+struct CleanseOptionalStringGuard {
+  std::optional<std::string> &value;
+  ~CleanseOptionalStringGuard() noexcept {
+    if (value.has_value()) {
+      volatile char *ptr = value->data();
+      for (std::size_t i = 0; i < value->size(); ++i)
+        ptr[i] = '\0';
+      value->clear();
+    }
+  }
+};
+
+struct ParsedOnlineInviteLink {
+  mp::PartyId party_id = mp::PartyId::create(1U).value();
+  std::string invite_link;
+};
+
+std::optional<ParsedOnlineInviteLink>
+parse_online_party_invite_link(std::string_view raw) {
+  static constexpr std::string_view kPrefix = "mppi1_";
+  if (!raw.starts_with(kPrefix) || raw.size() > 256U)
+    return std::nullopt;
+  const std::string_view body = raw.substr(kPrefix.size());
+  const auto sep = body.find('_');
+  if (sep == std::string_view::npos || sep == 0U || sep + 1U >= body.size())
+    return std::nullopt;
+  const auto pid = mp::PartyId::parse_decimal(body.substr(0U, sep));
+  if (!pid.has_value())
+    return std::nullopt;
+  const std::string_view secret = body.substr(sep + 1U);
+  if (secret.empty())
+    return std::nullopt;
+  for (const char ch : secret) {
+    const auto u = static_cast<unsigned char>(ch);
+    if (u <= 0x20U || u >= 0x7fU)
+      return std::nullopt;
+  }
+  return ParsedOnlineInviteLink{pid.value(), std::string{raw}};
+}
+
+std::string handle_online_status(const OnlineEnvConfig &env) {
+  if (!env.state_dir.has_value())
+    return env.state_dir_error;
+  auto store_res = mp::MpIdentityStore::open_existing(*env.state_dir);
+  if (!store_res.has_value()) {
+    if (mp::mp_client_error_of(store_res.error()) ==
+        mp::MpClientError::keystore_not_found) {
+      return format_online_onboarding_hint(env.client_cfg.authority);
+    }
+    return "Online status failed: " + format_mp_error_detail(store_res.error()) + "\n";
+  }
+  const mp::MpIdentityStore &store = store_res.value();
+  const mp::MpIdentityState &st = store.state();
+  const std::string &authority =
+      env.authority_from_env
+          ? env.client_cfg.authority
+          : (!st.authority.empty() ? st.authority : env.client_cfg.authority);
+
+  std::string cwt_summary;
+  if (st.device_cwt.empty()) {
+    cwt_summary = "absent";
+  } else if (st.root_seed.has_value()) {
+    const auto root_key = store.root_signing_key();
+    const auto dev_key = store.device_signing_key();
+    if (!root_key.has_value() || !dev_key.has_value()) {
+      cwt_summary = "invalid (key derivation failed)";
+    } else {
+      const std::int64_t now_s =
+          std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      const auto ver = mp::verify_device_cwt(mp::DeviceCwtVerifyRequest{
+          st.device_cwt,
+          root_key.value().public_key(),
+          dev_key.value().public_key(),
+          now_s,
+      });
+      if (ver.has_value()) {
+        const std::int64_t rem = ver.value().exp - now_s;
+        cwt_summary = "valid (exp=" + std::to_string(ver.value().exp) + ", " +
+                      format_duration_seconds(rem) + " left)";
+      } else if (mp::mp_error_of(ver.error()) == mp::MpError::cwt_expired) {
+        cwt_summary = "expired";
+      } else {
+        cwt_summary = "invalid (" + format_mp_error_detail(ver.error()) + ")";
+      }
+    }
+  } else {
+    cwt_summary = "present (" + std::to_string(st.device_cwt.size()) +
+                  " bytes; root key offline)";
+  }
+
+  std::string out = "Online status:\n";
+  out += "  Handle:     " +
+         (st.handle.empty() ? std::string{"(unset)"} : sanitize_inline(st.handle, 64)) +
+         "\n";
+  out += "  Account ID: " +
+         (st.account_id.has_value() ? st.account_id->to_decimal() : "(unset)") + "\n";
+  out += "  Device ID:  " +
+         (st.device_id.has_value() ? st.device_id->to_decimal() : "(unset)") + "\n";
+  out += "  Authority:  " + sanitize_inline(authority, 128) + "\n";
+  out += "  Root key:   " + std::string{st.root_seed.has_value() ? "yes" : "no"} + "\n";
+  out += "  Local CWT:  " + cwt_summary + "\n";
+  return out;
+}
+
+std::string handle_online_friend(std::string_view rest, const OnlineEnvConfig &env) {
+  const auto [action, tail] = split_first_token(rest);
+  if (action == "add") {
+    const auto [target, extra] = split_first_token(tail);
+    if (target.empty() || !extra.empty())
+      return "Usage: /online friend add <handle|account_id>\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    std::optional<mp::AccountId> target_id;
+    std::string resolved_handle;
+    if (is_all_ascii_digits(target)) {
+      const auto parsed = mp::AccountId::parse_decimal(target);
+      if (!parsed.has_value()) {
+        return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
+      }
+      target_id = parsed.value();
+    } else {
+      const auto valid_handle = mp::AccountHandle::parse(target);
+      if (!valid_handle.has_value()) {
+        return "Invalid handle or account_id: '" + sanitize_inline(target, 64) + "'\n";
+      }
+      const auto resolved = opened.client->resolve_handle(target);
+      if (!resolved.has_value()) {
+        return "Online resolve failed (" + sanitize_inline(target, 64) +
+               "): " + format_mp_error_detail(resolved.error()) + "\n";
+      }
+      target_id = resolved.value().account_id;
+      resolved_handle = resolved.value().handle;
+    }
+    const auto res = opened.client->send_or_accept_friend(*target_id);
+    if (!res.has_value()) {
+      return "Online friend add failed: " + format_mp_error_detail(res.error()) + "\n";
+    }
+    std::string out = "Online friend updated: account_id=" +
+                      res.value().target_account_id.to_decimal();
+    if (!resolved_handle.empty())
+      out += " handle=" + sanitize_inline(resolved_handle, 64);
+    out += " state=" + std::string{friend_edge_state_name(res.value().state)} + "\n";
+    return out;
+  }
+
+  if (action == "remove") {
+    const auto [target, extra] = split_first_token(tail);
+    if (target.empty() || !extra.empty())
+      return "Usage: /online friend remove <account_id>\n";
+    const auto target_id = mp::AccountId::parse_decimal(target);
+    if (!target_id.has_value()) {
+      return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto res = opened.client->remove_friend(target_id.value());
+    if (!res.has_value()) {
+      return "Online friend remove failed: " + format_mp_error_detail(res.error()) +
+             "\n";
+    }
+    return "Removed online friend: account_id=" + target_id.value().to_decimal() + "\n";
+  }
+
+  if (action == "block") {
+    const auto [target, extra] = split_first_token(tail);
+    if (target.empty() || !extra.empty())
+      return "Usage: /online friend block <account_id>\n";
+    const auto target_id = mp::AccountId::parse_decimal(target);
+    if (!target_id.has_value()) {
+      return "Invalid account_id: '" + sanitize_inline(target, 64) + "'\n";
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto res = opened.client->block_account(target_id.value());
+    if (!res.has_value()) {
+      return "Online friend block failed: " + format_mp_error_detail(res.error()) +
+             "\n";
+    }
+    return "Blocked online account: account_id=" + target_id.value().to_decimal() +
+           "\n";
+  }
+
+  return "Usage: /online friend [add <handle|account_id>|remove <account_id>|block "
+         "<account_id>]\n";
+}
+
+std::string handle_online_party(std::string_view rest, const OnlineEnvConfig &env) {
+  const auto [action, tail] = split_first_token(rest);
+
+  if (action == "create") {
+    mp::PartyVisibility vis = mp::PartyVisibility::friends;
+    mp::RelayPolicy relay_pol = mp::RelayPolicy::force_relays;
+    const auto [arg1, after1] = split_first_token(tail);
+    if (!arg1.empty()) {
+      if (arg1 == "private")
+        vis = mp::PartyVisibility::private_party;
+      else if (arg1 == "friends")
+        vis = mp::PartyVisibility::friends;
+      else
+        return "Usage: /online party create [private|friends] [force|allow|no]\n";
+      const auto [arg2, after2] = split_first_token(after1);
+      if (!arg2.empty()) {
+        if (!after2.empty())
+          return "Usage: /online party create [private|friends] [force|allow|no]\n";
+        if (arg2 == "force")
+          relay_pol = mp::RelayPolicy::force_relays;
+        else if (arg2 == "allow")
+          relay_pol = mp::RelayPolicy::allow_relays;
+        else if (arg2 == "no")
+          relay_pol = mp::RelayPolicy::no_relays;
+        else
+          return "Usage: /online party create [private|friends] [force|allow|no]\n";
+      }
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+
+    mp::CreatePartyRequest req{};
+    req.visibility = vis;
+    req.join_mode = mp::PartyJoinMode::invite_only;
+    req.relay_policy = relay_pol;
+    req.max_members = 4U;
+    if (relay_pol == mp::RelayPolicy::no_relays) {
+      req.relay_url.clear();
+      req.endpoint = mp::EndpointDescriptor{mp::TransportKind::direct_quic, "", {}};
+    } else {
+      req.relay_url = std::string{kDefaultOnlineRelayUrl};
+      req.endpoint = mp::EndpointDescriptor{
+          mp::TransportKind::iroh_quic, std::string{kDefaultOnlineRelayUrl}, {}};
+    }
+    const auto created = opened.client->create_party(req);
+    if (!created.has_value()) {
+      return "Online party create failed: " + format_mp_error_detail(created.error()) +
+             "\n";
+    }
+    std::string out = "Created online party:\n";
+    out += "  party_id:         " + created.value().party_id.to_decimal() + "\n";
+    out += "  party_epoch:      " + std::to_string(created.value().party_epoch) + "\n";
+    out += "  visibility:       " + std::string{party_visibility_name(vis)} + "\n";
+    out += "  join_mode:        " + std::string{party_join_mode_name(req.join_mode)} +
+           "\n";
+    out += "  relay_policy:     " + std::string{relay_policy_name(relay_pol)} + "\n";
+    out += "  max_members:      " + std::to_string(req.max_members) + "\n";
+    out += "  pinned_relay_url: " +
+           (created.value().pinned_relay_url.empty()
+                ? std::string{"(none)"}
+                : sanitize_inline(created.value().pinned_relay_url, 128)) +
+           "\n";
+    return out;
+  }
+
+  if (action == "info") {
+    const auto [pid_tok, extra] = split_first_token(tail);
+    if (pid_tok.empty() || !extra.empty())
+      return "Usage: /online party info <party_id>\n";
+    const auto pid = mp::PartyId::parse_decimal(pid_tok);
+    if (!pid.has_value())
+      return "Invalid party_id: '" + sanitize_inline(pid_tok, 64) + "'\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto info = opened.client->get_party(pid.value());
+    if (!info.has_value()) {
+      return "Online party info failed: " + format_mp_error_detail(info.error()) + "\n";
+    }
+    const mp::PartySummary &p = info.value();
+    std::string out = "Online party " + p.party_id.to_decimal() + ":\n";
+    out += "  party_epoch:      " + std::to_string(p.party_epoch) + "\n";
+    out += "  leader_account:   " + p.leader_account_id.to_decimal() + "\n";
+    out += "  leader_device:    " + p.leader_device_id.to_decimal() + "\n";
+    out += "  visibility:       " + std::string{party_visibility_name(p.visibility)} +
+           "\n";
+    out +=
+        "  join_mode:        " + std::string{party_join_mode_name(p.join_mode)} + "\n";
+    out +=
+        "  relay_policy:     " + std::string{relay_policy_name(p.relay_policy)} + "\n";
+    out += "  members:          " + std::to_string(p.member_count) + "/" +
+           std::to_string(p.max_members) + "\n";
+    out += "  pinned_relay_url: " +
+           (p.pinned_relay_url.empty() ? std::string{"(none)"}
+                                       : sanitize_inline(p.pinned_relay_url, 128)) +
+           "\n";
+    return out;
+  }
+
+  if (action == "invite") {
+    const auto [pid_tok, extra] = split_first_token(tail);
+    if (pid_tok.empty() || !extra.empty())
+      return "Usage: /online party invite <party_id>\n";
+    const auto pid = mp::PartyId::parse_decimal(pid_tok);
+    if (!pid.has_value())
+      return "Invalid party_id: '" + sanitize_inline(pid_tok, 64) + "'\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    mp::CreatePartyInviteRequest req{pid.value(), std::nullopt, 1U, 3600U};
+    const auto inv = opened.client->create_party_invite(req);
+    if (!inv.has_value()) {
+      return "Online party invite failed: " + format_mp_error_detail(inv.error()) +
+             "\n";
+    }
+    std::string out = "Created online party invite:\n";
+    out += "  party_id:        " + pid.value().to_decimal() + "\n";
+    out += "  party_invite_id: " + inv.value().party_invite_id.to_decimal() + "\n";
+    out += "  expires_at_ms:   " + std::to_string(inv.value().expires_at_ms) + "\n";
+    if (inv.value().invite_link.has_value() && !inv.value().invite_link->empty()) {
+      out += "  invite_link:     " + sanitize_inline(*inv.value().invite_link, 256) +
+             " (share over a confidential channel)\n";
+    }
+    return out;
+  }
+
+  if (action == "join") {
+    const auto [target, extra] = split_first_token(tail);
+    if (target.empty() || !extra.empty())
+      return "Usage: /online party join <party_id|mppi1_...>\n";
+    std::optional<mp::PartyId> pid;
+    std::optional<std::string> invite_link;
+    CleanseOptionalStringGuard invite_guard{invite_link};
+    if (target.starts_with("mppi1_")) {
+      auto parsed = parse_online_party_invite_link(target);
+      if (!parsed.has_value()) {
+        return "Invalid online party invite link (expected "
+               "mppi1_<party_id>_<secret>)\n";
+      }
+      pid = parsed->party_id;
+      invite_link = std::move(parsed->invite_link);
+    } else {
+      const auto parsed = mp::PartyId::parse_decimal(target);
+      if (!parsed.has_value()) {
+        return "Invalid party_id: '" + sanitize_inline(target, 64) + "'\n";
+      }
+      pid = parsed.value();
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const mp::EndpointDescriptor ep{
+        mp::TransportKind::iroh_quic, std::string{kDefaultOnlineRelayUrl}, {}};
+    mp::JoinPartyRequest req{*pid, ep, std::move(invite_link)};
+    CleanseOptionalStringGuard req_invite_guard{req.invite_link};
+    const auto joined = opened.client->join_party(req);
+    if (!joined.has_value()) {
+      return "Online party join failed: " + format_mp_error_detail(joined.error()) +
+             "\n";
+    }
+    if (joined.value().pending_approval) {
+      std::string out =
+          "Online party join pending approval: party_id=" + pid->to_decimal();
+      if (joined.value().request_id.has_value())
+        out += " request_id=" + joined.value().request_id->to_decimal();
+      out += '\n';
+      return out;
+    }
+    return "Joined online party " + pid->to_decimal() +
+           " (party_epoch=" + std::to_string(joined.value().party_epoch) + ")\n";
+  }
+
+  if (action == "leave") {
+    const auto [pid_tok, extra] = split_first_token(tail);
+    if (pid_tok.empty() || !extra.empty())
+      return "Usage: /online party leave <party_id>\n";
+    const auto pid = mp::PartyId::parse_decimal(pid_tok);
+    if (!pid.has_value())
+      return "Invalid party_id: '" + sanitize_inline(pid_tok, 64) + "'\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto left = opened.client->leave_party(pid.value());
+    if (!left.has_value()) {
+      return "Online party leave failed: " + format_mp_error_detail(left.error()) +
+             "\n";
+    }
+    return "Left online party " + pid.value().to_decimal() +
+           " (party_epoch=" + std::to_string(left.value().party_epoch) + ")\n";
+  }
+
+  if (action == "disband") {
+    const auto [pid_tok, epoch_rest] = split_first_token(tail);
+    if (pid_tok.empty())
+      return "Usage: /online party disband <party_id> [epoch]\n";
+    const auto pid = mp::PartyId::parse_decimal(pid_tok);
+    if (!pid.has_value())
+      return "Invalid party_id: '" + sanitize_inline(pid_tok, 64) + "'\n";
+    std::optional<std::uint64_t> explicit_epoch;
+    if (!epoch_rest.empty()) {
+      const auto [ep_tok, extra] = split_first_token(epoch_rest);
+      if (!extra.empty() || !is_all_ascii_digits(ep_tok))
+        return "Usage: /online party disband <party_id> [epoch]\n";
+      std::uint64_t parsed_epoch = 0;
+      const auto [ptr, ec] =
+          std::from_chars(ep_tok.data(), ep_tok.data() + ep_tok.size(), parsed_epoch);
+      if (ec != std::errc{} || ptr != ep_tok.data() + ep_tok.size())
+        return "Invalid party epoch: '" + sanitize_inline(ep_tok, 32) + "'\n";
+      explicit_epoch = parsed_epoch;
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    std::uint64_t expected_epoch = 0;
+    if (explicit_epoch.has_value()) {
+      expected_epoch = *explicit_epoch;
+    } else {
+      const auto summary = opened.client->get_party(pid.value());
+      if (!summary.has_value()) {
+        return "Online party disband failed (fetch epoch): " +
+               format_mp_error_detail(summary.error()) + "\n";
+      }
+      expected_epoch = summary.value().party_epoch;
+    }
+    const auto disbanded = opened.client->disband_party(
+        mp::DisbandPartyRequest{pid.value(), expected_epoch});
+    if (!disbanded.has_value()) {
+      return "Online party disband failed: " +
+             format_mp_error_detail(disbanded.error()) + "\n";
+    }
+    return "Disbanded online party " + pid.value().to_decimal() +
+           " (party_epoch=" + std::to_string(disbanded.value().party_epoch) + ")\n";
+  }
+
+  return "Usage: /online party [create [private|friends] [force|allow|no]|"
+         "info <party_id>|invite <party_id>|join <party_id|mppi1_...>|"
+         "leave <party_id>|disband <party_id> [epoch]]\n";
+}
+
+std::string handle_online(std::string_view args) {
+  const auto [sub, rest] = split_first_token(args);
+  const std::string_view cmd = sub.empty() ? std::string_view{"status"} : sub;
+
+  if (cmd == "help" || cmd == "--help" || cmd == "-h") {
+    if (!rest.empty())
+      return "Usage: /online help\n";
+    return std::string{kOnlineHelpText};
+  }
+
+  const OnlineEnvConfig env = load_online_env_config();
+  if (!env.fatal_error.empty())
+    return env.fatal_error;
+
+  if (cmd == "status") {
+    if (!rest.empty())
+      return "Usage: /online [status]\n";
+    return handle_online_status(env);
+  }
+
+  if (cmd == "health") {
+    if (!rest.empty())
+      return "Usage: /online health\n";
+    mp::MpControlClient client{env.client_cfg};
+    const auto res = client.health();
+    if (!res.has_value()) {
+      return "Online health failed: " + format_mp_error_detail(res.error()) + "\n";
+    }
+    return "Online health (" + sanitize_inline(env.client_cfg.authority, 128) + "):\n" +
+           "  status:        " + (res.value().ok ? "ok" : "degraded") + "\n" +
+           "  server_now_ms: " + std::to_string(res.value().server_now_ms) + "\n";
+  }
+
+  if (cmd == "whoami") {
+    if (!rest.empty())
+      return "Usage: /online whoami\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto res = opened.client->whoami();
+    if (!res.has_value()) {
+      return "Online whoami failed: " + format_mp_error_detail(res.error()) + "\n";
+    }
+    const mp::WhoamiResponse &me = res.value();
+    std::size_t active_devices = 0;
+    for (const auto &d : me.devices) {
+      if (!d.revoked_at_ms.has_value())
+        ++active_devices;
+    }
+    std::string out = "Online identity:\n";
+    out += "  handle:         " + sanitize_inline(me.handle, 64) + "\n";
+    out += "  account_id:     " + me.account_id.to_decimal() + "\n";
+    if (opened.client->identity().has_value() &&
+        opened.client->identity()->device_id.has_value()) {
+      out += "  device_id:      " + opened.client->identity()->device_id->to_decimal() +
+             "\n";
+    }
+    out +=
+        "  root_pubkey:    sha256:" + format_pubkey_sha256_hex(me.root_pubkey) + "\n";
+    if (const auto sn = mp::compute_safety_number(me.account_id, me.root_pubkey);
+        sn.has_value()) {
+      out += "  safety_number:  " + sn.value() + "\n";
+    }
+    out += "  active_devices: " + std::to_string(active_devices) + "/" +
+           std::to_string(me.devices.size()) + "\n";
+    const std::size_t shown_devs = std::min(me.devices.size(), kMaxListRows);
+    for (std::size_t i = 0; i < shown_devs; ++i) {
+      const auto &d = me.devices[i];
+      out += "    device_id=" + d.device_id.to_decimal() +
+             " label=" + sanitize_inline(d.label, 64) +
+             " gen=" + std::to_string(d.generation) +
+             " pop=" + (d.pop_verified ? "yes" : "no") +
+             " cwt_exp_ms=" + std::to_string(d.cwt_expires_ms);
+      if (d.revoked_at_ms.has_value())
+        out += " [revoked]";
+      out += '\n';
+    }
+    if (me.devices.size() > shown_devs) {
+      out += "    ... (" + std::to_string(me.devices.size() - shown_devs) + " more)\n";
+    }
+    out += "  active_parties: " + std::to_string(me.active_party_ids.size());
+    if (!me.active_party_ids.empty()) {
+      out += " [";
+      const std::size_t shown_parties =
+          std::min(me.active_party_ids.size(), kMaxListRows);
+      for (std::size_t i = 0; i < shown_parties; ++i) {
+        if (i > 0)
+          out += ", ";
+        out += me.active_party_ids[i].to_decimal();
+      }
+      if (me.active_party_ids.size() > shown_parties)
+        out += ", ...";
+      out += "]";
+    }
+    out += '\n';
+    return out;
+  }
+
+  if (cmd == "resolve") {
+    const auto [handle_tok, extra] = split_first_token(rest);
+    if (handle_tok.empty() || !extra.empty())
+      return "Usage: /online resolve <handle>\n";
+    const auto valid_handle = mp::AccountHandle::parse(handle_tok);
+    if (!valid_handle.has_value()) {
+      return "Invalid handle '" + sanitize_inline(handle_tok, 64) +
+             "': " + format_mp_error_detail(valid_handle.error()) + "\n";
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto resolved = opened.client->resolve_handle(handle_tok);
+    if (!resolved.has_value()) {
+      return "Online resolve failed (" + sanitize_inline(handle_tok, 64) +
+             "): " + format_mp_error_detail(resolved.error()) + "\n";
+    }
+    const mp::ResolvedAccount &acc = resolved.value();
+    std::string out = "Resolved online account:\n"
+                      "  handle:      " +
+                      sanitize_inline(acc.handle, 64) +
+                      "\n"
+                      "  account_id:  " +
+                      acc.account_id.to_decimal() +
+                      "\n"
+                      "  root_pubkey: sha256:" +
+                      format_pubkey_sha256_hex(acc.root_pubkey) + "\n";
+    if (const auto sn = mp::compute_safety_number(acc.account_id, acc.root_pubkey);
+        sn.has_value()) {
+      out += "  safety_number: " + sn.value() + "\n";
+    }
+    return out;
+  }
+
+  if (cmd == "friends") {
+    if (!rest.empty() && rest != "list")
+      return "Usage: /online friends\n";
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto res = opened.client->list_friends();
+    if (!res.has_value()) {
+      return "Online friends failed: " + format_mp_error_detail(res.error()) + "\n";
+    }
+    const auto &edges = res.value();
+    std::size_t friend_n = 0;
+    std::size_t pending_n = 0;
+    std::size_t blocked_n = 0;
+    for (const auto &e : edges) {
+      if (e.state == mp::FriendEdgeState::friend_edge)
+        ++friend_n;
+      else if (e.state == mp::FriendEdgeState::blocked)
+        ++blocked_n;
+      else
+        ++pending_n;
+    }
+    std::string out = "Online friends (friends=" + std::to_string(friend_n) +
+                      ", pending=" + std::to_string(pending_n) +
+                      ", blocked=" + std::to_string(blocked_n) + "):\n";
+    if (edges.empty()) {
+      out += "  (none)\n";
+      return out;
+    }
+    const std::size_t shown = std::min(edges.size(), kMaxListRows);
+    for (std::size_t i = 0; i < shown; ++i) {
+      const auto &e = edges[i];
+      out += "  account_id=" + e.peer_account_id.to_decimal() + " [" +
+             std::string{friend_edge_state_name(e.state)} +
+             "] updated_ms=" + std::to_string(e.updated_at_ms) + "\n";
+    }
+    if (edges.size() > shown) {
+      out += "  ... (" + std::to_string(edges.size() - shown) + " more)\n";
+    }
+    return out;
+  }
+
+  if (cmd == "friend")
+    return handle_online_friend(rest, env);
+
+  if (cmd == "party")
+    return handle_online_party(rest, env);
+
+  return "Unknown /online subcommand '" + sanitize_inline(cmd, 48) +
+         "'. Run `/online help` for usage.\n";
+}
+
 std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx) {
   const auto root = resolve_project_root(ctx);
   const auto party_config_path = resolve_party_config_path(ctx);
   const auto platoon_dir = root / ".blackbird" / "platoon";
   const auto [sub, rest] = split_first_token(args);
+
+  // /party online <args...> -> route cleanly to /online handler!
+  if (sub == "online")
+    return handle_online(rest);
 
   // /party close | /party hide
   if (sub == "close" || sub == "hide") {
@@ -3046,6 +3957,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_flightdeck(args, ctx));
     if (cmd == "/party")
       return bound_output(handle_party(args, ctx));
+    if (cmd == "/online")
+      return bound_output(handle_online(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

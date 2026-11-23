@@ -14132,3 +14132,15 @@ Blackbird must not present itself as another product.
   verified 100% bit-exact parity across every vector in `../multiplayer_site/docs/TEST_VECTORS.json` with zero codec discrepancies and recorded the operator's standalone non-Blackbird Outpost contract pointing to sibling repo `../multiplayer_outpost` (Platoon 3).
 - **Build & Review Trail (`CMakeLists.txt`):**
   linked `OpenSSL::SSL` (static `libssl.a` + `libcrypto.a` on macOS Release) and registered `mp_client` and `p2p_party_session` ctests (322 total ctests); archived `@dentist-2`'s Wave 11 verification report in `papers/2026-11-23-wave11-mpclient-p2psession-vectors-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #26 (Wave 12): `blackbird online` CLI, `/online` TUI Slash Commands, Canonical Cross-Company Safety Number & Linux Release Fix
+
+- **Linux Release Fix (`tests/mp_client_test.cpp`):**
+  replaced `-DNDEBUG`-compiled-out `assert()` calls with always-active C++23 `std::source_location` `require_ok`/`require_opt` helpers caught by `wintermute` Linux `release` verification (`context/linux/run-fyvqqmso`).
+- **Wave 12A — `blackbird online` CLI (`src/command_post_cli.cpp`, `tests/command_post_cli_test.cpp`, `scripts/blackbird`):**
+  wired `blackbird online health|register|whoami|resolve|devices|friends|party` (`scripts/blackbird` direct passthrough, `0700`/`0600` preflight preventing root-key clobbering or burned single-use invites, zero secret printing, `--epoch` safe-positive validation, canonical `safety_number` JSON output, offline loopback TLS 1.3 E2E tests).
+- **Wave 12B — Interactive `/online` & `/party online` TUI (`src/command_post_tui.cpp`, `tests/command_post_tui_test.cpp`, `src/terminal.cpp`):**
+  wired `/online` palette command and `/party online` alias (`status`, `health`, `whoami`, `resolve`, `friends`, `friend add/remove/block`, `party create/info/invite/join/leave/disband`), passive zero-disk-write status, `safety_number` display, `sanitize_inline()` escaping of untrusted server strings, and offline loopback TLS 1.3 tests.
+- **Wave 12C — Canonical Cross-Company Safety Number (`include/blackbird/mp_protocol.hpp`, `src/mp_protocol.cpp`, `tests/mp_protocol_test.cpp`):**
+  implemented `mp::compute_safety_number(AccountId, Ed25519PubKey)` matching Platoon 3 (`../multiplayer_outpost`, `xplat-board` `seq #15`/`#17`): `"mp-safety-v1:" || u64_le(account_id) || root_pubkey[32]` -> SHA-256[:20] -> 32 uppercase Crockford Base32 chars (`XXXX-XXXX-...`, 39 chars, golden vector `SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV`).
+- **Review Trail:** archived `@dentist-2`'s Wave 12 verification report in `papers/2026-11-23-wave12-online-cli-tui-safety-number-dentist-review.md`.

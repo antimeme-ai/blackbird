@@ -246,6 +246,11 @@ Result<Sha256Digest>
 hash_party_invite_secret(PartyId party_id,
                          std::span<const std::uint8_t, 32> raw_secret);
 
+inline constexpr std::size_t kSafetyNumberFormattedLength = 39U;
+
+Result<std::string> compute_safety_number(AccountId account_id,
+                                          const Ed25519PubKey &root_pubkey);
+
 class AccountHandle {
 public:
   static Result<AccountHandle> parse(std::string_view raw);

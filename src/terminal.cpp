@@ -191,6 +191,11 @@ const std::array builtin_commands{
                 "[status|peers|add ALIAS|all|operators|leaders|conflicts|say TEXT|"
                 "create [ROOM]|join URI|invite [URL]|close|leave|remove ALIAS]",
                 "Open/inspect Party Chat, manage peers, or message @all / @leader",
+                "Command Post"},
+    ChatCommand{"/online",
+                "[status|health|whoami|resolve HANDLE|friends|friend add/remove/block|"
+                "party create/info/invite/join/leave/disband]",
+                "Manage multiplayer.tech account, friends, and online P2P parties",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>

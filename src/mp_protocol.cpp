@@ -2024,6 +2024,56 @@ hash_party_invite_secret(PartyId party_id,
   return out;
 }
 
+Result<std::string> compute_safety_number(AccountId account_id,
+                                          const Ed25519PubKey &root_pubkey) {
+  if (const auto valid = validate_ed25519_pubkey_strict(root_pubkey);
+      !valid.has_value()) {
+    return Result<std::string>::failure(valid.error());
+  }
+
+  static constexpr std::string_view kDomain = "mp-safety-v1:";
+  static_assert(kDomain.size() == 13U);
+
+  std::array<std::uint8_t, kDomain.size() + 8U + 32U> preimage{};
+  static_assert(preimage.size() == 53U);
+  const auto acct_le = account_id.to_le_bytes();
+  std::memcpy(preimage.data(), kDomain.data(), kDomain.size());
+  std::memcpy(preimage.data() + kDomain.size(), acct_le.data(), acct_le.size());
+  std::memcpy(preimage.data() + kDomain.size() + acct_le.size(), root_pubkey.data(),
+              root_pubkey.size());
+
+  const auto digest = sha256(preimage);
+  if (!digest.has_value()) {
+    return Result<std::string>::failure(digest.error());
+  }
+
+  static constexpr std::string_view kCrockfordBase32 =
+      "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  static_assert(kCrockfordBase32.size() == 32U);
+
+  // First 20 bytes (160 bits = 4 x 40-bit chunks = 32 x 5-bit Crockford symbols),
+  // big-endian bit stream (MSB first, RFC 4648 bit ordering), formatted as
+  // 8 hyphen-separated groups of 4 (39 chars total).
+  std::string out;
+  out.reserve(kSafetyNumberFormattedLength);
+  for (std::size_t chunk = 0U; chunk < 4U; ++chunk) {
+    const std::size_t base = chunk * 5U;
+    std::uint64_t bits = 0U;
+    for (std::size_t byte_idx = 0U; byte_idx < 5U; ++byte_idx) {
+      bits = (bits << 8U) | static_cast<std::uint64_t>(digest.value()[base + byte_idx]);
+    }
+    for (std::size_t sym = 0U; sym < 8U; ++sym) {
+      if (!out.empty() && (((chunk * 8U) + sym) % 4U) == 0U) {
+        out.push_back('-');
+      }
+      const std::size_t shift = (7U - sym) * 5U;
+      const auto index = static_cast<std::size_t>((bits >> shift) & 0x1fU);
+      out.push_back(kCrockfordBase32[index]);
+    }
+  }
+  return Result<std::string>::success(std::move(out));
+}
+
 Result<AccountHandle> AccountHandle::parse(std::string_view raw) {
   if (raw.size() < 3U || raw.size() > 32U) {
     return fail<AccountHandle>(ErrorCode::invalid_identity, MpError::invalid_handle);

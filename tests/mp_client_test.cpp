@@ -6,10 +6,10 @@
 #include <arpa/inet.h>
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <source_location>
 #include <span>
 #include <string>
 #include <string_view>
@@ -44,6 +45,25 @@ namespace {
 
 using namespace blackbird;
 using namespace blackbird::mp;
+
+void require_ok(bool ok, std::source_location loc = std::source_location::current()) {
+  if (!ok) {
+    std::cerr << "mp_client_test FAIL at " << loc.file_name() << ":" << loc.line()
+              << "\n";
+    std::abort();
+  }
+}
+
+template <typename T>
+const T &require_opt(const std::optional<T> &opt,
+                     std::source_location loc = std::source_location::current()) {
+  if (!opt.has_value()) {
+    std::cerr << "mp_client_test FAIL (empty optional) at " << loc.file_name() << ":"
+              << loc.line() << "\n";
+    std::abort();
+  }
+  return *opt;
+}
 
 // ---------------------------------------------------------------------------
 // Temp directory RAII helper
@@ -82,25 +102,25 @@ EphemeralCert generate_self_signed_cert(const std::filesystem::path &out_pem,
   out.pem_path = out_pem;
 
   EVP_PKEY *raw_key = EVP_EC_gen("P-256");
-  assert(raw_key != nullptr);
+  require_ok(raw_key != nullptr);
   out.key.reset(raw_key);
 
   X509 *raw_cert = X509_new();
-  assert(raw_cert != nullptr);
+  require_ok(raw_cert != nullptr);
   out.cert.reset(raw_cert);
 
-  assert(X509_set_version(raw_cert, 2L) == 1);
-  assert(ASN1_INTEGER_set(X509_get_serialNumber(raw_cert), 1L) == 1);
-  assert(X509_gmtime_adj(X509_getm_notBefore(raw_cert), -3600L) != nullptr);
-  assert(X509_gmtime_adj(X509_getm_notAfter(raw_cert), 86400L) != nullptr);
-  assert(X509_set_pubkey(raw_cert, raw_key) == 1);
+  require_ok(X509_set_version(raw_cert, 2L) == 1);
+  require_ok(ASN1_INTEGER_set(X509_get_serialNumber(raw_cert), 1L) == 1);
+  require_ok(X509_gmtime_adj(X509_getm_notBefore(raw_cert), -3600L) != nullptr);
+  require_ok(X509_gmtime_adj(X509_getm_notAfter(raw_cert), 86400L) != nullptr);
+  require_ok(X509_set_pubkey(raw_cert, raw_key) == 1);
 
   X509_NAME *name = X509_get_subject_name(raw_cert);
-  assert(name != nullptr);
-  assert(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                                    reinterpret_cast<const unsigned char *>(san_dns),
-                                    -1, -1, 0) == 1);
-  assert(X509_set_issuer_name(raw_cert, name) == 1);
+  require_ok(name != nullptr);
+  require_ok(X509_NAME_add_entry_by_txt(
+                 name, "CN", MBSTRING_ASC,
+                 reinterpret_cast<const unsigned char *>(san_dns), -1, -1, 0) == 1);
+  require_ok(X509_set_issuer_name(raw_cert, name) == 1);
 
   X509V3_CTX v3ctx{};
   X509V3_set_ctx_nodb(&v3ctx);
@@ -109,8 +129,8 @@ EphemeralCert generate_self_signed_cert(const std::filesystem::path &out_pem,
   auto add_ext = [&](int nid, const char *val) {
     X509_EXTENSION *ext =
         X509V3_EXT_conf_nid(nullptr, &v3ctx, nid, const_cast<char *>(val));
-    assert(ext != nullptr);
-    assert(X509_add_ext(raw_cert, ext, -1) == 1);
+    require_ok(ext != nullptr);
+    require_ok(X509_add_ext(raw_cert, ext, -1) == 1);
     X509_EXTENSION_free(ext);
   };
   add_ext(NID_basic_constraints, "critical,CA:TRUE");
@@ -118,12 +138,12 @@ EphemeralCert generate_self_signed_cert(const std::filesystem::path &out_pem,
   const std::string san_value = std::string{"DNS:"} + san_dns + ",IP:127.0.0.1";
   add_ext(NID_subject_alt_name, san_value.c_str());
 
-  assert(X509_sign(raw_cert, raw_key, EVP_sha256()) != 0);
+  require_ok(X509_sign(raw_cert, raw_key, EVP_sha256()) != 0);
 
   FILE *fp = std::fopen(out_pem.c_str(), "wb");
-  assert(fp != nullptr);
-  assert(PEM_write_X509(fp, raw_cert) == 1);
-  assert(std::fclose(fp) == 0);
+  require_ok(fp != nullptr);
+  require_ok(PEM_write_X509(fp, raw_cert) == 1);
+  require_ok(std::fclose(fp) == 0);
   return out;
 }
 
@@ -169,8 +189,8 @@ std::string ws_accept_for(std::string_view key) {
   in.append("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
   std::array<unsigned char, 20> digest{};
   unsigned int len = 0U;
-  assert(EVP_Digest(in.data(), in.size(), digest.data(), &len, EVP_sha1(), nullptr) ==
-         1);
+  require_ok(
+      EVP_Digest(in.data(), in.size(), digest.data(), &len, EVP_sha1(), nullptr) == 1);
   return base64_encode_test(std::span<const std::uint8_t>{digest.data(), len});
 }
 
@@ -360,27 +380,29 @@ public:
   LoopbackTlsServer(const EphemeralCert &cert, LoopbackServerState &state)
       : state_(state) {
     ctx_ = SSL_CTX_new(TLS_server_method());
-    assert(ctx_ != nullptr);
-    assert(SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION) == 1);
-    assert(SSL_CTX_use_certificate(ctx_, cert.cert.get()) == 1);
-    assert(SSL_CTX_use_PrivateKey(ctx_, cert.key.get()) == 1);
+    require_ok(ctx_ != nullptr);
+    require_ok(SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION) == 1);
+    require_ok(SSL_CTX_use_certificate(ctx_, cert.cert.get()) == 1);
+    require_ok(SSL_CTX_use_PrivateKey(ctx_, cert.key.get()) == 1);
     SSL_CTX_set_alpn_select_cb(ctx_, &alpn_select_http11, nullptr);
 
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    assert(listen_fd_ >= 0);
+    require_ok(listen_fd_ >= 0);
     const int one = 1;
-    assert(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0);
+    require_ok(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ==
+               0);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0U;
-    assert(::bind(listen_fd_, reinterpret_cast<const sockaddr *>(&addr),
-                  sizeof(addr)) == 0);
+    require_ok(::bind(listen_fd_, reinterpret_cast<const sockaddr *>(&addr),
+                      sizeof(addr)) == 0);
     socklen_t len = sizeof(addr);
-    assert(::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
+    require_ok(::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&addr), &len) ==
+               0);
     port_ = ntohs(addr.sin_port);
-    assert(::listen(listen_fd_, 16) == 0);
+    require_ok(::listen(listen_fd_, 16) == 0);
 
     thread_ = std::thread([this]() { serve_loop(); });
   }
@@ -581,7 +603,7 @@ private:
     }
 
     const auto method = parse_http_method(method_str);
-    assert(method.has_value());
+    require_ok(method.has_value());
 
     const std::span<const std::uint8_t> body_span{
         reinterpret_cast<const std::uint8_t *>(body_str.data()), body_str.size()};
@@ -648,9 +670,9 @@ private:
 
     // 2. POST /v1/accounts/register
     if (method_str == "POST" && path == "/v1/accounts/register") {
-      assert(headers.contains("idempotency-key"));
+      require_ok(headers.contains("idempotency-key"));
       const auto json = parse_json(body_str);
-      assert(json.has_value());
+      require_ok(json.has_value());
       const std::string &root_b64 = json.value().find("root_pubkey_b64")->string();
       const std::string &dev_b64 = json.value().find("device_pubkey_b64")->string();
       const std::string &cwt_b64 = json.value().find("device_cwt_b64")->string();
@@ -688,7 +710,7 @@ private:
 
     // Determine whether .root or device key signed this request.
     const auto parsed_si = parse_signature_input(headers["signature-input"]);
-    assert(parsed_si.has_value());
+    require_ok(parsed_si.has_value());
     Ed25519PubKey verify_pk{};
     {
       std::lock_guard<std::mutex> lk{state_.mu};
@@ -726,18 +748,18 @@ private:
           std::to_string(state_.party_id) + "]}";
       send_json(ssl, 200, "OK", body);
     } else if (method_str == "GET" && path == "/v1/accounts/resolve") {
-      assert(query == "?handle=" + state_.handle);
+      require_ok(query == "?handle=" + state_.handle);
       send_json(ssl, 200, "OK",
                 "{\"account_id\":" + std::to_string(state_.account_id) +
                     ",\"handle\":\"" + state_.handle + "\",\"root_pubkey_b64\":\"" +
                     base64_encode_test(state_.registered_root_pubkey) + "\"}");
     } else if (method_str == "POST" && path == "/v1/devices") {
-      assert(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
+      require_ok(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
       send_json(ssl, 201, "Created",
                 "{\"device_id\":" + std::to_string(state_.enrolled_device_id) +
                     ",\"cwt_expires_ms\":" + std::to_string(now_ms + 86400000U) + "}");
     } else if (method_str == "DELETE" && path.starts_with("/v1/devices/")) {
-      assert(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
+      require_ok(std::holds_alternative<RootKeyId>(parsed_si.value().keyid));
       send_json(ssl, 200, "OK",
                 "{\"revoked\":true,\"evicted_parties\":[" +
                     std::to_string(state_.party_id) + "],\"pending_retries\":0}");
@@ -889,7 +911,7 @@ private:
     // PARTY_SNAPSHOT!
     const auto hello_bytes = encode_frame(
         0U, HelloAckMessage{SessionId::create(99U).value(), 1700000000000U, 20000U});
-    assert(hello_bytes.has_value());
+    require_ok(hello_bytes.has_value());
     const auto snap_bytes = encode_frame(0U, PartySnapshotMessage{
                                                  PartyId::create(5001U).value(),
                                                  2U,
@@ -902,7 +924,7 @@ private:
                                                  "https://relay.multiplayer.tech",
                                                  {member},
                                              });
-    assert(snap_bytes.has_value());
+    require_ok(snap_bytes.has_value());
 
     // Coalesce 101 + HELLO_ACK in one write
     std::vector<std::uint8_t> initial(resp.begin(), resp.end());
@@ -929,7 +951,7 @@ private:
       if (!f.has_value()) {
         break;
       }
-      assert(f->masked); // RFC 6455 client MUST mask!
+      require_ok(f->masked); // RFC 6455 client MUST mask!
       if (f->opcode == 0x0aU) {
         if (f->payload.size() == ping_payload.size() &&
             std::memcmp(f->payload.data(), ping_payload.data(), ping_payload.size()) ==
@@ -939,8 +961,8 @@ private:
         }
       } else if (f->opcode == 0x02U) {
         const auto decoded = decode_frame(f->payload);
-        assert(decoded.has_value());
-        assert(decoded.value().header.opcode == Opcode::party_endpoint_update);
+        require_ok(decoded.has_value());
+        require_ok(decoded.value().header.opcode == Opcode::party_endpoint_update);
         std::lock_guard<std::mutex> lk{state_.mu};
         state_.ws_received_masked_endpoint_update = true;
       } else if (f->opcode == 0x01U) {
@@ -990,14 +1012,15 @@ void test_identity_store() {
 
   // 1. open_existing fails closed without creating directories/files.
   const auto missing = MpIdentityStore::open_existing(missing_dir);
-  assert(!missing.has_value());
-  assert(mp_client_error_of(missing.error()) == MpClientError::keystore_not_found);
-  assert(!std::filesystem::exists(missing_dir));
+  require_ok(!missing.has_value());
+  require_ok(mp_client_error_of(missing.error()) == MpClientError::keystore_not_found);
+  require_ok(!std::filesystem::exists(missing_dir));
 
   // 2. Reject `..` traversal path.
   const auto traversal = MpIdentityStore::open_existing(tmp.path / "a" / ".." / "b");
-  assert(!traversal.has_value());
-  assert(mp_client_error_of(traversal.error()) == MpClientError::keystore_invalid_path);
+  require_ok(!traversal.has_value());
+  require_ok(mp_client_error_of(traversal.error()) ==
+             MpClientError::keystore_invalid_path);
 
   // 3. Save with root_seed + device_seed + metadata + CWT and check 0700/0600 perms.
   auto root_seed = CleansedSeed::generate().value();
@@ -1023,49 +1046,49 @@ void test_identity_store() {
 
   const auto store_dir = tmp.path / "identity";
   auto saved = MpIdentityStore::save(store_dir, state);
-  assert(saved.has_value());
+  require_ok(saved.has_value());
 
   struct stat st{};
-  assert(::stat(store_dir.c_str(), &st) == 0);
-  assert((st.st_mode & 0777U) == 0700U);
+  require_ok(::stat(store_dir.c_str(), &st) == 0);
+  require_ok((st.st_mode & 0777U) == 0700U);
   for (const char *fname :
        {"device.seed", "root.seed", "device.cwt", "identity.json"}) {
     const auto fpath = store_dir / fname;
-    assert(::stat(fpath.c_str(), &st) == 0);
-    assert((st.st_mode & 0777U) == 0600U);
+    require_ok(::stat(fpath.c_str(), &st) == 0);
+    require_ok((st.st_mode & 0777U) == 0600U);
   }
 
   // Round-trip reload
   auto reloaded = MpIdentityStore::open_existing(store_dir);
-  assert(reloaded.has_value());
-  assert(reloaded.value().state() == state);
-  assert(reloaded.value().device_signing_key().value().public_key() ==
-         dev_key.public_key());
-  assert(reloaded.value().root_signing_key().value().public_key() ==
-         root_key.public_key());
+  require_ok(reloaded.has_value());
+  require_ok(reloaded.value().state() == state);
+  require_ok(reloaded.value().device_signing_key().value().public_key() ==
+             dev_key.public_key());
+  require_ok(reloaded.value().root_signing_key().value().public_key() ==
+             root_key.public_key());
 
   // 4. Secondary device (no root_seed): root.seed removed cleanly!
   MpIdentityState secondary = state;
   secondary.root_seed.reset();
-  assert(reloaded.value().update(secondary).has_value());
-  assert(!std::filesystem::exists(store_dir / "root.seed"));
+  require_ok(reloaded.value().update(secondary).has_value());
+  require_ok(!std::filesystem::exists(store_dir / "root.seed"));
   const auto reloaded_sec = MpIdentityStore::open_existing(store_dir);
-  assert(reloaded_sec.has_value());
-  assert(!reloaded_sec.value().state().root_seed.has_value());
-  assert(mp_client_error_of(reloaded_sec.value().root_signing_key().error()) ==
-         MpClientError::missing_root_key);
+  require_ok(reloaded_sec.has_value());
+  require_ok(!reloaded_sec.value().state().root_seed.has_value());
+  require_ok(mp_client_error_of(reloaded_sec.value().root_signing_key().error()) ==
+             MpClientError::missing_root_key);
 
   // 5. Reject symlink directory.
   const auto sym_dir = tmp.path / "sym_identity";
   std::filesystem::create_directory_symlink(store_dir, sym_dir);
   const auto sym_open = MpIdentityStore::open_existing(sym_dir);
-  assert(!sym_open.has_value());
-  assert(mp_client_error_of(sym_open.error()) ==
-         MpClientError::keystore_symlink_rejected);
+  require_ok(!sym_open.has_value());
+  require_ok(mp_client_error_of(sym_open.error()) ==
+             MpClientError::keystore_symlink_rejected);
   const auto sym_save = MpIdentityStore::save(sym_dir, secondary);
-  assert(!sym_save.has_value());
-  assert(mp_client_error_of(sym_save.error()) ==
-         MpClientError::keystore_symlink_rejected);
+  require_ok(!sym_save.has_value());
+  require_ok(mp_client_error_of(sym_save.error()) ==
+             MpClientError::keystore_symlink_rejected);
 
   // 6. Reject symlink file inside store directory.
   const auto fake_seed = tmp.path / "outside.seed";
@@ -1073,48 +1096,48 @@ void test_identity_store() {
     std::ofstream ofs{fake_seed, std::ios::binary};
     ofs.write(reinterpret_cast<const char *>(dev_seed.bytes().data()), 32);
   }
-  assert(::chmod(fake_seed.c_str(), mode_t{0600}) == 0);
+  require_ok(::chmod(fake_seed.c_str(), mode_t{0600}) == 0);
   std::filesystem::remove(store_dir / "device.seed");
   std::filesystem::create_symlink(fake_seed, store_dir / "device.seed");
   const auto sym_file = MpIdentityStore::open_existing(store_dir);
-  assert(!sym_file.has_value());
-  assert(mp_client_error_of(sym_file.error()) ==
-         MpClientError::keystore_symlink_rejected);
+  require_ok(!sym_file.has_value());
+  require_ok(mp_client_error_of(sym_file.error()) ==
+             MpClientError::keystore_symlink_rejected);
 
   // 7. Reject insecure permissions (0755 directory).
   const auto bad_perm_dir = tmp.path / "bad_perm";
-  assert(MpIdentityStore::save(bad_perm_dir, secondary).has_value());
-  assert(::chmod(bad_perm_dir.c_str(), mode_t{0755}) == 0);
+  require_ok(MpIdentityStore::save(bad_perm_dir, secondary).has_value());
+  require_ok(::chmod(bad_perm_dir.c_str(), mode_t{0755}) == 0);
   const auto bad_perm_open = MpIdentityStore::open_existing(bad_perm_dir);
-  assert(!bad_perm_open.has_value());
-  assert(mp_client_error_of(bad_perm_open.error()) ==
-         MpClientError::keystore_insecure_permissions);
+  require_ok(!bad_perm_open.has_value());
+  require_ok(mp_client_error_of(bad_perm_open.error()) ==
+             MpClientError::keystore_insecure_permissions);
 
   // 8. Reject corrupted authority inside identity.json on open_existing().
   {
     const auto bad_auth_dir = tmp.path / "bad_auth";
-    assert(MpIdentityStore::save(bad_auth_dir, secondary).has_value());
+    require_ok(MpIdentityStore::save(bad_auth_dir, secondary).has_value());
     const auto meta_path = bad_auth_dir / "identity.json";
     {
       std::ofstream ofs{meta_path, std::ios::binary | std::ios::trunc};
       ofs << "{\"version\":1,\"account_id\":1001,\"device_id\":2001,"
              "\"handle\":\"alice_ks\",\"authority\":\"evil.example/inject\"}";
     }
-    assert(::chmod(meta_path.c_str(), mode_t{0600}) == 0);
+    require_ok(::chmod(meta_path.c_str(), mode_t{0600}) == 0);
     const auto bad_auth_open = MpIdentityStore::open_existing(bad_auth_dir);
-    assert(!bad_auth_open.has_value());
-    assert(mp_client_error_of(bad_auth_open.error()) ==
-           MpClientError::keystore_corrupt);
+    require_ok(!bad_auth_open.has_value());
+    require_ok(mp_client_error_of(bad_auth_open.error()) ==
+               MpClientError::keystore_corrupt);
   }
 
   // 9. Verify CleansedSeed zeroes moved-from buffer.
   CleansedSeed moved_from{dev_seed.bytes()};
   CleansedSeed moved_to{std::move(moved_from)};
-  assert(moved_to.bytes() == dev_seed.bytes());
+  require_ok(moved_to.bytes() == dev_seed.bytes());
   Ed25519Seed all_zero{};
   // Verify cleanse() clears buffer deterministically.
   moved_to.cleanse();
-  assert(moved_to.bytes() == all_zero);
+  require_ok(moved_to.bytes() == all_zero);
 
   std::cout << "PASS test_identity_store\n";
 }
@@ -1163,10 +1186,10 @@ void test_loopback_tls_rest_and_ws() {
     bad_ca_cfg.ca_bundle_path = wrong_cert.pem_path;
     MpControlClient bad_client{bad_ca_cfg};
     const auto bad_health = bad_client.health();
-    assert(!bad_health.has_value());
+    require_ok(!bad_health.has_value());
     const auto err = mp_client_error_of(bad_health.error());
-    assert(err == MpClientError::tls_verify_failed ||
-           err == MpClientError::tls_handshake_failed);
+    require_ok(err == MpClientError::tls_verify_failed ||
+               err == MpClientError::tls_handshake_failed);
   }
 
   // 2. Hostname mismatch MUST fail closed!
@@ -1175,26 +1198,26 @@ void test_loopback_tls_rest_and_ws() {
     bad_host_cfg.authority = "wrong.example.invalid";
     MpControlClient bad_client{bad_host_cfg};
     const auto bad_health = bad_client.health();
-    assert(!bad_health.has_value());
+    require_ok(!bad_health.has_value());
     const auto err = mp_client_error_of(bad_health.error());
-    assert(err == MpClientError::tls_verify_failed ||
-           err == MpClientError::tls_handshake_failed);
+    require_ok(err == MpClientError::tls_verify_failed ||
+               err == MpClientError::tls_handshake_failed);
   }
 
   // 3. health() with Content-Length AND Transfer-Encoding: chunked
   MpControlClient client{base_cfg};
   const auto h1 = client.health();
-  assert(h1.has_value());
-  assert(h1.value().ok);
-  assert(h1.value().server_now_ms > 0U);
+  require_ok(h1.has_value());
+  require_ok(h1.value().ok);
+  require_ok(h1.value().server_now_ms > 0U);
 
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
     srv_state.health_mode = HealthTestMode::chunked;
   }
   const auto h2 = client.health();
-  assert(h2.has_value());
-  assert(h2.value().ok);
+  require_ok(h2.has_value());
+  require_ok(h2.value().ok);
 
   // 3b. Reject corrupt /v1/health timestamps (0 or > kMaxSafeId) and malformed HTTP
   //     framing (unsupported TE, TE+CL together, non-identity Content-Encoding).
@@ -1205,8 +1228,9 @@ void test_loopback_tls_rest_and_ws() {
       srv_state.health_mode = mode;
     }
     const auto bad_h = client.health();
-    assert(!bad_h.has_value());
-    assert(mp_client_error_of(bad_h.error()) == MpClientError::http_response_schema);
+    require_ok(!bad_h.has_value());
+    require_ok(mp_client_error_of(bad_h.error()) ==
+               MpClientError::http_response_schema);
   }
   for (const auto mode :
        {HealthTestMode::unsupported_te_gzip_chunked, HealthTestMode::both_te_and_cl,
@@ -1216,8 +1240,9 @@ void test_loopback_tls_rest_and_ws() {
       srv_state.health_mode = mode;
     }
     const auto bad_h = client.health();
-    assert(!bad_h.has_value());
-    assert(mp_client_error_of(bad_h.error()) == MpClientError::http_malformed_response);
+    require_ok(!bad_h.has_value());
+    require_ok(mp_client_error_of(bad_h.error()) ==
+               MpClientError::http_malformed_response);
   }
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
@@ -1233,10 +1258,10 @@ void test_loopback_tls_rest_and_ws() {
   reg_req.device_label = "laptop";
   reg_req.device_cwt = cwt;
   const auto reg_res = client.register_account(root_key, reg_req);
-  assert(reg_res.has_value());
-  assert(reg_res.value().account_id == AccountId::create(1001U).value());
-  assert(reg_res.value().device_id == DeviceId::create(2001U).value());
-  assert(reg_res.value().handle == "alice_test");
+  require_ok(reg_res.has_value());
+  require_ok(reg_res.value().account_id == AccountId::create(1001U).value());
+  require_ok(reg_res.value().device_id == DeviceId::create(2001U).value());
+  require_ok(reg_res.value().handle == "alice_test");
 
   // Bind client identity
   MpIdentityState id_state{};
@@ -1256,18 +1281,18 @@ void test_loopback_tls_rest_and_ws() {
   }();
   client.set_clock_offset_seconds(600); // 10 minutes skewed forward!
   const auto me = client.whoami();
-  assert(me.has_value());
-  assert(me.value().account_id == AccountId::create(1001U).value());
-  assert(me.value().handle == "alice_test");
-  assert(me.value().devices.size() == 1U);
-  assert(me.value().devices[0].pop_verified);
-  assert(!me.value().devices[0].revoked_at_ms.has_value());
-  assert(me.value().active_party_ids.size() == 1U);
-  assert(std::abs(client.clock_offset_seconds()) <= 5);
+  require_ok(me.has_value());
+  require_ok(me.value().account_id == AccountId::create(1001U).value());
+  require_ok(me.value().handle == "alice_test");
+  require_ok(me.value().devices.size() == 1U);
+  require_ok(me.value().devices[0].pop_verified);
+  require_ok(!me.value().devices[0].revoked_at_ms.has_value());
+  require_ok(me.value().active_party_ids.size() == 1U);
+  require_ok(std::abs(client.clock_offset_seconds()) <= 5);
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
-    assert(srv_state.clock_skew_rejections == 1);
-    assert(srv_state.health_calls == health_before + 1);
+    require_ok(srv_state.clock_skew_rejections == 1);
+    require_ok(srv_state.health_calls == health_before + 1);
   }
 
   // 5b. Backward clock skew (-600s -> server returns 401 {"error":"expired",
@@ -1279,11 +1304,11 @@ void test_loopback_tls_rest_and_ws() {
     }();
     client.set_clock_offset_seconds(-600);
     const auto me_back = client.whoami();
-    assert(me_back.has_value());
-    assert(std::abs(client.clock_offset_seconds()) <= 5);
+    require_ok(me_back.has_value());
+    require_ok(std::abs(client.clock_offset_seconds()) <= 5);
     std::lock_guard<std::mutex> lk{srv_state.mu};
-    assert(srv_state.clock_skew_rejections == 2);
-    assert(srv_state.health_calls == health_pre_back + 1);
+    require_ok(srv_state.clock_skew_rejections == 2);
+    require_ok(srv_state.health_calls == health_pre_back + 1);
   }
 
   // 5c. Genuine 401 {"error":"expired","server_now_ms":now} with accurate clock
@@ -1295,58 +1320,58 @@ void test_loopback_tls_rest_and_ws() {
       return srv_state.health_calls;
     }();
     const auto cwt_exp = client.whoami();
-    assert(!cwt_exp.has_value());
-    assert(mp_client_error_of(cwt_exp.error()) == MpClientError::http_unauthorized);
+    require_ok(!cwt_exp.has_value());
+    require_ok(mp_client_error_of(cwt_exp.error()) == MpClientError::http_unauthorized);
     std::lock_guard<std::mutex> lk{srv_state.mu};
     srv_state.force_non_skew_expired_401 = false;
-    assert(srv_state.health_calls == health_pre_cwt);
+    require_ok(srv_state.health_calls == health_pre_cwt);
   }
 
   // 5d. Extreme clock_offset_seconds (INT64_MAX / INT64_MIN) fails cleanly (zero UB!).
   {
     client.set_clock_offset_seconds(std::numeric_limits<std::int64_t>::max());
     const auto ovf1 = client.whoami();
-    assert(!ovf1.has_value());
-    assert(mp_client_error_of(ovf1.error()) == MpClientError::invalid_config);
+    require_ok(!ovf1.has_value());
+    require_ok(mp_client_error_of(ovf1.error()) == MpClientError::invalid_config);
     client.set_clock_offset_seconds(std::numeric_limits<std::int64_t>::min());
     const auto ovf2 = client.whoami();
-    assert(!ovf2.has_value());
-    assert(mp_client_error_of(ovf2.error()) == MpClientError::invalid_config);
+    require_ok(!ovf2.has_value());
+    require_ok(mp_client_error_of(ovf2.error()) == MpClientError::invalid_config);
     client.set_clock_offset_seconds(0);
   }
 
   // 6. resolve_handle (@query signed!)
   const auto resolved = client.resolve_handle("alice_test");
-  assert(resolved.has_value());
-  assert(resolved.value().account_id == AccountId::create(1001U).value());
-  assert(resolved.value().root_pubkey == root_key.public_key());
+  require_ok(resolved.has_value());
+  require_ok(resolved.value().account_id == AccountId::create(1001U).value());
+  require_ok(resolved.value().root_pubkey == root_key.public_key());
 
   // 7. enroll_device + revoke_device (.root keyid)
   const auto enrolled = client.enroll_device(
       EnrollDeviceRequest{dev_key.public_key(), "wintermute", cwt});
-  assert(enrolled.has_value());
-  assert(enrolled.value().device_id == DeviceId::create(2002U).value());
+  require_ok(enrolled.has_value());
+  require_ok(enrolled.value().device_id == DeviceId::create(2002U).value());
 
   const auto revoked = client.revoke_device(enrolled.value().device_id);
-  assert(revoked.has_value());
-  assert(revoked.value().revoked);
-  assert(revoked.value().evicted_parties.size() == 1U);
+  require_ok(revoked.has_value());
+  require_ok(revoked.value().revoked);
+  require_ok(revoked.value().evicted_parties.size() == 1U);
 
   // 8. Social graph (friends & blocks)
   const auto bob_id = AccountId::create(1002U).value();
   const auto freq = client.send_or_accept_friend(bob_id);
-  assert(freq.has_value());
-  assert(freq.value().http_status == 202);
-  assert(freq.value().state == FriendEdgeState::invite_sent);
+  require_ok(freq.has_value());
+  require_ok(freq.value().http_status == 202);
+  require_ok(freq.value().state == FriendEdgeState::invite_sent);
 
   const auto friends = client.list_friends();
-  assert(friends.has_value());
-  assert(friends.value().size() == 1U);
-  assert(friends.value()[0].peer_account_id == bob_id);
-  assert(friends.value()[0].state == FriendEdgeState::friend_edge);
+  require_ok(friends.has_value());
+  require_ok(friends.value().size() == 1U);
+  require_ok(friends.value()[0].peer_account_id == bob_id);
+  require_ok(friends.value()[0].state == FriendEdgeState::friend_edge);
 
-  assert(client.block_account(bob_id).has_value());
-  assert(client.remove_friend(bob_id).has_value());
+  require_ok(client.block_account(bob_id).has_value());
+  require_ok(client.remove_friend(bob_id).has_value());
 
   // 9. Party lifecycle (create, get, invite, revoke invite, join, kick, leave, disband)
   const EndpointDescriptor ep{
@@ -1359,100 +1384,92 @@ void test_loopback_tls_rest_and_ws() {
       ep,
       "https://relay.multiplayer.tech",
   });
-  assert(created.has_value());
-  assert(created.value().party_id == PartyId::create(5001U).value());
-  assert(created.value().party_epoch == 1U);
+  require_ok(created.has_value());
+  require_ok(created.value().party_id == PartyId::create(5001U).value());
+  require_ok(created.value().party_epoch == 1U);
 
   const auto summary = client.get_party(created.value().party_id);
-  assert(summary.has_value());
-  assert(summary.value().party_id == created.value().party_id);
-  assert(summary.value().relay_policy == RelayPolicy::force_relays);
-  assert(summary.value().member_count == 2U);
+  require_ok(summary.has_value());
+  require_ok(summary.value().party_id == created.value().party_id);
+  require_ok(summary.value().relay_policy == RelayPolicy::force_relays);
+  require_ok(summary.value().member_count == 2U);
 
   const auto inv = client.create_party_invite(
       CreatePartyInviteRequest{created.value().party_id, std::nullopt, 2U, 3600U});
-  assert(inv.has_value());
-  assert(inv.value().invite_link.has_value());
-  assert(
+  require_ok(inv.has_value());
+  require_ok(inv.value().invite_link.has_value());
+  require_ok(
       client.revoke_party_invite(created.value().party_id, inv.value().party_invite_id)
           .has_value());
 
   const auto joined = client.join_party(
       JoinPartyRequest{created.value().party_id, ep, inv.value().invite_link});
-  assert(joined.has_value());
-  assert(!joined.value().pending_approval);
-  assert(joined.value().party_epoch == 2U);
+  require_ok(joined.has_value());
+  require_ok(!joined.value().pending_approval);
+  require_ok(joined.value().party_epoch == 2U);
 
   const auto kicked = client.kick_member(
       KickMemberRequest{created.value().party_id, bob_id, joined.value().party_epoch});
-  assert(kicked.has_value());
-  assert(kicked.value().party_epoch == 3U);
+  require_ok(kicked.has_value());
+  require_ok(kicked.value().party_epoch == 3U);
 
   const auto left = client.leave_party(created.value().party_id);
-  assert(left.has_value());
-  assert(left.value().party_epoch == 4U);
+  require_ok(left.has_value());
+  require_ok(left.value().party_epoch == 4U);
 
   const auto disbanded = client.disband_party(
       DisbandPartyRequest{created.value().party_id, left.value().party_epoch});
-  assert(disbanded.has_value());
-  assert(disbanded.value().party_epoch == 5U);
+  require_ok(disbanded.has_value());
+  require_ok(disbanded.value().party_epoch == 5U);
 
   // 10. Live TLS 1.3 RFC 6455 WebSocket upgrade + HELLO_ACK + fragmented PARTY_SNAPSHOT
   //     + RFC 6455 Ping->Pong + masked send_mp1 + MP1:PING->MP1:PONG + Close(4403)!
   {
     auto ws_res = client.connect_party_socket(created.value().party_id);
-    assert(ws_res.has_value());
+    require_ok(ws_res.has_value());
     MpControlSocket ws = std::move(ws_res).value();
-    assert(ws.is_open());
+    require_ok(ws.is_open());
 
     // Event 1: HELLO_ACK (coalesced directly after 101 headers!)
     const auto ev1 = ws.poll_event(3000);
-    assert(ev1.has_value());
-    const auto &opt1 = ev1.value();
-    assert(opt1.has_value());
-    const auto *f1 = std::get_if<MpWsMp1Frame>(&opt1.value());
-    assert(f1 != nullptr);
-    assert(f1->frame.header.opcode == Opcode::hello_ack);
+    require_ok(ev1.has_value());
+    const auto *f1 = std::get_if<MpWsMp1Frame>(&require_opt(ev1.value()));
+    require_ok(f1 != nullptr);
+    require_ok(f1->frame.header.opcode == Opcode::hello_ack);
     const auto *hello = std::get_if<HelloAckMessage>(&f1->frame.message);
-    assert(hello != nullptr && hello->session_id == SessionId::create(99U).value());
+    require_ok(hello != nullptr && hello->session_id == SessionId::create(99U).value());
 
     // Event 2: fragmented PARTY_SNAPSHOT with interleaved RFC 6455 Ping!
     const auto ev2 = ws.poll_event(3000);
-    assert(ev2.has_value());
-    const auto &opt2 = ev2.value();
-    assert(opt2.has_value());
-    const auto *f2 = std::get_if<MpWsMp1Frame>(&opt2.value());
-    assert(f2 != nullptr);
-    assert(f2->frame.header.opcode == Opcode::party_snapshot);
+    require_ok(ev2.has_value());
+    const auto *f2 = std::get_if<MpWsMp1Frame>(&require_opt(ev2.value()));
+    require_ok(f2 != nullptr);
+    require_ok(f2->frame.header.opcode == Opcode::party_snapshot);
     const auto *snap = std::get_if<PartySnapshotMessage>(&f2->frame.message);
-    assert(snap != nullptr);
-    assert(snap->party_id == created.value().party_id);
-    assert(snap->members.size() == 1U);
+    require_ok(snap != nullptr);
+    require_ok(snap->party_id == created.value().party_id);
+    require_ok(snap->members.size() == 1U);
 
     // Send masked MP1 binary frame + "MP1:PING" heartbeat
-    assert(ws.send_mp1(7U, PartyEndpointUpdateMessage{ep}).has_value());
-    assert(ws.send_ping().has_value());
+    require_ok(ws.send_mp1(7U, PartyEndpointUpdateMessage{ep}).has_value());
+    require_ok(ws.send_ping().has_value());
 
     // Event 3: "MP1:PONG"
     const auto ev3 = ws.poll_event(3000);
-    assert(ev3.has_value());
-    const auto &opt3 = ev3.value();
-    assert(opt3.has_value());
-    assert(std::holds_alternative<MpWsPong>(opt3.value()));
+    require_ok(ev3.has_value());
+    require_ok(std::holds_alternative<MpWsPong>(require_opt(ev3.value())));
 
     // Event 4: Close(4403)
     const auto ev4 = ws.poll_event(3000);
-    assert(ev4.has_value());
-    const auto &opt4 = ev4.value();
-    assert(opt4.has_value());
-    const auto *closed = std::get_if<MpWsClosed>(&opt4.value());
-    assert(closed != nullptr && closed->code == 4403U);
-    assert(!ws.is_open());
+    require_ok(ev4.has_value());
+    const auto *closed = std::get_if<MpWsClosed>(&require_opt(ev4.value()));
+    require_ok(closed != nullptr && closed->code == 4403U);
+    require_ok(!ws.is_open());
 
     std::lock_guard<std::mutex> lk{srv_state.mu};
-    assert(srv_state.ws_received_masked_pong);
-    assert(srv_state.ws_received_masked_endpoint_update);
-    assert(srv_state.ws_received_masked_ping);
+    require_ok(srv_state.ws_received_masked_pong);
+    require_ok(srv_state.ws_received_masked_endpoint_update);
+    require_ok(srv_state.ws_received_masked_ping);
   }
 
   // 11. WebSocket negative security tests:
@@ -1463,8 +1480,8 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
-    assert(!ws_bad.has_value());
-    assert(mp_client_error_of(ws_bad.error()) == MpClientError::ws_accept_mismatch);
+    require_ok(!ws_bad.has_value());
+    require_ok(mp_client_error_of(ws_bad.error()) == MpClientError::ws_accept_mismatch);
   }
 
   // (b) Bad Sec-WebSocket-Protocol
@@ -1474,9 +1491,9 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
-    assert(!ws_bad.has_value());
-    assert(mp_client_error_of(ws_bad.error()) ==
-           MpClientError::ws_subprotocol_mismatch);
+    require_ok(!ws_bad.has_value());
+    require_ok(mp_client_error_of(ws_bad.error()) ==
+               MpClientError::ws_subprotocol_mismatch);
   }
 
   // (c) Masked server->client frame rejected per RFC 6455 §5.1
@@ -1486,10 +1503,10 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     auto ws_ok = client.connect_party_socket(created.value().party_id);
-    assert(ws_ok.has_value());
+    require_ok(ws_ok.has_value());
     const auto ev = ws_ok.value().poll_event(3000);
-    assert(!ev.has_value());
-    assert(mp_client_error_of(ev.error()) == MpClientError::ws_masked_server_frame);
+    require_ok(!ev.has_value());
+    require_ok(mp_client_error_of(ev.error()) == MpClientError::ws_masked_server_frame);
   }
 
   // (d) Oversized frame (> 8192 B) rejected!
@@ -1499,10 +1516,10 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     auto ws_ok = client.connect_party_socket(created.value().party_id);
-    assert(ws_ok.has_value());
+    require_ok(ws_ok.has_value());
     const auto ev = ws_ok.value().poll_event(3000);
-    assert(!ev.has_value());
-    assert(mp_client_error_of(ev.error()) == MpClientError::ws_frame_too_large);
+    require_ok(!ev.has_value());
+    require_ok(mp_client_error_of(ev.error()) == MpClientError::ws_frame_too_large);
   }
 
   // (e) Duplicate Sec-WebSocket-Accept / Sec-WebSocket-Protocol & unsolicited
@@ -1513,8 +1530,8 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
-    assert(!ws_bad.has_value());
-    assert(mp_client_error_of(ws_bad.error()) == MpClientError::ws_accept_mismatch);
+    require_ok(!ws_bad.has_value());
+    require_ok(mp_client_error_of(ws_bad.error()) == MpClientError::ws_accept_mismatch);
   }
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
@@ -1522,9 +1539,9 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
-    assert(!ws_bad.has_value());
-    assert(mp_client_error_of(ws_bad.error()) ==
-           MpClientError::ws_subprotocol_mismatch);
+    require_ok(!ws_bad.has_value());
+    require_ok(mp_client_error_of(ws_bad.error()) ==
+               MpClientError::ws_subprotocol_mismatch);
   }
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
@@ -1532,8 +1549,8 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
-    assert(!ws_bad.has_value());
-    assert(mp_client_error_of(ws_bad.error()) == MpClientError::ws_protocol_error);
+    require_ok(!ws_bad.has_value());
+    require_ok(mp_client_error_of(ws_bad.error()) == MpClientError::ws_protocol_error);
   }
 
   // (f) 0-byte continuation frame flood (> 64 fragments) rejected!
@@ -1543,10 +1560,10 @@ void test_loopback_tls_rest_and_ws() {
   }
   {
     auto ws_ok = client.connect_party_socket(created.value().party_id);
-    assert(ws_ok.has_value());
+    require_ok(ws_ok.has_value());
     const auto ev = ws_ok.value().poll_event(3000);
-    assert(!ev.has_value());
-    assert(mp_client_error_of(ev.error()) == MpClientError::ws_protocol_error);
+    require_ok(!ev.has_value());
+    require_ok(mp_client_error_of(ev.error()) == MpClientError::ws_protocol_error);
   }
 
   // (g) Chunked 401 clock_skew on WebSocket upgrade self-heals cleanly!
@@ -1559,21 +1576,21 @@ void test_loopback_tls_rest_and_ws() {
     }();
     client.set_clock_offset_seconds(600);
     auto ws_healed = client.connect_party_socket(created.value().party_id);
-    assert(ws_healed.has_value());
-    assert(ws_healed.value().is_open());
-    assert(std::abs(client.clock_offset_seconds()) <= 5);
+    require_ok(ws_healed.has_value());
+    require_ok(ws_healed.value().is_open());
+    require_ok(std::abs(client.clock_offset_seconds()) <= 5);
     const auto ev = ws_healed.value().poll_event(3000);
-    assert(ev.has_value());
-    assert(ev.value().has_value());
-    assert(ws_healed.value().close(1000U).has_value());
+    require_ok(ev.has_value());
+    require_ok(ev.value().has_value());
+    require_ok(ws_healed.value().close(1000U).has_value());
     std::lock_guard<std::mutex> lk{srv_state.mu};
     srv_state.chunked_401_errors = false;
-    assert(srv_state.health_calls == health_pre_ws + 1);
+    require_ok(srv_state.health_calls == health_pre_ws + 1);
   }
 
   {
     std::lock_guard<std::mutex> lk{srv_state.mu};
-    assert(srv_state.verified_rfc9421_calls >= 15);
+    require_ok(srv_state.verified_rfc9421_calls >= 15);
   }
 
   std::cout << "PASS test_loopback_tls_rest_and_ws\n";

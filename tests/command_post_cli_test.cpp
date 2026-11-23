@@ -3,6 +3,7 @@
 #include "blackbird/capabilities.hpp"
 #include "blackbird/command_post_cli.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/mp_client.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
@@ -298,8 +299,9 @@ void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
 }
 
 void test_subcommand_dispatch_table() {
-  for (const char *name : {"mcp", "platoon", "issues", "memory", "peer", "capabilities",
-                           "metrics", "bridge", "join", "party", "flightdeck"}) {
+  for (const char *name :
+       {"mcp", "platoon", "issues", "memory", "peer", "capabilities", "metrics",
+        "bridge", "join", "party", "flightdeck", "online"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -2067,6 +2069,875 @@ void test_flightdeck_cli_once_and_themes(const fs::path &base) {
         "trailing-slash symlink --session must be rejected");
 }
 
+struct ScopedEnvVar {
+  std::string name;
+  std::optional<std::string> previous;
+
+  ScopedEnvVar(std::string var_name, std::optional<std::string> next_value)
+      : name(std::move(var_name)) {
+    if (const char *cur = std::getenv(name.c_str()); cur != nullptr)
+      previous = std::string{cur};
+    if (next_value.has_value())
+      (void)::setenv(name.c_str(), next_value->c_str(), 1);
+    else
+      (void)::unsetenv(name.c_str());
+  }
+  ScopedEnvVar(const ScopedEnvVar &) = delete;
+  ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+  ~ScopedEnvVar() {
+    if (previous.has_value())
+      (void)::setenv(name.c_str(), previous->c_str(), 1);
+    else
+      (void)::unsetenv(name.c_str());
+  }
+};
+
+std::string test_base64_encode(std::span<const std::uint8_t> bytes) {
+  static constexpr char kAlpha[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((bytes.size() + 2U) / 3U) * 4U);
+  std::size_t i = 0U;
+  while (i + 3U <= bytes.size()) {
+    const std::uint32_t t = (static_cast<std::uint32_t>(bytes[i]) << 16U) |
+                            (static_cast<std::uint32_t>(bytes[i + 1U]) << 8U) |
+                            static_cast<std::uint32_t>(bytes[i + 2U]);
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 6U) & 0x3fU]);
+    out.push_back(kAlpha[t & 0x3fU]);
+    i += 3U;
+  }
+  const std::size_t rem = bytes.size() - i;
+  if (rem == 1U) {
+    const std::uint32_t t = static_cast<std::uint32_t>(bytes[i]) << 16U;
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2U) {
+    const std::uint32_t t = (static_cast<std::uint32_t>(bytes[i]) << 16U) |
+                            (static_cast<std::uint32_t>(bytes[i + 1U]) << 8U);
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 6U) & 0x3fU]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+std::vector<std::uint8_t> read_binary_file(const fs::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  check(static_cast<bool>(in), "failed to open binary file");
+  return std::vector<std::uint8_t>{std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>()};
+}
+
+void run_command_checked(std::vector<std::string> argv) {
+  detail::Child child;
+  for (char **entry = environ; entry != nullptr && *entry != nullptr; ++entry)
+    child.child_environment.emplace_back(*entry);
+  child.start(std::move(argv), {}, true);
+  child.close_input();
+  int code = 0;
+  const std::string out = child.collect(detail::Clock::now() + std::chrono::seconds{20},
+                                        1024 * 1024, &code);
+  if (code != 0)
+    throw std::runtime_error("helper command failed (rc=" + std::to_string(code) +
+                             "): " + out);
+}
+
+void test_online_cli_subcommand(const fs::path &base) {
+  // Isolate environment overrides so host shell env never perturbs tests.
+  ScopedEnvVar env_dir{"BLACKBIRD_ONLINE_DIR", std::nullopt};
+  ScopedEnvVar env_auth{"BLACKBIRD_ONLINE_AUTHORITY", std::nullopt};
+  ScopedEnvVar env_host{"BLACKBIRD_ONLINE_CONNECT_HOST", std::nullopt};
+  ScopedEnvVar env_port{"BLACKBIRD_ONLINE_PORT", std::nullopt};
+  ScopedEnvVar env_ca{"BLACKBIRD_ONLINE_CA_BUNDLE", std::nullopt};
+
+  // 1. Help on top-level and subcommands exits 0 with usage on stderr and empty stdout.
+  for (const std::vector<std::string> &cmd : std::vector<std::vector<std::string>>{
+           {"online", "--help"},
+           {"online", "health", "--help"},
+           {"online", "register", "--help"},
+           {"online", "whoami", "--help"},
+           {"online", "resolve", "--help"},
+           {"online", "devices", "--help"},
+           {"online", "friends", "--help"},
+           {"online", "party", "--help"},
+           {"online", "party", "create", "--help"},
+           {"online", "party", "join", "--help"},
+       }) {
+    const auto help_res = run_cli(cmd);
+    check(help_res.exit_code == 0 && help_res.out.empty() && !help_res.err.empty(),
+          "online --help must exit 0 with usage on stderr");
+  }
+
+  // 2. Invalid paths (.. traversal, C1, BiDi, BOM) fail closed with exit 2 and ZERO
+  //    disk writes!
+  const fs::path invalid_probe_parent = base / "online-invalid-probe";
+  for (const char *bad_path : {
+           "/tmp/../etc/online-state",
+           "/tmp/bb-\xc2\x9b/online",
+           "/tmp/bb-\xe2\x80\xae/online",
+           "/tmp/bb-\xef\xbb\xbf/online",
+       }) {
+    const auto bad_state =
+        run_cli({"online", "whoami", "--local", "--state-dir", bad_path});
+    check(bad_state.exit_code == 2 && bad_state.out.empty() && !bad_state.err.empty(),
+          "invalid --state-dir must exit 2");
+    const auto bad_ca = run_cli({"online", "health", "--ca-bundle", bad_path});
+    check(bad_ca.exit_code == 2 && bad_ca.out.empty() && !bad_ca.err.empty(),
+          "invalid --ca-bundle must exit 2");
+  }
+  {
+    ScopedEnvVar bad_env{"BLACKBIRD_ONLINE_DIR",
+                         (invalid_probe_parent / ".." / "escape").string()};
+    const auto res = run_cli({"online", "whoami", "--local"});
+    check(res.exit_code == 2 && res.out.empty() && !res.err.empty(),
+          "invalid BLACKBIRD_ONLINE_DIR must exit 2");
+    check(!fs::exists(invalid_probe_parent),
+          "invalid env path must create zero directories");
+  }
+
+  // 3. Read-only / unregistered commands against absent --state-dir fail non-zero and
+  //    NEVER create directories or files!
+  const fs::path absent_state = base / "online-absent-state";
+  for (const std::vector<std::string> &cmd : std::vector<std::vector<std::string>>{
+           {"online", "whoami", "--local", "--state-dir", absent_state.string()},
+           {"online", "whoami", "--state-dir", absent_state.string()},
+           {"online", "resolve", "wingman", "--state-dir", absent_state.string()},
+           {"online", "friends", "list", "--state-dir", absent_state.string()},
+           {"online", "party", "info", "5001", "--state-dir", absent_state.string()},
+       }) {
+    const auto res = run_cli(cmd);
+    check(res.exit_code != 0 && res.out.empty() && !res.err.empty(),
+          "unregistered online command must fail cleanly on stderr");
+    check(!fs::exists(absent_state),
+          "read-only online command must NEVER create absent --state-dir");
+  }
+
+  // Invalid handle on register must exit 2, create zero dirs, and never leak invite.
+  {
+    const std::string secret = "mpinv1_secret_must_never_leak_invalid_handle";
+    const auto res = run_cli({"online", "register", "--invite", secret, "--handle",
+                              "admin", "--state-dir", absent_state.string()});
+    check(res.exit_code == 2 && res.out.empty() && !res.err.empty(),
+          "reserved handle must fail with exit 2");
+    check(res.err.find(secret) == std::string::npos,
+          "register error must never leak invite secret");
+    check(!fs::exists(absent_state),
+          "failed register validation must create zero directories");
+  }
+
+  // 4. Spin up an offline ephemeral loopback TLS 1.3 HTTPS mock server using openssl
+  //    CLI + inline python3 (TLSv1.3 + ALPN http/1.1, zero external network).
+  const fs::path tls_dir = base / "online-tls";
+  fs::create_directories(tls_dir);
+  const fs::path cnf_path = tls_dir / "openssl.cnf";
+  const fs::path key_path = tls_dir / "server.key";
+  const fs::path crt_path = tls_dir / "server.crt";
+  const fs::path srv_path = tls_dir / "mock_mp_server.py";
+  const fs::path req_log_path = tls_dir / "requests.log";
+
+  write_text_file(cnf_path, "[req]\n"
+                            "distinguished_name = dn\n"
+                            "prompt = no\n"
+                            "[dn]\n"
+                            "CN = api.test.local\n"
+                            "[v3_ext]\n"
+                            "basicConstraints = critical,CA:TRUE\n"
+                            "keyUsage = critical,digitalSignature,keyCertSign\n"
+                            "subjectAltName = DNS:api.test.local,IP:127.0.0.1\n");
+
+  run_command_checked({"openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                       "-out", key_path.string()});
+  run_command_checked({"openssl", "req", "-new", "-x509", "-key", key_path.string(),
+                       "-out", crt_path.string(), "-days", "1", "-config",
+                       cnf_path.string(), "-extensions", "v3_ext"});
+
+  // Generate a deterministic valid Ed25519 pubkey for mocked `resolve_handle` responses
+  // and `devices enroll`.
+  const auto wingman_key = mp::Ed25519SigningKey::generate();
+  check(wingman_key.has_value(), "Ed25519SigningKey::generate failed for wingman");
+  const std::string wingman_pub_b64 =
+      test_base64_encode(wingman_key.value().public_key());
+
+  const auto extra_dev_key = mp::Ed25519SigningKey::generate();
+  check(extra_dev_key.has_value(), "Ed25519SigningKey::generate failed for device");
+  const std::string extra_dev_pub_b64 =
+      test_base64_encode(extra_dev_key.value().public_key());
+
+  const std::string mock_server_py = R"PY(
+import json
+import signal
+import socket
+import ssl
+import sys
+import time
+import urllib.parse
+
+crt_path = sys.argv[1]
+key_path = sys.argv[2]
+wingman_pub_b64 = sys.argv[3]
+req_log_path = sys.argv[4]
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+ctx.set_alpn_protocols(["http/1.1"])
+ctx.load_cert_chain(certfile=crt_path, keyfile=key_path)
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(32)
+srv.settimeout(0.5)
+port = srv.getsockname()[1]
+
+running = True
+def _stop(_signum, _frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
+
+print(port, flush=True)
+
+state = {
+    "account_id": 1001,
+    "device_id": 2001,
+    "handle": "pilot_one",
+    "root_pubkey_b64": wingman_pub_b64,
+    "devices": [],
+    "friends": {},
+    "parties": {},
+    "next_device_id": 2002,
+    "next_party_id": 5001,
+    "next_invite_id": 7001,
+}
+
+def read_http_request(conn):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None
+        buf += chunk
+        if len(buf) > 65536:
+            return None
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.decode("latin1").split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) < 3:
+        return None
+    method, target = parts[0], parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    clen = int(headers.get("content-length", "0"))
+    while len(rest) < clen:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return method, target, headers, rest[:clen]
+
+def send_json(conn, status, payload):
+    body = json.dumps(payload).encode("utf-8")
+    reason = {200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized",
+              404: "Not Found", 409: "Conflict"}.get(status, "Error")
+    resp = (
+        f"HTTP/1.1 {status} {reason}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("latin1") + body
+    conn.sendall(resp)
+
+def handle_request(method, target, headers, body_bytes):
+    now_ms = int(time.time() * 1000)
+    parsed = urllib.parse.urlsplit(target)
+    path = parsed.path
+    query = urllib.parse.parse_qs(parsed.query)
+    with open(req_log_path, "a", encoding="utf-8") as logf:
+        logf.write(f"{method} {path}\n")
+
+    if method == "GET" and path == "/v1/health":
+        return 200, {"ok": True, "server_now_ms": now_ms}
+
+    # Every non-health endpoint MUST carry RFC 9421 Signature-Input + Signature.
+    if "signature-input" not in headers or "signature" not in headers:
+        return 401, {"error": "missing_signature"}
+    if method != "GET" and "content-digest" not in headers:
+        return 400, {"error": "missing_content_digest"}
+
+    body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+
+    if method == "POST" and path == "/v1/accounts/register":
+        if "idempotency-key" not in headers:
+            return 400, {"error": "missing_idempotency_key"}
+        state["handle"] = body["handle"]
+        state["root_pubkey_b64"] = body["root_pubkey_b64"]
+        state["devices"] = [{
+            "device_id": state["device_id"],
+            "pubkey_b64": body["device_pubkey_b64"],
+            "label": body["device_label"],
+            "cwt_expires_ms": now_ms + 30 * 86400 * 1000,
+            "generation": 1,
+            "pop_verified": True,
+            "created_at_ms": now_ms,
+            "revoked_at_ms": None,
+        }]
+        return 201, {
+            "account_id": state["account_id"],
+            "device_id": state["device_id"],
+            "handle": state["handle"],
+        }
+
+    if method == "GET" and path == "/v1/accounts/me":
+        return 200, {
+            "account_id": state["account_id"],
+            "handle": state["handle"],
+            "root_pubkey_b64": state["root_pubkey_b64"],
+            "devices": state["devices"],
+            "active_party_ids": list(state["parties"].keys()),
+        }
+
+    if method == "GET" and path == "/v1/accounts/resolve":
+        h = query.get("handle", [""])[0]
+        if h.lower() == "wingman":
+            return 200, {
+                "account_id": 1002,
+                "handle": "wingman",
+                "root_pubkey_b64": wingman_pub_b64,
+            }
+        return 404, {"error": "not_found"}
+
+    if method == "POST" and path == "/v1/devices":
+        did = state["next_device_id"]
+        state["next_device_id"] += 1
+        exp_ms = now_ms + 30 * 86400 * 1000
+        state["devices"].append({
+            "device_id": did,
+            "pubkey_b64": body["device_pubkey_b64"],
+            "label": body["device_label"],
+            "cwt_expires_ms": exp_ms,
+            "generation": 1,
+            "pop_verified": True,
+            "created_at_ms": now_ms,
+            "revoked_at_ms": None,
+        })
+        return 201, {"device_id": did, "cwt_expires_ms": exp_ms}
+
+    if method == "DELETE" and path.startswith("/v1/devices/"):
+        did = int(path.split("/")[-1])
+        for d in state["devices"]:
+            if d["device_id"] == did:
+                d["revoked_at_ms"] = now_ms
+        return 200, {"revoked": True, "evicted_parties": [], "pending_retries": 0}
+
+    if method == "GET" and path == "/v1/friends":
+        edges = [
+            {"peer_account_id": pid, "state": st, "updated_at_ms": now_ms}
+            for pid, st in sorted(state["friends"].items())
+        ]
+        return 200, {"friends": edges}
+
+    if method == "POST" and path == "/v1/friends/requests":
+        tid = int(body["target_account_id"])
+        state["friends"][tid] = 1
+        return 200, {"target_account_id": tid, "state": 1}
+
+    if method == "POST" and path.startswith("/v1/friends/") and path.endswith("/block"):
+        tid = int(path.split("/")[3])
+        state["friends"][tid] = 3
+        return 200, {"blocked": True}
+
+    if method == "DELETE" and path.startswith("/v1/friends/"):
+        tid = int(path.split("/")[3])
+        state["friends"].pop(tid, None)
+        return 200, {"removed": True}
+
+    if method == "POST" and path == "/v1/parties":
+        pid = state["next_party_id"]
+        state["next_party_id"] += 1
+        relay = body.get("relay_url", "")
+        state["parties"][pid] = {
+            "party_id": pid,
+            "party_epoch": 1,
+            "leader_account_id": state["account_id"],
+            "leader_device_id": state["device_id"],
+            "visibility": body["visibility"],
+            "join_mode": body["join_mode"],
+            "relay_policy": body["relay_policy"],
+            "pinned_relay_url": relay,
+            "max_members": body["max_members"],
+            "member_count": 1,
+        }
+        return 201, {"party_id": pid, "party_epoch": 1, "pinned_relay_url": relay}
+
+    if path.startswith("/v1/parties/"):
+        segs = path.split("/")
+        pid = int(segs[3])
+        party = state["parties"].get(pid)
+        if party is None:
+            return 404, {"error": "party_not_found"}
+        if method == "GET" and len(segs) == 4:
+            return 200, party
+        if method == "POST" and len(segs) == 5 and segs[4] == "invites":
+            iid = state["next_invite_id"]
+            state["next_invite_id"] += 1
+            return 201, {
+                "party_invite_id": iid,
+                "expires_at_ms": now_ms + int(body.get("ttl_sec", 3600)) * 1000,
+                "invite_link": f"mppi1_{pid}_testpartysecret42",
+            }
+        if method == "POST" and len(segs) == 5 and segs[4] == "join":
+            if body.get("invite_link") != f"mppi1_{pid}_testpartysecret42":
+                return 400, {"error": "invalid_invite_link"}
+            party["party_epoch"] += 1
+            party["member_count"] += 1
+            return 200, {"status": "joined", "party_epoch": party["party_epoch"]}
+        if method == "POST" and len(segs) == 5 and segs[4] == "kick":
+            if body.get("expected_party_epoch") != party["party_epoch"]:
+                return 409, {"error": "epoch_mismatch"}
+            party["party_epoch"] += 1
+            party["member_count"] = max(1, party["member_count"] - 1)
+            return 200, {"party_epoch": party["party_epoch"]}
+        if method == "POST" and len(segs) == 5 and segs[4] == "leave":
+            party["party_epoch"] += 1
+            return 200, {"party_epoch": party["party_epoch"]}
+        if method == "POST" and len(segs) == 5 and segs[4] == "disband":
+            if body.get("expected_party_epoch") != party["party_epoch"]:
+                return 409, {"error": "epoch_mismatch"}
+            party["party_epoch"] += 1
+            epoch = party["party_epoch"]
+            state["parties"].pop(pid, None)
+            return 200, {"party_epoch": epoch}
+
+    return 404, {"error": "unknown_route"}
+
+deadline = time.monotonic() + 30.0
+try:
+    while running and time.monotonic() < deadline:
+        try:
+            raw_conn, _addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            raw_conn.settimeout(5.0)
+            with ctx.wrap_socket(raw_conn, server_side=True) as tls_conn:
+                req = read_http_request(tls_conn)
+                if req is not None:
+                    status, payload = handle_request(*req)
+                    send_json(tls_conn, status, payload)
+        except Exception:
+            pass
+finally:
+    srv.close()
+)PY";
+  write_text_file(srv_path, mock_server_py);
+
+  int pipefd[2]{-1, -1};
+  check(::pipe(pipefd) == 0, "pipe failed for mock TLS server");
+  const pid_t srv_pid = ::fork();
+  check(srv_pid >= 0, "fork failed for mock TLS server");
+  if (srv_pid == 0) {
+    (void)::close(pipefd[0]);
+    (void)::dup2(pipefd[1], STDOUT_FILENO);
+    (void)::close(pipefd[1]);
+    std::string py = "python3";
+    std::string script = srv_path.string();
+    std::string crt = crt_path.string();
+    std::string key = key_path.string();
+    std::string pub = wingman_pub_b64;
+    std::string req_log = req_log_path.string();
+    char *child_argv[] = {py.data(),  script.data(),  crt.data(), key.data(),
+                          pub.data(), req_log.data(), nullptr};
+    ::execvp(py.c_str(), child_argv);
+    ::_exit(127);
+  }
+  (void)::close(pipefd[1]);
+
+  struct MockServerGuard {
+    pid_t pid = -1;
+    int fd = -1;
+    ~MockServerGuard() {
+      if (fd >= 0)
+        (void)::close(fd);
+      if (pid > 1) {
+        (void)::kill(pid, SIGTERM);
+        if (!wait_for_pid_exit(pid, std::chrono::milliseconds{1500}))
+          (void)::kill(pid, SIGKILL);
+        int st = 0;
+        (void)::waitpid(pid, &st, 0);
+      }
+    }
+  } srv_guard{srv_pid, pipefd[0]};
+
+  std::string port_line;
+  char ch = '\0';
+  while (::read(srv_guard.fd, &ch, 1) == 1) {
+    if (ch == '\n')
+      break;
+    port_line.push_back(ch);
+  }
+  (void)::close(srv_guard.fd);
+  srv_guard.fd = -1;
+  check(!port_line.empty(), "mock TLS 1.3 server failed to report listening port");
+
+  const std::string port_str = port_line;
+  const fs::path state_dir = base / "online-keystore";
+
+  // 5. `online health` succeeds over TLS 1.3 and creates zero state dir!
+  {
+    const Value h = parse_stdout_json(
+        run_cli({"online", "health", "--authority", "api.test.local", "--connect-host",
+                 "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()}),
+        "online health");
+    check(std::get<bool>(req_field(h, "ok").value()) &&
+              req_str(h, "authority") == "api.test.local" &&
+              req_int(h, "server_now_ms") > 1000,
+          "online health payload mismatch");
+    check(!fs::exists(state_dir), "online health must not create state dir");
+  }
+
+  // 6. `online register`: creates 0700/0600 keystore and leaks ZERO
+  // seeds/invite_secret!
+  const std::string reg_secret = "mpinv1_supersecret_do_not_leak_999";
+  {
+    const auto reg_res =
+        run_cli({"online", "register", "--invite", reg_secret, "--handle", "pilot_one",
+                 "--device-label", "test-rig", "--state-dir", state_dir.string(),
+                 "--authority", "api.test.local", "--connect-host", "127.0.0.1",
+                 "--port", port_str, "--ca-bundle", crt_path.string()});
+    const Value reg = parse_stdout_json(reg_res, "online register");
+    check(std::get<bool>(req_field(reg, "registered").value()) &&
+              req_int(reg, "account_id") == 1001 && req_int(reg, "device_id") == 2001 &&
+              req_str(reg, "handle") == "pilot_one" &&
+              req_str(reg, "authority") == "api.test.local" &&
+              req_str(reg, "root_pubkey_sha256").size() == 64U,
+          "online register JSON mismatch");
+
+    // Verify 0700 directory and 0600 keystore files.
+    struct stat st{};
+    check(::stat(state_dir.c_str(), &st) == 0 && (st.st_mode & 0777U) == 0700U,
+          "online keystore directory must have mode 0700");
+    for (const char *fname :
+         {"root.seed", "device.seed", "device.cwt", "identity.json"}) {
+      const fs::path fpath = state_dir / fname;
+      check(::stat(fpath.c_str(), &st) == 0 && (st.st_mode & 0777U) == 0600U,
+            "online keystore file must have mode 0600");
+    }
+
+    // Verify ZERO invite_secret or raw/hex/b64 private seeds appear in stdout or
+    // stderr!
+    const auto root_seed_bytes = read_binary_file(state_dir / "root.seed");
+    const auto dev_seed_bytes = read_binary_file(state_dir / "device.seed");
+    check(root_seed_bytes.size() == 32U && dev_seed_bytes.size() == 32U,
+          "expected 32-byte raw seeds in keystore");
+    const std::string combined = reg_res.out + "\n" + reg_res.err;
+    for (const std::string &forbidden : std::vector<std::string>{
+             reg_secret,
+             mp::hex_lower(root_seed_bytes),
+             mp::hex_lower(dev_seed_bytes),
+             test_base64_encode(root_seed_bytes),
+             test_base64_encode(dev_seed_bytes),
+         }) {
+      check(combined.find(forbidden) == std::string::npos,
+            "online register leaked secret material to stdout/stderr");
+    }
+
+    // 6b. Preflight regression tests (dentist-2 #256):
+    //   - Re-registering into an existing keystore MUST fail closed BEFORE hitting the
+    //     server and preserve existing root.seed / device.seed byte-for-byte!
+    //   - Registering into an insecure 0755 directory or non-directory regular file
+    //     MUST fail closed BEFORE hitting the server (zero burned invites)!
+    const std::string log_before = [&]() {
+      std::ifstream in(req_log_path);
+      return std::string{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>()};
+    }();
+
+    const std::string second_secret = "mpinv1_do_not_burn_existing_keystore";
+    const auto dup_reg =
+        run_cli({"online", "register", "--invite", second_secret, "--handle",
+                 "pilot_two", "--state-dir", state_dir.string(), "--authority",
+                 "api.test.local", "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    check(dup_reg.exit_code != 0 && dup_reg.out.empty() && !dup_reg.err.empty(),
+          "register into existing keystore must fail closed");
+    check(dup_reg.err.find(second_secret) == std::string::npos,
+          "duplicate register error must never leak invite secret");
+    check(read_binary_file(state_dir / "root.seed") == root_seed_bytes &&
+              read_binary_file(state_dir / "device.seed") == dev_seed_bytes,
+          "register into existing keystore must preserve existing seeds byte-for-byte");
+
+    const fs::path insecure_dir = base / "online-insecure-0755";
+    fs::create_directories(insecure_dir);
+    check(::chmod(insecure_dir.c_str(), mode_t{0755}) == 0, "chmod 0755 failed");
+    const auto insecure_reg =
+        run_cli({"online", "register", "--invite", second_secret, "--handle",
+                 "pilot_two", "--state-dir", insecure_dir.string(), "--authority",
+                 "api.test.local", "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    check(insecure_reg.exit_code != 0 && insecure_reg.out.empty() &&
+              !insecure_reg.err.empty(),
+          "register into 0755 directory must fail closed");
+    check(fs::is_empty(insecure_dir),
+          "failed register into 0755 dir must create zero files");
+
+    const fs::path file_as_dir = base / "online-regular-file";
+    write_text_file(file_as_dir, "not-a-directory\n");
+    const auto file_reg =
+        run_cli({"online", "register", "--invite", second_secret, "--handle",
+                 "pilot_two", "--state-dir", file_as_dir.string(), "--authority",
+                 "api.test.local", "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    check(file_reg.exit_code != 0 && file_reg.out.empty() && !file_reg.err.empty(),
+          "register into non-directory regular file must fail closed");
+
+    const std::string log_after = [&]() {
+      std::ifstream in(req_log_path);
+      return std::string{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>()};
+    }();
+    check(
+        log_before == log_after,
+        "preflight register failures must make ZERO HTTP requests (no burned invites)");
+  }
+
+  // 7. `online whoami --local` works offline without hitting the network, and leaks no
+  //    seeds.
+  {
+    const auto local_res =
+        run_cli({"online", "whoami", "--local", "--state-dir", state_dir.string()});
+    const Value loc = parse_stdout_json(local_res, "online whoami --local");
+    check(std::get<bool>(req_field(loc, "local").value()) &&
+              std::get<bool>(req_field(loc, "registered").value()) &&
+              std::get<bool>(req_field(loc, "has_root_key").value()) &&
+              req_int(loc, "account_id") == 1001 && req_int(loc, "device_id") == 2001 &&
+              req_str(loc, "handle") == "pilot_one" &&
+              req_str(loc, "authority") == "api.test.local",
+          "online whoami --local mismatch");
+    const auto root_seed_bytes = read_binary_file(state_dir / "root.seed");
+    const auto dev_seed_bytes = read_binary_file(state_dir / "device.seed");
+    check(local_res.out.find(mp::hex_lower(root_seed_bytes)) == std::string::npos &&
+              local_res.out.find(mp::hex_lower(dev_seed_bytes)) == std::string::npos,
+          "online whoami --local leaked seed");
+  }
+
+  // 8. `online whoami` (networked, using stored authority from keystore!).
+  {
+    const Value me = parse_stdout_json(
+        run_cli({"online", "whoami", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online whoami");
+    check(req_int(me, "account_id") == 1001 && req_str(me, "handle") == "pilot_one" &&
+              req_field(me, "devices").array().size() == 1U,
+          "online whoami response mismatch");
+  }
+
+  // 9. `online resolve wingman`
+  {
+    const Value resolved = parse_stdout_json(
+        run_cli({"online", "resolve", "wingman", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online resolve");
+    check(req_int(resolved, "account_id") == 1002 &&
+              req_str(resolved, "handle") == "wingman" &&
+              req_str(resolved, "root_pubkey_b64") == wingman_pub_b64,
+          "online resolve mismatch");
+  }
+
+  // 10. `online devices enroll` & `online devices revoke`
+  {
+    const Value enrolled = parse_stdout_json(
+        run_cli({"online", "devices", "enroll", "--label", "laptop", "--pubkey-b64",
+                 extra_dev_pub_b64, "--state-dir", state_dir.string(), "--connect-host",
+                 "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()}),
+        "online devices enroll");
+    check(std::get<bool>(req_field(enrolled, "enrolled").value()) &&
+              req_int(enrolled, "device_id") == 2002 &&
+              req_str(enrolled, "label") == "laptop",
+          "online devices enroll mismatch");
+
+    const Value revoked = parse_stdout_json(
+        run_cli({"online", "devices", "revoke", "2002", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online devices revoke");
+    check(std::get<bool>(req_field(revoked, "revoked").value()) &&
+              req_int(revoked, "device_id") == 2002,
+          "online devices revoke mismatch");
+  }
+
+  // 11. `online friends list / add (handle + numeric) / block / remove`
+  {
+    const Value empty_list = parse_stdout_json(
+        run_cli({"online", "friends", "list", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online friends list initial");
+    check(req_int(empty_list, "count") == 0, "expected 0 initial friends");
+
+    // Add via handle (auto-resolves wingman -> 1002)
+    const Value added_handle = parse_stdout_json(
+        run_cli({"online", "friends", "add", "wingman", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends add handle");
+    check(req_int(added_handle, "target_account_id") == 1002 &&
+              req_str(added_handle, "state") == "invite_sent" &&
+              req_str(added_handle, "handle") == "wingman",
+          "online friends add by handle mismatch");
+
+    // Add via numeric account_id
+    const Value added_num = parse_stdout_json(
+        run_cli({"online", "friends", "add", "1003", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online friends add numeric");
+    check(req_int(added_num, "target_account_id") == 1003 &&
+              req_str(added_num, "state") == "invite_sent",
+          "online friends add numeric mismatch");
+
+    const Value blocked = parse_stdout_json(
+        run_cli({"online", "friends", "block", "1002", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends block");
+    check(std::get<bool>(req_field(blocked, "blocked").value()) &&
+              req_int(blocked, "target_account_id") == 1002,
+          "online friends block mismatch");
+
+    const Value removed = parse_stdout_json(
+        run_cli({"online", "friends", "remove", "1003", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online friends remove");
+    check(std::get<bool>(req_field(removed, "removed").value()) &&
+              req_int(removed, "target_account_id") == 1003,
+          "online friends remove mismatch");
+
+    const Value final_list = parse_stdout_json(
+        run_cli({"online", "friends", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online friends default list");
+    check(req_int(final_list, "count") == 1, "expected 1 blocked edge remaining");
+    const auto &first_edge = req_field(final_list, "friends").array().at(0);
+    check(req_int(first_edge, "peer_account_id") == 1002 &&
+              req_str(first_edge, "state") == "blocked",
+          "remaining friend edge mismatch");
+  }
+
+  // 12. `online party create / info / invite / join / kick / leave / disband`
+  {
+    const Value created = parse_stdout_json(
+        run_cli({"online", "party", "create", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online party create");
+    check(req_int(created, "party_id") == 5001 &&
+              req_int(created, "party_epoch") == 1 &&
+              req_str(created, "pinned_relay_url") == "https://relay.multiplayer.tech",
+          "online party create defaults mismatch");
+
+    const Value info = parse_stdout_json(
+        run_cli({"online", "party", "info", "5001", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online party info");
+    check(req_int(info, "party_id") == 5001 && req_int(info, "party_epoch") == 1 &&
+              req_str(info, "visibility") == "friends" &&
+              req_str(info, "join_mode") == "invite" &&
+              req_str(info, "relay_policy") == "force" &&
+              req_int(info, "max_members") == 4,
+          "online party info defaults mismatch");
+
+    const Value inv = parse_stdout_json(
+        run_cli({"online", "party", "invite", "5001", "--max-uses", "2", "--ttl-s",
+                 "600", "--state-dir", state_dir.string(), "--connect-host",
+                 "127.0.0.1", "--port", port_str, "--ca-bundle", crt_path.string()}),
+        "online party invite");
+    const std::string invite_link = req_str(inv, "invite_link");
+    check(req_int(inv, "party_invite_id") == 7001 &&
+              invite_link == "mppi1_5001_testpartysecret42",
+          "online party invite mismatch");
+
+    // Auto-parse `mppi1_<party_id>_<secret>` link cleanly, and never echo the secret
+    // back!
+    const auto join_res =
+        run_cli({"online", "party", "join", invite_link, "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()});
+    const Value joined = parse_stdout_json(join_res, "online party join");
+    check(req_int(joined, "party_id") == 5001 &&
+              req_str(joined, "status") == "joined" &&
+              !std::get<bool>(req_field(joined, "pending_approval").value()) &&
+              req_int(joined, "party_epoch") == 2,
+          "online party join mismatch");
+    check(join_res.out.find("testpartysecret42") == std::string::npos &&
+              join_res.err.find("testpartysecret42") == std::string::npos,
+          "online party join must not leak invite secret");
+
+    // `--epoch 0` must fail closed with usage exit code 2 on both kick and disband.
+    const auto bad_kick_epoch =
+        run_cli({"online", "party", "kick", "5001", "1002", "--epoch", "0",
+                 "--state-dir", state_dir.string()});
+    check(bad_kick_epoch.exit_code == 2 && bad_kick_epoch.out.empty() &&
+              !bad_kick_epoch.err.empty(),
+          "online party kick --epoch 0 must exit 2");
+    const auto bad_disband_epoch =
+        run_cli({"online", "party", "disband", "5001", "--epoch", "0", "--state-dir",
+                 state_dir.string()});
+    check(bad_disband_epoch.exit_code == 2 && bad_disband_epoch.out.empty() &&
+              !bad_disband_epoch.err.empty(),
+          "online party disband --epoch 0 must exit 2");
+
+    // `kick` without `--epoch` fetches current epoch (2) first and advances to 3!
+    const Value kicked = parse_stdout_json(
+        run_cli({"online", "party", "kick", "5001", "1002", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online party kick");
+    check(std::get<bool>(req_field(kicked, "kicked").value()) &&
+              req_int(kicked, "party_id") == 5001 &&
+              req_int(kicked, "target_account_id") == 1002 &&
+              req_int(kicked, "party_epoch") == 3,
+          "online party kick auto-epoch mismatch");
+
+    const Value left = parse_stdout_json(
+        run_cli({"online", "party", "leave", "5001", "--state-dir", state_dir.string(),
+                 "--connect-host", "127.0.0.1", "--port", port_str, "--ca-bundle",
+                 crt_path.string()}),
+        "online party leave");
+    check(std::get<bool>(req_field(left, "left").value()) &&
+              req_int(left, "party_id") == 5001 && req_int(left, "party_epoch") == 4,
+          "online party leave mismatch");
+
+    // `disband` without `--epoch` fetches current epoch (4) first and advances to 5!
+    const Value disbanded = parse_stdout_json(
+        run_cli({"online", "party", "disband", "5001", "--state-dir",
+                 state_dir.string(), "--connect-host", "127.0.0.1", "--port", port_str,
+                 "--ca-bundle", crt_path.string()}),
+        "online party disband");
+    check(std::get<bool>(req_field(disbanded, "disbanded").value()) &&
+              req_int(disbanded, "party_id") == 5001 &&
+              req_int(disbanded, "party_epoch") == 5,
+          "online party disband auto-epoch mismatch");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2094,6 +2965,7 @@ int main(int argc, char **argv) {
     test_party_cli_roster_add_leader_and_say(temp.path());
     test_party_lobby_serve_and_status({temp.path(), self_exe});
     test_flightdeck_cli_once_and_themes(temp.path());
+    test_online_cli_subcommand(temp.path());
 
     std::cout << "PASS command_post_cli\n";
     return 0;

@@ -6,6 +6,8 @@
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/mp_client.hpp"
+#include "blackbird/mp_protocol.hpp"
 #include "blackbird/party_chat.hpp"
 #include "blackbird/party_lobby.hpp"
 #include "blackbird/peer_identity.hpp"
@@ -13,6 +15,7 @@
 #include "blackbird/project_memory.hpp"
 #include "blackbird/terminal.hpp"
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +25,8 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace blackbird;
@@ -1774,6 +1779,734 @@ void test_party_live_lobby_socket_zero_party_json() {
   server->stop();
 }
 
+std::string base64_encode_test(std::span<const std::uint8_t> bytes) {
+  static constexpr char kTable[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((bytes.size() + 2U) / 3U) * 4U);
+  for (std::size_t i = 0; i < bytes.size(); i += 3U) {
+    const std::uint32_t b0 = bytes[i];
+    const std::uint32_t b1 = (i + 1U < bytes.size()) ? bytes[i + 1U] : 0U;
+    const std::uint32_t b2 = (i + 2U < bytes.size()) ? bytes[i + 2U] : 0U;
+    const std::uint32_t triple = (b0 << 16U) | (b1 << 8U) | b2;
+    out.push_back(kTable[(triple >> 18U) & 0x3fU]);
+    out.push_back(kTable[(triple >> 12U) & 0x3fU]);
+    out.push_back((i + 1U < bytes.size()) ? kTable[(triple >> 6U) & 0x3fU] : '=');
+    out.push_back((i + 2U < bytes.size()) ? kTable[triple & 0x3fU] : '=');
+  }
+  return out;
+}
+
+int run_subprocess_sync(const std::vector<std::string> &argv) {
+  require(!argv.empty(), "run_subprocess_sync requires argv");
+  const pid_t pid = ::fork();
+  require(pid >= 0, "fork failed");
+  if (pid == 0) {
+    std::vector<char *> c_args;
+    c_args.reserve(argv.size() + 1U);
+    for (const std::string &arg : argv)
+      c_args.push_back(const_cast<char *>(arg.c_str()));
+    c_args.push_back(nullptr);
+    ::execvp(c_args[0], c_args.data());
+    ::_exit(127);
+  }
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR)
+      throw std::runtime_error("waitpid failed");
+  }
+  if (!WIFEXITED(status))
+    return -1;
+  return WEXITSTATUS(status);
+}
+
+struct MockTlsServerConfig {
+  std::filesystem::path script_path;
+  std::filesystem::path cert_path;
+  std::filesystem::path key_path;
+  std::filesystem::path port_file;
+  std::filesystem::path state_json_path;
+};
+
+class ScopedMockTlsServer {
+public:
+  explicit ScopedMockTlsServer(const MockTlsServerConfig &cfg) {
+    pid_ = ::fork();
+    require(pid_ >= 0, "fork mock TLS server failed");
+    if (pid_ == 0) {
+      const std::string s_py = "python3";
+      const std::string s_script = cfg.script_path.string();
+      const std::string s_cert = cfg.cert_path.string();
+      const std::string s_key = cfg.key_path.string();
+      const std::string s_port = cfg.port_file.string();
+      const std::string s_state = cfg.state_json_path.string();
+      std::array<char *, 7> c_args{
+          const_cast<char *>(s_py.c_str()),
+          const_cast<char *>(s_script.c_str()),
+          const_cast<char *>(s_cert.c_str()),
+          const_cast<char *>(s_key.c_str()),
+          const_cast<char *>(s_port.c_str()),
+          const_cast<char *>(s_state.c_str()),
+          nullptr,
+      };
+      ::execvp(c_args[0], c_args.data());
+      ::_exit(127);
+    }
+    for (int attempt = 0; attempt < 250; ++attempt) {
+      std::error_code ec;
+      if (std::filesystem::exists(cfg.port_file, ec) && !ec) {
+        std::ifstream in(cfg.port_file);
+        std::string line;
+        if (std::getline(in, line) && !line.empty()) {
+          port_ = std::stoi(line);
+          if (port_ > 0 && port_ <= 65535)
+            return;
+        }
+      }
+      int status = 0;
+      const pid_t exited = ::waitpid(pid_, &status, WNOHANG);
+      if (exited == pid_) {
+        pid_ = -1;
+        throw std::runtime_error("mock TLS 1.3 server exited prematurely");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    stop();
+    throw std::runtime_error("timed out waiting for mock TLS 1.3 server port file");
+  }
+
+  ~ScopedMockTlsServer() { stop(); }
+
+  ScopedMockTlsServer(const ScopedMockTlsServer &) = delete;
+  ScopedMockTlsServer &operator=(const ScopedMockTlsServer &) = delete;
+
+  int port() const noexcept { return port_; }
+
+  void stop() noexcept {
+    if (pid_ <= 0)
+      return;
+    (void)::kill(pid_, SIGTERM);
+    for (int i = 0; i < 50; ++i) {
+      int status = 0;
+      if (::waitpid(pid_, &status, WNOHANG) == pid_) {
+        pid_ = -1;
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    (void)::kill(pid_, SIGKILL);
+    int status = 0;
+    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+    pid_ = -1;
+  }
+
+private:
+  pid_t pid_ = -1;
+  int port_ = 0;
+};
+
+void test_online_tui_slash_env_validation_and_loopback_tls13() {
+  TempDir root_dir("bb-cptui-online");
+  TempDir home_dir("bb-cptui-online-home");
+  ScopedHomeEnv env_home{home_dir.path};
+  ScopedEnvVar clear_xdg{"XDG_CONFIG_HOME", std::nullopt};
+  ScopedEnvVar clear_dir{"BLACKBIRD_ONLINE_DIR", std::nullopt};
+  ScopedEnvVar clear_auth{"BLACKBIRD_ONLINE_AUTHORITY", std::nullopt};
+  ScopedEnvVar clear_host{"BLACKBIRD_ONLINE_CONNECT_HOST", std::nullopt};
+  ScopedEnvVar clear_port{"BLACKBIRD_ONLINE_PORT", std::nullopt};
+  ScopedEnvVar clear_ca{"BLACKBIRD_ONLINE_CA_BUNDLE", std::nullopt};
+
+  CommandPostTuiContext ctx;
+  ctx.project_root = root_dir.path;
+  ctx.actor = "pilot";
+
+  // 1. /online help & /party online help alias dispatch cleanly with zero disk writes.
+  const auto help_out = handle_command_post_slash("/online help", ctx);
+  if (!help_out.has_value())
+    throw std::runtime_error("/online help must return output");
+  const std::string &help_text = *help_out;
+  require(help_text.find("/online [status]") != std::string::npos &&
+              help_text.find("/online health") != std::string::npos &&
+              help_text.find("/online whoami") != std::string::npos &&
+              help_text.find("/online resolve <handle>") != std::string::npos &&
+              help_text.find("/online friends") != std::string::npos &&
+              help_text.find("/online party create") != std::string::npos,
+          "/online help prints concise usage summary");
+  const auto alias_help = handle_command_post_slash("/party online help", ctx);
+  require(alias_help.has_value() && *alias_help == help_text,
+          "/party online help routes identically to /online help");
+
+  // 2. Unregistered /online status (default $HOME/.config/blackbird/online and
+  //    explicit absent BLACKBIRD_ONLINE_DIR) -> onboarding hint, ZERO dirs created!
+  {
+    const auto unreg_default = handle_command_post_slash("/online", ctx);
+    require(unreg_default.has_value() &&
+                unreg_default->find("unregistered") != std::string::npos &&
+                unreg_default->find("Run: blackbird online register --invite "
+                                    "<mpinv1_...> --handle <name>") !=
+                    std::string::npos,
+            "unregistered /online returns onboarding hint");
+    require(!std::filesystem::exists(home_dir.path / ".config"),
+            "unregistered /online must NOT create ~/.config");
+
+    const auto absent_dir = root_dir.path / "never-created-online";
+    ScopedEnvVar set_absent{"BLACKBIRD_ONLINE_DIR", absent_dir.string()};
+    const auto unreg_explicit = handle_command_post_slash("/online status", ctx);
+    require(unreg_explicit.has_value() &&
+                unreg_explicit->find("Run: blackbird online register --invite "
+                                     "<mpinv1_...> --handle <name>") !=
+                    std::string::npos,
+            "unregistered /online status returns onboarding hint");
+    const auto unreg_whoami = handle_command_post_slash("/online whoami", ctx);
+    require(unreg_whoami.has_value() &&
+                unreg_whoami->find("Run: blackbird online register") !=
+                    std::string::npos,
+            "unregistered /online whoami returns onboarding hint");
+    require(!std::filesystem::exists(absent_dir),
+            "unregistered /online status/whoami must create ZERO directories on disk");
+  }
+
+  // 3. Fail-closed invalid BLACKBIRD_ONLINE_DIR (`..`, C1, BiDi, BOM) and invalid
+  //    BLACKBIRD_ONLINE_CA_BUNDLE with ZERO disk writes!
+  {
+    const auto watch_root = root_dir.path / "invalid-env-watch";
+    std::filesystem::create_directories(watch_root);
+    const auto tree_before = snapshot_tree_stats(watch_root);
+
+    const std::array<std::string, 5> bad_dirs{
+        (watch_root / "sub" / ".." / "escape").string(),
+        (watch_root / "bad-\xc2\x9b" / "online").string(),
+        (watch_root / "bad-\xe2\x80\xae" / "online").string(),
+        (watch_root / "bad-\xef\xbb\xbf" / "online").string(),
+        (watch_root / "bad-\x1b" / "online").string(),
+    };
+    for (const std::string &bad : bad_dirs) {
+      ScopedEnvVar set_bad_dir{"BLACKBIRD_ONLINE_DIR", bad};
+      for (const char *cmd : {"/online status", "/online health", "/online whoami",
+                              "/party online status"}) {
+        const auto res = handle_command_post_slash(cmd, ctx);
+        require(res.has_value() &&
+                    res->find("invalid BLACKBIRD_ONLINE_DIR") != std::string::npos &&
+                    !contains_raw_control_or_c1(*res),
+                "invalid BLACKBIRD_ONLINE_DIR must fail closed");
+      }
+    }
+
+    const std::array<std::string, 5> bad_cas{
+        (watch_root / ".." / "ca.pem").string(),
+        (watch_root / "ca-\xc2\x9b.pem").string(),
+        (watch_root / "ca-\xe2\x80\xae.pem").string(),
+        (watch_root / "ca-\xef\xbb\xbf.pem").string(),
+        (watch_root.string() + "/"),
+    };
+    for (const std::string &bad : bad_cas) {
+      ScopedEnvVar set_bad_ca{"BLACKBIRD_ONLINE_CA_BUNDLE", bad};
+      for (const char *cmd :
+           {"/online status", "/online health", "/party online health"}) {
+        const auto res = handle_command_post_slash(cmd, ctx);
+        require(res.has_value() &&
+                    res->find("invalid BLACKBIRD_ONLINE_CA_BUNDLE") !=
+                        std::string::npos &&
+                    !contains_raw_control_or_c1(*res),
+                "invalid BLACKBIRD_ONLINE_CA_BUNDLE must fail closed");
+      }
+    }
+
+    for (const char *bad_port : {"0", "0443", "65536", "notaport"}) {
+      ScopedEnvVar set_bad_port{"BLACKBIRD_ONLINE_PORT", std::string{bad_port}};
+      const auto res = handle_command_post_slash("/online health", ctx);
+      require(res.has_value() &&
+                  res->find("invalid BLACKBIRD_ONLINE_PORT") != std::string::npos,
+              "invalid BLACKBIRD_ONLINE_PORT must fail closed");
+    }
+
+    const auto tree_after = snapshot_tree_stats(watch_root);
+    require(tree_after == tree_before,
+            "invalid BLACKBIRD_ONLINE_* env vars must perform ZERO disk writes");
+  }
+
+  // 4. Populate a real MpIdentityStore (in a valid non-ASCII UTF-8 directory path!)
+  //    and verify live loopback TLS 1.3 REST calls + zero seed leakage!
+  const auto online_dir = root_dir.path / "store-\xc3\x89";
+  const auto root_seed = unwrap(mp::CleansedSeed::generate());
+  const auto dev_seed = unwrap(mp::CleansedSeed::generate());
+  const auto root_key = unwrap(mp::Ed25519SigningKey::from_seed(root_seed.bytes()));
+  const auto dev_key = unwrap(mp::Ed25519SigningKey::from_seed(dev_seed.bytes()));
+  const auto wingman_key = unwrap(mp::Ed25519SigningKey::generate());
+
+  const std::string root_seed_hex = mp::hex_lower(root_seed.bytes());
+  const std::string dev_seed_hex = mp::hex_lower(dev_seed.bytes());
+  const std::string root_seed_b64 = base64_encode_test(root_seed.bytes());
+  const std::string dev_seed_b64 = base64_encode_test(dev_seed.bytes());
+
+  const std::int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+  const auto cwt = unwrap(mp::encode_device_cwt(
+      root_key,
+      mp::DeviceCwtMintRequest{dev_key.public_key(), now_s - 60, now_s + 86400 * 10}));
+
+  mp::MpIdentityState id_state{};
+  id_state.root_seed = root_seed;
+  id_state.device_seed = dev_seed;
+  id_state.account_id = unwrap(mp::AccountId::create(1001U));
+  id_state.device_id = unwrap(mp::DeviceId::create(2001U));
+  id_state.handle = "pilot_one";
+  id_state.authority = "api.multiplayer.tech";
+  id_state.device_cwt = cwt;
+  (void)unwrap(mp::MpIdentityStore::save(online_dir, id_state));
+
+  // Generate ephemeral P-256 self-signed cert via openssl CLI.
+  const auto cert_path = root_dir.path / "cert.pem";
+  const auto key_path = root_dir.path / "key.pem";
+  const int ssl_rc = run_subprocess_sync({
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "ec",
+      "-pkeyopt",
+      "ec_paramgen_curve:prime256v1",
+      "-keyout",
+      key_path.string(),
+      "-out",
+      cert_path.string(),
+      "-days",
+      "1",
+      "-nodes",
+      "-subj",
+      "/CN=api.multiplayer.tech",
+      "-addext",
+      "basicConstraints=critical,CA:TRUE",
+      "-addext",
+      "keyUsage=critical,digitalSignature,keyCertSign",
+      "-addext",
+      "extendedKeyUsage=serverAuth",
+      "-addext",
+      "subjectAltName=DNS:api.multiplayer.tech,IP:127.0.0.1",
+  });
+  require(ssl_rc == 0 && std::filesystem::exists(cert_path) &&
+              std::filesystem::exists(key_path),
+          "openssl ephemeral P-256 cert generation must succeed");
+
+  // Write server state JSON (public keys only — never seeds!) and inline Python 3
+  // TLS 1.3 HTTP/1.1 mock control-plane server.
+  const auto state_json_path = root_dir.path / "mock_state.json";
+  write_text_file(
+      state_json_path,
+      "{\"root_pubkey_b64\":\"" + base64_encode_test(root_key.public_key()) +
+          "\",\"device_pubkey_b64\":\"" + base64_encode_test(dev_key.public_key()) +
+          "\",\"wingman_pubkey_b64\":\"" +
+          base64_encode_test(wingman_key.public_key()) + "\"}\n");
+
+  const auto script_path = root_dir.path / "mock_mp_server.py";
+  const auto port_file = root_dir.path / "mock_port.txt";
+  write_text_file(
+      script_path,
+      R"PY(import http.server, json, os, signal, ssl, sys, time, urllib.parse
+
+cert_path, key_path, port_file, state_path = sys.argv[1:5]
+with open(state_path, "r", encoding="utf-8") as f:
+    KEYS = json.load(f)
+
+PARTY_STATE = {"epoch": 1, "last_create": None}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, fmt, *args):
+        pass
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+    def _require_sig(self):
+        return bool(self.headers.get("Signature-Input") and self.headers.get("Signature"))
+    def _read_json(self):
+        cl = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(cl) if cl > 0 else b""
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/v1/health":
+            self._send_json(200, {"ok": True, "server_now_ms": int(time.time() * 1000)})
+            return
+        if not self._require_sig():
+            self._send_json(401, {"error": "missing_signature"})
+            return
+        if parsed.path == "/v1/accounts/me":
+            self._send_json(200, {
+                "account_id": 1001,
+                "handle": "pilot_one",
+                "root_pubkey_b64": KEYS["root_pubkey_b64"],
+                "devices": [
+                    {
+                        "device_id": 2001,
+                        "pubkey_b64": KEYS["device_pubkey_b64"],
+                        "label": "cockpit-\u009b6n",
+                        "cwt_expires_ms": 1900000000000,
+                        "generation": 1,
+                        "pop_verified": True,
+                        "created_at_ms": 1700000000000,
+                        "revoked_at_ms": None,
+                    },
+                    {
+                        "device_id": 2002,
+                        "pubkey_b64": KEYS["device_pubkey_b64"],
+                        "label": "old-laptop",
+                        "cwt_expires_ms": 1800000000000,
+                        "generation": 1,
+                        "pop_verified": True,
+                        "created_at_ms": 1690000000000,
+                        "revoked_at_ms": 1700000050000,
+                    },
+                ],
+                "active_party_ids": [5001],
+            })
+            return
+        if parsed.path == "/v1/accounts/resolve":
+            qs = urllib.parse.parse_qs(parsed.query)
+            h = (qs.get("handle") or [""])[0]
+            if h.lower() == "wingman":
+                self._send_json(200, {
+                    "account_id": 1002,
+                    "handle": "wingman",
+                    "root_pubkey_b64": KEYS["wingman_pubkey_b64"],
+                })
+                return
+            self._send_json(404, {"error": "not_found"})
+            return
+        if parsed.path == "/v1/friends":
+            self._send_json(200, {
+                "friends": [
+                    {"peer_account_id": 1002, "state": 0, "updated_at_ms": 1700000001000},
+                    {"peer_account_id": 1003, "state": 1, "updated_at_ms": 1700000002000},
+                    {"peer_account_id": 1004, "state": 3, "updated_at_ms": 1700000003000},
+                ]
+            })
+            return
+        if parsed.path == "/v1/parties/5001":
+            self._send_json(200, {
+                "party_id": 5001,
+                "party_epoch": PARTY_STATE["epoch"],
+                "leader_account_id": 1001,
+                "leader_device_id": 2001,
+                "visibility": 1,
+                "join_mode": 0,
+                "relay_policy": 1,
+                "pinned_relay_url": "https://relay.multiplayer.tech",
+                "max_members": 4,
+                "member_count": 2,
+            })
+            return
+        self._send_json(404, {"error": "unknown_route"})
+    def do_POST(self):
+        if not self._require_sig():
+            self._send_json(401, {"error": "missing_signature"})
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        body = self._read_json()
+        if parsed.path == "/v1/friends/requests":
+            self._send_json(202, {"target_account_id": body["target_account_id"], "state": 1})
+            return
+        if parsed.path == "/v1/friends/1004/block":
+            self._send_json(200, {"ok": True})
+            return
+        if parsed.path == "/v1/parties":
+            PARTY_STATE["last_create"] = body
+            PARTY_STATE["epoch"] = 1
+            if body.get("max_members") != 4 or body.get("join_mode") != 0:
+                self._send_json(400, {"error": "unexpected_party_defaults"})
+                return
+            self._send_json(201, {
+                "party_id": 5001,
+                "party_epoch": 1,
+                "pinned_relay_url": body.get("relay_url", ""),
+            })
+            return
+        if parsed.path == "/v1/parties/5001/invites":
+            self._send_json(201, {
+                "party_invite_id": 7001,
+                "expires_at_ms": 1900000000000,
+                "invite_link": "mppi1_5001_mockinvitetoken",
+            })
+            return
+        if parsed.path == "/v1/parties/5001/join":
+            PARTY_STATE["epoch"] = 2
+            self._send_json(200, {"status": "joined", "party_epoch": 2})
+            return
+        if parsed.path == "/v1/parties/5001/leave":
+            PARTY_STATE["epoch"] = 3
+            self._send_json(200, {"party_epoch": 3})
+            return
+        if parsed.path == "/v1/parties/5001/disband":
+            if body.get("expected_party_epoch") != PARTY_STATE["epoch"]:
+                self._send_json(409, {"error": "epoch_mismatch"})
+                return
+            PARTY_STATE["epoch"] = 4
+            self._send_json(200, {"party_epoch": 4})
+            return
+        self._send_json(404, {"error": "unknown_route"})
+    def do_DELETE(self):
+        if not self._require_sig():
+            self._send_json(401, {"error": "missing_signature"})
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/v1/friends/1002":
+            self._send_json(200, {"ok": True})
+            return
+        self._send_json(404, {"error": "unknown_route"})
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+ctx.set_alpn_protocols(["http/1.1"])
+ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+port = srv.server_address[1]
+tmp_file = port_file + ".tmp"
+with open(tmp_file, "w", encoding="utf-8") as f:
+    f.write(f"{port}\n")
+os.replace(tmp_file, port_file)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+srv.serve_forever()
+)PY");
+
+  ScopedMockTlsServer mock_srv{MockTlsServerConfig{script_path, cert_path, key_path,
+                                                   port_file, state_json_path}};
+
+  ScopedEnvVar set_online_dir{"BLACKBIRD_ONLINE_DIR", online_dir.string()};
+  ScopedEnvVar set_authority{"BLACKBIRD_ONLINE_AUTHORITY",
+                             std::string{"api.multiplayer.tech"}};
+  ScopedEnvVar set_connect_host{"BLACKBIRD_ONLINE_CONNECT_HOST",
+                                std::string{"127.0.0.1"}};
+  ScopedEnvVar set_port{"BLACKBIRD_ONLINE_PORT", std::to_string(mock_srv.port())};
+  ScopedEnvVar set_ca{"BLACKBIRD_ONLINE_CA_BUNDLE", cert_path.string()};
+
+  auto check_safe = [&](const std::optional<std::string> &res,
+                        const char *label) -> const std::string & {
+    require(res.has_value(), label);
+    require(res->find(root_seed_hex) == std::string::npos &&
+                res->find(dev_seed_hex) == std::string::npos &&
+                res->find(root_seed_b64) == std::string::npos &&
+                res->find(dev_seed_b64) == std::string::npos,
+            "ZERO raw seed material may ever appear in /online TUI output");
+    require(!contains_raw_control_or_c1(*res),
+            "/online TUI output must never emit raw C0/DEL/C1 controls");
+    return *res;
+  };
+
+  // /online status (registered, valid CWT, root key present)
+  const auto status_res = handle_command_post_slash("/online status", ctx);
+  const std::string &status_out = check_safe(status_res, "/online status");
+  require(status_out.find("pilot_one") != std::string::npos &&
+              status_out.find("1001") != std::string::npos &&
+              status_out.find("2001") != std::string::npos &&
+              status_out.find("api.multiplayer.tech") != std::string::npos &&
+              status_out.find("Root key:   yes") != std::string::npos &&
+              status_out.find("Local CWT:  valid") != std::string::npos,
+          "/online status renders handle, ids, authority, root key, and valid CWT");
+
+  // /online health & /party online health alias
+  const auto health_res = handle_command_post_slash("/online health", ctx);
+  const std::string &health_out = check_safe(health_res, "/online health");
+  require(health_out.find("status:        ok") != std::string::npos &&
+              health_out.find("server_now_ms:") != std::string::npos,
+          "/online health renders live ok status and server_now_ms");
+
+  const auto party_health_res = handle_command_post_slash("/party online health", ctx);
+  const std::string &party_health_out =
+      check_safe(party_health_res, "/party online health");
+  require(party_health_out.find("status:        ok") != std::string::npos &&
+              party_health_out.find("server_now_ms:") != std::string::npos,
+          "/party online health routes cleanly to /online health");
+
+  // /online whoami (verifies hostile C1 in device label is sanitized!)
+  const auto whoami_res = handle_command_post_slash("/online whoami", ctx);
+  const std::string &whoami_out = check_safe(whoami_res, "/online whoami");
+  require(whoami_out.find("pilot_one") != std::string::npos &&
+              whoami_out.find("account_id:     1001") != std::string::npos &&
+              whoami_out.find("device_id:      2001") != std::string::npos &&
+              whoami_out.find("active_devices: 1/2") != std::string::npos &&
+              whoami_out.find("cockpit-\\xc2\\x9b"
+                              "6n") != std::string::npos &&
+              whoami_out.find("[revoked]") != std::string::npos &&
+              whoami_out.find("active_parties: 1 [5001]") != std::string::npos,
+          "/online whoami displays account, sanitized devices, and active parties");
+
+  // /online resolve <handle>
+  const std::string expected_wingman_fp =
+      mp::hex_lower(unwrap(mp::sha256(wingman_key.public_key())));
+  const auto resolve_res = handle_command_post_slash("/online resolve wingman", ctx);
+  const std::string &resolve_out = check_safe(resolve_res, "/online resolve wingman");
+  require(resolve_out.find("handle:      wingman") != std::string::npos &&
+              resolve_out.find("account_id:  1002") != std::string::npos &&
+              resolve_out.find(expected_wingman_fp) != std::string::npos,
+          "/online resolve prints account_id, handle, and SHA-256 root_pubkey hex");
+
+  // /online friends
+  const auto friends_res = handle_command_post_slash("/online friends", ctx);
+  const std::string &friends_out = check_safe(friends_res, "/online friends");
+  require(friends_out.find("friends=1, pending=1, blocked=1") != std::string::npos &&
+              friends_out.find("account_id=1002 [friend]") != std::string::npos &&
+              friends_out.find("account_id=1003 [invite_sent]") != std::string::npos &&
+              friends_out.find("account_id=1004 [blocked]") != std::string::npos,
+          "/online friends renders friend/pending/blocked counts and rows");
+
+  // /online friend add/remove/block
+  const auto fadd_handle_res =
+      handle_command_post_slash("/online friend add wingman", ctx);
+  const std::string &fadd_handle_out =
+      check_safe(fadd_handle_res, "/online friend add wingman");
+  require(fadd_handle_out.find("account_id=1002") != std::string::npos &&
+              fadd_handle_out.find("handle=wingman") != std::string::npos &&
+              fadd_handle_out.find("state=invite_sent") != std::string::npos,
+          "/online friend add <handle> resolves and sends request");
+
+  const auto fadd_id_res = handle_command_post_slash("/online friend add 1002", ctx);
+  const std::string &fadd_id_out = check_safe(fadd_id_res, "/online friend add 1002");
+  require(fadd_id_out.find("account_id=1002") != std::string::npos,
+          "/online friend add <account_id> succeeds");
+
+  const auto frem_res = handle_command_post_slash("/online friend remove 1002", ctx);
+  const std::string &frem_out = check_safe(frem_res, "/online friend remove 1002");
+  require(frem_out.find("Removed online friend: account_id=1002") != std::string::npos,
+          "/online friend remove succeeds");
+
+  const auto fblk_res = handle_command_post_slash("/online friend block 1004", ctx);
+  const std::string &fblk_out = check_safe(fblk_res, "/online friend block 1004");
+  require(fblk_out.find("Blocked online account: account_id=1004") != std::string::npos,
+          "/online friend block succeeds");
+
+  // /online party create (default friends + force_relays + max_members=4 + relay URL)
+  const auto pcreate_res = handle_command_post_slash("/online party create", ctx);
+  const std::string &pcreate_out = check_safe(pcreate_res, "/online party create");
+  require(pcreate_out.find("party_id:         5001") != std::string::npos &&
+              pcreate_out.find("visibility:       friends") != std::string::npos &&
+              pcreate_out.find("join_mode:        invite_only") != std::string::npos &&
+              pcreate_out.find("relay_policy:     force_relays") != std::string::npos &&
+              pcreate_out.find("max_members:      4") != std::string::npos &&
+              pcreate_out.find("https://relay.multiplayer.tech") != std::string::npos,
+          "/online party create uses expected defaults and returns party_id");
+
+  // /online party create private no (verifies no_relays omits relay URL)
+  const auto pcreate_no_res =
+      handle_command_post_slash("/online party create private no", ctx);
+  const std::string &pcreate_no_out =
+      check_safe(pcreate_no_res, "/online party create private no");
+  require(pcreate_no_out.find("visibility:       private") != std::string::npos &&
+              pcreate_no_out.find("relay_policy:     no_relays") != std::string::npos &&
+              pcreate_no_out.find("pinned_relay_url: (none)") != std::string::npos,
+          "/online party create private no respects private & no_relays");
+
+  // /online party info 5001
+  const auto pinfo_res = handle_command_post_slash("/online party info 5001", ctx);
+  const std::string &pinfo_out = check_safe(pinfo_res, "/online party info 5001");
+  require(pinfo_out.find("Online party 5001:") != std::string::npos &&
+              pinfo_out.find("leader_account:   1001") != std::string::npos &&
+              pinfo_out.find("members:          2/4") != std::string::npos &&
+              pinfo_out.find("https://relay.multiplayer.tech") != std::string::npos,
+          "/online party info displays summary");
+
+  // /online party invite 5001
+  const auto pinv_res = handle_command_post_slash("/online party invite 5001", ctx);
+  const std::string &pinv_out = check_safe(pinv_res, "/online party invite 5001");
+  require(pinv_out.find("party_invite_id: 7001") != std::string::npos &&
+              pinv_out.find("mppi1_5001_mockinvitetoken") != std::string::npos,
+          "/online party invite returns invite_id and link");
+
+  // /online party join mppi1_5001_<secret> (must NEVER echo invite secret!)
+  const auto pjoin_inv_res =
+      handle_command_post_slash("/online party join mppi1_5001_supersecretjoin99", ctx);
+  const std::string &pjoin_inv_out =
+      check_safe(pjoin_inv_res, "/online party join invite");
+  require(pjoin_inv_out.find("Joined online party 5001") != std::string::npos &&
+              pjoin_inv_out.find("party_epoch=2") != std::string::npos &&
+              pjoin_inv_out.find("supersecretjoin99") == std::string::npos,
+          "/online party join succeeds without echoing invite secret");
+
+  // Malformed mppi1_ invite must also fail closed without echoing secret!
+  const auto pjoin_bad_inv =
+      handle_command_post_slash("/online party join mppi1_bad_secretleak77", ctx);
+  const std::string &pjoin_bad_out =
+      check_safe(pjoin_bad_inv, "/online party join malformed invite");
+  require(pjoin_bad_out.find("Invalid online party invite link") != std::string::npos &&
+              pjoin_bad_out.find("secretleak77") == std::string::npos,
+          "malformed mppi1_ invite fails closed without echoing secret");
+
+  // /online party join <party_id> (numeric party_id)
+  const auto pjoin_id_res = handle_command_post_slash("/online party join 5001", ctx);
+  const std::string &pjoin_id_out =
+      check_safe(pjoin_id_res, "/online party join numeric id");
+  require(pjoin_id_out.find("Joined online party 5001") != std::string::npos,
+          "/online party join <party_id> succeeds");
+
+  // /online party leave 5001
+  const auto pleave_res = handle_command_post_slash("/online party leave 5001", ctx);
+  const std::string &pleave_out = check_safe(pleave_res, "/online party leave 5001");
+  require(pleave_out.find("Left online party 5001") != std::string::npos &&
+              pleave_out.find("party_epoch=3") != std::string::npos,
+          "/online party leave succeeds");
+
+  // /online party disband 5001 (auto-fetches current epoch=3, disbands to epoch=4)
+  const auto pdisband_res =
+      handle_command_post_slash("/online party disband 5001", ctx);
+  const std::string &pdisband_out =
+      check_safe(pdisband_res, "/online party disband 5001");
+  require(pdisband_out.find("Disbanded online party 5001") != std::string::npos &&
+              pdisband_out.find("party_epoch=4") != std::string::npos,
+          "/online party disband fetches current epoch and disbands cleanly");
+
+  // 5. Device-only store (root_seed absent), expired CWT, and XDG_CONFIG_HOME fallback.
+  {
+    const auto dev_only_dir = root_dir.path / "dev-only-online";
+    mp::MpIdentityState dev_only = id_state;
+    dev_only.root_seed = std::nullopt;
+    (void)unwrap(mp::MpIdentityStore::save(dev_only_dir, dev_only));
+    ScopedEnvVar set_dev_dir{"BLACKBIRD_ONLINE_DIR", dev_only_dir.string()};
+    const auto dev_status = handle_command_post_slash("/online status", ctx);
+    const std::string &dev_out = check_safe(dev_status, "/online status dev-only");
+    require(dev_out.find("Root key:   no") != std::string::npos &&
+                dev_out.find("root key offline") != std::string::npos,
+            "device-only identity reports Root key: no cleanly");
+  }
+  {
+    const auto exp_dir = root_dir.path / "expired-cwt-online";
+    mp::MpIdentityState exp_state = id_state;
+    exp_state.device_cwt = unwrap(mp::encode_device_cwt(
+        root_key,
+        mp::DeviceCwtMintRequest{dev_key.public_key(), now_s - 7200, now_s - 3600}));
+    (void)unwrap(mp::MpIdentityStore::save(exp_dir, exp_state));
+    ScopedEnvVar set_exp_dir{"BLACKBIRD_ONLINE_DIR", exp_dir.string()};
+    const auto exp_status = handle_command_post_slash("/online status", ctx);
+    const std::string &exp_out = check_safe(exp_status, "/online status expired cwt");
+    require(exp_out.find("Local CWT:  expired") != std::string::npos,
+            "expired local CWT reports expired cleanly");
+  }
+  {
+    const auto xdg_base = root_dir.path / "xdg-root";
+    const auto xdg_online = xdg_base / "blackbird" / "online";
+    ScopedEnvVar unset_dir{"BLACKBIRD_ONLINE_DIR", std::nullopt};
+    ScopedEnvVar set_xdg{"XDG_CONFIG_HOME", xdg_base.string()};
+    const auto xdg_unreg = handle_command_post_slash("/online status", ctx);
+    require(xdg_unreg.has_value() &&
+                xdg_unreg->find("unregistered") != std::string::npos &&
+                !std::filesystem::exists(xdg_base),
+            "XDG_CONFIG_HOME fallback creates zero directories when unregistered");
+    (void)unwrap(mp::MpIdentityStore::save(xdg_online, id_state));
+    const auto xdg_reg = handle_command_post_slash("/online status", ctx);
+    const std::string &xdg_out = check_safe(xdg_reg, "XDG_CONFIG_HOME status");
+    require(xdg_out.find("pilot_one") != std::string::npos &&
+                xdg_out.find("Local CWT:  valid") != std::string::npos,
+            "XDG_CONFIG_HOME fallback reads $XDG_CONFIG_HOME/blackbird/online");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1791,6 +2524,7 @@ int main() {
     test_party_passive_say_and_lifecycle();
     test_wave9b2_flightdeck_detach_and_party_zero_ceremony();
     test_party_live_lobby_socket_zero_party_json();
+    test_online_tui_slash_env_validation_and_loopback_tls13();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {
