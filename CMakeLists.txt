@@ -1528,3 +1528,17 @@ add_executable(nvim_rpc_test tests/nvim_rpc_test.cpp)
 target_link_libraries(nvim_rpc_test PRIVATE blackbird_foundation)
 add_test(NAME nvim_rpc COMMAND nvim_rpc_test)
 set_tests_properties(nvim_rpc PROPERTIES TIMEOUT 60)
+
+target_sources(blackbird_foundation PRIVATE src/mcp_client.cpp)
+add_executable(mcp_client_test tests/mcp_client_test.cpp)
+target_link_libraries(mcp_client_test PRIVATE blackbird_foundation Threads::Threads)
+add_test(NAME mcp_client COMMAND mcp_client_test)
+set_tests_properties(mcp_client PROPERTIES TIMEOUT 60)
+
+target_sources(blackbird_coding PRIVATE src/saas_packs.cpp)
+add_executable(saas_packs_test tests/saas_packs_test.cpp)
+target_link_libraries(saas_packs_test PRIVATE blackbird_coding Threads::Threads)
+target_compile_definitions(saas_packs_test PRIVATE
+  BLACKBIRD_INTEGRATIONS_DIR="${CMAKE_SOURCE_DIR}/programs/integrations")
+add_test(NAME saas_packs COMMAND saas_packs_test)
+set_tests_properties(saas_packs PROPERTIES TIMEOUT 60)
