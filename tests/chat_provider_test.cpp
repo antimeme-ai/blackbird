@@ -133,10 +133,54 @@ void test_chat_completions_export_and_parse() {
           "usage normalized into Blackbird canonical shape");
 }
 
+void test_deepseek_reasoning_and_cache() {
+  const std::string sse =
+      "data: {\"id\":\"ds-1\",\"model\":\"deepseek-reasoner\","
+      "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+      "\"reasoning_content\":\"Check file first.\"}}]}\n\n"
+      "data: {\"id\":\"ds-1\",\"model\":\"deepseek-reasoner\","
+      "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,"
+      "\"id\":\"call_ds1\",\"type\":\"function\","
+      "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.cc\\\"}"
+      "\"}}]}}],"
+      "\"usage\":{\"prompt_tokens\":200,\"completion_tokens\":25,\"total_tokens\":225,"
+      "\"prompt_cache_hit_tokens\":160}}\n\n"
+      "data: [DONE]\n\n";
+
+  const auto completed = unwrap(chat_completions_completed_response(sse));
+  const auto &out = field(completed, "output").array();
+  require(out.size() == 2, "reasoning item + function_call item");
+  require(string_field(out[0], "type") == "reasoning" &&
+              string_field(out[0], "chat_reasoning_content") == "Check file first.",
+          "DeepSeek reasoning_content captured cleanly");
+  require(field(field(completed, "usage"), "input_tokens_details")
+                  .find("cached_tokens")
+                  ->number()
+                  .text() == "160",
+          "DeepSeek prompt_cache_hit_tokens normalized to cached_tokens");
+
+  // Round-trip back into the next request's assistant message.
+  Value::Array input;
+  input.push_back(Value::object({{"role", Value{"user"}}, {"content", Value{"go"}}}));
+  input.push_back(out[0]);
+  input.push_back(out[1]);
+  input.push_back(Value::object({{"type", Value{"function_call_output"}},
+                                 {"call_id", Value{"call_ds1"}},
+                                 {"output", Value{"int main(){}"}}}));
+  const auto wire = export_chat_completions_request(Value::object(
+      {{"model", Value{"deepseek-reasoner"}}, {"input", Value{std::move(input)}}}));
+  const auto &msgs = field(wire, "messages").array();
+  require(msgs.size() == 3, "user + assistant(reasoning+tool_calls) + tool");
+  require(string_field(msgs[1], "reasoning_content") == "Check file first." &&
+              field(msgs[1], "tool_calls").array().size() == 1,
+          "DeepSeek reasoning_content preserved on assistant tool-call message");
+}
+
 void test_catalog_kimi_and_live_provider_swap() {
   ProviderAuth auth;
   const auto cat = auth.catalog();
-  bool has_gemini = false, has_kimi = false, has_grok = false;
+  bool has_gemini = false, has_kimi = false, has_grok = false, has_deepseek = false,
+       has_jev = false;
   for (const auto &p : field(cat, "providers").array()) {
     const auto &id = string_field(p, "id");
     if (id == "gemini" && string_field(p, "protocol") == "chat")
@@ -145,9 +189,15 @@ void test_catalog_kimi_and_live_provider_swap() {
       has_kimi = true;
     if (id == "grok" && string_field(p, "protocol") == "chat")
       has_grok = true;
+    if (id == "deepseek" && string_field(p, "protocol") == "chat" &&
+        string_field(p, "environment") == "DEEPSEEK_API_KEY")
+      has_deepseek = true;
+    if (id == "jev" && string_field(p, "protocol") == "decision" &&
+        string_field(p, "environment") == "TYPESAFE_API_KEY")
+      has_jev = true;
   }
-  require(has_gemini && has_kimi && has_grok,
-          "built-in catalog includes gemini (chat), kimi (messages), and grok (chat)");
+  require(has_gemini && has_kimi && has_grok && has_deepseek && has_jev,
+          "built-in catalog includes gemini, kimi, grok, deepseek, and jev");
 
   // Kimi Messages export skips Claude-only adaptive thinking / Claude Code prefix.
   const Value kimi_req = Value::object(
@@ -214,6 +264,7 @@ void test_catalog_kimi_and_live_provider_swap() {
 int main() {
   try {
     test_chat_completions_export_and_parse();
+    test_deepseek_reasoning_and_cache();
     test_catalog_kimi_and_live_provider_swap();
     return 0;
   } catch (const Error &e) {

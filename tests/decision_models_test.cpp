@@ -1,6 +1,7 @@
 #include "blackbird/coding.hpp"
 #include "blackbird/decision_models.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/provider_auth.hpp"
 #include <iostream>
 #include <unistd.h>
 
@@ -208,6 +209,22 @@ int main(int argc, char **argv) {
     rejects([&] { (void)adapter.evaluate(q); }, ErrorCode::unsupported);
     write_file(base / "credentials", "jev=native-test-secret\n");
     write_file(base / "mode", "ok");
+    // Verify ProviderAuth stored key (`blackbird auth key jev`) resolves lazily.
+    {
+      const auto auth_dir = base / "auth";
+      (void)setenv("BLACKBIRD_AUTH_HOME", auth_dir.c_str(), 1);
+      (void)unsetenv("BLACKBIRD_JEV_ENV_FILE");
+      ProviderAuth auth;
+      auth.set_key("jev", "default", "native-test-secret");
+      DecisionModelConfig auth_cfg;
+      auth_cfg.curl_executable = config.curl_executable;
+      auth_cfg.response_limit = 8192;
+      DecisionModels auth_adapter{auth_cfg};
+      const auto via_auth = auth_adapter.evaluate(q);
+      check(string_field(via_auth, "status") == "ok",
+            "ProviderAuth stored jev key failed");
+      (void)unsetenv("BLACKBIRD_AUTH_HOME");
+    }
     const auto auditdir = base / "session";
     std::filesystem::create_directory(auditdir);
     std::filesystem::permissions(auditdir, std::filesystem::perms::owner_all);

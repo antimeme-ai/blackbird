@@ -3,6 +3,7 @@
 #include "blackbird/value.hpp"
 #include <filesystem>
 #include <functional>
+#include <optional>
 
 namespace blackbird {
 struct RawProviderOwner;
@@ -56,6 +57,7 @@ public:
   Value catalog() const;
   Value status() const;
   bool selected(std::string_view provider, const RawAuthParent *parent = nullptr) const;
+  std::optional<std::string> stored_key(std::string_view provider) const;
   void set_key(std::string_view provider, std::string_view account, std::string key,
                const RawAuthParent *parent = nullptr);
   void use(std::string_view provider, std::string_view account,

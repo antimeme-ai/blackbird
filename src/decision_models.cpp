@@ -1,5 +1,6 @@
 #include "blackbird/decision_models.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/provider_auth.hpp"
 #include "blackbird/raw_caller.hpp"
 #include "native_process.hpp"
 #include <cmath>
@@ -110,62 +111,74 @@ std::string credential(const DecisionModelConfig &config) {
     if (const auto *v = std::getenv(name); v && *v)
       return checked_key(v);
   auto path = config.credential_file;
-  if (path.empty())
-    if (const auto *v = std::getenv("BLACKBIRD_JEV_ENV_FILE"))
+  const bool explicit_file = !path.empty();
+  if (!explicit_file) {
+    if (const auto *v = std::getenv("BLACKBIRD_JEV_ENV_FILE"); v && *v)
       path = v;
-  if (path.empty())
-    fail(ErrorCode::unsupported);
-  std::ifstream file(path);
-  if (!file)
-    fail(ErrorCode::unsupported);
-  std::string input;
-  char c;
-  while (file.get(c)) {
-    if (input.size() >= 65536)
-      fail(ErrorCode::capacity);
-    input += c;
   }
-  if (!file.eof())
-    fail(ErrorCode::io);
-  std::string primary, alternate;
-  std::size_t pos = 0;
-  while (pos < input.size()) {
-    auto end = input.find('\n', pos);
-    if (end == std::string::npos)
-      end = input.size();
-    auto line = trim(input.substr(pos, end - pos));
-    pos = end + 1;
-    if (line.starts_with("export "))
-      line = trim(line.substr(7));
-    const auto equals = line.find('=');
-    if (equals == std::string::npos)
-      continue;
-    const auto name = trim(line.substr(0, equals));
-    if (name != "TYPESAFE_API_KEY" && name != "jev")
-      continue;
-    auto value = trim(line.substr(equals + 1));
-    if (value.empty())
-      fail(ErrorCode::unsupported);
-    if (value.front() == '\'' || value.front() == '"') {
-      const auto closing = value.find(value.front(), 1);
-      if (closing == std::string::npos)
-        fail(ErrorCode::unsupported);
-      const auto remainder = trim(value.substr(closing + 1));
-      if (!remainder.empty() && !remainder.starts_with('#'))
-        fail(ErrorCode::unsupported);
-      value = value.substr(1, closing - 1);
-    } else {
-      const auto comment = value.find_first_of(" \t#");
-      if (comment != std::string::npos) {
-        const auto remainder = trim(value.substr(comment));
-        if (!remainder.empty() && !remainder.starts_with('#'))
-          fail(ErrorCode::unsupported);
-        value.resize(comment);
+  if (!path.empty()) {
+    std::ifstream file(path);
+    if (file) {
+      std::string input;
+      char c;
+      while (file.get(c)) {
+        if (input.size() >= 65536)
+          fail(ErrorCode::capacity);
+        input += c;
       }
+      if (!file.eof())
+        fail(ErrorCode::io);
+      std::string primary, alternate;
+      std::size_t pos = 0;
+      while (pos < input.size()) {
+        auto end = input.find('\n', pos);
+        if (end == std::string::npos)
+          end = input.size();
+        auto line = trim(input.substr(pos, end - pos));
+        pos = end + 1;
+        if (line.starts_with("export "))
+          line = trim(line.substr(7));
+        const auto equals = line.find('=');
+        if (equals == std::string::npos)
+          continue;
+        const auto name = trim(line.substr(0, equals));
+        if (name != "TYPESAFE_API_KEY" && name != "jev")
+          continue;
+        auto value = trim(line.substr(equals + 1));
+        if (value.empty())
+          fail(ErrorCode::unsupported);
+        if (value.front() == '\'' || value.front() == '"') {
+          const auto closing = value.find(value.front(), 1);
+          if (closing == std::string::npos)
+            fail(ErrorCode::unsupported);
+          const auto remainder = trim(value.substr(closing + 1));
+          if (!remainder.empty() && !remainder.starts_with('#'))
+            fail(ErrorCode::unsupported);
+          value = value.substr(1, closing - 1);
+        } else {
+          const auto comment = value.find_first_of(" \t#");
+          if (comment != std::string::npos) {
+            const auto remainder = trim(value.substr(comment));
+            if (!remainder.empty() && !remainder.starts_with('#'))
+              fail(ErrorCode::unsupported);
+            value.resize(comment);
+          }
+        }
+        (name == "TYPESAFE_API_KEY" ? primary : alternate) = checked_key(value);
+      }
+      if (!primary.empty() || !alternate.empty())
+        return checked_key(primary.empty() ? alternate : primary);
+      if (explicit_file)
+        fail(ErrorCode::unsupported);
+    } else if (explicit_file) {
+      fail(ErrorCode::unsupported);
     }
-    (name == "TYPESAFE_API_KEY" ? primary : alternate) = checked_key(value);
   }
-  return checked_key(primary.empty() ? alternate : primary);
+  if (!explicit_file) {
+    if (auto stored = ProviderAuth{}.stored_key("jev"))
+      return checked_key(std::move(*stored));
+  }
+  fail(ErrorCode::unsupported);
 }
 } // namespace
 

@@ -66,6 +66,8 @@ Value normalize_chat_usage(const Value &raw) {
     if (const auto *cached = pd->find("cached_tokens"))
       out.emplace_back("input_tokens_details",
                        Value::object({{"cached_tokens", *cached}}));
+  } else if (const auto *hit = raw.find("prompt_cache_hit_tokens")) {
+    out.emplace_back("input_tokens_details", Value::object({{"cached_tokens", *hit}}));
   }
   if (const auto *cd = raw.find("completion_tokens_details");
       cd && std::holds_alternative<Value::Object>(cd->value())) {
@@ -104,6 +106,7 @@ Value export_chat_completions_request(const Value &request) {
 
   bool pending_assistant = false;
   std::string assistant_text;
+  std::string assistant_reasoning;
   Value::Array assistant_calls;
   auto flush_assistant = [&] {
     if (!pending_assistant)
@@ -113,11 +116,14 @@ Value export_chat_completions_request(const Value &request) {
       msg.emplace_back("content", Value{assistant_text});
     else
       msg.emplace_back("content", Value{});
+    if (!assistant_reasoning.empty())
+      msg.emplace_back("reasoning_content", Value{assistant_reasoning});
     if (!assistant_calls.empty())
       msg.emplace_back("tool_calls", Value{std::move(assistant_calls)});
     messages.push_back(Value::object(std::move(msg)));
     pending_assistant = false;
     assistant_text.clear();
+    assistant_reasoning.clear();
     assistant_calls.clear();
   };
 
@@ -127,8 +133,16 @@ Value export_chat_completions_request(const Value &request) {
       if (!std::holds_alternative<Value::Object>(item.value()))
         continue;
       const auto type = optional_string(item, "type");
-      if (type == "reasoning")
+      if (type == "reasoning") {
+        const auto rc = optional_string(item, "chat_reasoning_content");
+        if (!rc.empty()) {
+          if (pending_assistant && !assistant_calls.empty())
+            flush_assistant();
+          pending_assistant = true;
+          assistant_reasoning += rc;
+        }
         continue;
+      }
       if (type == "function_call") {
         pending_assistant = true;
         const auto call_id = string_field(item, "call_id");
@@ -233,6 +247,7 @@ Result<Value> chat_completions_completed_response(std::string_view stream,
       std::string response_id;
       std::string response_model;
       std::string assistant_text;
+      std::string reasoning_text;
       std::map<std::size_t, ToolCallAcc> tool_calls;
       Value usage;
       bool saw_chunk = false;
@@ -271,6 +286,10 @@ Result<Value> chat_completions_completed_response(std::string_view stream,
         if (const auto *content = delta->find("content");
             content && std::holds_alternative<std::string>(content->value())) {
           assistant_text += content->string();
+        }
+        if (const auto *rc = delta->find("reasoning_content");
+            rc && std::holds_alternative<std::string>(rc->value())) {
+          reasoning_text += rc->string();
         }
         if (const auto *tcs = delta->find("tool_calls");
             tcs && std::holds_alternative<Value::Array>(tcs->value())) {
@@ -344,6 +363,11 @@ Result<Value> chat_completions_completed_response(std::string_view stream,
         throw Error{ErrorCode::incomplete};
 
       Value::Array output;
+      if (!reasoning_text.empty()) {
+        output.push_back(Value::object(
+            {{"type", Value{"reasoning"}},
+             {"chat_reasoning_content", Value{std::move(reasoning_text)}}}));
+      }
       if (!assistant_text.empty()) {
         output.push_back(Value::object(
             {{"type", Value{"message"}},

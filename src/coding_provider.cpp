@@ -220,7 +220,11 @@ Value::Array project_input_for_provider(Value::Array items,
           std::holds_alternative<std::string>(anth_id->value()) &&
           !anth_id->string().empty();
       const bool has_encrypted = item.find("encrypted_content") != nullptr;
-      if (anthropic) {
+      const bool has_chat_reasoning = item.find("chat_reasoning_content") != nullptr;
+      if (has_chat_reasoning) {
+        if (anthropic || keeps_encrypted || provider_identity == "openai")
+          continue;
+      } else if (anthropic) {
         if (!valid_anthropic)
           continue;
       } else {

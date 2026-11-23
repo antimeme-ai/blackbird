@@ -310,10 +310,14 @@ Value builtin(std::string_view id) {
   if (id == "gemini")
     return make("https://generativelanguage.googleapis.com/v1beta/openai", "chat",
                 "GEMINI_API_KEY");
+  if (id == "deepseek")
+    return make("https://api.deepseek.com/v1", "chat", "DEEPSEEK_API_KEY");
   if (id == "moonshot")
     return make("https://api.moonshot.ai/v1", "chat", "MOONSHOT_API_KEY");
   if (id == "openrouter")
     return make("https://openrouter.ai/api/v1", "chat", "OPENROUTER_API_KEY");
+  if (id == "jev")
+    return make("https://api.typesafe.ai/v1", "decision", "TYPESAFE_API_KEY");
   throw Error{ErrorCode::unsupported};
 }
 Value descriptor(Store &s, std::string_view id) {
@@ -728,8 +732,8 @@ Value ProviderAuth::catalog() const {
 
     Store s{config_, false};
     Value::Array out;
-    for (const auto id : {"kimi", "gemini", "grok", "openai", "anthropic", "mimo",
-                          "moonshot", "openrouter"})
+    for (const auto id : {"kimi", "gemini", "grok", "deepseek", "openai", "anthropic",
+                          "mimo", "moonshot", "openrouter", "jev"})
       out.push_back(builtin(id));
     for (const auto &[k, v] : s.field("providers").object()) {
       (void)k;
@@ -911,6 +915,25 @@ bool ProviderAuth::selected(std::string_view p, const RawAuthParent *parent) con
   } catch (...) {
     trace.finish(5);
     throw;
+  }
+}
+std::optional<std::string> ProviderAuth::stored_key(std::string_view p) const {
+  try {
+    identifier(p);
+    Store s{config_, false};
+    const auto active = str(s.field("active"), p);
+    if (active.empty())
+      return std::nullopt;
+    const auto *acct = s.account(p, active);
+    if (!acct || str(*acct, "kind") != "api_key" ||
+        str(*acct, "state", "ready") != "ready")
+      return std::nullopt;
+    const auto token = str(*acct, "access");
+    if (token.empty())
+      return std::nullopt;
+    return token;
+  } catch (...) {
+    return std::nullopt;
   }
 }
 void ProviderAuth::set_key(std::string_view p, std::string_view a, std::string key,

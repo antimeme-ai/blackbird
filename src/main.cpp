@@ -1254,6 +1254,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 {"grok-code-fast-1", "xAI Grok Code Fast"},
                 {"grok-3", "xAI Grok 3"},
                 {"grok-3-mini", "Fast xAI Grok 3 Mini"}};
+      if (target_provider == "deepseek")
+        return {{"deepseek-chat", "DeepSeek V3.2 Chat"},
+                {"deepseek-reasoner", "DeepSeek V3.2 Reasoner (thinking mode)"}};
       if (target_provider == "moonshot")
         return {{"kimi-k2-0905-preview", "Moonshot Kimi K2"},
                 {"kimi-k2-thinking", "Moonshot Kimi K2 Thinking"}};
@@ -1346,6 +1349,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         for (const auto &p : field(cat, "providers").array()) {
           const auto &pid = string_field(p, "id");
           const auto &proto = string_field(p, "protocol");
+          if (proto == "decision")
+            continue;
           const auto &env = string_field(p, "environment");
           out += (pid == provider_name ? " * " : "   ") + pid + " (" + proto + ", " +
                  provider_auth_tag(st, {pid, env}) + ")\n";
@@ -1357,6 +1362,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       for (const auto &p : field(cat, "providers").array()) {
         const auto &pid = string_field(p, "id");
         const auto &proto = string_field(p, "protocol");
+        if (proto == "decision")
+          continue;
         const auto &env = string_field(p, "environment");
         const auto tag = provider_auth_tag(st, {pid, env});
         const std::string desc =
@@ -1718,8 +1725,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 }
                 out += "Sign in / add keys from your shell:\n"
                        "  blackbird auth login kimi | grok | openai | anthropic\n"
-                       "  blackbird auth key gemini | kimi | grok | openrouter | "
-                       "moonshot\n";
+                       "  blackbird auth key gemini | deepseek | jev | kimi | grok | "
+                       "openrouter\n";
                 ui.notice(out);
               }
             } else if (prompt == "/auth providers") {
@@ -1751,8 +1758,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               const std::string msg =
                   "Use `blackbird auth` outside chat for login/key/use/logout "
                   "(e.g. `blackbird auth login kimi`, `blackbird auth login grok`, "
-                  "`blackbird auth key gemini`). Secrets stay out of session "
-                  "history.\n";
+                  "`blackbird auth key gemini`, `blackbird auth key deepseek`, "
+                  "`blackbird auth key jev`). Secrets stay out of session history.\n";
               if (tui)
                 ui.notice("\n" + msg);
               else
@@ -2117,64 +2124,85 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 }
                 if (tui)
                   ui.question(std::nullopt);
-                auto next_provider =
-                    make_coding_provider(target_provider, command_context);
-                auto candidate = session_store.settings();
-                candidate.provider = target_provider;
-                if (!target_model.empty()) {
-                  candidate.model = target_model;
+                if (target_provider == "jev") {
+                  const auto st = ProviderAuth{}.status();
+                  const auto tag = provider_auth_tag(st, {"jev", "TYPESAFE_API_KEY"});
+                  const std::string msg =
+                      "Jev is Blackbird's native decision model (not a primary chat "
+                      "provider).\n"
+                      "  Status:    " +
+                      tag +
+                      "\n"
+                      "  Auth:      blackbird auth key jev   (or TYPESAFE_API_KEY / "
+                      "BLACKBIRD_JEV_ENV_FILE)\n"
+                      "  Model tool: decision_model (Choice / Score / Noul over shared "
+                      "state)\n"
+                      "  Lua API:   blackbird.decide({state=..., questions=...})\n"
+                      "  Operator:  /decision {...}\n";
+                  if (tui)
+                    ui.notice("\n" + msg);
+                  else
+                    emit(msg);
                 } else {
-                  const auto suggestions = suggested_models(target_provider);
-                  if (!suggestions.empty())
-                    candidate.model = suggestions.front().first;
-                }
-                candidate.effort_pending = false;
-                const auto levels = prepare_route(candidate, command_context);
-                if (candidate.effort_pending && !levels.empty()) {
-                  candidate.effort = levels.front();
-                  candidate.effort_pending = false;
-                }
-                const RawAuthParent switch_parent{
-                    command_context.parent.value_or(RawEventRef{})};
-                auto next_bound = start_binding(target_provider, &switch_parent);
-                SessionProfiles next_profiles = session_profiles;
-                next_profiles.binding = std::move(next_bound.binding);
-                next_profiles.deferral = std::move(next_bound.deferral);
-                next_profiles.bind =
-                    [p = target_provider](const RawAuthParent *parent) {
-                      return profile_binding(p, parent);
-                    };
-                if (next_profiles.binding) {
-                  if (const auto resolved = resolve_binding(
-                          *next_profiles.set, *next_profiles.binding, candidate.model,
-                          next_profiles.session_override
-                              ? &*next_profiles.session_override
-                              : nullptr);
-                      !resolved.has_value()) {
-                    emit("Provider profile refused for " + target_provider + "/" +
-                         candidate.model + ": " + resolved.error().message() + "\n");
-                    throw Error{ErrorCode::invalid_range};
+                  auto next_provider =
+                      make_coding_provider(target_provider, command_context);
+                  auto candidate = session_store.settings();
+                  candidate.provider = target_provider;
+                  if (!target_model.empty()) {
+                    candidate.model = target_model;
+                  } else {
+                    const auto suggestions = suggested_models(target_provider);
+                    if (!suggestions.empty())
+                      candidate.model = suggestions.front().first;
                   }
+                  candidate.effort_pending = false;
+                  const auto levels = prepare_route(candidate, command_context);
+                  if (candidate.effort_pending && !levels.empty()) {
+                    candidate.effort = levels.front();
+                    candidate.effort_pending = false;
+                  }
+                  const RawAuthParent switch_parent{
+                      command_context.parent.value_or(RawEventRef{})};
+                  auto next_bound = start_binding(target_provider, &switch_parent);
+                  SessionProfiles next_profiles = session_profiles;
+                  next_profiles.binding = std::move(next_bound.binding);
+                  next_profiles.deferral = std::move(next_bound.deferral);
+                  next_profiles.bind =
+                      [p = target_provider](const RawAuthParent *parent) {
+                        return profile_binding(p, parent);
+                      };
+                  if (next_profiles.binding) {
+                    if (const auto resolved = resolve_binding(
+                            *next_profiles.set, *next_profiles.binding, candidate.model,
+                            next_profiles.session_override
+                                ? &*next_profiles.session_override
+                                : nullptr);
+                        !resolved.has_value()) {
+                      emit("Provider profile refused for " + target_provider + "/" +
+                           candidate.model + ": " + resolved.error().message() + "\n");
+                      throw Error{ErrorCode::invalid_range};
+                    }
+                  }
+                  session_store.save(candidate, &command_context);
+                  provider = std::move(next_provider);
+                  provider_name = candidate.provider;
+                  model = candidate.model;
+                  effort = candidate.effort;
+                  session_profiles = std::move(next_profiles);
+                  engine.set_provider(*provider);
+                  engine.model(model);
+                  engine.effort(effort);
+                  (void)engine.profiles(session_profiles);
+                  const std::string switched = "Switched provider to " + provider_name +
+                                               "/" + model + " (effort " + effort +
+                                               ").\n";
+                  if (tui)
+                    ui.notice("\n" + switched);
+                  else
+                    emit(switched);
+                  if (target_model.empty() && tui)
+                    ask_model_picker(provider_name, model);
                 }
-                session_store.save(candidate, &command_context);
-                provider = std::move(next_provider);
-                provider_name = candidate.provider;
-                model = candidate.model;
-                effort = candidate.effort;
-                session_profiles = std::move(next_profiles);
-                engine.set_provider(*provider);
-                engine.model(model);
-                engine.effort(effort);
-                (void)engine.profiles(session_profiles);
-                const std::string switched = "Switched provider to " + provider_name +
-                                             "/" + model + " (effort " + effort +
-                                             ").\n";
-                if (tui)
-                  ui.notice("\n" + switched);
-                else
-                  emit(switched);
-                if (target_model.empty() && tui)
-                  ask_model_picker(provider_name, model);
               }
             } else if (prompt == "/model" || prompt.starts_with("/model ")) {
               raw_main_branch(dispatch, 35);
@@ -2239,6 +2267,33 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 }
                 ask_effort(candidate, levels);
               }
+            } else if (prompt == "/decision" || prompt == "/decision ") {
+              raw_main_branch(dispatch, 37);
+              const auto st = ProviderAuth{}.status();
+              std::string tag = provider_auth_tag(st, {"jev", "TYPESAFE_API_KEY"});
+              if (tag == "not signed in") {
+                if (const auto *v = std::getenv("jev"); v && *v)
+                  tag = "env jev";
+                else if (const auto *f = std::getenv("BLACKBIRD_JEV_ENV_FILE");
+                         f && *f && std::filesystem::exists(f))
+                  tag = std::string{"env-file "} + f;
+              }
+              const std::string msg =
+                  "Native decision model (Jev, default jev-1.13.0):\n"
+                  "  Status:     " +
+                  tag +
+                  "\n"
+                  "  Configure:  blackbird auth key jev   (or TYPESAFE_API_KEY)\n"
+                  "  Main model: calls `decision_model` tool or "
+                  "`blackbird.decide(...)` "
+                  "in Lua\n"
+                  "  Example:    /decision "
+                  "{\"state\":{\"msg\":\"build failed\"},\"questions\":{\"ok\":"
+                  "{\"type\":\"noul\",\"instructions\":\"Did the build succeed?\"}}}\n";
+              if (tui)
+                ui.notice("\n" + msg);
+              else
+                emit(msg);
             } else if (prompt.starts_with("/decision ")) {
               raw_main_branch(dispatch, 37);
               emit_structured(engine.operator_call(

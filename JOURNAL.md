@@ -13695,3 +13695,20 @@ Addressed six operator field notes from live TUI use:
   - Implemented chat-bounded drag selection (`Ink::highlight` confined strictly to the chat
     content viewport, skipping header, `  │ ` rail, mascot/task pane, and composer) with
     automatic OSC 52 clipboard copy on release (`terminal_extract_chat_selection`).
+
+## 2026-11-22 — Add DeepSeek (`deepseek`) + Unified Jev (`jev`) Auth & Status
+
+- Added `deepseek` (`https://api.deepseek.com/v1`, `chat`, `DEEPSEEK_API_KEY`) to built-in
+  `ProviderAuth` catalog and `/provider` / `/model` pickers (`deepseek-chat`,
+  `deepseek-reasoner`).
+- Added DeepSeek Thinking Mode `reasoning_content` round-tripping and
+  `prompt_cache_hit_tokens` cache normalization in `ChatCompletionsCodingProvider`
+  (`src/chat_provider.cpp`), with cross-provider projection in `src/coding_provider.cpp`
+  so hot-swapping away to OpenAI Responses or Anthropic Messages strips chat-only
+  reasoning items cleanly.
+- Registered `jev` (`https://api.typesafe.ai/v1`, `decision`, `TYPESAFE_API_KEY`) in
+  `ProviderAuth` so `blackbird auth key jev` works alongside env vars and
+  `BLACKBIRD_JEV_ENV_FILE`; `DecisionModels` resolves the stored key lazily for the main
+  model's `decision_model` tool, Lua `blackbird.decide`, and `/decision`.
+- Added bare `/decision` status/usage notice and `/provider jev` guidance notice while
+  keeping non-conversational `decision` providers out of the primary `/provider` picker.
