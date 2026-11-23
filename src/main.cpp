@@ -236,6 +236,40 @@ std::string describe_profile(const LoadedProfiles &loaded,
            (leaf.basis.empty() ? std::string{"none"} : leaf.basis) + "\n";
   return out + profile_set_lines(loaded);
 }
+struct ApplicationCli {
+  bool enabled = false;
+  bool valid = true;
+};
+ApplicationCli parse_application_cli(int argc, char **argv) {
+  ApplicationCli cli;
+  bool has_session = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg = argv[i];
+    if (arg == "--application") {
+      if (cli.enabled)
+        cli.valid = false;
+      cli.enabled = true;
+    } else if (arg == "--session") {
+      if (has_session || i + 1 >= argc || argv[i + 1][0] == '\0') {
+        cli.valid = false;
+        if (i + 1 < argc)
+          ++i;
+      } else {
+        ++i;
+        has_session = true;
+      }
+    } else if (arg == "--station" || arg == "--backstop" || arg == "--seed-session" ||
+               arg == "--effort" || arg == "--workflow" || arg == "--provider" ||
+               arg == "--model" || arg == "--once") {
+      cli.valid = false;
+      if (i + 1 < argc)
+        ++i;
+    } else {
+      cli.valid = false;
+    }
+  }
+  return cli;
+}
 } // namespace
 int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 RawSuccessorHandoff *selected_handoff = nullptr,
@@ -3082,11 +3116,11 @@ int main(int argc, char **argv) {
     std::cout << BLACKBIRD_VERSION_STRING << '\n';
     return 0;
   }
-  if (argc > 1 && std::string_view{argv[1]} == "--application") {
+  if (const auto app_cli = parse_application_cli(argc, argv); app_cli.enabled) {
     ApplicationConnection application;
     std::string id;
     try {
-      if (argc != 2)
+      if (!app_cli.valid)
         throw Error{ErrorCode::invalid_range};
       const auto open = application.open();
       id = string_field(open, "id");

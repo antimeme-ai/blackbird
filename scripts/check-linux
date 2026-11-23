@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ordinary native checks on the operator-selected Wintermute host; never mutants."""
+"""Run ordinary native checks on an operator-selected Linux SSH host; never mutants."""
 import argparse
 import io
 import os
@@ -12,8 +12,6 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
-HOST = os.environ.get("BLACKBIRD_LINUX_HOST", "patrick@wintermute")
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", HOST]
 
 
 def main():
@@ -26,6 +24,15 @@ def main():
     parser.add_argument("--fuzz-runs", type=int, default=1000000,
                         help="Bounded libFuzzer executions of the profile reader in the fuzz profile")
     args = parser.parse_args()
+    host = os.environ.get("BLACKBIRD_LINUX_HOST", "").strip()
+    if not host:
+        print(
+            "BLACKBIRD_LINUX_HOST is unset. Set it to your Linux SSH build host, e.g.:\n"
+            "  BLACKBIRD_LINUX_HOST=user@linux-host ./scripts/check-linux",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host]
     # Explicit current native unit source scope, excluding history, credentials and captures.
     paths = ["CMakeLists.txt", "include", "src", "tests", "programs", "tooling/probes",
              "assets", "packages", "profiles", "scripts/check-foundation-api", "scripts/check-terminal-pty", "scripts/check-new-session-pty", "scripts/check-participants-pty", "scripts/check-tiny-terminal-pty", "scripts/check-provider-auth", "scripts/check-trajectory", "scripts/check-observations", "scripts/check-tasks-pty", "scripts/check-command-jobs-pty", "scripts/check-command-jobs-station", "scripts/check-rrc", "scripts/arco", "scripts/blackbird", "scripts/terminal-screen-oracle.py", "scripts/native-packet.py"]
@@ -55,12 +62,12 @@ def main():
     parent.mkdir(parents=True, exist_ok=True)
     capture = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
     print(f"Linux capture: {capture}", flush=True)
-    remote = subprocess.check_output([*SSH, "mktemp -d /tmp/arconaut-linux-XXXXXXXX"], text=True, timeout=15).strip()
+    remote = subprocess.check_output([*ssh, "mktemp -d /tmp/arconaut-linux-XXXXXXXX"], text=True, timeout=15).strip()
     if not remote.startswith("/tmp/arconaut-linux-") or len(remote.splitlines()) != 1:
         raise RuntimeError("unexpected remote workspace")
     keep_remote = False
     try:
-        subprocess.run([*SSH, "tar -xzf - -C " + shlex.quote(remote)], input=archive.getvalue(), check=True, timeout=30)
+        subprocess.run([*ssh, "tar -xzf - -C " + shlex.quote(remote)], input=archive.getvalue(), check=True, timeout=30)
         commands = '''import os, platform, subprocess, re
 from pathlib import Path
 root = Path.cwd()
@@ -158,7 +165,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
 '''
         commands = "test_regex = " + repr(args.test_regex) + "\nbuild_targets = " + repr(args.targets) + "\nselected_profiles = " + repr(args.profiles) + "\nfuzz_runs = " + repr(args.fuzz_runs) + "\n" + commands
         with (capture / "checks.log").open("wb") as output:
-            result = subprocess.run([*SSH, "cd " + shlex.quote(remote) + " && python3 -"], input=commands.encode(), stdout=output, stderr=subprocess.STDOUT)
+            result = subprocess.run([*ssh, "cd " + shlex.quote(remote) + " && python3 -"], input=commands.encode(), stdout=output, stderr=subprocess.STDOUT)
         if args.profiles and "fuzz" in args.profiles:
             # Crash, leak and timeout inputs come back before the remote workspace goes.
             # A failed or timed-out copy keeps the workspace, so no input is lost.
@@ -166,7 +173,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
             kept.mkdir()
             failure = None
             try:
-                copy = subprocess.run([*SSH, "cd " + shlex.quote(remote) + " && if test -d build/fuzz/artifacts; then tar -czf - -C build/fuzz artifacts; else exit 3; fi"], capture_output=True, timeout=600)
+                copy = subprocess.run([*ssh, "cd " + shlex.quote(remote) + " && if test -d build/fuzz/artifacts; then tar -czf - -C build/fuzz artifacts; else exit 3; fi"], capture_output=True, timeout=600)
                 if copy.returncode == 3:
                     print("Fuzz artifacts: none (the fuzz step made no artifact directory)")
                 elif copy.returncode != 0:
@@ -182,7 +189,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
                 failure = f"unpacking failed: {error}"
             if failure:
                 keep_remote = True
-                note = f"Fuzz artifact copy-back failed ({failure}); remote workspace kept at {HOST}:{remote}"
+                note = f"Fuzz artifact copy-back failed ({failure}); remote workspace kept at {host}:{remote}"
                 (capture / "copy-back-error.txt").write_text(note + "\n")
                 print(note, file=sys.stderr)
         if result.returncode:
@@ -197,10 +204,10 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
     finally:
         # A kept workspace only skips the removal; the checks' own result still stands.
         if keep_remote:
-            print(f"Remote workspace kept for its fuzz artifacts: {HOST}:{remote}", file=sys.stderr)
+            print(f"Remote workspace kept for its fuzz artifacts: {host}:{remote}", file=sys.stderr)
         else:
             try:
-                subprocess.run([*SSH, "rm -rf -- " + shlex.quote(remote)], check=True, timeout=15)
+                subprocess.run([*ssh, "rm -rf -- " + shlex.quote(remote)], check=True, timeout=15)
             except (subprocess.SubprocessError, OSError) as error:
                 warning = f"Remote cleanup failed for {remote}: {error}"
                 try:

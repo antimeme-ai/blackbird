@@ -150,7 +150,7 @@ void owners() {
     const auto quoted = "'" + std::filesystem::canonical(directory.path).string() +
                         "/session'\"'\"''\"'\"''\"'\"''";
     check(string_field(field(listing, "sessions").array()[0], "resume_command") ==
-              "./scripts/blackbird --session " + quoted,
+              "blackbird --session " + quoted,
           "literal apostrophe quote changed");
     const auto missing = list_sessions(named / "does-not-exist", &context);
     check(string_field(missing, "root") == stable + "/does-not-exist" &&

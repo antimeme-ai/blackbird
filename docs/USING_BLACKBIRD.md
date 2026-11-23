@@ -19,8 +19,8 @@ Use `--session DIRECTORY` to reopen a conversation or choose its location;
 Recovery, inspection, continuation and diagnostic expiry require `--session`.
 The working directory is the tool working
 directory. Only one process may hold a session. `--once 'prompt'` runs one turn.
-`--provider ID` selects OpenAI, OpenRouter or a registered Responses route; switching
-providers requires an explicit `--model NAME`. `--effort low|medium|high|xhigh|max` selects reasoning
+`--provider ID` selects OpenAI, OpenRouter, or a registered Responses, Chat Completions,
+or Messages route; switching providers requires an explicit `--model NAME`. `--effort low|medium|high|xhigh|max` selects reasoning
 (initial default `medium`). If that effort is unsupported by the chosen route,
 the interactive harness opens and asks which supported level you intended.
 No request runs until you answer; quitting preserves the unanswered question for
@@ -46,7 +46,7 @@ available. See [reopen behavior](SESSION_REOPEN.md) for unsupported cases.
 lists the current session's parent. Results have stable absolute paths, Unix-second
 last activity from audit mtime (null with explicit unavailable status if stat fails),
 saved provider/model/effort/workflow and a shell-quoted
-explicit `./scripts/blackbird --session 'PATH'` resume command. Ordinary reopen does not
+explicit `blackbird --session 'PATH'` resume command. Ordinary reopen does not
 consume a pending RRC intent; use `--resume-continue` explicitly when appropriate.
 
 Listing reads bounded `session-info.bbm` configuration snapshots and stats audits;
@@ -270,11 +270,17 @@ persistent state. The model has a `lua` tool and the same APIs:
   Timeout/cancellation still interrupt the turn; partial chunks and their attempt
   references remain in audit for explicit later inspection/retrieval. The existing
   16 MiB process collection capacity remains; this is not a memory/stream budget.
-- `blackbird.context()` returns `{base, entries}`; each entry has stable `id` and `item`.
-  Transform the presentation and use `blackbird.edit(candidate)`. Stale bases and invalid
-  IDs produce retained rejections. Edits/removals preserve originals.
-- `blackbird.stats()` (also `/stats` and `context_stats`) reports entry count,
-  per-entry item bytes, serialized input-array bytes and full view bytes. All are
+- `blackbird.blocks([include_archived])` lists live context blocks (and archived
+  blocks when `include_archived` is true); each block has a stable numeric `id`,
+  `kind`, `pinned`, `bytes` and preview. `blackbird.read_block(id[, {offset, limit}])`
+  reads retained block content without replaying effects. `blackbird.compact(args)`
+  applies compaction (`op` is `"drop"`, `"summarize"`, `"restore"`, `"pin"`, or
+  `"unpin"`), `blackbird.pin(id_or_ids[, pinned])` is a shorthand for pin/unpin,
+  `blackbird.set_blocks(list)` replaces the active block presentation directly, and
+  `blackbird.flush_context()` flushes deferred cache-warm compactions immediately.
+  Edits and drops preserve originals in the audit journal.
+- `blackbird.stats()` (also `/stats`) reports block counts,
+  serialized input bytes and full view bytes. All are
   native binary packet byte counts, **not tokens**. `last_request_bytes` measures the
   native packet size after request overrides; authentication headers are not
   part of it. Request size is shown before provider transport; actual returned
@@ -282,16 +288,12 @@ persistent state. The model has a `lua` tool and the same APIs:
   total counts and cached/reasoning details, never arbitrary extension strings.
   Last request/usage are scoped to this process; null means unavailable. No token
   estimates or model-limit guesses are made.
-- `blackbird.originals()` lists originals; `blackbird.restore(id)` repairs an item.
-  `blackbird.append(items[, {class = "instruction" | "result"}])` adds synthetic
-  items with fresh original IDs. The class belongs to the appended record and an
-  edit cannot change it: an instruction is never archived, summarised or left out
-  by `context_manage`, except an older copy whose bytes equal a later live
-  instruction, which may be archived or left out by a select; the default,
-  `result`, can be archived. An
-  append holding function calls or reasoning takes no class and is a `round`,
-  atomic with the outputs that answer its calls; outputs take no class either and
-  join their call's round. Any other option or class is refused.
+- `blackbird.blocks(true)` lists live and archived originals; `blackbird.read_block(id)`
+  inspects retained content and `blackbird.compact({op="restore", ids={id}})` repairs
+  an archived block.
+  `blackbird.append(items[, {kind = "instruction" | "note"}])` adds synthetic
+  items with fresh block IDs. Instructions and pinned blocks are protected from
+  `drop` and `summarize`.
 - `blackbird.live_instruction(item)` returns true when a live entry whose creating
   record makes it an instruction holds an item equal to `item`, ignoring the order of
   object keys at every depth (both are compared with keys sorted; every other byte,
@@ -306,8 +308,10 @@ persistent state. The model has a `lua` tool and the same APIs:
   matching streamed text. `blackbird.display(text)` and `print(...)` retain explicit
   display output. Streaming preview is derived from already-retained raw bytes.
 
-Base/coroutine/table/string/math/utf8 Lua facilities are available. Host I/O goes
-through `blackbird.call`; raw io/os/package/debug and file loaders are absent. Evaluate
+Base/coroutine/table/string/math/utf8 Lua facilities and a safe read-only `os` subset
+(`os.time`, `os.clock`, `os.difftime`) are available. Host I/O goes
+through `blackbird.call`; shell/filesystem/env `os` functions and raw
+`io`/`package`/`debug` and file loaders (`dofile`/`loadfile`) are absent. Evaluate
 modules with `load` on audited `read_file` content. This keeps effects in the audit;
 it is not a hostile-code sandbox or an approval system.
 
@@ -376,11 +380,12 @@ context linkage incomplete. The next provider request refuses that presentation;
 ordinary failure does not automatically repair it or replay effects. Interruption
 and capacity stops already supply their native stop placeholders.
 
-After inspecting the retained failed program, operation results and unknowns, use
-an explicit recovery workflow:
+After inspecting the retained failed program, operation results and unknowns, inspect
+live blocks with `blackbird.blocks()` and repair or replace the presentation explicitly
+with `blackbird.set_blocks(...)` or `/workflow programs/turn.lua`:
 
 ```text
-/lua local r=blackbird.call('context_repair',{base=blackbird.context().base}); print(blackbird.json.encode(r))
+/lua print(blackbird.json.encode(blackbird.blocks()))
 /workflow programs/turn.lua
 <your next useful request, with instructions not to replay uncertain effects>
 ```
@@ -414,46 +419,30 @@ is mechanism evidence; readiness for daily self-development depends on operator 
 
 ### Explicit managed compaction (B1)
 
-`/compact JSON` accepts `{base,mode,ids,reason,source}`; mode is `archive`, `select`,
-`summarize` or `restore`. Summary also requires `summary:{role:"assistant",content:...}`.
-Use `/context` for entry IDs/revision. `ids` name whole units. A response round is
-one unit: the reasoning, messages and calls of one record plus every output that
-answers those calls, wherever the outputs sit; a Lua append of calls or reasoning is
-a round too. Every other entry is its own unit. The class comes from the record that
-created the entry, never from an edit:
-- never archived, summarised or left out of a select: instructions (operator prompts,
-  restart notes, backstop instructions, Lua appends declared `instruction`, the
-  built-in ultracode brief, seeded user/system/developer entries, and user, system
-  or developer entries of Lua appends written before S2 or of other legacy records),
-  and pinned units. An older instruction whose item bytes equal a later live
-  instruction may be archived or left out of a select, never summarised;
-- archivable: rounds, results (the Lua default, workflow continuations, protocol
-  repairs, stop linkage, `operator.beads`, application observations), request state
-  and summaries.
-Refusals: `partial-tool-group` (a call without its output, or a call no output
-answers yet), then `partial-round` (reasoning without the rest of its round), both
-over the whole selection; then, at the first unit in context order with a problem,
-`protected-unit`, `pinned-unit` or `partial-unit` (part of a unit), checked in that
-order for that unit. A select keeps the open round at the tail. Restore merges exact
-originals in capture order and repairs selected edited/reordered presentations.
-Archive only changes presentation. Summaries have fresh IDs and source ancestry;
+`/compact JSON` passes arguments to `context_compact`: `{op, ids, from, to, summary, apply}`
+where `op` (`CompactOp`) is `drop`, `summarize`, `restore`, `pin`, or `unpin`.
+`summarize` also requires a non-empty `summary` string. Use `/context` or `/originals`
+for block IDs; `/restore ID` is shorthand for `{"op":"restore","ids":[ID]}`.
+Instructions and pinned blocks are protected from `drop` and `summarize`.
+`restore` reintroduces archived originals in capture order.
+`drop` and `summarize` only change the working presentation; originals remain in the
+audit journal. Summaries carry fresh block IDs and source ancestry;
 structural acceptance cannot establish fact accuracy. Management never runs
 automatically. The default context budget (trigger 393216 bytes, target 196608)
 only invites the model to act; see [CONTEXT_BUDGET](CONTEXT_BUDGET.md).
 
-Lua uses `blackbird.manage(proposal)` and `blackbird.inspect(query)`. Model tools are
-`context_manage {proposal}` and `context_inspect {query}`. A supplied base is strict
-CAS. Model tool proposals may omit base to explicitly bind the invocation snapshot
-(the concrete resolved proposal is audited), avoiding the provider-call append gap.
-Managed requests during a workflow stage until successful completion, retaining the
-current tool exchange. Failed/interrupted workflows cancel. One pending request;
-o overlapping last-writer-wins. Generic CLM edit/append remain available.
+Lua uses `blackbird.blocks([include_archived])`, `blackbird.compact(args)`,
+`blackbird.read_block(id[, {offset, limit}])`, `blackbird.set_blocks(list)`,
+`blackbird.pin(id_or_ids[, pinned])`, and `blackbird.flush_context()`. Model tools are
+`context_list`, `context_compact`, and `context_read`. While the prompt cache is warm
+during a turn, `apply="auto"` (the default) defers `drop`/`summarize` until cache cold,
+route switch, overflow, turn end, or `blackbird.flush_context()`; pass `apply="now"`
+to apply immediately and roll a fresh cache epoch. `pin`, `unpin`, and `restore` apply
+immediately.
 
-`/inspect {"kind":"index"}` returns bounded hex-encoded BBM2 stream bytes. Add `"format":"json"` for a JSON export.
-Kinds: `index`, `history`, `originals`; originals may specify `entry`. Optional
-`offset` and `limit` (default4096, max65536) page exact source bytes without dumping
-old history into a request. Decode hex locally; ranges may split UTF-8 codepoints.
-Audit/originals grow even when presentation shrinks. No automatic effect replay.
+`/inspect JSON` calls `context_read` (e.g. `{"id":1,"offset":0,"limit":4096}`) to page
+exact retained content of a live or archived block without dumping old history into a
+request. Audit/originals grow even when presentation shrinks. No automatic effect replay.
 
 A tool deadline returns `timed_out:true`, `effect_outcome:"unknown"` and an
 `output_ref` for retained partial output. The workflow continues so the model can
@@ -812,9 +801,9 @@ services, configure an explicit HTTPS origin and one of the three wire formats:
 
 Custom IDs cannot replace builtin origins. Supported protocols are `responses`,
 `responses-portable`, `chat` (chat/completions), and `messages` (Anthropic-style).
-The two Responses protocols support the main coding loop. Built-in `anthropic`
-also supports it through its native Messages adapter; other registered Messages
-providers remain context-only colleague routes. See
+All four protocols—Responses, portable Responses, Chat Completions (`chat`), and
+Messages (`messages`)—run the main coding loop through their respective native
+adapters. See
 [Paper Instruments setup](TOKENOMICS.md#paper-instruments-and-registered-responses).
 Credentials are sent
 through curl's private stdin configuration, not its argv; no redirects or HTTP
@@ -825,8 +814,9 @@ verification; no provider SDK/auth library is linked.
 Admissions retain protocol/origin/account/revision, never token material; an
 account change before dispatch refuses that admission. Requested/observed models
 and provider usage remain separate. HTTP401/403,429 and transport timeout have
-distinct outcomes. The main coding loop supports OpenAI, explicit OpenRouter
-Responses, registered Responses routes and built-in Anthropic Messages.
+distinct outcomes. The main coding loop supports OpenAI, explicit OpenRouter,
+registered Responses routes, Chat Completions (`chat`) providers, and Messages
+(`messages`) providers including built-in `anthropic`.
 OpenAI can use its owned ChatGPT-plan login or key; existing Codex
 authentication remains the compatibility path when neither is selected.
 Provider `claude` remains the explicit Claude CLI

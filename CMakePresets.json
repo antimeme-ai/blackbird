@@ -23,8 +23,10 @@
     },
     {
       "name": "release",
-      "inherits": "base",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_BUILD_TYPE": "Release",
         "BLACKBIRD_INSTRUMENTATION": "none",
         "BLACKBIRD_DEBUG": "OFF"

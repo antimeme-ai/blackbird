@@ -32,6 +32,7 @@ if [ "${1:-}" = auth ] || [ "${1:-}" = --version ] || [ "${1:-}" = -V ]; then
   exec "$blackbird_executable" "$@"
 fi
 blackbird_probe=false
+blackbird_application=false
 blackbird_session=''
 blackbird_session_option=false
 blackbird_existing_session=false
@@ -48,6 +49,7 @@ for blackbird_argument in "$@"; do
     continue
   fi
   case "$blackbird_argument" in
+    --application) blackbird_application=true; blackbird_probe=true ;;
     --help|--version|-V|--list-sessions) blackbird_probe=true ;;
     --audit-last|--expire-diagnostics|--rebuild-session|--recover-unknown-effects|--resume-continue)
       blackbird_existing_session=true ;;
@@ -58,6 +60,9 @@ for blackbird_argument in "$@"; do
     --plain) blackbird_plain=true ;;
   esac
 done
+if "$blackbird_application"; then
+  exec "$blackbird_executable" "$@"
+fi
 if ! "$blackbird_session_option" && "$blackbird_existing_session" && ! "$blackbird_probe"; then
   printf 'Select an existing session with --session DIRECTORY for inspection, recovery, continuation or maintenance.\n' >&2
   exit 1

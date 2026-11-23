@@ -13,8 +13,10 @@ This host already includes `~/.local/bin` on `PATH`. Another host can select a
 prefix with `--prefix DIRECTORY` and add its `bin` directory to `PATH`. The script
 prints the installed command location; it never edits shell configuration.
 `CMAKE=/absolute/path/to/cmake` selects the CMake executable. The repository's
-`release` preset still supplies the qualified compiler and Lua requirements;
-the script does not install a compiler, libraries or other dependencies.
+portable `release` preset builds with Ninja and auto-discovers the qualified LLVM
+Clang compiler on macOS (Homebrew LLVM 23.1.2) and Linux (`clang++` 23.1.3 with
+libc++ 23.1.3) unless `CXX` is set explicitly; the script does not install a compiler,
+libraries or other dependencies.
 
 To build and activate the current local source again:
 
@@ -27,6 +29,25 @@ build parallelism (default 6). Update never fetches, resets, stashes or checks o
 Git changes. Local edits are included in the build. Run source checks before
 installing a changed checkout; the installer's offline smoke checks exercise
 packaging, rather than replacing the development suite.
+
+### Managing installed generations
+
+```sh
+./scripts/install-blackbird --list [--prefix DIR]
+./scripts/install-blackbird --rollback [GENERATION] [--prefix DIR]
+./scripts/install-blackbird --prune [--keep N] [--prefix DIR]
+```
+
+- `--list` prints all installed generations under `<prefix>/lib/blackbird/releases/`,
+  marking the active `current` generation with `*` alongside its install timestamp
+  and `MANIFEST` version.
+- `--rollback [GENERATION]` atomically switches `current` back to the named
+  generation (or the most recent previous runnable generation when `GENERATION` is
+  omitted), serialized by `install.lock`.
+- `--prune [--keep N]` removes older generations beyond the keep budget (default
+  `3`), always preserving the active `current` generation even if it is the oldest.
+  Do not prune a generation still used by a running process or a saved session
+  workflow path.
 
 The checkout's `./scripts/blackbird` also follows the managed installation at
 `~/.local/bin/blackbird` when present, so an old checkout build cannot silently
@@ -41,11 +62,13 @@ An installation under another prefix is selected through its `bin/blackbird`.
 Packaged launchers stay within their own generation regardless of other installs.
 An obsolete `blackbird-ui` sibling does not participate in executable selection.
 
-Each installation builds production executables directly into a fresh generation
-under `~/.local/lib/blackbird/releases/`, alongside copied Lua programs and assets.
-This preserves compiled absolute helper paths and removes the running program's
-need for the source checkout's files. After help, isolated provider-catalog and a
-local Lua/PTY-helper smoke succeed, the script atomically switches `current`.
+Each installation builds production executables in a temporary `.build` directory
+inside a fresh generation under `~/.local/lib/blackbird/releases/`, copies the lean
+production binaries into `bin/` alongside copied Lua programs, assets and provider
+profiles under `share/blackbird/`, and removes `.build` before activation.
+This removes the running program's need for the source checkout's files. After
+version, help, isolated provider-catalog and a local Lua/PTY-helper smoke succeed,
+the script atomically switches `current`.
 A failed build or smoke preserves the previous `current` generation. An unrelated
 existing `bin/blackbird` is refused. Installations on the same prefix are serialized
 with `lib/blackbird/install.lock`; remove an abandoned lock only after its installer
@@ -75,10 +98,11 @@ Use the corresponding prefix when installing elsewhere. Resolving `current`
 first pins the selected Lua to that generation. Keep an explicitly authored
 workflow selected when that is the desired behavior.
 
-Generation build trees are intentionally retained with the executables: the
-helper paths were compiled at those fixed paths. This is a host installation,
-rather than a relocatable binary distribution. macOS and Linux use their native
-atomic symlink-replacement flags; other platforms are refused.
+Intermediate `.build` directories are pruned before activation; each generation
+retains its packaged `bin/` executables, `share/blackbird/` resources, `scripts/`,
+and `MANIFEST`. This is a host installation rather than a relocatable binary
+distribution. macOS and Linux use their native atomic symlink-replacement flags;
+other platforms are refused.
 
 The runtime also resolves executable-owned programs/assets and helper siblings
 when deliberately packaged or moved. See [portable runtime resources](PORTABLE_RUNTIME.md)

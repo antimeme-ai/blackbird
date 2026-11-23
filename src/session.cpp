@@ -337,7 +337,7 @@ Value list_sessions(const std::filesystem::path &requested,
         quoted += c == '\'' ? "'\"'\"'" : std::string(1, c);
       quoted += '\'';
       (void)call.source(9, quoted, quoted_source, 4222);
-      constexpr std::string_view prefix = "./scripts/blackbird --session ";
+      constexpr std::string_view prefix = "blackbird --session ";
       auto resume_source =
           call.source_credit(raw_session_bound(prefix.size(), quoted.size()));
       const auto resume_command = std::string{prefix} + quoted;

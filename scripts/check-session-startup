@@ -79,13 +79,61 @@ with tempfile.TemporaryDirectory(prefix='blackbird-startup-') as temporary:
         before = directories()
         run(command, ['--help'])
         listed = run(command, ['--list-sessions'])
-        discovered = {Path(item['path']) for item in json.loads(listed.stdout)['sessions']}
+        listed_sessions = json.loads(listed.stdout)['sessions']
+        discovered = {Path(item['path']) for item in listed_sessions}
         assert before <= discovered, (before, discovered)
+        for item in listed_sessions:
+            assert item['resume_command'].startswith('blackbird --session '), item
         for flag in ('--audit-last', '--expire-diagnostics', '--rebuild-session',
                      '--recover-unknown-effects', '--resume-continue', '--resume-once'):
             refused = run(command, [flag], success=False)
             assert '--session DIRECTORY' in refused.stderr, (flag, refused.stderr)
         assert directories() == before
+
+    # --application works through the launcher directly and with --session,
+    # without allocating a stray session directory.
+    app_session = root / 'app-session'
+    before = directories()
+    for app_args in (['--application'],
+                     ['--session', str(app_session), '--application']):
+        proc = subprocess.Popen([launcher, *app_args], env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        try:
+            def send_frame(value):
+                frame_path = root / 'app-frame.bbm'
+                native_packet.write_packet(frame_path, value)
+                data = frame_path.read_bytes()
+                proc.stdin.write(struct.pack('>I', len(data)) + data)
+                proc.stdin.flush()
+
+            def recv_frame():
+                buf = bytearray()
+                while len(buf) < 4:
+                    chunk = proc.stdout.read(4 - len(buf))
+                    assert chunk, 'application stdout closed early'
+                    buf.extend(chunk)
+                size = struct.unpack('>I', bytes(buf))[0]
+                body = bytearray()
+                while len(body) < size:
+                    chunk = proc.stdout.read(size - len(body))
+                    assert chunk, 'application stdout truncated'
+                    body.extend(chunk)
+                return native_packet.decode_packet(bytes(body))
+
+            send_frame({'type': 'open', 'id': 'open', 'session': str(app_session)})
+            ready = recv_frame()
+            assert ready['type'] == 'ready' and ready['session'] == str(app_session), ready
+            send_frame({'type': 'close', 'id': 'close'})
+            closed = recv_frame()
+            assert closed == {'type': 'closed', 'id': 'close'}, closed
+            proc.stdin.close()
+            assert proc.wait(timeout=20) == 0, proc.stderr.read().decode()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert directories() == before, '--application created a stray session directory'
 
     # The wrapper must retain its newly allocated path across exit-75 refit.
     workflow.write_text('''local bs=blackbird.blocks().blocks

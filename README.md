@@ -87,10 +87,11 @@ The working directory is the tool working directory. Without `--session`, every 
 
 Blackbird owns provider account storage, selection and refresh. Explicit OpenAI
 sign-in uses browser OAuth; Kimi and Grok use device login; Anthropic, MiMo and
-other providers accept API keys. The main coding loop
-uses OpenAI by default, with explicit OpenRouter and registered Responses support,
-including Paper Instruments through the portable Responses dialect. Native Claude
-uses `--provider anthropic --model claude-sonnet-4-6`; see
+other providers accept API keys. The main coding loop uses OpenAI by default and
+supports OpenRouter, registered Responses (`responses`, `responses-portable`),
+Chat Completions (`chat`), and Messages (`messages`) providers, including Paper
+Instruments through the portable Responses dialect and native Claude with
+`--provider anthropic --model claude-sonnet-4-6`; see
 [Claude setup and limits](docs/USING_BLACKBIRD.md#native-claude-main-provider). See
 [provider routing, prompt caching and usage](docs/TOKENOMICS.md) for selection and
 limits. Direct context-only colleagues can use the wider provider registry.
@@ -107,7 +108,7 @@ and return actual application results during a turn. See the
 
 ### Building this checkout
 
-The build uses pinned development profiles. The local macOS profile uses Clang 23.1.2 and Lua 5.5.1; the Linux compiler profile uses Clang 23.1.4 and libc++ 23.1.4 and also requires Lua 5.5.1. CMake presets contain host-specific tool paths. A fresh machine needs its profile configured deliberately, rather than assuming these paths will exist. The Lua upgrade is checked on macOS; the Linux runtime check remains separate.
+The build uses pinned development profiles. The macOS profile uses Clang 23.1.2 and Lua 5.5.1; the Linux compiler profile uses Clang 23.1.3 and libc++ 23.1.3 and also requires Lua 5.5.1. The `release` preset is portable across macOS and Linux (auto-discovering LLVM Clang unless `CXX` is set), while the macOS development presets pin local rigor tool paths. The Lua upgrade is checked on macOS; the Linux runtime check remains separate.
 
 ```sh
 scripts/rigor doctor
@@ -158,9 +159,9 @@ local state = blackbird.stats()
 blackbird.display(blackbird.json.encode(state))
 ```
 
-`blackbird.request(options)` lets a program configure a model request, including its assembly and request-local choices. `blackbird.context()`, `blackbird.edit(...)`, `blackbird.manage(...)`, and `blackbird.inspect(...)` expose the working context and retained material. `blackbird.call(...)` gives Lua the same native tools used by the model. The model's Lua tool makes these interfaces available during normal work.
+`blackbird.request(options)` lets a program configure a model request, including its assembly and request-local choices. `blackbird.blocks(...)`, `blackbird.compact(...)`, `blackbird.read_block(...)`, `blackbird.set_blocks(...)`, `blackbird.pin(...)`, and `blackbird.flush_context()` expose the working context and retained material. `blackbird.call(...)` gives Lua the same native tools used by the model. The model's Lua tool makes these interfaces available during normal work.
 
-Lua globals are ephemeral between turns. Persistent state belongs in context, files, or services. Base, coroutine, table, string, math, and UTF-8 facilities are available; host effects go through the audited interfaces. Raw `io`, `os`, `package`, and `debug` libraries are absent. Named modules can be staged through `program_config` and imported with
+Lua globals are ephemeral between turns. Persistent state belongs in context, files, or services. Base, coroutine, table, string, math, and UTF-8 facilities plus a safe read-only `os` subset (`os.time`, `os.clock`, `os.difftime`) are available; host effects go through the audited interfaces. Shell/filesystem/env `os` functions and raw `io`, `package`, and `debug` libraries are absent. Named modules can be staged through `program_config` and imported with
 `blackbird.module(name)` from retained, workflow-pinned source; explicit tool reads and
 `load` remain available for experiments. This arrangement keeps ordinary effects visible in the audit. It does not claim hostile-code isolation.
 
@@ -193,10 +194,11 @@ The implemented managed operations are:
 
 | Operation | Effect on the working presentation |
 | --- | --- |
-| Summarize | Replace selected material with a new summary and retained ancestry. |
-| Select | Keep a selected presentation while enforcing required structure. |
-| Archive | Remove selected material from the active view while preserving originals. |
-| Restore | Reintroduce exact originals in capture order and repair selected presentations. |
+| `drop` | Remove selected blocks from the active view while preserving originals. |
+| `summarize` | Replace selected blocks with a new summary and retained ancestry. |
+| `restore` | Reintroduce archived originals in capture order. |
+| `pin` | Protect selected blocks from `drop` and `summarize`. |
+| `unpin` | Clear pin protection on selected blocks. |
 
 Managed proposals use revision checks. Supplied bases are strict; stale proposals are retained as rejections. Complete call/result intervals stay together, and live user, system, and developer instructions are conservatively protected. Proposals made during a workflow stage until successful completion. Failed or interrupted workflows cancel them.
 
@@ -321,7 +323,7 @@ The [participants and modes brief](docs/PARTICIPANTS_AND_MODES.md) and [integrat
 
 [Blackbird](BLACKBIRD.md) is the working doctrine. It asks for aggressive progress underwritten by discipline: read the literature and source, make the design and plan explicit, choose tests with real oracles, fix consequential findings, and finish useful conceptual units. We abhor ceremony and unsupported claims.
 
-The rigor stack includes strict compiler diagnostics, focused static analysis, debug and optimized builds, ASan/UBSan, TSan, fuzz tooling, and direct behavioral tests. Ordinary Linux checks run on Wintermute. Tool availability does not establish product correctness, and a sanitizer pass does not establish a protocol contract. Tests are selected for the fault class and the actual changed behavior. Mutation campaigns are deferred until a mature suite merits them; mutations run on the fleet, never the laptop.
+The rigor stack includes strict compiler diagnostics, focused static analysis, debug and optimized builds, ASan/UBSan, TSan, fuzz tooling, and direct behavioral tests. Ordinary Linux checks run on an operator-selected Linux host via `scripts/check-linux`. Tool availability does not establish product correctness, and a sanitizer pass does not establish a protocol contract. Tests are selected for the fault class and the actual changed behavior. Mutation campaigns are deferred until a mature suite merits them; mutations run on the fleet, never the laptop.
 
 Independent Kimi and ChatGPT reviews have found real defects. Unavailable credit, an authentication failure, or a timed-out reviewer is reported as such. Advisory Jev judgments are available for structured decisions and experiments; they do not replace exact checks or become approval gates.
 

@@ -13879,3 +13879,17 @@ Blackbird must not present itself as another product.
   `finding`, `friction`, `preference`), superseding lineage, and live component-wise
   `O_NOFOLLOW | O_CLOEXEC` SHA-256 source-file freshness verification (`fresh` / `stale` /
   `missing_source` / `unpinned`).
+
+## 2026-11-23 — Public-Repo Bug Fixes & Hygiene (`--application`, `--list-sessions`, Portable Release, Docs)
+
+- Fixed `blackbird --application` failing through launchers (`parse_application_cli()` in
+  `src/main.cpp` accepts optional `--session DIR` in either order while rejecting
+  incompatible flags; `scripts/blackbird` passes `--application` through directly without
+  allocating a stray session directory), with new regression checks in
+  `scripts/check-application` and `scripts/check-session-startup`.
+- Updated `list_sessions()` (`src/session.cpp`) resume hint from `./scripts/blackbird --session`
+  to `blackbird --session`.
+- Removed hardcoded private build-host defaults from `scripts/check-linux` (now requires
+  `BLACKBIRD_LINUX_HOST`), made the CMake `release` preset portable across macOS/Linux
+  without hardcoded Homebrew/Anaconda paths, and fixed doc mismatches in `README.md`,
+  `docs/USING_BLACKBIRD.md`, and `docs/INSTALLING.md`.
