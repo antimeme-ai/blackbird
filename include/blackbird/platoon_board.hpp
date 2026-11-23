@@ -17,6 +17,7 @@ inline constexpr std::size_t kPlatoonMaxBriefBytes = 64 * 1024;
 inline constexpr std::size_t kPlatoonMaxFieldBytes = 4096;
 inline constexpr std::size_t kPlatoonMaxRefs = 64;
 inline constexpr std::size_t kPlatoonMaxRefBytes = 1024;
+inline constexpr std::size_t kPlatoonMaxRosterMembers = 512;
 inline constexpr std::size_t kPlatoonDefaultReadLimit = 64;
 
 enum class PlatoonMessageKind : std::uint8_t {

@@ -463,6 +463,8 @@ Result<std::vector<PlatoonMember>> read_roster_locked(int dir_fd) {
   const auto *array = std::get_if<Value::Array>(&members_field->value());
   if (!array)
     return Result<std::vector<PlatoonMember>>::failure({ErrorCode::corrupt});
+  if (array->size() > kPlatoonMaxRosterMembers)
+    return Result<std::vector<PlatoonMember>>::failure({ErrorCode::capacity});
 
   std::vector<PlatoonMember> result;
   result.reserve(array->size());
@@ -553,6 +555,64 @@ Result<void> write_roster_atomic_locked(int dir_fd,
     return Result<void>::failure(native_error(errno));
   cleanup.dismiss();
   return fsync_fd(dir_fd);
+}
+
+Result<void> quarantine_roster_locked(int dir_fd) {
+  const auto pid = static_cast<unsigned long long>(::getpid());
+  const auto ns = static_cast<unsigned long long>(wall_now_ns());
+  const std::string base =
+      "roster.corrupt." + std::to_string(pid) + "." + std::to_string(ns);
+  std::string target = base;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    if (::faccessat(dir_fd, target.c_str(), F_OK, AT_SYMLINK_NOFOLLOW) != 0 &&
+        errno == ENOENT) {
+      break;
+    }
+    const auto seq = g_tmp_counter.fetch_add(1, std::memory_order_relaxed);
+    target = base + "." + std::to_string(seq);
+  }
+  if (::renameat(dir_fd, kRosterFile, dir_fd, target.c_str()) != 0) {
+    if (errno == ENOENT)
+      return Result<void>::success();
+    return Result<void>::failure(native_error(errno));
+  }
+  return fsync_fd(dir_fd);
+}
+
+Result<ScopedFd> open_or_create_board(int dir_fd, bool &created) noexcept {
+  created = false;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    int fd = -1;
+    do {
+      fd = ::openat(dir_fd, kBoardFile, O_RDWR | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    if (fd >= 0) {
+      ScopedFd owned{fd};
+      auto checked = check_restricted(owned.get(), false);
+      if (!checked.has_value())
+        return Result<ScopedFd>::failure(checked.error());
+      return Result<ScopedFd>::success(std::move(owned));
+    }
+    if (errno != ENOENT)
+      return Result<ScopedFd>::failure(native_error(errno));
+
+    do {
+      fd = ::openat(dir_fd, kBoardFile,
+                    O_RDWR | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+                    mode_t{0600});
+    } while (fd < 0 && errno == EINTR);
+    if (fd >= 0) {
+      created = true;
+      ScopedFd owned{fd};
+      auto checked = check_restricted(owned.get(), false);
+      if (!checked.has_value())
+        return Result<ScopedFd>::failure(checked.error());
+      return Result<ScopedFd>::success(std::move(owned));
+    }
+    if (errno != EEXIST && errno != ENOENT)
+      return Result<ScopedFd>::failure(native_error(errno));
+  }
+  return Result<ScopedFd>::failure({ErrorCode::busy, EEXIST});
 }
 
 struct BoardScanSummary {
@@ -806,17 +866,27 @@ Result<PlatoonMember> PlatoonBoard::upsert_member(const PlatoonMember &member) {
     if (!lock.has_value())
       return Result<PlatoonMember>::failure(lock.error());
 
+    std::vector<PlatoonMember> list;
     auto existing = read_roster_locked(dir_fd_);
-    if (!existing.has_value())
+    if (existing.has_value()) {
+      list = std::move(existing).value();
+    } else if (existing.error().code == ErrorCode::corrupt ||
+               existing.error().code == ErrorCode::capacity) {
+      auto quarantined = quarantine_roster_locked(dir_fd_);
+      if (!quarantined.has_value())
+        return Result<PlatoonMember>::failure(quarantined.error());
+    } else {
       return Result<PlatoonMember>::failure(existing.error());
+    }
 
-    auto list = std::move(existing).value();
     auto found =
         std::find_if(list.begin(), list.end(),
                      [&](const PlatoonMember &entry) { return entry.id == stored.id; });
     if (found != list.end()) {
       *found = stored;
     } else {
+      if (list.size() >= kPlatoonMaxRosterMembers)
+        return Result<PlatoonMember>::failure({ErrorCode::capacity});
       list.push_back(stored);
       std::sort(list.begin(), list.end(),
                 [](const PlatoonMember &lhs, const PlatoonMember &rhs) {
@@ -875,24 +945,10 @@ Result<PlatoonMessage> PlatoonBoard::post(PlatoonPost message) {
       return Result<PlatoonMessage>::failure(lock.error());
 
     bool created = false;
-    int fd = -1;
-    do {
-      fd = ::openat(dir_fd_, kBoardFile, O_RDWR | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
-    } while (fd < 0 && errno == EINTR);
-    if (fd < 0 && errno == ENOENT) {
-      do {
-        fd = ::openat(dir_fd_, kBoardFile,
-                      O_RDWR | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
-                      mode_t{0600});
-      } while (fd < 0 && errno == EINTR);
-      created = (fd >= 0);
-    }
-    if (fd < 0)
-      return Result<PlatoonMessage>::failure(native_error(errno));
-    ScopedFd board_fd{fd};
-    auto checked = check_restricted(board_fd.get(), false);
-    if (!checked.has_value())
-      return Result<PlatoonMessage>::failure(checked.error());
+    auto opened_board = open_or_create_board(dir_fd_, created);
+    if (!opened_board.has_value())
+      return Result<PlatoonMessage>::failure(opened_board.error());
+    ScopedFd board_fd = std::move(opened_board).value();
 
     auto scanned =
         scan_board_fd(board_fd.get(), [](PlatoonMessage &&) { return true; });

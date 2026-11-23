@@ -2,6 +2,7 @@
 #include "blackbird/platoon_runner.hpp"
 #include "blackbird/process_lifetime.hpp"
 #include "blackbird/value.hpp"
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -10,6 +11,8 @@
 #include <fstream>
 #include <iostream>
 #include <limits.h>
+#include <memory>
+#include <mutex>
 #include <signal.h>
 #include <stdexcept>
 #include <string>
@@ -17,6 +20,8 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+extern char **environ;
 
 using namespace blackbird;
 
@@ -65,6 +70,16 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
     return 0;
   }
 
+  if (mode == "acp_hang_init") {
+    std::string init_line;
+    if (!std::getline(std::cin, init_line))
+      return 11;
+    std::cerr << "ACP_HANG_INIT\n" << std::flush;
+    for (int i = 0; i < 300; ++i)
+      ::usleep(100000);
+    return 0;
+  }
+
   std::string line;
   if (!std::getline(std::cin, line))
     return 11;
@@ -75,15 +90,27 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
       require_string(init_req.value(), "method") != "initialize")
     return 13;
 
+  if (mode == "acp_oversized_line") {
+    const std::string giant(2U * 1024U * 1024U, 'A');
+    std::cout << giant << '\n' << std::flush;
+  }
+
   std::cerr << "ACP_STDERR_DIAG\n" << std::flush;
-  if (!send_json(Value::object(
-          {{"jsonrpc", Value{"2.0"}},
-           {"id", require_field(init_req.value(), "id")},
-           {"result",
-            Value::object(
-                {{"protocolVersion", Value{Number{std::int64_t{1}}}},
-                 {"agentInfo", Value::object({{"name", Value{"fake-acp"}}})}})}})))
-    return 14;
+  if (mode == "acp_double_id") {
+    std::cout
+        << R"({"jsonrpc":"2.0","id":1.0,"result":{"protocolVersion":1,"agentInfo":{"name":"fake-acp-double"}}})"
+        << '\n'
+        << std::flush;
+  } else {
+    if (!send_json(Value::object(
+            {{"jsonrpc", Value{"2.0"}},
+             {"id", require_field(init_req.value(), "id")},
+             {"result",
+              Value::object(
+                  {{"protocolVersion", Value{Number{std::int64_t{1}}}},
+                   {"agentInfo", Value::object({{"name", Value{"fake-acp"}}})}})}})))
+      return 14;
+  }
 
   if (!std::getline(std::cin, line))
     return 21;
@@ -111,14 +138,26 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
     return 0;
   }
 
-  if (!send_json(Value::object(
-          {{"jsonrpc", Value{"2.0"}},
-           {"id", require_field(sess_req.value(), "id")},
-           {"result", Value::object({{"sessionId", Value{"acp-sess-99"}}})}})))
-    return 26;
+  if (mode == "acp_double_id") {
+    std::cout << R"({"jsonrpc":"2.0","id":2.0,"result":{"sessionId":"acp-sess-99"}})"
+              << '\n'
+              << std::flush;
+  } else {
+    if (!send_json(Value::object(
+            {{"jsonrpc", Value{"2.0"}},
+             {"id", require_field(sess_req.value(), "id")},
+             {"result", Value::object({{"sessionId", Value{"acp-sess-99"}}})}})))
+      return 26;
+  }
 
   if (!std::getline(std::cin, line))
     return 31;
+  if (mode == "acp_hang_prompt") {
+    std::cerr << "ACP_HANG_PROMPT\n" << std::flush;
+    for (int i = 0; i < 300; ++i)
+      ::usleep(100000);
+    return 0;
+  }
   const auto prompt_req = parse_json(line);
   if (!prompt_req.has_value())
     return 32;
@@ -139,7 +178,8 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
   Value::Array leaked;
   for (const char *secret_key :
        {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SECRET_TOKEN", "GEMINI_API_KEY",
-        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT"}) {
+        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT", "SSH_AUTH_SOCK",
+        "ASAN_OPTIONS", "LSAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS"}) {
     if (std::getenv(secret_key) != nullptr)
       leaked.emplace_back(secret_key);
   }
@@ -148,20 +188,32 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
           {{"jsonrpc", Value{"2.0"}},
            {"method", Value{"session/update"}},
            {"params",
-            Value::object({{"sessionId", Value{"acp-sess-99"}},
-                           {"echo", Value{"acp:" + prompt_text}},
-                           {"cwd", Value{cwd}},
-                           {"argv", Value{std::move(args)}},
-                           {"leaked_env", Value{std::move(leaked)}},
-                           {"has_path", Value{std::getenv("PATH") != nullptr}},
-                           {"xdg_config", Value{env_or_empty("XDG_CONFIG_HOME")}}})}})))
+            Value::object(
+                {{"sessionId", Value{"acp-sess-99"}},
+                 {"echo", Value{"acp:" + prompt_text}},
+                 {"cwd", Value{cwd}},
+                 {"argv", Value{std::move(args)}},
+                 {"leaked_env", Value{std::move(leaked)}},
+                 {"has_path", Value{std::getenv("PATH") != nullptr}},
+                 {"xdg_config", Value{env_or_empty("XDG_CONFIG_HOME")}},
+                 {"owner_actor", Value{env_or_empty("BLACKBIRD_PLATOON_OWNER_ACTOR")}},
+                 {"command_room",
+                  Value{env_or_empty("BLACKBIRD_PLATOON_COMMAND_ROOM")}},
+                 {"tool_allowlist",
+                  Value{env_or_empty("BLACKBIRD_PLATOON_TOOL_ALLOWLIST")}}})}})))
     return 36;
 
-  if (!send_json(Value::object(
-          {{"jsonrpc", Value{"2.0"}},
-           {"id", require_field(prompt_req.value(), "id")},
-           {"result", Value::object({{"stopReason", Value{"end_turn"}}})}})))
-    return 37;
+  if (mode == "acp_double_id") {
+    std::cout << R"({"jsonrpc":"2.0","id":3.0,"result":{"stopReason":"end_turn"}})"
+              << '\n'
+              << std::flush;
+  } else {
+    if (!send_json(Value::object(
+            {{"jsonrpc", Value{"2.0"}},
+             {"id", require_field(prompt_req.value(), "id")},
+             {"result", Value::object({{"stopReason", Value{"end_turn"}}})}})))
+      return 37;
+  }
 
   // Expect clean stdin EOF from parent after prompt completion.
   if (std::getline(std::cin, line))
@@ -172,8 +224,27 @@ int run_fake_acp_peer(int argc, char **argv, std::string_view mode) {
 
 int run_fake_peer(int argc, char **argv) {
   const std::string mode = env_or_empty("BLACKBIRD_PLATOON_TEST_MODE");
-  if (mode == "acp" || mode == "acp_error" || mode == "acp_early_exit")
+  if (mode == "acp" || mode == "acp_error" || mode == "acp_early_exit" ||
+      mode == "acp_hang_init" || mode == "acp_hang_prompt" || mode == "acp_double_id" ||
+      mode == "acp_oversized_line")
     return run_fake_acp_peer(argc, argv, mode);
+  if (mode == "grandchild_pin") {
+    const std::string gc_file = env_or_empty("BLACKBIRD_PLATOON_TEST_GC_PID_FILE");
+    const pid_t child = ::fork();
+    if (child == 0) {
+      // Grandchild keeps stdout/stderr inherited and sleeps 60s.
+      for (int i = 0; i < 600; ++i)
+        ::usleep(100000);
+      ::_exit(0);
+    }
+    if (child > 0 && !gc_file.empty()) {
+      std::ofstream out{gc_file};
+      out << child << '\n';
+      out.flush();
+    }
+    std::cout << "LEADER_DONE_PINNED\n" << std::flush;
+    return 0;
+  }
   if (mode == "sleep") {
     std::cout << "READY\n" << std::flush;
     for (int i = 0; i < 300; ++i)
@@ -223,9 +294,18 @@ int run_fake_peer(int argc, char **argv) {
   Value::Array leaked_env;
   for (const char *secret_key :
        {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SECRET_TOKEN", "GEMINI_API_KEY",
-        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT"}) {
+        "CUSTOM_KEY", "XDG_SECRET_TOKEN", "UNRELATED_AMBIENT", "ASAN_OPTIONS",
+        "LSAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS"}) {
     if (std::getenv(secret_key) != nullptr)
       leaked_env.emplace_back(secret_key);
+  }
+
+  std::int64_t path_count = 0;
+  if (environ != nullptr) {
+    for (char **entry = environ; *entry != nullptr; ++entry) {
+      if (std::string_view{*entry}.starts_with("PATH="))
+        ++path_count;
+    }
   }
 
   Value::Object report;
@@ -236,8 +316,24 @@ int run_fake_peer(int argc, char **argv) {
   report.emplace_back("board", Value{env_or_empty("BLACKBIRD_PLATOON_BOARD")});
   report.emplace_back("peer_id", Value{env_or_empty("BLACKBIRD_PLATOON_PEER_ID")});
   report.emplace_back("role", Value{env_or_empty("BLACKBIRD_PLATOON_ROLE")});
+  report.emplace_back("owner_actor",
+                      Value{env_or_empty("BLACKBIRD_PLATOON_OWNER_ACTOR")});
+  report.emplace_back("command_room",
+                      Value{env_or_empty("BLACKBIRD_PLATOON_COMMAND_ROOM")});
+  report.emplace_back("has_command_room",
+                      Value{std::getenv("BLACKBIRD_PLATOON_COMMAND_ROOM") != nullptr});
+  report.emplace_back("tool_allowlist",
+                      Value{env_or_empty("BLACKBIRD_PLATOON_TOOL_ALLOWLIST")});
+  report.emplace_back(
+      "has_tool_allowlist",
+      Value{std::getenv("BLACKBIRD_PLATOON_TOOL_ALLOWLIST") != nullptr});
+  report.emplace_back("ssh_auth_sock", Value{env_or_empty("SSH_AUTH_SOCK")});
+  report.emplace_back("has_ssh_auth_sock",
+                      Value{std::getenv("SSH_AUTH_SOCK") != nullptr});
   report.emplace_back("xdg_config", Value{env_or_empty("XDG_CONFIG_HOME")});
   report.emplace_back("has_path", Value{std::getenv("PATH") != nullptr});
+  report.emplace_back("path", Value{env_or_empty("PATH")});
+  report.emplace_back("path_count", Value{Number{path_count}});
   report.emplace_back("leaked_env", Value{std::move(leaked_env)});
 
   const auto json = dump_json(Value{std::move(report)});
@@ -813,7 +909,7 @@ int main(int argc, char **argv) {
                 "external driver argv element mismatch");
       };
 
-      // claude_code with model and C2 metadata.
+      // claude_code with model, tool_allowlist (--allowedTools), and C2 metadata env.
       {
         PlatoonPeerSpec spec;
         spec.peer_id = "peer-claude";
@@ -822,6 +918,7 @@ int main(int argc, char **argv) {
         spec.model = "claude-opus-4-6";
         spec.owner_actor = "patrick@macbook";
         spec.command_room = "platoon:alpha";
+        spec.tool_allowlist = "Read,Edit,Bash";
         spec.working_dir = work_a;
         spec.prompt = "refactor parser";
         spec.executable = self_exe;
@@ -839,10 +936,18 @@ int main(int argc, char **argv) {
               "claude_code owner_actor mismatch");
         check(done.value().command_room == "platoon:alpha",
               "claude_code command_room mismatch");
+        check(done.value().tool_allowlist == "Read,Edit,Bash",
+              "claude_code tool_allowlist mismatch");
         const Value report = parse_first_line(done.value().output_tail);
-        assert_argv(report,
-                    {"-p", "refactor parser", "--output-format", "stream-json",
-                     "--verbose", "--model", "claude-opus-4-6", "--max-turns", "4"});
+        assert_argv(report, {"-p", "refactor parser", "--output-format", "stream-json",
+                             "--verbose", "--model", "claude-opus-4-6",
+                             "--allowedTools", "Read,Edit,Bash", "--max-turns", "4"});
+        check(require_string(report, "owner_actor") == "patrick@macbook",
+              "claude_code BLACKBIRD_PLATOON_OWNER_ACTOR env missing");
+        check(require_string(report, "command_room") == "platoon:alpha",
+              "claude_code BLACKBIRD_PLATOON_COMMAND_ROOM env missing");
+        check(require_string(report, "tool_allowlist") == "Read,Edit,Bash",
+              "claude_code BLACKBIRD_PLATOON_TOOL_ALLOWLIST env missing");
         const Value snap_val = to_value(done.value());
         check(require_string(snap_val, "driver") == "claude_code",
               "claude_code to_value driver mismatch");
@@ -904,7 +1009,7 @@ int main(int argc, char **argv) {
         spec.model = "claude-sonnet-4-5";
         spec.session_dir = sess_a;
         spec.tool_allowlist = "read,grep,find,ls";
-        spec.owner_actor = "bob@wintermute";
+        spec.owner_actor = "bob@workstation";
         spec.command_room = "lend-lease-1";
         spec.working_dir = work_a;
         spec.prompt = "scan headers";
@@ -1155,6 +1260,13 @@ int main(int argc, char **argv) {
       ScopedEnv env_key{"CUSTOM_KEY", "custom-do-not-leak"};
       ScopedEnv env_xdg_sec{"XDG_SECRET_TOKEN", "xdg-secret-do-not-leak"};
       ScopedEnv env_unrel{"UNRELATED_AMBIENT", "ambient-do-not-leak"};
+      ScopedEnv env_ssh{"SSH_AUTH_SOCK", "/tmp/ambient-ssh-do-not-leak.sock"};
+      ScopedEnv env_asan{"ASAN_OPTIONS", "log_path=/tmp/pwn"};
+      ScopedEnv env_lsan{"LSAN_OPTIONS", "suppressions=/tmp/pwn"};
+      ScopedEnv env_ubsan{"UBSAN_OPTIONS", "log_path=/tmp/pwn"};
+      ScopedEnv env_tsan{"TSAN_OPTIONS", "log_path=/tmp/pwn"};
+      ScopedEnv env_stale_room{"BLACKBIRD_PLATOON_COMMAND_ROOM", "stale-ambient-room"};
+      ScopedEnv env_stale_tools{"BLACKBIRD_PLATOON_TOOL_ALLOWLIST", "stale,tools"};
       ScopedEnv env_xdg{"XDG_CONFIG_HOME", "/tmp/blackbird-xdg-test"};
       ScopedEnv env_board{"BLACKBIRD_PLATOON_BOARD", "/tmp/blackbird-board-allow"};
 
@@ -1186,7 +1298,16 @@ int main(int argc, char **argv) {
               "env-isolation external peer did not complete");
         const Value report = parse_first_line(done.value().output_tail);
         check(require_field(report, "leaked_env").array().empty(),
-              "ambient secret or non-allowlisted env leaked into external peer");
+              "ambient secret, sanitizer var, or non-allowlisted env leaked into "
+              "external peer");
+        check(require_field(report, "has_ssh_auth_sock") == Value{false},
+              "ambient SSH_AUTH_SOCK leaked into external peer");
+        check(require_string(report, "owner_actor") == "local",
+              "default BLACKBIRD_PLATOON_OWNER_ACTOR missing");
+        check(require_field(report, "has_command_room") == Value{false},
+              "stale ambient BLACKBIRD_PLATOON_COMMAND_ROOM leaked when empty");
+        check(require_field(report, "has_tool_allowlist") == Value{false},
+              "stale ambient BLACKBIRD_PLATOON_TOOL_ALLOWLIST leaked when empty");
         check(require_field(report, "has_path") == Value{true},
               "allowlisted PATH missing in external peer");
         check(require_string(report, "xdg_config") == "/tmp/blackbird-xdg-test",
@@ -1195,12 +1316,43 @@ int main(int argc, char **argv) {
               "allowlisted BLACKBIRD_PLATOON_BOARD missing in external peer");
       }
 
+      // Explicit SSH_AUTH_SOCK opt-in and PATH override dedupe via extra_env.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "env-explicit-optin";
+        spec.driver = PlatoonPeerDriver::codex;
+        spec.role = "external";
+        spec.working_dir = work_a;
+        spec.prompt = "check explicit opt-in and path dedupe";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"SSH_AUTH_SOCK", "/tmp/explicit-ssh-optin.sock"},
+                          {"PATH", "/custom/platoon/bin"}};
+
+        check(runner.spawn(spec).has_value(), "env-explicit-optin spawn failed");
+        const auto done = runner.wait("env-explicit-optin", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "env-explicit-optin did not complete");
+        const Value report = parse_first_line(done.value().output_tail);
+        check(require_field(report, "has_ssh_auth_sock") == Value{true} &&
+                  require_string(report, "ssh_auth_sock") ==
+                      "/tmp/explicit-ssh-optin.sock",
+              "explicit SSH_AUTH_SOCK opt-in via extra_env was dropped");
+        check(require_string(report, "path") == "/custom/platoon/bin",
+              "extra_env PATH override did not win");
+        check(require_field(report, "path_count") == Value{Number{std::int64_t{1}}},
+              "extra_env PATH override left duplicate PATH entries");
+      }
+
       // Verify ACP driver also receives clean allowlisted baseline env with zero leaks.
       {
         PlatoonPeerSpec spec;
         spec.peer_id = "env-acp";
         spec.driver = PlatoonPeerDriver::acp;
         spec.role = "acp-external";
+        spec.owner_actor = "ops@acp";
+        spec.command_room = "room:acp";
+        spec.tool_allowlist = "read,grep";
         spec.working_dir = work_a;
         spec.prompt = "check acp env isolation";
         spec.executable = self_exe;
@@ -1213,11 +1365,284 @@ int main(int argc, char **argv) {
               "env-acp did not complete");
         const std::string &out = done.value().output_tail;
         check(out.find("\"leaked_env\":[]") != std::string::npos,
-              "ambient secret leaked into acp peer");
+              "ambient secret/SSH_AUTH_SOCK/sanitizer var leaked into acp peer");
         check(out.find("\"has_path\":true") != std::string::npos,
               "allowlisted PATH missing in acp peer");
         check(out.find("/tmp/blackbird-xdg-test") != std::string::npos,
               "allowlisted XDG_CONFIG_HOME missing in acp peer");
+        check(out.find("\"owner_actor\":\"ops@acp\"") != std::string::npos,
+              "acp BLACKBIRD_PLATOON_OWNER_ACTOR missing");
+        check(out.find("\"command_room\":\"room:acp\"") != std::string::npos,
+              "acp BLACKBIRD_PLATOON_COMMAND_ROOM missing");
+        check(out.find("\"tool_allowlist\":\"read,grep\"") != std::string::npos,
+              "acp BLACKBIRD_PLATOON_TOOL_ALLOWLIST missing");
+      }
+    }
+
+    // 13. H1: Concurrent spawn() + ~PlatoonRunner() must not UAF or leak children.
+    {
+      auto runner = std::make_unique<PlatoonRunner>(2);
+      PlatoonPeerSpec spec;
+      spec.peer_id = "race-dtor";
+      spec.role = "worker";
+      spec.provider = "openai";
+      spec.model = "gpt-6.1-sol";
+      spec.working_dir = work_a;
+      spec.session_dir = sess_a;
+      spec.prompt = "race spawn and destructor";
+      spec.executable = self_exe;
+      spec.extra_env = {{"BLACKBIRD_PLATOON_TEST_MODE", "sleep"}};
+
+      std::unique_lock spawn_gate{detail::process_spawn_mutex};
+      Result<PlatoonPeerSnapshot> spawn_result =
+          Result<PlatoonPeerSnapshot>::failure({ErrorCode::invalid_range});
+      std::thread spawner([&]() { spawn_result = runner->spawn(spec); });
+
+      // Wait until spawn() has acquired impl_ + registered peer + incremented
+      // active_spawns and is now parked on detail::process_spawn_mutex.
+      const auto enter_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds{3};
+      while (runner->active_count() == 0 &&
+             std::chrono::steady_clock::now() < enter_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      }
+      check(runner->active_count() == 1,
+            "spawner did not enter spawn_peer_process gate");
+
+      std::atomic<bool> dtor_done{false};
+      std::thread destroyer([&]() {
+        runner.reset();
+        dtor_done.store(true);
+      });
+
+      // Give ~PlatoonRunner time to set shutting_down and park on active_spawns == 0.
+      std::this_thread::sleep_for(std::chrono::milliseconds{30});
+      check(!dtor_done.load(),
+            "destructor completed while spawn() was still in-flight (H1 UAF risk)");
+
+      spawn_gate.unlock();
+      spawner.join();
+      destroyer.join();
+
+      check(dtor_done.load(), "destructor did not finish after spawn drained");
+      check(!spawn_result.has_value() && spawn_result.error().code == ErrorCode::busy,
+            "in-flight spawn during shutdown did not abort cleanly with busy");
+      check(detail::owned_children.load() == 0,
+            "owned_children leaked during concurrent spawn+destroy");
+    }
+
+    // 14. H2: ACP handshake/prompt timeouts, integral double IDs (1.0), and 2 MiB line.
+    {
+      PlatoonRunner runner{4};
+
+      // Invalid timeout values rejected.
+      {
+        PlatoonPeerSpec bad;
+        bad.peer_id = "acp-bad-timeout";
+        bad.driver = PlatoonPeerDriver::acp;
+        bad.role = "acp";
+        bad.working_dir = work_a;
+        bad.prompt = "hi";
+        bad.executable = self_exe;
+        bad.acp_handshake_timeout_ms = 0;
+        const auto r1 = runner.spawn(bad);
+        check(!r1.has_value() && r1.error().code == ErrorCode::invalid_range,
+              "zero acp_handshake_timeout_ms accepted");
+        bad.acp_handshake_timeout_ms = 1000;
+        bad.acp_prompt_timeout_ms = -5;
+        const auto r2 = runner.spawn(bad);
+        check(!r2.has_value() && r2.error().code == ErrorCode::invalid_range,
+              "negative acp_prompt_timeout_ms accepted");
+      }
+
+      // Hanging ACP handshake times out cleanly to failed and kills process group.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "acp-hang-init";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp";
+        spec.working_dir = work_a;
+        spec.prompt = "hang on init";
+        spec.executable = self_exe;
+        spec.acp_handshake_timeout_ms = 150;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_hang_init"}};
+
+        const auto before = std::chrono::steady_clock::now();
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "acp_hang_init spawn failed");
+        const auto done = runner.wait("acp-hang-init", 4000);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - before)
+                                    .count();
+        check(done.has_value() && done.value().state == PlatoonPeerState::failed,
+              "hanging ACP handshake did not time out to failed");
+        check(elapsed_ms < 2500, "hanging ACP handshake timeout took too long");
+        check(wait_for_process_gone(static_cast<pid_t>(done.value().pid),
+                                    std::chrono::milliseconds{1000}),
+              "timed-out ACP handshake peer process survived");
+      }
+
+      // Hanging ACP prompt times out cleanly to failed and kills process group.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "acp-hang-prompt";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp";
+        spec.working_dir = work_a;
+        spec.prompt = "hang on prompt";
+        spec.executable = self_exe;
+        spec.acp_handshake_timeout_ms = 2000;
+        spec.acp_prompt_timeout_ms = 150;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_hang_prompt"}};
+
+        const auto before = std::chrono::steady_clock::now();
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "acp_hang_prompt spawn failed");
+        const auto done = runner.wait("acp-hang-prompt", 4000);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - before)
+                                    .count();
+        check(done.has_value() && done.value().state == PlatoonPeerState::failed,
+              "hanging ACP prompt did not time out to failed");
+        check(elapsed_ms < 2500, "hanging ACP prompt timeout took too long");
+        check(wait_for_process_gone(static_cast<pid_t>(done.value().pid),
+                                    std::chrono::milliseconds{1000}),
+              "timed-out ACP prompt peer process survived");
+      }
+
+      // Integral double JSON-RPC IDs ({"id": 1.0}, 2.0, 3.0) match cleanly.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "acp-double-id";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp";
+        spec.working_dir = work_a;
+        spec.prompt = "double id test";
+        spec.executable = self_exe;
+        spec.acp_handshake_timeout_ms = 2000;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_double_id"}};
+
+        check(runner.spawn(spec).has_value(), "acp_double_id spawn failed");
+        const auto done = runner.wait("acp-double-id", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "ACP peer replying with {\"id\": 1.0} did not complete");
+        check(done.value().output_tail.find("fake-acp-double") != std::string::npos,
+              "acp_double_id response missing from output_tail");
+      }
+
+      // Oversized 2 MiB single line on ACP stdout is discarded via line_overflow.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "acp-oversized";
+        spec.driver = PlatoonPeerDriver::acp;
+        spec.role = "acp";
+        spec.working_dir = work_a;
+        spec.prompt = "oversized line test";
+        spec.executable = self_exe;
+        spec.acp_handshake_timeout_ms = 4000;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_FAKE_PEER", "1"},
+                          {"BLACKBIRD_PLATOON_TEST_MODE", "acp_oversized_line"}};
+
+        check(runner.spawn(spec).has_value(), "acp_oversized_line spawn failed");
+        const auto done = runner.wait("acp-oversized", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "ACP peer with 2 MiB line overflow did not complete cleanly");
+        check(done.value().output_bytes > 2U * 1024U * 1024U,
+              "acp_oversized output_bytes did not account for 2 MiB line");
+      }
+    }
+
+    // 15. M9 / Grandchild pipe-pin sweep, stop(grace_ms=0), and L10 path normalization.
+    {
+      PlatoonRunner runner{4};
+
+      // Grandchild inherits stdout pipe and sleeps 60s after leader exits 0.
+      {
+        const auto gc_pid_file = std::filesystem::canonical(temp.path) / "pin_gc.pid";
+        PlatoonPeerSpec spec;
+        spec.peer_id = "gc-pin";
+        spec.role = "worker";
+        spec.provider = "openai";
+        spec.model = "gpt-6.1-sol";
+        spec.working_dir = work_a;
+        spec.session_dir = sess_a;
+        spec.prompt = "grandchild pin";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_TEST_MODE", "grandchild_pin"},
+                          {"BLACKBIRD_PLATOON_TEST_GC_PID_FILE", gc_pid_file.string()}};
+
+        const auto before = std::chrono::steady_clock::now();
+        check(runner.spawn(spec).has_value(), "gc-pin spawn failed");
+        const auto done = runner.wait("gc-pin", 4000);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - before)
+                                    .count();
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "grandchild pipe-pin peer did not settle to completed");
+        check(elapsed_ms < 2500, "grandchild pipe-pin hung past drain_grace_ms");
+
+        pid_t gc_pid = -1;
+        {
+          std::ifstream in{gc_pid_file};
+          in >> gc_pid;
+        }
+        check(gc_pid > 0, "grandchild pipe-pin pid missing");
+        check(wait_for_process_gone(gc_pid, std::chrono::milliseconds{1000}),
+              "pipe-pinning grandchild was not SIGKILLed");
+      }
+
+      // stop(grace_ms = 0) takes immediate SIGKILL path.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "zero-grace";
+        spec.role = "worker";
+        spec.provider = "openai";
+        spec.model = "gpt-6.1-sol";
+        spec.working_dir = work_a;
+        spec.session_dir = sess_a;
+        spec.prompt = "ignore term";
+        spec.executable = self_exe;
+        spec.extra_env = {{"BLACKBIRD_PLATOON_TEST_MODE", "ignore_term"}};
+
+        check(runner.spawn(spec).has_value(), "zero-grace spawn failed");
+        check(wait_for_output_substring(
+                  runner, {"zero-grace", "ARMED", std::chrono::milliseconds{3000}}),
+              "zero-grace did not arm");
+        const auto stopped = runner.stop("zero-grace", 0);
+        check(stopped.has_value() && stopped.value().state == PlatoonPeerState::stopped,
+              "stop(grace_ms=0) did not yield stopped");
+        check(stopped.value().exit_code.has_value() &&
+                  *stopped.value().exit_code == 128 + SIGKILL,
+              "stop(grace_ms=0) did not terminate via SIGKILL");
+        check(wait_for_process_gone(static_cast<pid_t>(stopped.value().pid),
+                                    std::chrono::milliseconds{1000}),
+              "zero-grace peer process survived SIGKILL");
+      }
+
+      // L10: lexical normalization of working_dir and session_dir in snapshots.
+      {
+        PlatoonPeerSpec spec;
+        spec.peer_id = "norm-paths";
+        spec.role = "worker";
+        spec.provider = "openai";
+        spec.model = "gpt-6.1-sol";
+        spec.working_dir = work_a / "." / ".." / work_a.filename();
+        spec.session_dir = sess_a / "." / ".." / sess_a.filename();
+        spec.prompt = "normalize paths";
+        spec.executable = self_exe;
+
+        const auto spawned = runner.spawn(spec);
+        check(spawned.has_value(), "norm-paths spawn failed");
+        check(spawned.value().working_dir == work_a,
+              "working_dir was not lexically normalized in snapshot");
+        check(spawned.value().session_dir == sess_a,
+              "session_dir was not lexically normalized in snapshot");
+        const auto done = runner.wait("norm-paths", 5000);
+        check(done.has_value() && done.value().state == PlatoonPeerState::completed,
+              "norm-paths peer did not complete");
       }
     }
 

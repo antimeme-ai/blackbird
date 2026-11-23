@@ -49,6 +49,8 @@ struct PlatoonPeerSpec {
   std::string command_room;
   std::string tool_allowlist;
   std::vector<std::string> extra_args;
+  int acp_handshake_timeout_ms = 30000;
+  int acp_prompt_timeout_ms = 300000;
 };
 
 struct PlatoonPeerSnapshot {
@@ -84,6 +86,9 @@ public:
   static constexpr std::size_t max_output_bytes_limit = 4U * 1024U * 1024U;
   static constexpr std::size_t max_extra_args = 32;
   static constexpr std::size_t max_extra_arg_bytes = 4U * 1024U;
+  static constexpr int default_acp_handshake_timeout_ms = 30000;
+  static constexpr int default_acp_prompt_timeout_ms = 300000;
+  static constexpr int max_acp_timeout_ms = 24 * 60 * 60 * 1000;
 
   explicit PlatoonRunner(std::size_t max_peers = default_max_peers);
   ~PlatoonRunner();
@@ -109,7 +114,7 @@ public:
 
 private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 } // namespace blackbird

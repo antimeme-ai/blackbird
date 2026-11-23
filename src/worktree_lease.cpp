@@ -18,6 +18,13 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/proc.h>
+#elif defined(__linux__)
+#include <fstream>
+#include <sstream>
+#endif
 
 namespace blackbird {
 namespace {
@@ -198,18 +205,117 @@ enum class ProcessLiveness : std::uint8_t {
   dead,
 };
 
-ProcessLiveness check_process_liveness(std::int64_t owner_pid) noexcept {
-  if (owner_pid <= 0)
+struct OwnerProcess {
+  std::int64_t pid = 0;
+  std::int64_t lease_created_ns = 0;
+};
+
+constexpr std::int64_t kProcessStartSkewGraceNs = 2'000'000'000LL;
+
+#ifdef __linux__
+std::optional<std::int64_t> read_linux_boot_time_sec() noexcept {
+  std::ifstream in{"/proc/stat"};
+  if (!in)
+    return std::nullopt;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.starts_with("btime ")) {
+      std::int64_t btime = 0;
+      const char *begin = line.data() + 6;
+      const char *end = line.data() + line.size();
+      const auto [ptr, ec] = std::from_chars(begin, end, btime);
+      if (ec == std::errc{} && ptr != begin)
+        return btime;
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+#endif
+
+ProcessLiveness check_process_liveness(const OwnerProcess &owner) noexcept {
+  if (owner.pid <= 0)
     return ProcessLiveness::no_pid;
-  if (owner_pid > static_cast<std::int64_t>(std::numeric_limits<pid_t>::max()))
+  if (owner.pid == 1 ||
+      owner.pid > static_cast<std::int64_t>(std::numeric_limits<pid_t>::max()))
     return ProcessLiveness::dead;
-  const int rc = ::kill(static_cast<pid_t>(owner_pid), 0);
-  if (rc == 0)
+  const auto pid = static_cast<pid_t>(owner.pid);
+  const int rc = ::kill(pid, 0);
+  if (rc != 0) {
+    // ESRCH (gone) and EPERM (foreign UID, cannot be our lease owner) are reclaimable.
+    return ProcessLiveness::dead;
+  }
+
+  const uid_t self_uid = ::geteuid();
+#ifdef __APPLE__
+  struct proc_bsdinfo bsd{};
+  const int sz =
+      ::proc_pidinfo(static_cast<int>(pid), PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd));
+  if (sz != static_cast<int>(sizeof(bsd))) {
+    if (errno == ESRCH || errno == EPERM)
+      return ProcessLiveness::dead;
     return ProcessLiveness::alive;
-  if (errno == ESRCH)
+  }
+  if (bsd.pbi_status == SZOMB || bsd.pbi_uid != self_uid)
     return ProcessLiveness::dead;
-  // EPERM or other non-ESRCH error: conservatively treat as alive so we never reap.
+  if (owner.lease_created_ns > 0) {
+    const std::int64_t proc_start_ns =
+        static_cast<std::int64_t>(bsd.pbi_start_tvsec) * 1'000'000'000LL +
+        static_cast<std::int64_t>(bsd.pbi_start_tvusec) * 1'000LL;
+    if (proc_start_ns > owner.lease_created_ns + kProcessStartSkewGraceNs)
+      return ProcessLiveness::dead;
+  }
   return ProcessLiveness::alive;
+#elif defined(__linux__)
+  const std::string proc_dir = "/proc/" + std::to_string(owner.pid);
+  struct stat st{};
+  if (::stat(proc_dir.c_str(), &st) != 0)
+    return ProcessLiveness::dead;
+  if (st.st_uid != self_uid)
+    return ProcessLiveness::dead;
+
+  std::ifstream stat_file{proc_dir + "/stat"};
+  std::string stat_line;
+  if (!stat_file || !std::getline(stat_file, stat_line))
+    return ProcessLiveness::dead;
+  const auto close_paren = stat_line.rfind(')');
+  if (close_paren == std::string::npos || close_paren + 2 >= stat_line.size())
+    return ProcessLiveness::dead;
+  const char state = stat_line[close_paren + 2];
+  if (state == 'Z' || state == 'X')
+    return ProcessLiveness::dead;
+
+  if (owner.lease_created_ns > 0) {
+    std::istringstream fields{stat_line.substr(close_paren + 2)};
+    std::string token;
+    std::uint64_t start_ticks = 0;
+    bool parsed_start = false;
+    // Field 3 (state) is index 1 here; field 22 (starttime) is index 20.
+    for (int idx = 1; idx <= 20; ++idx) {
+      if (!(fields >> token))
+        break;
+      if (idx == 20) {
+        const auto [ptr, ec] =
+            std::from_chars(token.data(), token.data() + token.size(), start_ticks);
+        parsed_start = (ec == std::errc{} && ptr == token.data() + token.size());
+      }
+    }
+    const long ticks_per_sec = ::sysconf(_SC_CLK_TCK);
+    const auto btime = read_linux_boot_time_sec();
+    if (parsed_start && ticks_per_sec > 0 && btime.has_value()) {
+      const auto tps = static_cast<std::uint64_t>(ticks_per_sec);
+      const std::int64_t proc_start_ns =
+          (*btime + static_cast<std::int64_t>(start_ticks / tps)) * 1'000'000'000LL +
+          static_cast<std::int64_t>((start_ticks % tps) * 1'000'000'000ULL / tps);
+      if (proc_start_ns > owner.lease_created_ns + kProcessStartSkewGraceNs)
+        return ProcessLiveness::dead;
+    }
+  }
+  return ProcessLiveness::alive;
+#else
+  (void)self_uid;
+  return ProcessLiveness::alive;
+#endif
 }
 
 class FileLock {
@@ -276,7 +382,7 @@ Result<void> ensure_private_directory(const fs::path &dir) {
     if (fs::is_symlink(st) || !fs::is_directory(st))
       return Result<void>::failure({ErrorCode::conflict});
   } else {
-    if (::mkdir(dir.c_str(), 0700) != 0) {
+    if (::mkdir(dir.c_str(), mode_t{0700}) != 0) {
       const int err = errno;
       if (err != EEXIST)
         return Result<void>::failure({ErrorCode::io, err});
@@ -285,9 +391,71 @@ Result<void> ensure_private_directory(const fs::path &dir) {
         return Result<void>::failure({ErrorCode::conflict});
     }
   }
-  if (::chmod(dir.c_str(), 0700) != 0)
-    return Result<void>::failure({ErrorCode::io, errno});
+  int fd = -1;
+  do {
+    fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    const int err = errno;
+    return Result<void>::failure(
+        {err == ELOOP || err == ENOTDIR ? ErrorCode::conflict : ErrorCode::io, err});
+  }
+  const int chmod_rc = ::fchmod(fd, mode_t{0700});
+  const int chmod_err = errno;
+  (void)::close(fd);
+  if (chmod_rc != 0)
+    return Result<void>::failure({ErrorCode::io, chmod_err});
   return Result<void>::success();
+}
+
+Result<void> ensure_private_directory_tree(const fs::path &dir) {
+  fs::path clean = dir.lexically_normal();
+  while (clean.has_relative_path() && clean.filename().empty())
+    clean = clean.parent_path();
+  if (clean.empty())
+    return Result<void>::failure({ErrorCode::invalid_range});
+
+  std::error_code ec;
+  const fs::file_status existing = fs::symlink_status(clean, ec);
+  if (ec && ec != std::errc::no_such_file_or_directory)
+    return Result<void>::failure({ErrorCode::io, ec.value()});
+  if (!ec) {
+    if (!fs::is_directory(existing))
+      return Result<void>::failure({ErrorCode::conflict});
+    return Result<void>::success();
+  }
+
+  std::vector<fs::path> missing;
+  fs::path cursor = clean;
+  while (!cursor.empty()) {
+    ec.clear();
+    const fs::file_status st = fs::symlink_status(cursor, ec);
+    if (!ec) {
+      if (!fs::is_directory(st))
+        return Result<void>::failure({ErrorCode::conflict});
+      break;
+    }
+    if (ec != std::errc::no_such_file_or_directory)
+      return Result<void>::failure({ErrorCode::io, ec.value()});
+    missing.push_back(cursor);
+    const fs::path parent = cursor.parent_path();
+    if (parent == cursor)
+      break;
+    cursor = parent;
+  }
+
+  for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+    if (::mkdir(it->c_str(), mode_t{0700}) != 0) {
+      const int err = errno;
+      if (err != EEXIST)
+        return Result<void>::failure({ErrorCode::io, err});
+      ec.clear();
+      const fs::file_status recheck = fs::symlink_status(*it, ec);
+      if (ec || fs::is_symlink(recheck) || !fs::is_directory(recheck))
+        return Result<void>::failure({ErrorCode::conflict});
+    }
+  }
+  return ensure_private_directory(clean);
 }
 
 Result<void> sync_directory(const fs::path &dir) {
@@ -418,10 +586,12 @@ Result<GitOutput> run_git(const fs::path &directory, std::vector<std::string> su
                           bool read_only) {
   try {
     std::vector<std::string> argv;
-    argv.reserve(subargs.size() + 3);
+    argv.reserve(subargs.size() + 5);
     argv.emplace_back("git");
     argv.emplace_back("-C");
     argv.emplace_back(directory.string());
+    argv.emplace_back("-c");
+    argv.emplace_back("core.hooksPath=/dev/null");
     for (auto &arg : subargs)
       argv.emplace_back(std::move(arg));
 
@@ -430,6 +600,7 @@ Result<GitOutput> run_git(const fs::path &directory, std::vector<std::string> su
       if (!std::string_view{*entry}.starts_with("GIT_"))
         child.child_environment.emplace_back(*entry);
     }
+    child.child_environment.emplace_back("GIT_CONFIG_NOSYSTEM=1");
     child.child_environment.emplace_back("GIT_TERMINAL_PROMPT=0");
     if (read_only)
       child.child_environment.emplace_back("GIT_OPTIONAL_LOCKS=0");
@@ -543,28 +714,70 @@ Result<LeaseRecord> load_lease_record(const fs::path &leases_dir,
   return parse_record({bytes.value(), lease_id});
 }
 
-Result<std::vector<LeaseRecord>> load_all_records(const fs::path &leases_dir) {
-  std::vector<LeaseRecord> records;
+void quarantine_corrupt_lease_file(const fs::path &leases_dir,
+                                   const std::string &filename) noexcept {
+  static std::atomic<std::uint64_t> quarantine_counter{0};
+  const auto pid = static_cast<unsigned long long>(::getpid());
+  const fs::path src = leases_dir / filename;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const auto seq = quarantine_counter.fetch_add(1, std::memory_order_relaxed);
+    const fs::path dst = leases_dir / (filename + ".corrupt." + std::to_string(pid) +
+                                       "." + std::to_string(seq));
+    std::error_code ec;
+    (void)fs::symlink_status(dst, ec);
+    if (ec == std::errc::no_such_file_or_directory) {
+      (void)::rename(src.c_str(), dst.c_str());
+      return;
+    }
+  }
+}
+
+Result<std::vector<LeaseRecord>> load_all_records(const fs::path &leases_dir,
+                                                  bool quarantine_corrupt) {
+  std::vector<std::string> filenames;
   std::error_code ec;
   fs::directory_iterator it{leases_dir, ec};
   if (ec)
     return Result<std::vector<LeaseRecord>>::failure({ErrorCode::io, ec.value()});
 
   for (const auto &entry : it) {
-    const fs::path &entry_path = entry.path();
-    const std::string filename = entry_path.filename().string();
+    const std::string filename = entry.path().filename().string();
     if (filename == "leases.lock" || filename.starts_with(".tmp-"))
       continue;
     if (!filename.ends_with(".json"))
       continue;
+    filenames.push_back(filename);
+  }
+
+  std::vector<LeaseRecord> records;
+  bool quarantined_any = false;
+  for (const auto &filename : filenames) {
     const std::string_view stem{filename.data(), filename.size() - 5};
-    if (!is_valid_lease_id(stem))
-      return Result<std::vector<LeaseRecord>>::failure({ErrorCode::corrupt});
+    if (!is_valid_lease_id(stem)) {
+      if (quarantine_corrupt) {
+        quarantine_corrupt_lease_file(leases_dir, filename);
+        quarantined_any = true;
+      }
+      continue;
+    }
     auto record = load_lease_record(leases_dir, stem);
-    if (!record.has_value())
+    if (!record.has_value()) {
+      const ErrorCode code = record.error().code;
+      if (code == ErrorCode::corrupt || code == ErrorCode::conflict) {
+        if (quarantine_corrupt) {
+          quarantine_corrupt_lease_file(leases_dir, filename);
+          quarantined_any = true;
+        }
+        continue;
+      }
+      if (code == ErrorCode::stale_handle)
+        continue;
       return Result<std::vector<LeaseRecord>>::failure(record.error());
+    }
     records.push_back(std::move(record).value());
   }
+  if (quarantined_any)
+    (void)sync_directory(leases_dir);
 
   std::sort(records.begin(), records.end(),
             [](const LeaseRecord &lhs, const LeaseRecord &rhs) {
@@ -669,7 +882,8 @@ Result<WorktreeLeaseInfo> inspect_lease(const LeaseRecord &record,
   info.owner_pid = record.owner_pid;
   info.created_ns = record.created_ns;
   info.path = roots.lease_root / record.lease_id;
-  info.owner_alive = check_process_liveness(record.owner_pid) == ProcessLiveness::alive;
+  info.owner_alive = check_process_liveness({record.owner_pid, record.created_ns}) ==
+                     ProcessLiveness::alive;
 
   std::error_code ec;
   const fs::file_status st = fs::symlink_status(info.path, ec);
@@ -872,18 +1086,9 @@ WorktreeLeaseManager::open(const WorktreeLeaseConfig &config) {
   if (lease_root_conflicts_with_repo(pre_lease, repo_paths))
     return Result<WorktreeLeaseManager>::failure({ErrorCode::conflict});
 
-  (void)fs::symlink_status(config.lease_root, ec);
-  if (ec && ec != std::errc::no_such_file_or_directory)
-    return Result<WorktreeLeaseManager>::failure({ErrorCode::io, ec.value()});
-  if (ec) {
-    fs::create_directories(config.lease_root, ec);
-    if (ec)
-      return Result<WorktreeLeaseManager>::failure({ErrorCode::io, ec.value()});
-    if (::chmod(config.lease_root.c_str(), 0700) != 0)
-      return Result<WorktreeLeaseManager>::failure({ErrorCode::io, errno});
-  } else if (!fs::is_directory(config.lease_root, ec)) {
-    return Result<WorktreeLeaseManager>::failure({ErrorCode::conflict});
-  }
+  auto lease_root_ok = ensure_private_directory_tree(config.lease_root);
+  if (!lease_root_ok.has_value())
+    return Result<WorktreeLeaseManager>::failure(lease_root_ok.error());
 
   const fs::path canonical_lease = fs::canonical(config.lease_root, ec);
   if (ec)
@@ -937,7 +1142,7 @@ WorktreeLeaseManager::acquire(const WorktreeLeaseRequest &req) {
   if (!lock.has_value())
     return Result<WorktreeLeaseInfo>::failure(lock.error());
 
-  auto existing = load_all_records(leases_dir());
+  auto existing = load_all_records(leases_dir(), true);
   if (!existing.has_value())
     return Result<WorktreeLeaseInfo>::failure(existing.error());
 
@@ -1030,7 +1235,7 @@ Result<std::vector<WorktreeLeaseInfo>> WorktreeLeaseManager::list() const {
   if (!lock.has_value())
     return Result<std::vector<WorktreeLeaseInfo>>::failure(lock.error());
 
-  auto records = load_all_records(leases_dir());
+  auto records = load_all_records(leases_dir(), false);
   if (!records.has_value())
     return Result<std::vector<WorktreeLeaseInfo>>::failure(records.error());
 
@@ -1081,13 +1286,14 @@ Result<WorktreeReclaimReport> WorktreeLeaseManager::reclaim_stale() {
   if (!lock.has_value())
     return Result<WorktreeReclaimReport>::failure(lock.error());
 
-  auto records = load_all_records(leases_dir());
+  auto records = load_all_records(leases_dir(), true);
   if (!records.has_value())
     return Result<WorktreeReclaimReport>::failure(records.error());
 
   WorktreeReclaimReport report;
   for (const auto &record : records.value()) {
-    if (check_process_liveness(record.owner_pid) != ProcessLiveness::dead)
+    if (check_process_liveness({record.owner_pid, record.created_ns}) !=
+        ProcessLiveness::dead)
       continue;
 
     auto info = inspect_lease(record, {repo_root_, lease_root_});

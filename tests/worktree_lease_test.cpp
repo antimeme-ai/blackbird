@@ -566,6 +566,153 @@ void test_corrupt_worktree_under_parent_repo_does_not_abort_reclaim() {
         "force release must clean up corrupt lease");
 }
 
+void test_rogue_corrupt_lease_quarantine() {
+  TempDir tmp{"bb-wt-rogue"};
+  const fs::path repo = tmp.path() / "repo";
+  const fs::path leases = tmp.path() / "leases";
+  (void)init_temp_repo(repo);
+
+  auto opened = WorktreeLeaseManager::open({repo, leases, 4});
+  check(opened.has_value(), "open failed");
+  WorktreeLeaseManager &mgr = opened.value();
+
+  const std::int64_t live_pid = static_cast<std::int64_t>(::getpid());
+  const std::int64_t dead_pid = spawn_and_reap_dead_pid();
+  check(
+      mgr.acquire({"live-1", "br-live-1", "HEAD", "live", live_pid, false}).has_value(),
+      "acquire live-1 failed");
+  auto stale = mgr.acquire({"stale-1", "br-stale-1", "HEAD", "dead", dead_pid, false});
+  check(stale.has_value(), "acquire stale-1 failed");
+
+  // Drop malformed JSON and invalid-stem JSON into .leases.
+  const fs::path leases_dir = mgr.lease_root() / ".leases";
+  write_text_file(leases_dir / "rogue.json", "{not valid json");
+  write_text_file(leases_dir / "INVALID_UPPER.json", "{}");
+
+  // Explicit status on rogue fails with corrupt.
+  auto rogue_status = mgr.status("rogue");
+  check(!rogue_status.has_value() && rogue_status.error().code == ErrorCode::corrupt,
+        "status on corrupt rogue.json must return corrupt");
+
+  // list() must still succeed and return only the 2 valid leases.
+  auto listed = mgr.list();
+  check(listed.has_value() && listed.value().size() == 2,
+        "list() must skip rogue/corrupt lease files without bricking");
+
+  // reclaim_stale() must quarantine rogue files AND reclaim stale-1.
+  auto report = mgr.reclaim_stale();
+  check(report.has_value(), "reclaim_stale must not fail due to rogue.json");
+  check(report.value().reclaimed.size() == 1 &&
+            report.value().reclaimed[0] == "stale-1",
+        "reclaim_stale must reclaim valid stale-1 despite rogue.json");
+  check(!fs::exists(leases_dir / "rogue.json"),
+        "rogue.json must be renamed/quarantined out of active .json namespace");
+  check(!fs::exists(leases_dir / "INVALID_UPPER.json"),
+        "INVALID_UPPER.json must be quarantined");
+
+  int quarantined_count = 0;
+  for (const auto &entry : fs::directory_iterator(leases_dir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.find(".json.corrupt.") != std::string::npos)
+      ++quarantined_count;
+  }
+  check(quarantined_count == 2, "expected 2 quarantined .json.corrupt.* files");
+
+  // New acquire must succeed cleanly after quarantine.
+  check(
+      mgr.acquire({"live-2", "br-live-2", "HEAD", "live", live_pid, false}).has_value(),
+      "acquire after rogue quarantine must succeed");
+  check(mgr.release("live-1", false).has_value(), "release live-1 failed");
+  check(mgr.release("live-2", false).has_value(), "release live-2 failed");
+}
+
+void test_owner_pid_one_and_pid_reuse_reclaim() {
+  TempDir tmp{"bb-wt-pid1"};
+  const fs::path repo = tmp.path() / "repo";
+  const fs::path leases = tmp.path() / "leases";
+  const std::string base_head = init_temp_repo(repo);
+
+  auto opened = WorktreeLeaseManager::open({repo, leases, 4});
+  check(opened.has_value(), "open failed");
+  WorktreeLeaseManager &mgr = opened.value();
+
+  // M5: owner_pid = 1 must NOT be treated as an immortal owner; must be reclaimable.
+  auto pid1 = mgr.acquire({"pid1-lease", "br-pid1", "HEAD", "spoof", 1, false});
+  check(pid1.has_value(), "acquire with owner_pid=1 failed");
+  check(!pid1.value().owner_alive, "owner_pid=1 must report owner_alive == false");
+
+  // M5: PID reuse detection — a lease whose created_ns predates the current process's
+  // start time must report owner_alive == false and be reclaimed.
+  const std::int64_t self_pid = static_cast<std::int64_t>(::getpid());
+  auto reused =
+      mgr.acquire({"reused-pid", "br-reused", "HEAD", "old-owner", self_pid, false});
+  check(reused.has_value(), "acquire reused-pid failed");
+  const fs::path reused_meta = mgr.lease_root() / ".leases" / "reused-pid.json";
+  write_text_file(reused_meta,
+                  std::string{"{\"version\":1,\"lease_id\":\"reused-pid\",\"branch\":"
+                              "\"br-reused\",\"base_ref\":\"HEAD\",\"base_sha\":\""} +
+                      base_head + "\",\"owner_id\":\"old-owner\",\"owner_pid\":" +
+                      std::to_string(self_pid) + ",\"created_ns\":1}\n");
+
+  auto reused_st = mgr.status("reused-pid");
+  check(reused_st.has_value() && !reused_st.value().owner_alive,
+        "PID-reused lease (created_ns before process start) must report owner_alive == "
+        "false");
+
+  auto report = mgr.reclaim_stale();
+  check(report.has_value(), "reclaim_stale for pid=1/reused failed");
+  check(report.value().reclaimed.size() == 2 &&
+            std::find(report.value().reclaimed.begin(), report.value().reclaimed.end(),
+                      "pid1-lease") != report.value().reclaimed.end() &&
+            std::find(report.value().reclaimed.begin(), report.value().reclaimed.end(),
+                      "reused-pid") != report.value().reclaimed.end(),
+        "reclaim_stale must reclaim both pid1-lease and reused-pid");
+  check(!fs::exists(pid1.value().path), "pid1-lease worktree must be removed");
+  check(!fs::exists(reused.value().path), "reused-pid worktree must be removed");
+}
+
+void test_git_hooks_disabled_and_symlink_conflict() {
+  TempDir tmp{"bb-wt-hard"};
+  const fs::path repo = tmp.path() / "repo";
+  const fs::path leases = tmp.path() / "nested" / "leases";
+  (void)init_temp_repo(repo);
+
+  // M6: install a malicious executable post-checkout hook in the repo.
+  const fs::path sentinel = tmp.path() / "hook-executed.txt";
+  const fs::path hook_path = repo / ".git" / "hooks" / "post-checkout";
+  write_text_file(hook_path, "#!/bin/sh\necho pwned > \"" + sentinel.string() + "\"\n");
+  check(::chmod(hook_path.c_str(), 0700) == 0, "chmod hook failed");
+
+  auto opened = WorktreeLeaseManager::open({repo, leases, 4});
+  check(opened.has_value(), "open nested lease_root failed");
+  WorktreeLeaseManager &mgr = opened.value();
+
+  // L5: lease_root itself must be created with 0700 permissions.
+  struct stat root_st{};
+  check(::lstat(mgr.lease_root().c_str(), &root_st) == 0, "lstat lease_root failed");
+  check((root_st.st_mode & 0777) == 0700, "lease_root must have 0700 permissions");
+
+  auto acquired = mgr.acquire({"hook-test", "br-hook", "HEAD", "owner",
+                               static_cast<std::int64_t>(::getpid()), false});
+  check(acquired.has_value(), "acquire with repo hook present failed");
+  check(!fs::exists(sentinel),
+        "repo post-checkout hook executed during WorktreeLeaseManager::acquire!");
+
+  // Symlink-replaced worktree between acquire and status must return conflict.
+  const fs::path wt_path = acquired.value().path;
+  fs::remove_all(wt_path);
+  check(::symlink("/tmp", wt_path.c_str()) == 0,
+        "failed to replace worktree with symlink");
+
+  auto sym_status = mgr.status("hook-test");
+  check(!sym_status.has_value() && sym_status.error().code == ErrorCode::conflict,
+        "symlink-replaced worktree status() must return ErrorCode::conflict");
+
+  // Clean up symlink before release.
+  check(::unlink(wt_path.c_str()) == 0, "failed to unlink test symlink");
+  check(mgr.release("hook-test", true).has_value(), "cleanup release failed");
+}
+
 } // namespace
 
 int main() {
@@ -577,6 +724,9 @@ int main() {
     test_reclaim_stale();
     test_concurrent_acquire_capacity();
     test_corrupt_worktree_under_parent_repo_does_not_abort_reclaim();
+    test_rogue_corrupt_lease_quarantine();
+    test_owner_pid_one_and_pid_reuse_reclaim();
+    test_git_hooks_disabled_and_symlink_conflict();
     std::cout << "PASS worktree_lease\n";
     return 0;
   } catch (const std::exception &ex) {

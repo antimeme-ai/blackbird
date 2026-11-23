@@ -13893,3 +13893,23 @@ Blackbird must not present itself as another product.
   `BLACKBIRD_LINUX_HOST`), made the CMake `release` preset portable across macOS/Linux
   without hardcoded Homebrew/Anaconda paths, and fixed doc mismatches in `README.md`,
   `docs/USING_BLACKBIRD.md`, and `docs/INSTALLING.md`.
+
+## 2026-11-23 — Kimi Review #1 Remediation (PlatoonBoard, WorktreeLeaseManager, PlatoonRunner)
+
+- Independent cross-model adversarial review by Kimi (`kimi-code/k3`, capture
+  `context/kimi-review/run-904phwxi`, session `session_ba1c145a-7efa-4caf-8328-9e662cb52914`)
+  reported 2 High + 9 Medium findings; documented all dispositions in
+  `papers/2026-11-23-platoon-core-kimi-review.md` and remediated all 11 with 12 new direct
+  regression tests:
+  - `PlatoonRunner`: `std::shared_ptr<Impl>` + `active_spawns` drain closing `spawn()` vs
+    `~PlatoonRunner()` UAF (H1); steady-clock ACP handshake/prompt stage deadlines + integral
+    `double`/`Decimal` JSON-RPC ID matching (H2); dropped `SSH_AUTH_SOCK` and `*SAN_OPTIONS`
+    from external allowlist (M7); propagated `BLACKBIRD_PLATOON_OWNER_ACTOR`/`COMMAND_ROOM`/
+    `TOOL_ALLOWLIST` + Claude `--allowedTools` (M8); `getpgid`-guarded `ECHILD`/drain
+    grandchild SIGKILL sweep (M9); lexical path normalization (L10).
+  - `PlatoonBoard`: open-existing/`O_CREAT|O_EXCL` create-race retry loop in `post()` (M1);
+    `kPlatoonMaxRosterMembers = 512` cap (M2); corrupt/oversized `roster.json` quarantine
+    and rebuild (M3).
+  - `WorktreeLeaseManager`: `.leases/*.json` corrupt-entry quarantine (M4); PID-1/foreign-UID
+    rejection + process start-time liveness verification (M5); `GIT_CONFIG_NOSYSTEM=1` +
+    `-c core.hooksPath=/dev/null` (M6); iterative `0700` private directory creation (L5).

@@ -543,6 +543,253 @@ void test_crash_resilience(const std::filesystem::path &base) {
         "uncommitted missing-nl line resurrected or displaced m5");
 }
 
+void test_multiprocess_fresh_board_first_post_race(const std::filesystem::path &base) {
+  g_stage = "multiprocess_fresh_board_first_post_race";
+  // Exercise M1: multiple processes racing to open and post to a brand-new,
+  // non-existent board root (creating board.jsonl concurrently for the first time).
+  for (int round = 0; round < 4; ++round) {
+    const auto root = base / ("fresh-race-" + std::to_string(round));
+    constexpr int kChildren = 4;
+    constexpr int kPerProc = 5;
+    std::vector<pid_t> pids;
+    pids.reserve(kChildren);
+
+    for (int c = 0; c < kChildren; ++c) {
+      const pid_t pid = ::fork();
+      check(pid >= 0, "fork failed in fresh-board race");
+      if (pid == 0) {
+        auto board = PlatoonBoard::open(root);
+        if (!board.has_value())
+          ::_exit(20);
+        const std::string sender = "racer-" + std::to_string(c);
+        for (int i = 0; i < kPerProc; ++i) {
+          auto posted = board.value().post({
+              sender,
+              "all",
+              PlatoonMessageKind::message,
+              "round=" + std::to_string(round) + " c=" + std::to_string(c) +
+                  " i=" + std::to_string(i),
+              {},
+          });
+          if (!posted.has_value())
+            ::_exit(21);
+        }
+        ::_exit(0);
+      }
+      pids.push_back(pid);
+    }
+
+    for (const pid_t pid : pids) {
+      int status = 0;
+      check(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0,
+            "fresh-board race child failed (possible EEXIST race)");
+    }
+
+    auto verify = must(PlatoonBoard::open(root), "reopen fresh-race root");
+    const auto expected = static_cast<std::size_t>(kChildren * kPerProc);
+    check(must(verify.latest_seq(), "fresh-race latest_seq") == expected,
+          "fresh-race latest_seq mismatch");
+    const auto msgs = must(verify.read_since(0, 100), "read fresh-race msgs");
+    check(msgs.size() == expected, "fresh-race message count mismatch");
+    for (std::size_t idx = 0; idx < msgs.size(); ++idx)
+      check(msgs[idx].seq == idx + 1, "fresh-race seq not strictly 1..N");
+  }
+}
+
+void test_roster_cap_and_corrupt_recovery(const std::filesystem::path &base) {
+  g_stage = "roster_cap_and_corrupt_recovery";
+  // M2: enforce bounded roster member count (kPlatoonMaxRosterMembers = 512).
+  {
+    const auto root = base / "roster-cap";
+    auto board = must(PlatoonBoard::open(root), "open roster-cap board");
+    for (std::size_t i = 0; i < kPlatoonMaxRosterMembers; ++i) {
+      const PlatoonMember m{
+          "m-" + std::to_string(i),
+          "worker",
+          "openai",
+          "gpt-5",
+          "/tmp/ws",
+          "main",
+          PlatoonMemberState::working,
+          static_cast<std::int64_t>(i + 1),
+          1000,
+          "",
+      };
+      (void)must(board.upsert_member(m), "upsert within roster cap");
+    }
+    check(must(board.members(), "members at cap").size() == kPlatoonMaxRosterMembers,
+          "roster size at cap mismatch");
+
+    // Updating an existing member at cap must still succeed.
+    const PlatoonMember update_existing{
+        "m-0",
+        "worker",
+        "openai",
+        "gpt-5",
+        "/tmp/ws",
+        "main",
+        PlatoonMemberState::completed,
+        1,
+        2000,
+        "done",
+    };
+    check(board.upsert_member(update_existing).has_value(),
+          "updating existing member at cap was rejected");
+
+    // Adding a 513th distinct member must fail with capacity.
+    const PlatoonMember over_cap{
+        "m-overflow",
+        "worker",
+        "openai",
+        "gpt-5",
+        "/tmp/ws",
+        "main",
+        PlatoonMemberState::starting,
+        999,
+        3000,
+        "",
+    };
+    const auto overflow_res = board.upsert_member(over_cap);
+    check(!overflow_res.has_value() && overflow_res.error().code == ErrorCode::capacity,
+          "513th member did not fail with capacity");
+  }
+
+  // M3: corrupt/truncated roster.json is quarantined and rebuilt on upsert_member.
+  {
+    const auto root = base / "roster-corrupt";
+    auto board = must(PlatoonBoard::open(root), "open roster-corrupt board");
+    const auto roster_path = root / "roster.json";
+    {
+      const int fd =
+          ::open(roster_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+      check(fd >= 0, "failed to create corrupt roster.json");
+      const std::string_view garbage = R"({"version":1,"members":[{"id":"broken")";
+      const ssize_t n = ::write(fd, garbage.data(), garbage.size());
+      (void)::close(fd);
+      check(n == static_cast<ssize_t>(garbage.size()),
+            "failed to write corrupt roster");
+    }
+
+    const auto bad_read = board.members();
+    check(!bad_read.has_value() && bad_read.error().code == ErrorCode::corrupt,
+          "corrupt roster.json did not fail members() with corrupt");
+
+    const PlatoonMember survivor{
+        "rebuilt-1",
+        "coord",
+        "anthropic",
+        "claude",
+        "/tmp/ws",
+        "main",
+        PlatoonMemberState::working,
+        42,
+        1234,
+        "recovered",
+    };
+    (void)must(board.upsert_member(survivor),
+               "upsert_member must recover corrupt roster");
+
+    const auto recovered = must(board.members(), "members after corrupt recovery");
+    check(recovered.size() == 1 && recovered[0] == survivor,
+          "rebuilt roster contents mismatch");
+
+    bool found_quarantine = false;
+    for (const auto &entry : std::filesystem::directory_iterator(root)) {
+      if (entry.path().filename().string().starts_with("roster.corrupt."))
+        found_quarantine = true;
+    }
+    check(found_quarantine, "corrupt roster was not quarantined to roster.corrupt.*");
+  }
+
+  // M3: oversized (>16 MiB) roster.json is also quarantined and rebuilt cleanly.
+  {
+    const auto root = base / "roster-oversized";
+    auto board = must(PlatoonBoard::open(root), "open roster-oversized board");
+    const auto roster_path = root / "roster.json";
+    {
+      const int fd =
+          ::open(roster_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+      check(fd >= 0, "failed to create oversized roster.json");
+      const std::string chunk(64 * 1024, ' ');
+      constexpr std::size_t kTotalChunks = (17U * 1024U * 1024U) / (64U * 1024U);
+      for (std::size_t i = 0; i < kTotalChunks; ++i) {
+        const ssize_t n = ::write(fd, chunk.data(), chunk.size());
+        check(n == static_cast<ssize_t>(chunk.size()),
+              "failed writing oversized roster");
+      }
+      (void)::close(fd);
+    }
+
+    const auto bad_read = board.members();
+    check(!bad_read.has_value() && bad_read.error().code == ErrorCode::capacity,
+          "17 MiB roster.json did not fail members() with capacity");
+
+    const PlatoonMember survivor{
+        "rebuilt-big",
+        "coord",
+        "openai",
+        "gpt-5",
+        "/tmp/ws",
+        "main",
+        PlatoonMemberState::working,
+        77,
+        5678,
+        "recovered from oversized",
+    };
+    (void)must(board.upsert_member(survivor),
+               "upsert_member must recover oversized roster");
+    const auto recovered = must(board.members(), "members after oversized recovery");
+    check(recovered.size() == 1 && recovered[0] == survivor,
+          "rebuilt roster after oversized quarantine mismatch");
+
+    bool found_quarantine = false;
+    for (const auto &entry : std::filesystem::directory_iterator(root)) {
+      if (entry.path().filename().string().starts_with("roster.corrupt."))
+        found_quarantine = true;
+    }
+    check(found_quarantine, "oversized roster was not quarantined to roster.corrupt.*");
+  }
+}
+
+void test_board_overflow_line_recovery(const std::filesystem::path &base) {
+  g_stage = "board_overflow_line_recovery";
+  const auto root = base / "overflow-line";
+  auto board = must(PlatoonBoard::open(root), "open overflow-line board");
+
+  const auto m1 = must(
+      board.post({"alpha", "all", PlatoonMessageKind::message, "before giant", {}}),
+      "post m1 before giant");
+  check(m1.seq == 1, "m1 seq != 1");
+
+  // Append a 2 MiB single line ending in '\n' directly to board.jsonl.
+  const auto board_path = root / "board.jsonl";
+  {
+    const int fd = ::open(board_path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    check(fd >= 0, "open board.jsonl for 2 MiB injection failed");
+    const std::string chunk(64 * 1024, 'x');
+    for (int i = 0; i < 32; ++i) {
+      const ssize_t n = ::write(fd, chunk.data(), chunk.size());
+      check(n == static_cast<ssize_t>(chunk.size()), "failed writing 2 MiB line chunk");
+    }
+    const char nl = '\n';
+    check(::write(fd, &nl, 1) == 1, "failed writing trailing newline for 2 MiB line");
+    (void)::close(fd);
+  }
+
+  check(must(board.latest_seq(), "latest_seq with 2 MiB line") == 1,
+        "2 MiB line corrupted latest_seq");
+
+  const auto m2 =
+      must(board.post({"beta", "all", PlatoonMessageKind::decision, "after giant", {}}),
+           "post m2 after giant");
+  check(m2.seq == 2, "post after 2 MiB line did not receive seq == 2");
+
+  const auto msgs = must(board.read_since(0, 64), "read_since skipping 2 MiB line");
+  check(msgs.size() == 2 && msgs[0] == m1 && msgs[1] == m2,
+        "read_since did not cleanly skip 2 MiB overflow line");
+}
+
 } // namespace
 
 int main() {
@@ -558,10 +805,14 @@ int main() {
     test_multithread_concurrent_appends(base);
     test_multiprocess_concurrent_appends(base);
     test_crash_resilience(base);
+    test_multiprocess_fresh_board_first_post_race(base);
+    test_roster_cap_and_corrupt_recovery(base);
+    test_board_overflow_line_recovery(base);
     std::filesystem::remove_all(base);
-    std::cout << "platoon_board: directory security, roster upsert/validation, "
-                 "message filtering/pagination, multithread/multiprocess "
-                 "concurrency, and crash recovery passed\n";
+    std::cout << "platoon_board: directory security, roster upsert/validation/cap, "
+                 "corrupt/oversized roster recovery, message filtering/pagination, "
+                 "multithread/multiprocess concurrency, fresh-board race, "
+                 "2 MiB overflow-line skip, and crash recovery passed\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << g_stage << ": " << error.what() << '\n';

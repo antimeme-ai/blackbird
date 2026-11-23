@@ -7,10 +7,12 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <poll.h>
@@ -279,11 +281,9 @@ bool is_disallowed_extra_env_key(std::string_view key) {
 bool is_allowlisted_external_env_key(std::string_view key) {
   if (key.empty() || is_ambient_secret_env_key(key))
     return false;
-  constexpr std::array<std::string_view, 16> exact_allowed = {
-      "HOME",        "USER",          "LOGNAME",      "PATH",          "TMPDIR",
-      "TERM",        "COLORTERM",     "NO_COLOR",     "LANG",          "TZ",
-      "SHELL",       "SSH_AUTH_SOCK", "ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS",
-      "TSAN_OPTIONS"};
+  constexpr std::array<std::string_view, 11> exact_allowed = {
+      "HOME",      "USER",     "LOGNAME", "PATH", "TMPDIR", "TERM",
+      "COLORTERM", "NO_COLOR", "LANG",    "TZ",   "SHELL"};
   for (const auto allowed : exact_allowed) {
     if (key == allowed)
       return true;
@@ -292,15 +292,31 @@ bool is_allowlisted_external_env_key(std::string_view key) {
          key.starts_with("BLACKBIRD_PLATOON_");
 }
 
-std::vector<std::string>
-build_spawn_env(PlatoonPeerDriver driver,
-                const std::vector<std::pair<std::string, std::string>> &extra_env) {
+struct SpawnEnvInput {
+  PlatoonPeerDriver driver = PlatoonPeerDriver::blackbird;
+  std::string_view owner_actor;
+  std::string_view command_room;
+  std::string_view tool_allowlist;
+  const std::vector<std::pair<std::string, std::string>> &extra_env;
+};
+
+std::vector<std::string> build_spawn_env(const SpawnEnvInput &input) {
   std::vector<std::string> env_storage;
   std::map<std::string, std::string, std::less<>> overrides;
-  for (const auto &[key, value] : extra_env)
+  for (const auto &[key, value] : input.extra_env)
     overrides.emplace(key, value);
+  overrides.insert_or_assign("BLACKBIRD_PLATOON_OWNER_ACTOR",
+                             std::string{input.owner_actor});
+  if (!input.command_room.empty()) {
+    overrides.insert_or_assign("BLACKBIRD_PLATOON_COMMAND_ROOM",
+                               std::string{input.command_room});
+  }
+  if (!input.tool_allowlist.empty()) {
+    overrides.insert_or_assign("BLACKBIRD_PLATOON_TOOL_ALLOWLIST",
+                               std::string{input.tool_allowlist});
+  }
 
-  const bool external_driver = (driver != PlatoonPeerDriver::blackbird);
+  const bool external_driver = (input.driver != PlatoonPeerDriver::blackbird);
   if (environ != nullptr) {
     for (char **entry = environ; *entry != nullptr; ++entry) {
       const std::string_view item{*entry};
@@ -308,14 +324,15 @@ build_spawn_env(PlatoonPeerDriver driver,
       if (eq == std::string_view::npos)
         continue;
       const std::string_view key = item.substr(0, eq);
-      if (overrides.contains(key))
+      if (overrides.contains(key) || key == "BLACKBIRD_PLATOON_COMMAND_ROOM" ||
+          key == "BLACKBIRD_PLATOON_TOOL_ALLOWLIST")
         continue;
       if (external_driver && !is_allowlisted_external_env_key(key))
         continue;
       env_storage.emplace_back(item);
     }
   }
-  for (const auto &[key, value] : extra_env)
+  for (const auto &[key, value] : overrides)
     env_storage.push_back(key + "=" + value);
   return env_storage;
 }
@@ -339,6 +356,13 @@ bool valid_absolute_path(const std::filesystem::path &path) {
   if (native.empty() || native.find('\0') != std::string::npos || !valid_utf8(native))
     return false;
   return path.is_absolute();
+}
+
+std::filesystem::path normalize_absolute_path(const std::filesystem::path &path) {
+  std::filesystem::path norm = path.lexically_normal();
+  while (norm.has_relative_path() && norm.filename().empty())
+    norm = norm.parent_path();
+  return norm;
 }
 
 // Ring buffer preserving the exact last `capacity` bytes in O(N) total time.
@@ -468,6 +492,8 @@ struct ValidatedSpec {
   std::filesystem::path session_dir;
   std::vector<std::string> argv;
   std::string prompt;
+  int acp_handshake_timeout_ms = PlatoonRunner::default_acp_handshake_timeout_ms;
+  int acp_prompt_timeout_ms = PlatoonRunner::default_acp_prompt_timeout_ms;
 };
 
 bool valid_driver_enum(PlatoonPeerDriver driver) noexcept {
@@ -516,6 +542,12 @@ Result<ValidatedSpec> validate_spec(const PlatoonPeerSpec &spec) {
     return Result<ValidatedSpec>::failure({ErrorCode::invalid_range});
   if (spec.max_output_bytes == 0 ||
       spec.max_output_bytes > PlatoonRunner::max_output_bytes_limit)
+    return Result<ValidatedSpec>::failure({ErrorCode::invalid_range});
+  if (spec.acp_handshake_timeout_ms <= 0 ||
+      spec.acp_handshake_timeout_ms > PlatoonRunner::max_acp_timeout_ms)
+    return Result<ValidatedSpec>::failure({ErrorCode::invalid_range});
+  if (spec.acp_prompt_timeout_ms <= 0 ||
+      spec.acp_prompt_timeout_ms > PlatoonRunner::max_acp_timeout_ms)
     return Result<ValidatedSpec>::failure({ErrorCode::invalid_range});
 
   std::string normalized_owner = spec.owner_actor.empty() ? "local" : spec.owner_actor;
@@ -606,11 +638,14 @@ Result<ValidatedSpec> validate_spec(const PlatoonPeerSpec &spec) {
   out.command_room = spec.command_room;
   out.tool_allowlist = spec.tool_allowlist;
   out.executable = std::move(exe);
-  out.working_dir = spec.working_dir;
-  out.session_dir = spec.session_dir;
+  out.working_dir = normalize_absolute_path(spec.working_dir);
+  if (!spec.session_dir.empty())
+    out.session_dir = normalize_absolute_path(spec.session_dir);
   out.prompt = spec.prompt;
+  out.acp_handshake_timeout_ms = spec.acp_handshake_timeout_ms;
+  out.acp_prompt_timeout_ms = spec.acp_prompt_timeout_ms;
 
-  out.argv.reserve(16U + spec.extra_args.size());
+  out.argv.reserve(18U + spec.extra_args.size());
   out.argv.push_back(out.executable.string());
   switch (spec.driver) {
   case PlatoonPeerDriver::blackbird:
@@ -644,6 +679,10 @@ Result<ValidatedSpec> validate_spec(const PlatoonPeerSpec &spec) {
       out.argv.emplace_back("--model");
       out.argv.push_back(spec.model);
     }
+    if (!spec.tool_allowlist.empty()) {
+      out.argv.emplace_back("--allowedTools");
+      out.argv.push_back(spec.tool_allowlist);
+    }
     for (const auto &arg : spec.extra_args)
       out.argv.push_back(arg);
     break;
@@ -670,9 +709,9 @@ Result<ValidatedSpec> validate_spec(const PlatoonPeerSpec &spec) {
       out.argv.emplace_back("--model");
       out.argv.push_back(spec.model);
     }
-    if (!spec.session_dir.empty()) {
+    if (!out.session_dir.empty()) {
       out.argv.emplace_back("--session-dir");
-      out.argv.push_back(spec.session_dir.string());
+      out.argv.push_back(out.session_dir.string());
     }
     if (!spec.tool_allowlist.empty()) {
       out.argv.emplace_back("--tools");
@@ -840,8 +879,9 @@ Result<SpawnedProcess> spawn_peer_process(SpawnInput input) {
     argv_ptrs.push_back(arg.data());
   argv_ptrs.push_back(nullptr);
 
-  std::vector<std::string> env_storage =
-      build_spawn_env(input.validated.driver, input.extra_env);
+  std::vector<std::string> env_storage = build_spawn_env(
+      {input.validated.driver, input.validated.owner_actor,
+       input.validated.command_room, input.validated.tool_allowlist, input.extra_env});
 
   std::vector<char *> envp_ptrs;
   envp_ptrs.reserve(env_storage.size() + 1U);
@@ -884,6 +924,32 @@ bool jsonrpc_id_matches(const Value *id_val, std::uint64_t expected) noexcept {
     return *u == expected;
   if (const auto *s = std::get_if<std::int64_t>(&num->storage()))
     return *s >= 0 && static_cast<std::uint64_t>(*s) == expected;
+  if (const auto *d = std::get_if<double>(&num->storage())) {
+    if (!std::isfinite(*d) || *d < 0.0 || *d >= 18446744073709551616.0 ||
+        std::trunc(*d) != *d)
+      return false;
+    return static_cast<std::uint64_t>(*d) == expected;
+  }
+  if (const auto *dec = std::get_if<Decimal>(&num->storage())) {
+    if (dec->limbs.empty() || dec->exponent < 0 || dec->exponent > 20)
+      return false;
+    if (dec->negative)
+      return expected == 0 && dec->limbs.size() == 1 && dec->limbs[0] == 0;
+    std::uint64_t value = 0;
+    constexpr std::uint64_t kBase = 1000000000ULL;
+    for (std::size_t i = dec->limbs.size(); i > 0; --i) {
+      const auto limb = static_cast<std::uint64_t>(dec->limbs[i - 1]);
+      if (value > (std::numeric_limits<std::uint64_t>::max() - limb) / kBase)
+        return false;
+      value = value * kBase + limb;
+    }
+    for (std::int64_t e = 0; e < dec->exponent; ++e) {
+      if (value > std::numeric_limits<std::uint64_t>::max() / 10ULL)
+        return false;
+      value *= 10ULL;
+    }
+    return value == expected;
+  }
   return false;
 }
 
@@ -943,20 +1009,35 @@ enum class AcpStage : std::uint8_t {
   done,
 };
 
+struct AcpStartConfig {
+  std::filesystem::path working_dir;
+  std::string prompt;
+  std::chrono::milliseconds handshake_timeout{
+      PlatoonRunner::default_acp_handshake_timeout_ms};
+  std::chrono::milliseconds prompt_timeout{
+      PlatoonRunner::default_acp_prompt_timeout_ms};
+};
+
 struct AcpClientSession {
   AcpStage stage = AcpStage::inactive;
   bool failed = false;
   bool line_overflow = false;
   std::filesystem::path working_dir;
   std::string prompt;
+  std::chrono::milliseconds handshake_timeout{
+      PlatoonRunner::default_acp_handshake_timeout_ms};
+  std::chrono::milliseconds prompt_timeout{
+      PlatoonRunner::default_acp_prompt_timeout_ms};
+  std::optional<SteadyClock::time_point> stage_deadline;
   std::string write_buf;
   std::size_t write_offset = 0;
   std::string line_buf;
 
-  void start(const std::filesystem::path &cwd, std::string prompt_text,
-             OwnedFd &stdin_write) noexcept {
-    working_dir = cwd;
-    prompt = std::move(prompt_text);
+  void start(AcpStartConfig config, OwnedFd &stdin_write) noexcept {
+    working_dir = std::move(config.working_dir);
+    prompt = std::move(config.prompt);
+    handshake_timeout = config.handshake_timeout;
+    prompt_timeout = config.prompt_timeout;
     try {
       auto init = build_acp_initialize_line();
       if (!init.has_value()) {
@@ -965,6 +1046,7 @@ struct AcpClientSession {
       }
       enqueue(std::move(init).value());
       stage = AcpStage::awaiting_initialize;
+      stage_deadline = SteadyClock::now() + handshake_timeout;
     } catch (...) {
       fail(stdin_write);
     }
@@ -973,6 +1055,7 @@ struct AcpClientSession {
   void fail(OwnedFd &stdin_write) noexcept {
     failed = true;
     stage = AcpStage::done;
+    stage_deadline.reset();
     write_buf.clear();
     write_offset = 0;
     stdin_write.close();
@@ -980,9 +1063,20 @@ struct AcpClientSession {
 
   void finish(OwnedFd &stdin_write) noexcept {
     stage = AcpStage::done;
+    stage_deadline.reset();
     write_buf.clear();
     write_offset = 0;
     stdin_write.close();
+  }
+
+  bool check_timeout(SteadyClock::time_point now, OwnedFd &stdin_write) noexcept {
+    if (stage == AcpStage::inactive || stage == AcpStage::done)
+      return false;
+    if (stage_deadline.has_value() && now >= *stage_deadline) {
+      fail(stdin_write);
+      return true;
+    }
+    return false;
   }
 
   void enqueue(std::string_view line) {
@@ -1063,6 +1157,7 @@ struct AcpClientSession {
         }
         enqueue(std::move(next).value());
         stage = AcpStage::awaiting_session_new;
+        stage_deadline = SteadyClock::now() + handshake_timeout;
       } else if (stage == AcpStage::awaiting_session_new &&
                  jsonrpc_id_matches(id_val, 2U)) {
         if (has_error || res_val == nullptr ||
@@ -1085,6 +1180,7 @@ struct AcpClientSession {
         }
         enqueue(std::move(next).value());
         stage = AcpStage::awaiting_prompt;
+        stage_deadline = SteadyClock::now() + prompt_timeout;
       } else if (stage == AcpStage::awaiting_prompt && jsonrpc_id_matches(id_val, 3U)) {
         if (has_error || res_val == nullptr) {
           fail(stdin_write);
@@ -1264,6 +1360,8 @@ struct PlatoonRunner::Impl {
     bool counted = false;
     bool stop_requested = false;
     int stop_grace_ms = 1500;
+    int acp_handshake_timeout_ms = PlatoonRunner::default_acp_handshake_timeout_ms;
+    int acp_prompt_timeout_ms = PlatoonRunner::default_acp_prompt_timeout_ms;
     bool settled = false;
     OwnedFd wake_write;
     std::thread reader;
@@ -1275,7 +1373,9 @@ struct PlatoonRunner::Impl {
           owner_actor(validated.owner_actor), command_room(validated.command_room),
           tool_allowlist(validated.tool_allowlist), working_dir(validated.working_dir),
           session_dir(validated.session_dir), output_ring(spec.max_output_bytes),
-          order(seq_order) {}
+          order(seq_order),
+          acp_handshake_timeout_ms(validated.acp_handshake_timeout_ms),
+          acp_prompt_timeout_ms(validated.acp_prompt_timeout_ms) {}
 
     ~Peer() {
       if (reader.joinable())
@@ -1287,6 +1387,7 @@ struct PlatoonRunner::Impl {
   std::condition_variable cv;
   std::size_t max_peers = default_max_peers;
   std::uint64_t next_order = 1;
+  std::size_t active_spawns = 0;
   bool shutting_down = false;
   std::map<std::string, std::shared_ptr<Peer>, std::less<>> peers;
 
@@ -1372,7 +1473,10 @@ struct PlatoonRunner::Impl {
 
     AcpClientSession acp;
     if (acp_mode) {
-      acp.start(peer->working_dir, std::move(handles.acp_prompt), stdin_write);
+      acp.start({peer->working_dir, std::move(handles.acp_prompt),
+                 std::chrono::milliseconds{peer->acp_handshake_timeout_ms},
+                 std::chrono::milliseconds{peer->acp_prompt_timeout_ms}},
+                stdin_write);
     }
 
     bool stdout_closed = (output_read.fd < 0);
@@ -1504,6 +1608,15 @@ struct PlatoonRunner::Impl {
         drain_deadline = now + std::chrono::milliseconds{drain_grace_ms};
       }
 
+      if (acp_mode && !leader_exited && acp.check_timeout(now, stdin_write)) {
+        if (!kill_sent) {
+          signal_peer_group({pid, SIGKILL});
+          term_sent = true;
+          kill_sent = true;
+          drain_deadline = now + std::chrono::milliseconds{drain_grace_ms};
+        }
+      }
+
       if (acp_mode)
         acp.flush_stdin(stdin_write);
       drain_stdout(64U * 1024U);
@@ -1533,6 +1646,8 @@ struct PlatoonRunner::Impl {
           reaped = true;
           stdin_write.close();
           detail::uncontained_exec.store(true);
+          if (::getpgid(pid) == pid)
+            (void)::kill(-pid, SIGKILL);
           drain_deadline = SteadyClock::now() + std::chrono::milliseconds{50};
         }
       }
@@ -1543,6 +1658,8 @@ struct PlatoonRunner::Impl {
         // Leader is a zombie pinning the PGID: sweep any grandchild holding the pipe.
         if (!reaped)
           signal_peer_group({pid, SIGKILL});
+        else if (::getpgid(pid) == pid)
+          (void)::kill(-pid, SIGKILL);
         drain_stdout(64U * 1024U);
         drain_stderr(64U * 1024U);
         output_read.close();
@@ -1572,6 +1689,8 @@ struct PlatoonRunner::Impl {
       };
       if (term_sent && !kill_sent && !leader_exited)
         clamp_timeout(kill_deadline);
+      if (acp_mode && !leader_exited && acp.stage_deadline.has_value())
+        clamp_timeout(acp.stage_deadline);
       if (leader_exited && !(stdout_closed && stderr_closed))
         clamp_timeout(drain_deadline);
 
@@ -1645,7 +1764,7 @@ struct PlatoonRunner::Impl {
 PlatoonRunner::PlatoonRunner(std::size_t max_peers) {
   if (max_peers == 0 || max_peers > max_peers_limit)
     throw Error{ErrorCode::invalid_range};
-  impl_ = std::make_unique<Impl>(max_peers);
+  impl_ = std::make_shared<Impl>(max_peers);
 }
 
 PlatoonRunner::~PlatoonRunner() {
@@ -1653,8 +1772,17 @@ PlatoonRunner::~PlatoonRunner() {
     return;
   std::vector<std::shared_ptr<Impl::Peer>> all_peers;
   {
-    const std::lock_guard lock{impl_->mutex};
+    std::unique_lock lock{impl_->mutex};
     impl_->shutting_down = true;
+    for (auto &[id, peer] : impl_->peers) {
+      (void)id;
+      if (!peer->settled) {
+        peer->stop_requested = true;
+        peer->stop_grace_ms = std::min(peer->stop_grace_ms, destructor_grace_ms);
+        wake_reader_locked(peer->wake_write.fd);
+      }
+    }
+    impl_->cv.wait(lock, [&] { return impl_->active_spawns == 0; });
     all_peers.reserve(impl_->peers.size());
     for (auto &[id, peer] : impl_->peers) {
       (void)id;
@@ -1671,6 +1799,7 @@ PlatoonRunner::~PlatoonRunner() {
 }
 
 Result<PlatoonPeerSnapshot> PlatoonRunner::spawn(const PlatoonPeerSpec &spec) {
+  const auto impl = impl_;
   auto validated = validate_spec(spec);
   if (!validated.has_value())
     return Result<PlatoonPeerSnapshot>::failure(validated.error());
@@ -1678,37 +1807,57 @@ Result<PlatoonPeerSnapshot> PlatoonRunner::spawn(const PlatoonPeerSpec &spec) {
   std::shared_ptr<Impl::Peer> peer;
   std::vector<std::shared_ptr<Impl::Peer>> to_join;
   {
-    const std::lock_guard lock{impl_->mutex};
-    if (impl_->shutting_down)
+    const std::lock_guard lock{impl->mutex};
+    if (impl->shutting_down)
       return Result<PlatoonPeerSnapshot>::failure({ErrorCode::busy});
 
-    const auto existing = impl_->peers.find(spec.peer_id);
-    if (existing != impl_->peers.end() && !existing->second->settled)
+    const auto existing = impl->peers.find(spec.peer_id);
+    if (existing != impl->peers.end() && !existing->second->settled)
       return Result<PlatoonPeerSnapshot>::failure({ErrorCode::conflict});
 
-    if (impl_->active_count_locked() >= impl_->max_peers)
+    if (impl->active_count_locked() >= impl->max_peers)
       return Result<PlatoonPeerSnapshot>::failure({ErrorCode::capacity});
 
-    if (existing != impl_->peers.end()) {
+    if (existing != impl->peers.end()) {
       to_join.push_back(std::move(existing->second));
-      impl_->peers.erase(existing);
+      impl->peers.erase(existing);
     }
-    impl_->collect_settled_for_join_locked(to_join);
+    impl->collect_settled_for_join_locked(to_join);
 
-    peer = std::make_shared<Impl::Peer>(spec, validated.value(), impl_->next_order++);
-    impl_->peers.emplace(spec.peer_id, peer);
+    peer = std::make_shared<Impl::Peer>(spec, validated.value(), impl->next_order++);
+    impl->peers.emplace(spec.peer_id, peer);
+    ++impl->active_spawns;
   }
+
+  struct ActiveSpawnGuard {
+    std::shared_ptr<Impl> impl;
+    bool active = true;
+    void finish_locked() noexcept {
+      if (active) {
+        active = false;
+        --impl->active_spawns;
+        impl->cv.notify_all();
+      }
+    }
+    ~ActiveSpawnGuard() {
+      if (active) {
+        const std::lock_guard lock{impl->mutex};
+        --impl->active_spawns;
+        impl->cv.notify_all();
+      }
+    }
+  } spawn_guard{impl};
 
   Impl::join_peers(to_join);
 
   auto spawned = spawn_peer_process({validated.value(), spec.extra_env});
   if (!spawned.has_value()) {
-    const std::lock_guard lock{impl_->mutex};
+    const std::lock_guard lock{impl->mutex};
     peer->settled = true;
-    const auto it = impl_->peers.find(spec.peer_id);
-    if (it != impl_->peers.end() && it->second == peer)
-      impl_->peers.erase(it);
-    impl_->cv.notify_all();
+    const auto it = impl->peers.find(spec.peer_id);
+    if (it != impl->peers.end() && it->second == peer)
+      impl->peers.erase(it);
+    spawn_guard.finish_locked();
     return Result<PlatoonPeerSnapshot>::failure(spawned.error());
   }
 
@@ -1717,44 +1866,75 @@ Result<PlatoonPeerSnapshot> PlatoonRunner::spawn(const PlatoonPeerSpec &spec) {
   std::string acp_prompt;
   if (validated.value().driver == PlatoonPeerDriver::acp)
     acp_prompt = std::move(validated.value().prompt);
+
+  bool abort_for_shutdown = false;
   {
-    const std::lock_guard lock{impl_->mutex};
-    peer->pid = proc.pid;
-    peer->started_ns = started;
-    peer->counted = true;
-    peer->launched = true;
-    peer->wake_write = std::move(proc.wake_write);
-    Impl::ReaderHandles handles{
-        std::move(proc.stdin_write), std::move(proc.output_read),
-        std::move(proc.stderr_read), std::move(proc.wake_read), std::move(acp_prompt)};
-    try {
-      peer->reader = std::thread(
-          [impl = impl_.get(), peer, handles = std::move(handles)]() mutable {
-            impl->reader_loop(peer, std::move(handles));
-          });
-    } catch (...) {
-      peer->wake_write.close();
-      signal_peer_group({proc.pid, SIGKILL});
-      int status = 0;
-      pid_t waited = -1;
-      do {
-        waited = ::waitpid(proc.pid, &status, 0);
-      } while (waited < 0 && errno == EINTR);
-      if (peer->counted) {
-        --detail::owned_children;
-        peer->counted = false;
+    const std::lock_guard lock{impl->mutex};
+    if (impl->shutting_down) {
+      abort_for_shutdown = true;
+    } else {
+      peer->pid = proc.pid;
+      peer->started_ns = started;
+      peer->counted = true;
+      peer->launched = true;
+      peer->wake_write = std::move(proc.wake_write);
+      Impl::ReaderHandles handles{std::move(proc.stdin_write),
+                                  std::move(proc.output_read),
+                                  std::move(proc.stderr_read),
+                                  std::move(proc.wake_read), std::move(acp_prompt)};
+      try {
+        peer->reader =
+            std::thread([impl, peer, handles = std::move(handles)]() mutable {
+              impl->reader_loop(peer, std::move(handles));
+            });
+      } catch (...) {
+        peer->wake_write.close();
+        signal_peer_group({proc.pid, SIGKILL});
+        int status = 0;
+        pid_t waited = -1;
+        do {
+          waited = ::waitpid(proc.pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (peer->counted) {
+          --detail::owned_children;
+          peer->counted = false;
+        }
+        peer->settled = true;
+        const auto it = impl->peers.find(spec.peer_id);
+        if (it != impl->peers.end() && it->second == peer)
+          impl->peers.erase(it);
+        spawn_guard.finish_locked();
+        return Result<PlatoonPeerSnapshot>::failure({ErrorCode::io, EAGAIN});
       }
-      peer->settled = true;
-      const auto it = impl_->peers.find(spec.peer_id);
-      if (it != impl_->peers.end() && it->second == peer)
-        impl_->peers.erase(it);
-      impl_->cv.notify_all();
-      return Result<PlatoonPeerSnapshot>::failure({ErrorCode::io, EAGAIN});
+      if (peer->stop_requested)
+        wake_reader_locked(peer->wake_write.fd);
+      auto snap = impl->make_snapshot_locked(*peer);
+      spawn_guard.finish_locked();
+      return Result<PlatoonPeerSnapshot>::success(std::move(snap));
     }
-    if (peer->stop_requested)
-      wake_reader_locked(peer->wake_write.fd);
-    return Result<PlatoonPeerSnapshot>::success(impl_->make_snapshot_locked(*peer));
   }
+
+  if (abort_for_shutdown) {
+    proc.stdin_write.close();
+    proc.output_read.close();
+    proc.stderr_read.close();
+    proc.wake_read.close();
+    proc.wake_write.close();
+    signal_peer_group({proc.pid, SIGKILL});
+    int status = 0;
+    pid_t waited = -1;
+    do {
+      waited = ::waitpid(proc.pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    const std::lock_guard lock{impl->mutex};
+    --detail::owned_children;
+    peer->settled = true;
+    const auto it = impl->peers.find(spec.peer_id);
+    if (it != impl->peers.end() && it->second == peer)
+      impl->peers.erase(it);
+    spawn_guard.finish_locked();
+  }
+  return Result<PlatoonPeerSnapshot>::failure({ErrorCode::busy});
 }
 
 std::vector<PlatoonPeerSnapshot> PlatoonRunner::list() const {
