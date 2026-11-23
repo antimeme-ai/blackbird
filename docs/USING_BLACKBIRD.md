@@ -768,7 +768,7 @@ chat: keys and callback codes do not enter session prompts or operation inputs.
 ./scripts/blackbird auth login kimi personal
 ./scripts/blackbird auth login grok personal
 ./scripts/blackbird auth login openai personal
-./scripts/blackbird auth login anthropic personal
+./scripts/blackbird auth key anthropic work
 ./scripts/blackbird auth key mimo work
 ./scripts/blackbird auth use openai personal
 ./scripts/blackbird auth logout openai personal
@@ -778,8 +778,7 @@ Kimi/Grok login prints a verification URL and code, then polls using the
 provider's interval. OpenAI prints a browser URL and receives its callback on a
 loopback listener; its signed ID token, issuer, audience, expiry, nonce and plan
 scopes are checked before storing credentials. Reauthorization reuses the issued
-client/account registration. Anthropic uses browser PKCE and a pasted code#state
-with hidden input, following the older OpenCode/Pi flow. These flows do not read
+client/account registration. Anthropic accepts API keys only. These flows do not read
 Codex/Claude/Kimi credential caches. Browser consent is performed by the operator.
 Provider endpoint/client behavior can change; deterministic checks are not live
 subscription validation. No switch to separately billed access is automatic.
@@ -833,35 +832,31 @@ authentication remains the compatibility path when neither is selected.
 Provider `claude` remains the explicit Claude CLI
 bridge, while `anthropic` uses owned direct authentication. Both support
 context-only colleagues and participants. The `anthropic` route also supports
-the main coding loop described below. Owned Anthropic OAuth has deterministic
-login/refresh checks; the live token-exchange result is tracked separately from
-those checks. See the [auth inventory](../papers/claude-auth-integration-2026-10-17/SOURCE_INVENTORY.md)
-and [current primary-source notes](../papers/claude-auth-integration-2026-10-17/PRIMARY_SOURCES.md).
+the main coding loop described below.
 Source integration does not activate a running session or install a release.
 
 ### Native Claude main provider
 
-Native Messages keeps Blackbird's own tool loop. Anthropic documents
-[API authentication](https://platform.claude.com/docs/en/manage-claude/authentication)
-for direct clients; its subscription `/login` and `setup-token` instructions apply
-to Claude Code. The [Agent SDK guide](https://code.claude.com/docs/en/agent-sdk/overview#get-started)
-requires prior approval for third-party products offering claude.ai login or
-subscription rate limits. Blackbird's reference-derived subscription sign-in
-below has not passed live validation; matching OpenCode does not establish
-official support or successful service acceptance.
+Native Messages keeps Blackbird's own tool loop. It authenticates with an
+Anthropic API key, billed by Anthropic's API pricing (see Anthropic's
+[API authentication](https://platform.claude.com/docs/en/manage-claude/authentication)).
+Blackbird does not offer Claude subscription (claude.ai) sign-in: Anthropic's
+terms reserve subscription login for Claude Code and approved products, and
+Blackbird never presents itself as Claude Code.
 
-Sign in through the separate operator auth process, then select the provider and
-model explicitly for a fresh conversation:
+Store a key through the separate operator auth process (or set
+`ANTHROPIC_API_KEY`), then select the provider and model explicitly:
 
 ```sh
-blackbird auth login anthropic personal
+blackbird auth key anthropic work
 blackbird --provider anthropic --model claude-sonnet-4-6 --effort medium
 ```
 
-An explicitly selected Anthropic API key also works with this route, using its
-issuer's API billing. Blackbird does not switch a failed subscription login to
-that route automatically. The installed Claude CLI bridge has its own account
-selection and is independent of owned Anthropic sign-in.
+An Anthropic subscription sign-in saved by an earlier Blackbird is refused,
+never sent or refreshed, and never silently replaced by an environment key.
+Remove it with `blackbird auth logout anthropic ACCOUNT` and store a key. The
+installed Claude CLI bridge (provider `claude`) runs Anthropic's own `claude`
+executable with its own account selection.
 
 Native Messages uses the retained Lua workflow and ordinary native tools. It
 streams text, preserves complete signed/redacted thinking and tool-result
@@ -871,12 +866,6 @@ valid answers are saved. The initial adapter supports text and function tools; u
 content is refused. A context containing Anthropic's opaque thinking cannot be
 sent to a Responses provider; start a fresh conversation for that change.
 
-The owned sign-in uses browser consent plus a hidden pasted callback code. A
-successful browser page alone does not mean credentials were saved: confirm
-`Sign-in saved` in Terminal and an active account in `blackbird auth status`.
-The observed [token-exchange 429](../papers/claude-auth-integration-2026-10-17/LIVE_RATE_LIMIT.md)
-is a distinct live compatibility/service result. There is no automatic replay of
-an authorization code after an unknown exchange outcome.
 
 ## Trajectory inspection
 

@@ -591,21 +591,14 @@ void ProviderAuth::browser_login(std::string_view p, std::string_view account,
     const auto expected = number(registration, "revision");
     trace.scalar(RawAuthField::browser_revision, expected);
     const auto verifier = secure_nonce();
-    const auto state = p == "anthropic" ? verifier : secure_nonce(),
-               nonce = secure_nonce();
+    const auto state = secure_nonce(), nonce = secure_nonce();
     auto client = p == "openai" ? text(registration, "client_id", text(d, "client_id"))
                                 : text(d, "client_id");
     const bool new_registration = client == "dynamic_agent_client";
-    std::string callback, authorize;
-    std::unique_ptr<Callback> server;
-    if (p == "openai") {
-      server = std::make_unique<Callback>();
-      callback = server->uri;
-      authorize = "https://auth.openai.com/api/accounts/authorize";
-    } else {
-      callback = "https://console.anthropic.com/oauth/code/callback";
-      authorize = "https://claude.ai/oauth/authorize";
-    }
+    // Only OpenAI offers browser login; it always returns through a local callback.
+    const auto server = std::make_unique<Callback>();
+    const std::string callback = server->uri;
+    const std::string authorize = "https://auth.openai.com/api/accounts/authorize";
     std::string challenge;
     RawAuthExchange pkce{trace, {1615, 1616}};
     try {
@@ -629,8 +622,6 @@ void ProviderAuth::browser_login(std::string_view p, std::string_view account,
                       "&redirect_uri=" + form(callback) +
                       "&scope=" + form(text(d, "scope")) + "&state=" + form(state) +
                       "&code_challenge_method=S256&code_challenge=" + challenge;
-    if (p == "anthropic")
-      url += "&code=true";
     Value metadata = Value::object({});
     if (p == "openai") {
       // Stable host identity is separate from account credentials; no provider cache.
@@ -680,23 +671,7 @@ void ProviderAuth::browser_login(std::string_view p, std::string_view account,
     auth_callback(trace, 1, [&] {
       notice("Open this sign-in URL in your browser:\n" + url + "\n");
     });
-    std::map<std::string, std::string> values;
-    if (server)
-      values = auth_callback(trace, 2, [&] { return server->wait(config_, state); });
-    else {
-      auth_callback(trace, 3,
-                    [&] { notice("Paste the returned code#state (input hidden): "); });
-      const auto input = auth_callback(trace, 4, [&] { return read_secret(); });
-      const auto at = input.find('#');
-      if (at != std::string::npos) {
-        values["code"] = input.substr(0, at);
-        values["state"] = input.substr(at + 1);
-      } else {
-        const auto q = input.find('?');
-        values = query(q == std::string::npos ? std::string_view{input}
-                                              : std::string_view{input}.substr(q + 1));
-      }
-    }
+    auto values = auth_callback(trace, 2, [&] { return server->wait(config_, state); });
     if (values["state"] != state || !values["error"].empty() || values["code"].empty())
       throw Error{ErrorCode::provider_auth};
     if (p == "openai") {
@@ -720,16 +695,6 @@ void ProviderAuth::browser_login(std::string_view p, std::string_view account,
                           30};
     if (p == "openai")
       r.body += "&resource=https%3A%2F%2Fapi.openai.com%2Fv1";
-    if (p == "anthropic") {
-      r.headers = {{"Content-Type", "application/json"}};
-      r.body =
-          unwrap(dump_json(Value::object({{"grant_type", Value{"authorization_code"}},
-                                          {"client_id", Value{client}},
-                                          {"code", Value{values["code"]}},
-                                          {"state", Value{state}},
-                                          {"redirect_uri", Value{callback}},
-                                          {"code_verifier", Value{verifier}}})));
-    }
     auto reply = http(config_, r, trace, 4);
     require_provider_success(reply.status);
     auto tokens = unwrap(parse_json(reply.body));

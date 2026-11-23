@@ -110,9 +110,9 @@ void roundtrip() {
     if (key == "input")
       value.array().push_back(output.back());
   rejects([&] { (void)export_anthropic_request(incomplete); }, ErrorCode::conflict);
-  check(
-      string_field(export_anthropic_request(request(), 16384, true), "system")
-          .starts_with("You are Claude Code, Anthropic's official CLI for Claude.\n"));
+  // Blackbird never presents itself to Anthropic as Claude Code.
+  check(string_field(export_anthropic_request(request()), "system") ==
+        "Blackbird instructions");
 }
 void malformed() {
   const auto valid = stream(blocks());

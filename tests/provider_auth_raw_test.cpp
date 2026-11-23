@@ -584,8 +584,8 @@ void private_surfaces(const std::filesystem::path &directory) {
       (void)auth.status();
       const auto tokens = unwrap(parse_json(
           R"({"access_token":"private-access-sentinel","refresh_token":"private-refresh-sentinel","expires_in":120,"token_type":"Bearer"})"));
-      auth.save_oauth("anthropic", "account", tokens, "private-client-sentinel",
-                      "https://console.anthropic.com/v1/oauth/token",
+      auth.save_oauth("kimi", "account", tokens, "private-client-sentinel",
+                      "https://auth.kimi.com/api/oauth/token",
                       Value::object({{"id_token", Value{"private-jwt-sentinel"}}}));
       ProviderAuthConfig owned = config;
       owned.http = [](const ProviderHttpRequest &request,
@@ -602,16 +602,16 @@ void private_surfaces(const std::filesystem::path &directory) {
         return reply(response, 200, "{}");
       };
       ProviderAuth selected{owned};
-      const auto expected_binding = selected.binding("anthropic");
+      const auto expected_binding = selected.binding("kimi");
       clock = 220;
-      check(selected.request("anthropic", "models", Value::object({}), 30, {},
+      check(selected.request("kimi", "models", Value::object({}), 30, {},
                              &expected_binding)
                     .body == "{}",
             "owned native resolution result changed");
       bool caught = false;
       try {
         auth.browser_login(
-            "anthropic", "account",
+            "openai", "account",
             [](std::string_view) { throw std::runtime_error{"observer error"}; },
             [] { return std::string{"private-browser-code-sentinel"}; });
       } catch (const std::runtime_error &) {

@@ -13784,3 +13784,37 @@ Addressed six operator field notes from live TUI use:
 - Supports monotonic `bb-N` IDs, blocker-aware `ready()` ordering, iterative DFS cycle
   rejection, optimistic CAS `expected_revision` updates/claims/closes, and verified
   multi-thread + `fork()` multi-process contention.
+
+## 2026-11-23 — Remove Claude subscription sign-in; Anthropic is API-key only
+
+The operator had directed the autodev loop to drop Claude subscription auth after
+reading Anthropic's terms; it was still present. The `anthropic` login borrowed
+Claude Code's OAuth client, sent `User-Agent: claude-cli/2.1.163`, `x-app: cli`
+and the `claude-code-20250219` beta, and prefixed every system prompt (main loop
+and colleague) with "You are Claude Code, Anthropic's official CLI for Claude."
+Blackbird must not present itself as another product.
+
+- `builtin("anthropic")` is now key-only (`ANTHROPIC_API_KEY` or `auth key`);
+  browser/device login refuse it through the existing `login` gate.
+- Removed the spoofed headers, the Claude Code prompt prefix
+  (`export_anthropic_request` loses its `oauth` parameter), the Anthropic PKCE
+  exchange/refresh JSON bodies and the copy-code paste path. Browser login is
+  OpenAI-only and always uses its loopback callback.
+- New rule in owned resolution: an OAuth credential is refused when its provider
+  no longer offers an OAuth login. A Claude token saved by an earlier build is
+  never sent, refreshed, or replaced by an ambient key.
+- Tests: `anthropic_key_only_checks` (catalog, refused logins, clean API-key wire,
+  legacy-token refusal with no HTTP); the generic refresh-failure state machine
+  moved from the Anthropic fixture to Kimi OAuth so its coverage remains.
+  `provider_auth_raw` retargets its owned-refresh and observer-exception cases to
+  Kimi and OpenAI. Red before the source change ("Anthropic catalog still offers
+  subscription OAuth"); six affected tests green after.
+- Open for the operator: Kimi (`X-Msh-Platform: kimi_cli`, Kimi CLI client ID),
+  Grok (`grok-cli:access` scope) and the ChatGPT/Codex backend use the same
+  borrowed-client pattern; not changed here.
+- Kimi review (`papers/2026-11-23-claude-auth-removal-kimi-review.md`): requirements
+  1–3 no finding. Two minor findings fixed: the native export test now asserts exact
+  system text, and the `/auth` notice moves Anthropic from `auth login` to `auth key`.
+- The first gated commit attempt failed only on eight TUI/display tests in the fresh
+  worktree because the pinned `tui-test` was not installed there; installed with
+  `scripts/tui-test --install` and reran the gate.

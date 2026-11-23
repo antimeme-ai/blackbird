@@ -298,11 +298,9 @@ Value builtin(std::string_view id) {
                 "https://auth.openai.com/api/accounts/oauth/token",
                 "openid profile email offline_access resource.invoke "
                 "chatgpt.tokens.use.direct");
+  // API key only: Blackbird has no Anthropic OAuth client of its own.
   if (id == "anthropic")
-    return make("https://api.anthropic.com/v1", "messages", "ANTHROPIC_API_KEY",
-                "browser", "9d1c250a-e61b-44d9-88ed-5944d1962f5e", "",
-                "https://console.anthropic.com/v1/oauth/token",
-                "org:create_api_key user:profile user:inference");
+    return make("https://api.anthropic.com/v1", "messages", "ANTHROPIC_API_KEY");
   if (id == "kimi")
     return make("https://api.kimi.com/coding/v1", "messages", "KIMI_API_KEY", "device",
                 "17e5f671-d194-4dfb-9706-5516cb48c098",
@@ -1506,6 +1504,10 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
           if (str(*a, "state", "ready") != "ready")
             throw Error{ErrorCode::provider_auth};
           kind = str(*a, "kind");
+          // An OAuth credential is usable only while the provider still offers an
+          // OAuth login; credentials saved for a withdrawn login are never sent.
+          if (kind == "oauth" && str(d, "login") == "none")
+            throw Error{ErrorCode::provider_auth};
           bool refresh = false;
           if (kind == "oauth") {
             trace.stage(RawAuthField::refresh_expiry);
@@ -1535,13 +1537,6 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
                 oauth_headers(p), 30};
             if (p == "openai")
               r.body += "&resource=https%3A%2F%2Fapi.openai.com%2Fv1";
-            if (p == "anthropic") {
-              r.headers = {{"Content-Type", "application/json"}};
-              r.body = unwrap(dump_json(
-                  Value::object({{"grant_type", Value{"refresh_token"}},
-                                 {"client_id", Value{str(*a, "client_id")}},
-                                 {"refresh_token", Value{str(*a, "refresh")}}})));
-            }
             ProviderHttpResponse reply;
             try {
               reply = http(config_, r, trace, 3);
@@ -1650,12 +1645,6 @@ ProviderAuth::request(std::string_view p, std::string_view route, const Value &b
         r.headers.emplace_back("x-api-key", token);
       else
         r.headers.emplace_back("Authorization", "Bearer " + token);
-      if (p == "anthropic" && kind == "oauth") {
-        r.headers.emplace_back("anthropic-beta",
-                               "oauth-2025-04-20,claude-code-20250219");
-        r.headers.emplace_back("User-Agent", "claude-cli/2.1.163 (external, cli)");
-        r.headers.emplace_back("x-app", "cli");
-      }
       if (p == "kimi")
         r.headers.emplace_back("User-Agent", "KimiCLI/blackbird-0.1");
     } else

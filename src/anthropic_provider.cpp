@@ -304,7 +304,7 @@ void validate_anthropic_route(std::string_view model, std::string_view effort) {
     throw Error{ErrorCode::unsupported};
 }
 Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
-                               bool oauth, bool anthropic_native) {
+                               bool anthropic_native) {
   for (const auto &[key, value] : request.object()) {
     (void)value;
     if (key != "model" && key != "instructions" && key != "input" && key != "tools" &&
@@ -458,9 +458,6 @@ Value export_anthropic_request(const Value &request, std::uint64_t max_tokens,
       string_field(messages.front(), "role") != "user")
     throw Error{ErrorCode::conflict};
   std::string instructions = string_field(request, "instructions");
-  if (oauth && anthropic_native)
-    instructions =
-        "You are Claude Code, Anthropic's official CLI for Claude.\n" + instructions;
   auto result = Value::object(
       {{"model", Value{model}},
        {"system", Value{std::move(instructions)}},
@@ -642,9 +639,8 @@ Value AnthropicCodingProvider::respond(
     config.cancelled = cancelled;
     ProviderAuth auth{std::move(config)};
     const bool is_anthropic = config_.provider == "anthropic";
-    const auto wire = export_anthropic_request(
-        request, config_.max_tokens, string_field(binding_, "kind") == "oauth",
-        is_anthropic);
+    const auto wire =
+        export_anthropic_request(request, config_.max_tokens, is_anthropic);
     const auto response =
         auth.request(config_.provider, "messages", wire, config_.timeout_seconds,
                      capture, &binding_, owner, context);
