@@ -477,9 +477,7 @@ private:
       text += "e0"; // past int64: Lua reads a float
     }
     double binary64 = 0;
-    const auto r =
-        std::from_chars(spelled.data(), spelled.data() + spelled.size(), binary64);
-    if (r.ec == std::errc::result_out_of_range)
+    if (parse_decimal_double(spelled, binary64) == std::errc::result_out_of_range)
       refuse(at, "numeral",
              "numeral `" + std::string{negative ? "-" : ""} + std::string{spelled} +
                  "` is outside the range of a Lua float");

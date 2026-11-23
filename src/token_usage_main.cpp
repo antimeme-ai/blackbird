@@ -4,11 +4,16 @@
 #include <cmath>
 #include <cstdio>
 #include <string_view>
+#include <type_traits>
 
 namespace {
 template <class T> bool number(std::string_view text, T &value) {
-  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-  return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+  if constexpr (std::is_same_v<T, double>) {
+    return blackbird::parse_decimal_double(text, value) == std::errc{};
+  } else {
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+  }
 }
 bool rate(std::string_view text, std::optional<double> &value) {
   if (text == "-") {

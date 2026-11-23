@@ -52,8 +52,7 @@ double number(const Value &v) {
     fail(ErrorCode::corrupt);
   double result = 0;
   const auto &s = v.number().text();
-  const auto p = std::from_chars(s.data(), s.data() + s.size(), result);
-  if (p.ec != std::errc{} || p.ptr != s.data() + s.size() || !std::isfinite(result))
+  if (parse_decimal_double(s, result) != std::errc{} || !std::isfinite(result))
     fail(ErrorCode::corrupt);
   return result;
 }

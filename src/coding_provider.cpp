@@ -859,9 +859,8 @@ Value CodingEngine::request_impl(Value options) {
             return std::nullopt;
           const auto &n = v->number().text();
           double out = 0.0;
-          const auto parsed = std::from_chars(n.data(), n.data() + n.size(), out);
-          if (parsed.ec != std::errc{} || parsed.ptr != n.data() + n.size() ||
-              !std::isfinite(out) || out < 0.0)
+          if (parse_decimal_double(n, out) != std::errc{} || !std::isfinite(out) ||
+              out < 0.0)
             return std::nullopt;
           return out;
         };

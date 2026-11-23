@@ -8,6 +8,8 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -332,5 +334,9 @@ public:
   // occur.
   virtual Result<void> dispatch(const EffectIntent &intent) = 0;
 };
+
+// Locale-independent strict decimal floating-point parser compatible with macOS 15+
+// and Linux (avoids macOS 26.0-only libc++ floating-point std::from_chars).
+std::errc parse_decimal_double(std::string_view text, double &out) noexcept;
 
 } // namespace blackbird

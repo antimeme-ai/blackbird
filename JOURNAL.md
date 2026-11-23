@@ -14162,3 +14162,10 @@ Blackbird must not present itself as another product.
 - **Wave 13A — Live Control-Plane WS ↔ `iroh` P2P Party Runtime (`include/blackbird/mp_party_runtime.hpp`, `src/mp_party_runtime.cpp`, `tests/mp_party_runtime_test.cpp`, `CMakeLists.txt`):**
   wired `MpControlSocket` (`/v1/parties/<id>/ws`) directly into `P2pPartySession` (`iroh` v1.5.0) with `HELLO_ACK` clock-skew sync, `"MP1:PING"`/`"MP1:PONG"` heartbeat + lease refresh, automatic `PARTY_ENDPOINT_UPDATE`, live endpoint roaming re-dial, `<= 60s` offline TTL eviction, immediate `4403` QUIC hard-teardown on `4401`/`4403`/reconnect-401/disband, and full 2-peer Alice+Bob live TLS 1.3 + `iroh` QUIC Mutual RPK E2E tests (323 total ctests; 5/5 Guard Malloc + ASan/UBSan + `-O2 -DNDEBUG` clean).
 - **Review Trail:** archived `@dentist-2`'s Wave 13A verification report in `papers/2026-11-23-wave13a-mp-party-runtime-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #29: macOS 15.0+ `parse_decimal_double` Portability & Linux `ld-linux` Packager Fix for `v0.1.0`
+
+- **macOS 15.0+ Floating-Point Portability (`include/blackbird/foundation.hpp`, `src/foundation.cpp`, `src/token_usage.cpp`, `src/decision_models.cpp`, `src/metrics_consumer.cpp`, `src/command_post_tools.cpp`, `src/profile_reader.cpp`, `src/coding_provider.cpp`, `src/token_usage_main.cpp`):**
+  added locale-independent `parse_decimal_double()` (using `std::from_chars` on Linux/macOS 26+ and strict decimal-grammar + C-locale `strtod_l` on macOS < 26) across all 7 floating-point parse call sites; verified `LC_BUILD_VERSION minos 15.0` across all 10 production binaries.
+- **Linux Dynamic Linker Detection (`scripts/package-release`):**
+  normalized `ldd` left-hand SONAME with `os.path.basename()` so Arch Linux `/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2` is properly recognized as core glibc dynamic loader during post-bundle RPATH containment verification.

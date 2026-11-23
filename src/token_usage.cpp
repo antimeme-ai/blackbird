@@ -180,9 +180,8 @@ void cost(const Value *value, UsageObservation &observation,
   if (const auto *number = std::get_if<Number>(&value->value())) {
     const auto text = number->text();
     double amount = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), amount);
-    if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() &&
-        std::isfinite(amount) && amount >= 0) {
+    if (parse_decimal_double(text, amount) == std::errc{} && std::isfinite(amount) &&
+        amount >= 0) {
       if (observation.reported_cost && *observation.reported_cost != *number)
         observation.conflicting_cost = true;
       if (!observation.reported_cost)

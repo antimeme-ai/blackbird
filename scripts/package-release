@@ -201,7 +201,7 @@ def parse_ldd_output(output: str) -> tuple[list[tuple[str, str]], list[str]]:
             continue
         if "=>" in line:
             left, right = line.split("=>", 1)
-            soname = left.strip()
+            soname = os.path.basename(left.strip())
             rhs = right.strip()
             if rhs.startswith("not found"):
                 missing.append(soname)

@@ -1734,9 +1734,8 @@ std::optional<double> parse_finite_probability(const Value *val) noexcept {
     return std::nullopt;
   const std::string text = num->text();
   double out = 0.0;
-  const auto res = std::from_chars(text.data(), text.data() + text.size(), out);
-  if (res.ec != std::errc{} || res.ptr != text.data() + text.size() ||
-      !std::isfinite(out) || out < 0.0 || out > 1.0) {
+  if (parse_decimal_double(text, out) != std::errc{} || !std::isfinite(out) ||
+      out < 0.0 || out > 1.0) {
     return std::nullopt;
   }
   return out;

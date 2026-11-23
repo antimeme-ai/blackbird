@@ -82,9 +82,7 @@ std::optional<double> parse_finite_double(const Value *field) {
     return std::nullopt;
   const std::string text = num->text();
   double parsed = 0.0;
-  const auto [ptr, ec] =
-      std::from_chars(text.data(), text.data() + text.size(), parsed);
-  if (ec != std::errc{} || ptr != text.data() + text.size() || !std::isfinite(parsed))
+  if (parse_decimal_double(text, parsed) != std::errc{} || !std::isfinite(parsed))
     return std::nullopt;
   if (parsed == 0.0)
     parsed = 0.0;
@@ -193,8 +191,7 @@ bool is_whitespace_only(std::string_view line) noexcept {
 std::optional<double> parse_number_double(const Number &num) {
   const std::string text = num.text();
   double out = 0.0;
-  const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-  if (ec != std::errc{} || ptr != text.data() + text.size() || !std::isfinite(out) ||
+  if (parse_decimal_double(text, out) != std::errc{} || !std::isfinite(out) ||
       out < 0.0)
     return std::nullopt;
   if (out == 0.0)

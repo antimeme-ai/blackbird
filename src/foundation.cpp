@@ -1,8 +1,16 @@
 #include "blackbird/foundation.hpp"
 
+#include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <ratio>
+#include <string>
 #include <type_traits>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 
 namespace blackbird {
 
@@ -174,6 +182,83 @@ Result<ClockSample> NativeClock::observe() {
     return Result<ClockSample>::failure(monotonic.error());
   }
   return ClockSample::from({domain_, wall.value()}, {domain_, monotonic.value()});
+}
+
+std::errc parse_decimal_double(std::string_view text, double &out) noexcept {
+  if (text.empty()) {
+    return std::errc::invalid_argument;
+  }
+#if !defined(__APPLE__) || (defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) &&  \
+                            __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 260000)
+  double parsed = 0.0;
+  const auto res = std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (res.ec != std::errc{}) {
+    return res.ec;
+  }
+  if (res.ptr != text.data() + text.size()) {
+    return std::errc::invalid_argument;
+  }
+  out = parsed;
+  return std::errc{};
+#else
+  // Validate strict JSON/from_chars decimal grammar (no leading whitespace, '+', hex,
+  // inf/nan, or embedded NUL) before invoking C-locale strtod_l.
+  std::size_t i = 0U;
+  if (text[i] == '-') {
+    ++i;
+  }
+  const std::size_t int_start = i;
+  while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+    ++i;
+  }
+  const bool has_int = i > int_start;
+  bool has_frac = false;
+  if (i < text.size() && text[i] == '.') {
+    ++i;
+    const std::size_t frac_start = i;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+      ++i;
+    }
+    has_frac = i > frac_start;
+  }
+  if (!has_int && !has_frac) {
+    return std::errc::invalid_argument;
+  }
+  if (i < text.size() && (text[i] == 'e' || text[i] == 'E')) {
+    ++i;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-')) {
+      ++i;
+    }
+    const std::size_t exp_start = i;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+      ++i;
+    }
+    if (i == exp_start) {
+      return std::errc::invalid_argument;
+    }
+  }
+  if (i != text.size()) {
+    return std::errc::invalid_argument;
+  }
+  try {
+    static const locale_t c_locale = ::newlocale(LC_NUMERIC_MASK, "C", nullptr);
+    const std::string buf{text};
+    char *end = nullptr;
+    errno = 0;
+    const double parsed = c_locale ? ::strtod_l(buf.c_str(), &end, c_locale)
+                                   : std::strtod(buf.c_str(), &end);
+    if (end != buf.c_str() + buf.size()) {
+      return std::errc::invalid_argument;
+    }
+    if (errno == ERANGE) {
+      return std::errc::result_out_of_range;
+    }
+    out = parsed;
+    return std::errc{};
+  } catch (...) {
+    return std::errc::not_enough_memory;
+  }
+#endif
 }
 
 } // namespace blackbird
