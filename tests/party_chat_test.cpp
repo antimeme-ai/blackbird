@@ -715,12 +715,12 @@ void test_hostile_escape_sanitization_and_responsive_rendering() {
   evil_msg.verified_peer = false;
   evil_msg.target = "@all";
   evil_msg.kind = PartyMessageKind::chat;
-  evil_msg.body = std::string{"hello\x1b[31m\x07\x7f\x9b"
-                              "2J\xc2\x9b"
-                              "32m\xe2\x80\xae"
-                              "spoof\xe2\x80\x8e\xe2\x80\x8f\xd8\x9c\xe2\x81\xa6"
-                              "iso\x00end",
-                              55};
+  constexpr char kEvilBody[] = "hello\x1b[31m\x07\x7f\x9b"
+                               "2J\xc2\x9b"
+                               "32m\xe2\x80\xae"
+                               "spoof\xe2\x80\x8e\xe2\x80\x8f\xd8\x9c\xe2\x81\xa6"
+                               "iso\x00end";
+  evil_msg.body = std::string{kEvilBody, sizeof(kEvilBody) - 1};
   evil_msg.untrusted_remote = true;
 
   snap.messages = {evil_msg};

@@ -1,8 +1,10 @@
 #include "blackbird/command_post_tui.hpp"
+#include "blackbird/bridge_relay.hpp"
 #include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/party_chat.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
@@ -11,12 +13,17 @@
 #include "blackbird/worktree_lease.hpp"
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <sstream>
+#include <sys/random.h>
+#include <unistd.h>
 
 namespace blackbird {
 namespace {
@@ -1578,6 +1585,545 @@ std::string handle_flightdeck(std::string_view args, const CommandPostTuiContext
   return view.render(telemetry, opts).text();
 }
 
+// --- /party ---
+constexpr std::string_view kPartyUsage =
+    "Usage: /party [status|all|operators|leaders|conflicts|say <text>|create [room]|"
+    "start [room]|join <room|bbjoin1:...> [--alias <name>]|invite [relay_url]|"
+    "leave|remove <alias>]\n";
+
+std::int64_t party_wall_now_ns() noexcept {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+  return ns <= 0 ? 1 : static_cast<std::int64_t>(ns);
+}
+
+bool party_eq_ci(std::string_view lhs, std::string_view rhs) noexcept {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    const char a = (lhs[i] >= 'A' && lhs[i] <= 'Z')
+                       ? static_cast<char>(lhs[i] - 'A' + 'a')
+                       : lhs[i];
+    const char b = (rhs[i] >= 'A' && rhs[i] <= 'Z')
+                       ? static_cast<char>(rhs[i] - 'A' + 'a')
+                       : rhs[i];
+    if (a != b)
+      return false;
+  }
+  return true;
+}
+
+bool is_solo_party_scope(std::string_view scope) noexcept {
+  return scope.empty() || party_eq_ci(scope, "solo") || party_eq_ci(scope, "none");
+}
+
+std::optional<std::filesystem::path> resolve_peers_dir_from_home() {
+  const char *home = std::getenv("HOME");
+  if (home == nullptr || home[0] == '\0')
+    return std::nullopt;
+  return std::filesystem::path{home} / ".local" / "share" / "blackbird" / "peers";
+}
+
+PartyConfig make_passive_party_config(const CommandPostTuiContext &ctx) {
+  const auto root = resolve_project_root(ctx);
+  PartyConfig cfg = PartyConfig::for_project(root);
+  cfg.local_operator_id = ctx.actor.empty() ? std::string{"operator"} : ctx.actor;
+  cfg.local_actor_fp = try_load_local_peer_fingerprint();
+  return cfg;
+}
+
+Result<PartyRosterConfig>
+load_or_default_party_roster(const std::filesystem::path &path) {
+  std::error_code ec;
+  const auto st = std::filesystem::symlink_status(path, ec);
+  if (ec) {
+    if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory)
+      return Result<PartyRosterConfig>::success(PartyRosterConfig{});
+    return Result<PartyRosterConfig>::failure({ErrorCode::io, ec.value()});
+  }
+  if (std::filesystem::is_symlink(st))
+    return Result<PartyRosterConfig>::failure({ErrorCode::io, ELOOP});
+  if (!std::filesystem::exists(st))
+    return Result<PartyRosterConfig>::success(PartyRosterConfig{});
+  return load_party_roster_config(path);
+}
+
+std::string derive_creator_alias(std::string_view fingerprint) {
+  std::string_view raw = fingerprint;
+  if (raw.starts_with("SHA256:"))
+    raw.remove_prefix(7);
+  std::string out = "peer-";
+  for (const char ch : raw) {
+    if (out.size() >= 17)
+      break;
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+      out.push_back(ch);
+    else if (ch >= 'A' && ch <= 'Z')
+      out.push_back(static_cast<char>(ch - 'A' + 'a'));
+  }
+  if (out.size() <= 5)
+    out += "creator";
+  return out;
+}
+
+std::string normalize_invite_room_id(std::string_view scope) {
+  std::string out;
+  out.reserve(scope.size());
+  for (const char ch : scope) {
+    if (ch == '/')
+      out.push_back(':');
+    else
+      out.push_back(ch);
+  }
+  return out;
+}
+
+Result<std::string> generate_party_invite_code() {
+  std::array<std::uint8_t, 16> bytes{};
+  if (::getentropy(bytes.data(), bytes.size()) != 0)
+    return Result<std::string>::failure({ErrorCode::io, errno});
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (const std::uint8_t byte : bytes) {
+    out.push_back(kHex[(byte >> 4U) & 0x0fU]);
+    out.push_back(kHex[byte & 0x0fU]);
+  }
+  return Result<std::string>::success(std::move(out));
+}
+
+std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx) {
+  const auto root = resolve_project_root(ctx);
+  const auto party_config_path = root / ".blackbird" / "party.json";
+  const auto platoon_dir = root / ".blackbird" / "platoon";
+  const auto [sub, rest] = split_first_token(args);
+
+  // Passive read-only inspection & filter views (zero dirs created!).
+  if (sub.empty() || sub == "status" || sub == "all" || sub == "operators" ||
+      sub == "leaders" || sub == "conflicts") {
+    if (!rest.empty())
+      return std::string{kPartyUsage};
+    PartyMessageFilter filter = PartyMessageFilter::all;
+    if (sub == "operators")
+      filter = PartyMessageFilter::operators;
+    else if (sub == "leaders")
+      filter = PartyMessageFilter::leaders;
+    else if (sub == "conflicts")
+      filter = PartyMessageFilter::conflicts;
+
+    const PartyConfig cfg = make_passive_party_config(ctx);
+    auto snap_res = load_party_snapshot(cfg);
+    if (!snap_res.has_value()) {
+      return "Party Chat unavailable: " +
+             std::string{error_name(snap_res.error().code)} + "\n";
+    }
+    PartyChatPane pane{std::move(snap_res).value()};
+    pane.set_filter(filter);
+    return pane.render(100, 24);
+  }
+
+  // /party say <text>
+  if (sub == "say") {
+    if (rest.empty())
+      return "Usage: /party say [@all|@alias ...] <message>\n";
+    const PartyConfig cfg = make_passive_party_config(ctx);
+    auto snap_res = load_party_snapshot(cfg);
+    if (!snap_res.has_value()) {
+      return "Party Chat unavailable: " +
+             std::string{error_name(snap_res.error().code)} + "\n";
+    }
+    const PartySnapshot &snap = snap_res.value();
+    auto parsed_res = parse_party_input(rest, snap);
+    if (!parsed_res.has_value())
+      return "Usage: /party say [@all|@alias ...] <message>\n";
+    const ParsedPartyInput &parsed = parsed_res.value();
+
+    std::string recipient = "all";
+    std::string post_text = parsed.body;
+    if (!parsed.broadcast) {
+      if (parsed.resolved_targets.size() == 1 && parsed.unknown_targets.empty() &&
+          valid_platoon_member_id(parsed.resolved_targets[0])) {
+        recipient = parsed.resolved_targets[0];
+      } else if (parsed.resolved_targets.empty() &&
+                 parsed.mentioned_aliases.size() == 1 &&
+                 valid_platoon_member_id(parsed.mentioned_aliases[0])) {
+        recipient = parsed.mentioned_aliases[0];
+      } else if (parsed.mentioned_aliases.size() > 1 ||
+                 parsed.resolved_targets.size() > 1) {
+        recipient = "all";
+        post_text = parsed.target_label + " " + parsed.body;
+      }
+    }
+
+    auto board_res = PlatoonBoard::open(platoon_dir);
+    if (!board_res.has_value()) {
+      return "Party board unavailable: " +
+             std::string{error_name(board_res.error().code)} + "\n";
+    }
+    PlatoonPost post;
+    post.from = safe_platoon_actor(ctx.actor);
+    post.to = recipient;
+    post.kind = PlatoonMessageKind::message;
+    post.text = std::move(post_text);
+    auto posted_res = board_res.value().post(std::move(post));
+    if (!posted_res.has_value()) {
+      return "Party say failed: " + std::string{error_name(posted_res.error().code)} +
+             "\n";
+    }
+    const auto &posted = posted_res.value();
+    std::string out = "Party posted #" + std::to_string(posted.seq) + " [" +
+                      sanitize_inline(posted.from, 48) + " -> " +
+                      sanitize_inline(parsed.target_label, 64) +
+                      "]: " + quote_untrusted_peer_text(posted.text, kMaxPreviewBytes) +
+                      "\n";
+    if (!parsed.resolved_targets.empty()) {
+      out += "  Routed: ";
+      for (std::size_t i = 0; i < parsed.resolved_targets.size(); ++i) {
+        if (i > 0)
+          out += ", ";
+        out += "@" + sanitize_inline(parsed.resolved_targets[i], 48);
+      }
+      out += '\n';
+    }
+    std::vector<std::string> remote_hints;
+    for (const auto &target_id : parsed.resolved_targets) {
+      for (const auto &p : snap.participants) {
+        if (party_eq_ci(p.id, target_id) && p.ssh_target.has_value() &&
+            !p.ssh_target->empty()) {
+          remote_hints.push_back("@" + sanitize_inline(p.id, 48) + " (" +
+                                 sanitize_inline(*p.ssh_target, 64) + ")");
+          break;
+        }
+      }
+    }
+    if (!remote_hints.empty()) {
+      out += "  Remote peer(s): ";
+      for (std::size_t i = 0; i < remote_hints.size(); ++i) {
+        if (i > 0)
+          out += ", ";
+        out += remote_hints[i];
+      }
+      out += " (use `blackbird party say` or bridge sync for remote delivery)\n";
+    }
+    if (parsed.has_unknown_targets()) {
+      out += "  Unknown target(s): ";
+      for (std::size_t i = 0; i < parsed.unknown_targets.size(); ++i) {
+        if (i > 0)
+          out += ", ";
+        out += "@" + sanitize_inline(parsed.unknown_targets[i], 48);
+      }
+      out += '\n';
+    }
+    return out;
+  }
+
+  // /party create [room] | /party start [room]
+  if (sub == "create" || sub == "start") {
+    const auto [room_tok, extra] = split_first_token(rest);
+    if (!extra.empty())
+      return "Usage: /party create [room]\n";
+    const std::string_view room = room_tok.empty() ? kPartyDefaultScope : room_tok;
+    if (is_solo_party_scope(room))
+      return "Invalid party room name: '" + sanitize_inline(room, 64) + "'\n";
+    auto roster_res = load_or_default_party_roster(party_config_path);
+    if (!roster_res.has_value()) {
+      return "Party config unreadable: " +
+             std::string{error_name(roster_res.error().code)} + "\n";
+    }
+    PartyRosterConfig cfg = std::move(roster_res).value();
+    cfg.room_scope = std::string{room};
+    cfg.mode_override = PartyModeOverride::auto_detect;
+    auto saved = save_party_roster_config(party_config_path, cfg);
+    if (!saved.has_value()) {
+      return "Party create failed: " + std::string{error_name(saved.error().code)} +
+             "\n";
+    }
+    return "Party room active: " + sanitize_inline(cfg.room_scope, 128) +
+           " (saved to .blackbird/party.json; Alt+P opens Party Chat)\n";
+  }
+
+  // /party join <bbjoin1:...> [--alias <name>] | /party join <room> [--alias <name>]
+  if (sub == "join") {
+    const auto [target, after_target] = split_first_token(rest);
+    if (target.empty())
+      return "Usage: /party join <room|bbjoin1:...> [--alias <name>]\n";
+    std::optional<std::string> explicit_alias;
+    std::string_view rem = after_target;
+    while (!rem.empty()) {
+      const auto [flag, after_flag] = split_first_token(rem);
+      if (flag == "--alias") {
+        const auto [val, next] = split_first_token(after_flag);
+        if (val.empty())
+          return "Usage: /party join <room|bbjoin1:...> [--alias <name>]\n";
+        explicit_alias = std::string{val};
+        rem = next;
+      } else {
+        return "Usage: /party join <room|bbjoin1:...> [--alias <name>]\n";
+      }
+    }
+
+    if (target.starts_with("bbjoin1:")) {
+      const std::int64_t now_ns = party_wall_now_ns();
+      auto parsed_res = parse_room_invite(target, now_ns);
+      if (!parsed_res.has_value()) {
+        if (parsed_res.error().code == ErrorCode::stale_handle)
+          return "Party join failed: invite expired\n";
+        return "Party join failed: " +
+               std::string{error_name(parsed_res.error().code)} + "\n";
+      }
+      const RoomInvite &invite = parsed_res.value();
+      const std::string creator_alias =
+          explicit_alias.has_value() ? *explicit_alias
+                                     : derive_creator_alias(invite.creator_fingerprint);
+      if (!valid_peer_alias(creator_alias) || !valid_party_alias(creator_alias)) {
+        return "Party join failed: invalid alias '" +
+               sanitize_inline(creator_alias, 48) + "'\n";
+      }
+      const auto peers_dir = resolve_peers_dir_from_home();
+      if (!peers_dir.has_value())
+        return "Party join failed: HOME is not set\n";
+      auto known_res = KnownPeersStore::open(*peers_dir);
+      if (!known_res.has_value()) {
+        return "Party join failed: known peers store unavailable (" +
+               std::string{error_name(known_res.error().code)} + ")\n";
+      }
+      PinPeerRequest pin_req;
+      pin_req.alias = creator_alias;
+      pin_req.public_key = invite.creator_public_key;
+      pin_req.trust_note =
+          "Joined party room " + invite.room_id + " via " + invite.relay_url;
+      auto pin_res = known_res.value().pin_peer(pin_req);
+      if (!pin_res.has_value()) {
+        if (pin_res.error().code == ErrorCode::conflict) {
+          return "Party join rejected (conflict): key mismatch for pinned alias '" +
+                 sanitize_inline(creator_alias, 48) + "'\n";
+        }
+        return "Party join failed: " + std::string{error_name(pin_res.error().code)} +
+               "\n";
+      }
+
+      auto roster_res = load_or_default_party_roster(party_config_path);
+      if (!roster_res.has_value()) {
+        return "Party config unreadable: " +
+               std::string{error_name(roster_res.error().code)} + "\n";
+      }
+      PartyRosterConfig cfg = std::move(roster_res).value();
+      cfg.room_scope = invite.room_id;
+      cfg.mode_override = PartyModeOverride::auto_detect;
+
+      PartyRosterPeerConfig peer_entry{};
+      peer_entry.alias = creator_alias;
+      peer_entry.role = PartyMemberRole::operator_human;
+      peer_entry.fingerprint = invite.creator_fingerprint;
+      bool updated = false;
+      for (auto &existing : cfg.peers) {
+        if (party_eq_ci(existing.alias, creator_alias)) {
+          existing = peer_entry;
+          updated = true;
+          break;
+        }
+      }
+      if (!updated)
+        cfg.peers.push_back(std::move(peer_entry));
+
+      auto saved = save_party_roster_config(party_config_path, cfg);
+      if (!saved.has_value()) {
+        return "Party join save failed: " +
+               std::string{error_name(saved.error().code)} + "\n";
+      }
+      return "Joined party room '" + sanitize_inline(invite.room_id, 128) +
+             "' (pinned creator @" + sanitize_inline(creator_alias, 48) + " [" +
+             sanitize_inline(invite.creator_fingerprint, 64) + "] via " +
+             sanitize_inline(invite.relay_url, 128) + ")\n";
+    }
+
+    // Plain room join/switch.
+    if (is_solo_party_scope(target))
+      return "Invalid party room name: '" + sanitize_inline(target, 64) + "'\n";
+    if (explicit_alias.has_value()) {
+      return "Usage: /party join <bbjoin1:...> --alias <name> (--alias is only valid "
+             "with bbjoin1: invites)\n";
+    }
+    auto roster_res = load_or_default_party_roster(party_config_path);
+    if (!roster_res.has_value()) {
+      return "Party config unreadable: " +
+             std::string{error_name(roster_res.error().code)} + "\n";
+    }
+    PartyRosterConfig cfg = std::move(roster_res).value();
+    cfg.room_scope = std::string{target};
+    cfg.mode_override = PartyModeOverride::auto_detect;
+    auto saved = save_party_roster_config(party_config_path, cfg);
+    if (!saved.has_value()) {
+      return "Party join failed: " + std::string{error_name(saved.error().code)} + "\n";
+    }
+    return "Joined party room: " + sanitize_inline(cfg.room_scope, 128) +
+           " (saved to .blackbird/party.json)\n";
+  }
+
+  // /party invite [relay_url]
+  if (sub == "invite") {
+    const auto [relay_tok, extra] = split_first_token(rest);
+    if (!extra.empty())
+      return "Usage: /party invite [relay_url]\n";
+
+    std::string room_scope{kPartyDefaultScope};
+    {
+      auto roster_res = load_or_default_party_roster(party_config_path);
+      if (!roster_res.has_value()) {
+        return "Party config unreadable: " +
+               std::string{error_name(roster_res.error().code)} + "\n";
+      }
+      if (is_solo_party_scope(roster_res.value().room_scope))
+        return "No active party room (run `/party create <room>` first).\n";
+      room_scope = roster_res.value().room_scope;
+    }
+
+    const auto peers_dir = resolve_peers_dir_from_home();
+    if (!peers_dir.has_value())
+      return "Party invite failed: HOME is not set\n";
+    std::error_code pec;
+    const auto st = std::filesystem::symlink_status(*peers_dir, pec);
+    if (pec || std::filesystem::is_symlink(st) || !std::filesystem::is_directory(st)) {
+      return "Party invite failed: no peer identity found (run `blackbird peer init` "
+             "first; invite never creates keys)\n";
+    }
+    const auto key_st = std::filesystem::symlink_status(*peers_dir / "id_ed25519", pec);
+    if (pec || std::filesystem::is_symlink(key_st) ||
+        !std::filesystem::is_regular_file(key_st)) {
+      return "Party invite failed: no peer identity found (run `blackbird peer init` "
+             "first; invite never creates keys)\n";
+    }
+    const auto pub_st =
+        std::filesystem::symlink_status(*peers_dir / "id_ed25519.pub", pec);
+    if (pec || std::filesystem::is_symlink(pub_st) ||
+        !std::filesystem::is_regular_file(pub_st)) {
+      return "Party invite failed: no peer identity found (run `blackbird peer init` "
+             "first; invite never creates keys)\n";
+    }
+    auto identity_res = PeerIdentityStore::open_existing(*peers_dir);
+    if (!identity_res.has_value()) {
+      return "Party invite failed: peer identity unavailable (" +
+             std::string{error_name(identity_res.error().code)} + ")\n";
+    }
+
+    std::string relay_url;
+    if (!relay_tok.empty()) {
+      relay_url = std::string{relay_tok};
+    } else if (const char *env_relay = std::getenv("BLACKBIRD_RELAY_URL");
+               env_relay != nullptr && env_relay[0] != '\0') {
+      relay_url = env_relay;
+    } else {
+      relay_url = "https://relay.blackbird.local/v1";
+    }
+
+    auto code_res = generate_party_invite_code();
+    if (!code_res.has_value()) {
+      return "Party invite failed: entropy unavailable (" +
+             std::string{error_name(code_res.error().code)} + ")\n";
+    }
+
+    constexpr std::int64_t kInviteTtlNs = 24LL * 3600LL * 1'000'000'000LL;
+    const std::int64_t now_ns = party_wall_now_ns();
+    if (now_ns > std::numeric_limits<std::int64_t>::max() - kInviteTtlNs)
+      return "Party invite failed: clock overflow\n";
+
+    RoomInvite invite;
+    invite.room_id = normalize_invite_room_id(room_scope);
+    invite.relay_url = std::move(relay_url);
+    invite.creator_fingerprint = identity_res.value().identity().fingerprint;
+    invite.creator_public_key = identity_res.value().identity().public_key;
+    invite.invite_code = std::move(code_res).value();
+    invite.expires_ns = now_ns + kInviteTtlNs;
+
+    auto encoded = encode_room_invite(invite);
+    if (!encoded.has_value()) {
+      return "Party invite failed: " + std::string{error_name(encoded.error().code)} +
+             "\n";
+    }
+    return "Party invite (valid 24h; share over a confidential channel):\n"
+           "  Room:  " +
+           sanitize_inline(invite.room_id, 128) +
+           "\n"
+           "  Relay: " +
+           sanitize_inline(invite.relay_url, 128) +
+           "\n"
+           "  URI:   " +
+           encoded.value() + "\n";
+  }
+
+  // /party leave
+  if (sub == "leave") {
+    if (!rest.empty())
+      return "Usage: /party leave\n";
+    std::error_code ec;
+    const auto st = std::filesystem::symlink_status(party_config_path, ec);
+    if (ec == std::errc::no_such_file_or_directory ||
+        ec == std::errc::not_a_directory || (!ec && !std::filesystem::exists(st))) {
+      return "Left party (already in solo mode; history and pinned peers untouched).\n";
+    }
+    if (ec || std::filesystem::is_symlink(st))
+      return "Party leave failed: cannot access .blackbird/party.json\n";
+
+    auto loaded = load_party_roster_config(party_config_path);
+    const std::string prev_scope =
+        loaded.has_value() ? loaded.value().room_scope : std::string{};
+    PartyRosterConfig solo_cfg{};
+    solo_cfg.room_scope = "solo";
+    solo_cfg.mode_override = PartyModeOverride::single_operator;
+    solo_cfg.peers.clear();
+    auto saved = save_party_roster_config(party_config_path, solo_cfg);
+    if (!saved.has_value()) {
+      return "Party leave failed: " + std::string{error_name(saved.error().code)} +
+             "\n";
+    }
+    if (!prev_scope.empty() && !is_solo_party_scope(prev_scope)) {
+      return "Left party room '" + sanitize_inline(prev_scope, 64) +
+             "' — returned to solo mode (history and pinned peers preserved).\n";
+    }
+    return "Left party — returned to solo mode (history and pinned peers preserved).\n";
+  }
+
+  // /party remove <alias>
+  if (sub == "remove") {
+    const auto [alias, extra] = split_first_token(rest);
+    if (alias.empty() || !extra.empty())
+      return "Usage: /party remove <alias>\n";
+    std::error_code ec;
+    const auto st = std::filesystem::symlink_status(party_config_path, ec);
+    if (ec == std::errc::no_such_file_or_directory ||
+        ec == std::errc::not_a_directory || (!ec && !std::filesystem::exists(st))) {
+      return "Party participant not found: @" + sanitize_inline(alias, 48) +
+             " (no .blackbird/party.json)\n";
+    }
+    if (ec || std::filesystem::is_symlink(st))
+      return "Party remove failed: cannot access .blackbird/party.json\n";
+    auto loaded = load_party_roster_config(party_config_path);
+    if (!loaded.has_value()) {
+      return "Party config unreadable: " +
+             std::string{error_name(loaded.error().code)} + "\n";
+    }
+    PartyRosterConfig cfg = std::move(loaded).value();
+    const auto before_count = cfg.peers.size();
+    cfg.peers.erase(std::remove_if(cfg.peers.begin(), cfg.peers.end(),
+                                   [&](const PartyRosterPeerConfig &p) {
+                                     return party_eq_ci(p.alias, alias);
+                                   }),
+                    cfg.peers.end());
+    if (cfg.peers.size() == before_count) {
+      return "Party participant not found: @" + sanitize_inline(alias, 48) + "\n";
+    }
+    auto saved = save_party_roster_config(party_config_path, cfg);
+    if (!saved.has_value()) {
+      return "Party remove failed: " + std::string{error_name(saved.error().code)} +
+             "\n";
+    }
+    return "Removed party participant @" + sanitize_inline(alias, 48) +
+           " (remaining peers: " + std::to_string(cfg.peers.size()) + ")\n";
+  }
+
+  return std::string{kPartyUsage};
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -1603,6 +2149,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_swarmboard(args, ctx));
     if (cmd == "/flightdeck")
       return bound_output(handle_flightdeck(args, ctx));
+    if (cmd == "/party")
+      return bound_output(handle_party(args, ctx));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

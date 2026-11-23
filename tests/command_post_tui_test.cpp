@@ -1,10 +1,12 @@
 #include "blackbird/board_bridge.hpp"
+#include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
 #include "blackbird/command_post_tui.hpp"
 #include "blackbird/context.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/party_chat.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
@@ -75,11 +77,11 @@ void test_dispatch_unknown_and_palette_discovery() {
   require(!handle_command_post_slash("/stats", ctx).has_value(),
           "existing /stats command returns nullopt");
 
-  // All 8 Command Post slash commands appear in terminal_help() and command hint /
+  // All 9 Command Post slash commands appear in terminal_help() and command hint /
   // palette.
   const std::string help = terminal_help();
   for (const auto *cmd : {"/platoon", "/issues", "/memory", "/capabilities", "/metrics",
-                          "/companion", "/swarmboard", "/flightdeck"}) {
+                          "/companion", "/swarmboard", "/flightdeck", "/party"}) {
     require(help.find(cmd) != std::string::npos, "terminal_help lists new command");
     const std::string hint = terminal_command_hint(cmd);
     require(hint.starts_with(cmd), "terminal_command_hint matches new command");
@@ -110,6 +112,14 @@ void test_dispatch_unknown_and_palette_discovery() {
   require(deck_lines.size() >= 2 &&
               deck_lines[1].find("/flightdeck") != std::string::npos,
           "command palette discovers /flightdeck");
+
+  Composer party_palette;
+  party_palette.draft("keep draft");
+  for (const char ch : std::string_view{"\0party", 6})
+    (void)party_palette.feed(ch);
+  const auto party_lines = party_palette.palette_lines(6);
+  require(party_lines.size() >= 2 && party_lines[1].find("/party") != std::string::npos,
+          "command palette discovers /party");
 }
 
 void test_platoon_quoted_untrusted_framing() {
@@ -990,6 +1000,251 @@ void test_flightdeck_empty_populated_ticks_and_hostile_labels() {
   }
 }
 
+void test_party_passive_say_and_lifecycle() {
+  TempDir home_dir("bb-cptui-party-home");
+  ScopedHomeEnv env_home{home_dir.path};
+
+  // 1. Empty workspace: passive /party, /party status, /party leaders, /party leave,
+  //    and failed /party invite create ZERO directories on disk!
+  {
+    TempDir empty_dir("bb-cptui-party-empty");
+    CommandPostTuiContext ctx;
+    ctx.project_root = empty_dir.path;
+    ctx.actor = "patrick";
+
+    const auto out = handle_command_post_slash("/party", ctx);
+    require(out.has_value() && out->find("PARTY CHAT") != std::string::npos &&
+                out->find("no party messages yet") != std::string::npos,
+            "empty /party renders cleanly");
+    const auto status_out = handle_command_post_slash("/party status", ctx);
+    require(status_out.has_value() &&
+                status_out->find("PARTY CHAT") != std::string::npos,
+            "empty /party status renders cleanly");
+    const auto leaders_out = handle_command_post_slash("/party leaders", ctx);
+    require(leaders_out.has_value() &&
+                leaders_out->find("Filter: leaders") != std::string::npos,
+            "empty /party leaders renders filter cleanly");
+    const auto leave_noop = handle_command_post_slash("/party leave", ctx);
+    require(leave_noop.has_value() && leave_noop->find("solo") != std::string::npos,
+            "empty /party leave reports solo mode cleanly");
+    const auto no_id_invite = handle_command_post_slash("/party invite", ctx);
+    require(no_id_invite.has_value() &&
+                no_id_invite->find("no peer identity") != std::string::npos,
+            "/party invite fails closed without peer identity");
+    for (const auto *bad : {"/party bogus", "/party leaders extra", "/party say",
+                            "/party say @wintermute", "/party remove",
+                            "/party leave extra", "/party join"}) {
+      const auto bad_out = handle_command_post_slash(bad, ctx);
+      require(bad_out.has_value() &&
+                  bad_out->find("Usage: /party") != std::string::npos,
+              "invalid /party subcommand returns usage");
+    }
+    require(!std::filesystem::exists(empty_dir.path / ".blackbird"),
+            "passive /party commands must NOT create .blackbird");
+    require(
+        !std::filesystem::exists(home_dir.path / ".local"),
+        "passive /party commands and failed /party invite must NOT create ~/.local");
+  }
+
+  // 2. Create room, add peer, populated read-only inspection, /party say @all & @alias.
+  TempDir dir("bb-cptui-party-full");
+  CommandPostTuiContext ctx;
+  ctx.project_root = dir.path;
+  ctx.actor = "patrick";
+
+  const auto created = handle_command_post_slash("/party create ops/alpha", ctx);
+  require(created.has_value() && created->find("ops/alpha") != std::string::npos,
+          "/party create activates room");
+  const auto party_json = dir.path / ".blackbird" / "party.json";
+  require(std::filesystem::exists(party_json), "/party create writes party.json");
+  auto loaded_cfg = unwrap(load_party_roster_config(party_json));
+  require(loaded_cfg.room_scope == "ops/alpha", "party.json stores ops/alpha");
+
+  PartyRosterPeerConfig wm{};
+  wm.alias = "wintermute";
+  wm.role = PartyMemberRole::platoon_leader;
+  wm.host = "wintermute";
+  wm.ssh_target = "patrick@wintermute";
+  wm.provider = "deepseek";
+  wm.model = "deepseek-chat";
+  loaded_cfg.peers.push_back(wm);
+  PartyRosterPeerConfig nm{};
+  nm.alias = "neuromancer";
+  nm.role = PartyMemberRole::platoon_leader;
+  nm.host = "neuromancer";
+  nm.ssh_target = "patrick@neuromancer";
+  loaded_cfg.peers.push_back(nm);
+  unwrap(save_party_roster_config(party_json, loaded_cfg));
+
+  // Say to @all, single @wintermute, and multi-target @wintermute @neuromancer.
+  const auto say_all = handle_command_post_slash("/party say @all hello team", ctx);
+  require(say_all.has_value() && say_all->find("#1") != std::string::npos &&
+              say_all->find("@all") != std::string::npos &&
+              say_all->find("hello team") != std::string::npos &&
+              say_all->find("@wintermute") != std::string::npos,
+          "/party say @all posts and routes to active leaders");
+
+  const auto say_wm = handle_command_post_slash("/party say @wintermute ping", ctx);
+  require(say_wm.has_value() && say_wm->find("#2") != std::string::npos &&
+              say_wm->find("@wintermute") != std::string::npos &&
+              say_wm->find("patrick@wintermute") != std::string::npos &&
+              say_wm->find("ping") != std::string::npos,
+          "/party say @wintermute routes and prints remote peer hint");
+
+  const auto say_multi =
+      handle_command_post_slash("/party say @wintermute @neuromancer sync up", ctx);
+  require(say_multi.has_value() && say_multi->find("#3") != std::string::npos &&
+              say_multi->find("@wintermute") != std::string::npos &&
+              say_multi->find("@neuromancer") != std::string::npos &&
+              say_multi->find("sync up") != std::string::npos,
+          "/party say with multiple targets routes to both");
+  {
+    auto board = unwrap(PlatoonBoard::open(dir.path / ".blackbird" / "platoon"));
+    const auto msgs =
+        unwrap(board.read({.after_seq = 2, .limit = 4, .recipient_filter = {}}));
+    require(msgs.size() == 1 && msgs[0].to == "all" &&
+                msgs[0].text == "@wintermute @neuromancer sync up",
+            "multi-target /party say preserves all targets on PlatoonBoard");
+  }
+
+  // Add a leader message to PlatoonBoard to verify /party leaders filter & read-only.
+  {
+    auto board = unwrap(PlatoonBoard::open(dir.path / ".blackbird" / "platoon"));
+    PlatoonPost lp;
+    lp.from = "wintermute";
+    lp.to = "patrick";
+    lp.kind = PlatoonMessageKind::status;
+    lp.text = "builds-green";
+    unwrap(board.post(std::move(lp)));
+  }
+
+  const auto tree_before = snapshot_tree_stats(dir.path / ".blackbird");
+  const auto pop_all = handle_command_post_slash("/party", ctx);
+  require(pop_all.has_value() && pop_all->find("ops/alpha") != std::string::npos &&
+              pop_all->find("wintermute") != std::string::npos &&
+              pop_all->find("hello team") != std::string::npos &&
+              pop_all->find("builds-green") != std::string::npos,
+          "populated /party displays room, roster, and messages");
+  const auto pop_leaders = handle_command_post_slash("/party leaders", ctx);
+  require(pop_leaders.has_value() &&
+              pop_leaders->find("Filter: leaders") != std::string::npos &&
+              pop_leaders->find("builds-green") != std::string::npos &&
+              pop_leaders->find("hello team") == std::string::npos,
+          "/party leaders filters to leader messages");
+  const auto tree_after = snapshot_tree_stats(dir.path / ".blackbird");
+  require(tree_after == tree_before,
+          "passive /party inspection must NOT mutate .blackbird");
+
+  // 3. /party invite + /party join (bbjoin1:..., MITM conflict, expired, plain room).
+  const auto peers_dir = home_dir.path / ".local" / "share" / "blackbird" / "peers";
+  // Partial keypair (id_ed25519 without id_ed25519.pub) MUST fail closed without
+  // creating identity.lock!
+  write_text_file(peers_dir / "id_ed25519", "partial-private-key");
+  const auto partial_invite =
+      handle_command_post_slash("/party invite https://relay.example.test/v1", ctx);
+  require(
+      partial_invite.has_value() &&
+          partial_invite->find("no peer identity") != std::string::npos &&
+          !std::filesystem::exists(peers_dir / "identity.lock"),
+      "/party invite fails closed on partial keypair without creating identity.lock");
+  std::filesystem::remove_all(peers_dir);
+
+  auto local_id = unwrap(PeerIdentityStore::open_or_create(peers_dir));
+  const auto invite_out =
+      handle_command_post_slash("/party invite https://relay.example.test/v1", ctx);
+  if (!invite_out.has_value())
+    throw std::runtime_error("/party invite returns output");
+  const std::string &invite_text = *invite_out;
+  require(invite_text.find("bbjoin1:") != std::string::npos &&
+              invite_text.find("ops:alpha") != std::string::npos,
+          "/party invite mints bbjoin1 URI");
+  const auto uri_pos = invite_text.find("bbjoin1:");
+  const auto uri_end = invite_text.find('\n', uri_pos);
+  const std::string minted_uri = invite_text.substr(uri_pos, uri_end - uri_pos);
+  const auto parsed_minted = unwrap(parse_room_invite(minted_uri, wall_now_ns()));
+  require(parsed_minted.room_id == "ops:alpha" &&
+              parsed_minted.creator_fingerprint == local_id.identity().fingerprint,
+          "minted /party invite URI parses cleanly");
+
+  // Second operator creates an invite -> local operator joins with --alias alice.
+  auto alice_id = unwrap(PeerIdentityStore::open_or_create(dir.path / "id-alice"));
+  auto evil_id = unwrap(PeerIdentityStore::open_or_create(dir.path / "id-evil"));
+  RoomInvite alice_inv;
+  alice_inv.room_id = "squad-red";
+  alice_inv.relay_url = "https://relay.example.test/v1";
+  alice_inv.creator_fingerprint = alice_id.identity().fingerprint;
+  alice_inv.creator_public_key = alice_id.identity().public_key;
+  alice_inv.invite_code = "0123456789abcdef0123456789abcdef";
+  alice_inv.expires_ns = wall_now_ns() + 3'600'000'000'000LL;
+  const std::string alice_uri = unwrap(encode_room_invite(alice_inv));
+
+  const auto joined_inv =
+      handle_command_post_slash("/party join " + alice_uri + " --alias alice", ctx);
+  require(joined_inv.has_value() &&
+              joined_inv->find("squad-red") != std::string::npos &&
+              joined_inv->find("@alice") != std::string::npos,
+          "/party join bbjoin1:... pins creator and switches room");
+  auto known = unwrap(KnownPeersStore::open(peers_dir));
+  const auto pinned_alice = unwrap(known.find_by_alias("alice"));
+  require(pinned_alice.has_value() &&
+              pinned_alice->fingerprint == alice_id.identity().fingerprint,
+          "/party join pinned alice into KnownPeersStore");
+
+  // MITM key-swap attempt for same alias MUST fail closed with conflict!
+  RoomInvite mitm_inv = alice_inv;
+  mitm_inv.creator_fingerprint = evil_id.identity().fingerprint;
+  mitm_inv.creator_public_key = evil_id.identity().public_key;
+  const std::string mitm_uri = unwrap(encode_room_invite(mitm_inv));
+  const auto mitm_out =
+      handle_command_post_slash("/party join " + mitm_uri + " --alias alice", ctx);
+  require(mitm_out.has_value() && mitm_out->find("conflict") != std::string::npos,
+          "/party join rejects MITM key-swap with conflict");
+
+  // Expired invite MUST be rejected!
+  RoomInvite expired_inv = alice_inv;
+  expired_inv.expires_ns = 1000;
+  const std::string expired_uri = unwrap(encode_room_invite(expired_inv));
+  const auto exp_out = handle_command_post_slash("/party join " + expired_uri, ctx);
+  require(exp_out.has_value() && exp_out->find("expired") != std::string::npos,
+          "/party join rejects expired invite");
+
+  // Plain room join rejects --alias cleanly, then switches room without --alias.
+  const auto bad_room_alias =
+      handle_command_post_slash("/party join ops/beta --alias nope", ctx);
+  require(bad_room_alias.has_value() &&
+              bad_room_alias->find("only valid with bbjoin1:") != std::string::npos,
+          "/party join <room> rejects --alias cleanly");
+  const auto joined_room = handle_command_post_slash("/party join ops/beta", ctx);
+  require(joined_room.has_value() && joined_room->find("ops/beta") != std::string::npos,
+          "/party join <room> switches active room");
+  require(unwrap(load_party_roster_config(party_json)).room_scope == "ops/beta",
+          "party.json updated to ops/beta");
+
+  const auto removed_wm = handle_command_post_slash("/party remove wintermute", ctx);
+  require(removed_wm.has_value() &&
+              removed_wm->find("Removed party participant @wintermute") !=
+                  std::string::npos,
+          "/party remove deletes participant from party.json");
+  const auto removed_missing = handle_command_post_slash("/party remove ghost", ctx);
+  require(removed_missing.has_value() &&
+              removed_missing->find("not found") != std::string::npos,
+          "/party remove reports missing alias cleanly");
+
+  const auto left = handle_command_post_slash("/party leave", ctx);
+  require(left.has_value() && left->find("solo") != std::string::npos,
+          "/party leave confirms return to solo mode");
+  const auto snap_after_leave =
+      unwrap(load_party_snapshot(PartyConfig::for_project(dir.path)));
+  require(!terminal_party_is_active(snap_after_leave),
+          "after /party leave, ambient party badge treats workspace as solo/inactive");
+  // History and pinned peers MUST be preserved after /party leave!
+  require(std::filesystem::exists(dir.path / ".blackbird" / "platoon"),
+          "/party leave preserves platoon history");
+  const auto alice_still_pinned = unwrap(known.find_by_alias("alice"));
+  require(alice_still_pinned.has_value() && !alice_still_pinned->revoked,
+          "/party leave preserves pinned peer keys");
+}
+
 } // namespace
 
 int main() {
@@ -1004,6 +1259,7 @@ int main() {
     test_c1_raw_and_utf8_sanitization_regression();
     test_swarmboard_empty_populated_filters_and_readonly();
     test_flightdeck_empty_populated_ticks_and_hostile_labels();
+    test_party_passive_say_and_lifecycle();
     std::cout << "Command Post TUI unit tests passed.\n";
     return 0;
   } catch (const std::exception &e) {

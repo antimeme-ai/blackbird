@@ -7,6 +7,7 @@
 #include "blackbird/json.hpp"
 #include "blackbird/mcp_server.hpp"
 #include "blackbird/metrics_consumer.hpp"
+#include "blackbird/party_chat.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/platoon_runner.hpp"
@@ -4599,12 +4600,755 @@ int run_join_cli(std::span<char *> args, CliIo io) {
                        }));
 }
 
+// ============================================================================
+// 10. blackbird party
+// ============================================================================
+
+bool valid_party_ssh_target(std::string_view ssh) noexcept {
+  if (ssh.empty() || ssh.size() > 256 || !valid_utf8(ssh))
+    return false;
+  if (ssh.front() == '-')
+    return false;
+  std::size_t at_pos = std::string_view::npos;
+  for (std::size_t i = 0; i < ssh.size(); ++i) {
+    const auto b = static_cast<unsigned char>(ssh[i]);
+    if (b <= 0x20U || b == 0x7fU)
+      return false;
+    if (ssh[i] == '@') {
+      if (at_pos != std::string_view::npos)
+        return false;
+      at_pos = i;
+    }
+  }
+  if (at_pos != std::string_view::npos) {
+    if (at_pos == 0 || at_pos + 1 >= ssh.size())
+      return false;
+    if (ssh[at_pos + 1] == '-')
+      return false;
+  }
+  return true;
+}
+
+Value party_participant_to_value(const PartyParticipant &p) {
+  Value::Object obj{
+      {"id", Value{p.id}},
+      {"display_name", Value{p.display_name}},
+      {"role", Value{std::string{party_member_role_name(p.role)}}},
+      {"host", Value{p.host}},
+      {"model", Value{p.model}},
+      {"fingerprint", Value{p.fingerprint}},
+      {"state", Value{std::string{party_participant_state_name(p.state)}}},
+      {"last_seen_ns", Value{Number{p.last_seen_ns}}},
+      {"local_self", Value{p.local_self}},
+  };
+  if (p.ssh_target.has_value())
+    obj.emplace_back("ssh_target", Value{*p.ssh_target});
+  if (p.provider.has_value())
+    obj.emplace_back("provider", Value{*p.provider});
+  if (p.remote_model.has_value())
+    obj.emplace_back("remote_model", Value{*p.remote_model});
+  if (p.remote_session.has_value())
+    obj.emplace_back("remote_session", Value{*p.remote_session});
+  return Value::object(std::move(obj));
+}
+
+int run_party_roster(std::span<char *> args, CliIo io) {
+  PartyConfig cfg;
+  cfg.party_config_path = fs::path{".blackbird"} / "party.json";
+  cfg.platoon_dir = fs::path{".blackbird"} / "platoon";
+  cfg.bridge_dir = fs::path{".blackbird"} / "bridge";
+  if (const char *home = std::getenv("HOME"); home != nullptr && home[0] != '\0')
+    cfg.known_peers_dir = fs::path{home} / ".local" / "share" / "blackbird" / "peers";
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party roster [--party-file PATH] [--platoon DIR] "
+                "[--bridge DIR] [--peers DIR] [--scope SCOPE]\n";
+      return 0;
+    }
+    if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.party_config_path = fs::path{*v};
+    } else if (arg == "--platoon") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.platoon_dir = fs::path{*v};
+    } else if (arg == "--bridge") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.bridge_dir = fs::path{*v};
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.known_peers_dir = fs::path{*v};
+    } else if (arg == "--scope") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party roster: --scope must not be empty");
+      cfg.room_scope = *v;
+    } else {
+      return fail_usage(io, "party roster: unknown option: " + std::string{arg});
+    }
+  }
+
+  auto snap_res = load_party_snapshot(cfg);
+  if (!snap_res.has_value())
+    return fail_error(io, "party roster", snap_res.error());
+  const PartySnapshot &snap = snap_res.value();
+
+  Value::Array participants;
+  participants.reserve(snap.participants.size());
+  for (const auto &p : snap.participants)
+    participants.push_back(party_participant_to_value(p));
+
+  Value::Array conflicts;
+  conflicts.reserve(snap.conflicts.size());
+  for (const auto &c : snap.conflicts)
+    conflicts.push_back(conflict_to_value(c));
+
+  return emit_json(
+      io, Value::object({
+              {"mode", Value{std::string{party_mode_name(snap.mode)}}},
+              {"scope", Value{snap.room_scope}},
+              {"participant_count",
+               Value{Number{static_cast<std::uint64_t>(snap.participants.size())}}},
+              {"message_count",
+               Value{Number{static_cast<std::uint64_t>(snap.messages.size())}}},
+              {"participants", Value{std::move(participants)}},
+              {"conflicts", Value{std::move(conflicts)}},
+          }));
+}
+
+int run_party_add_leader(std::span<char *> args, CliIo io) {
+  fs::path party_file = fs::path{".blackbird"} / "party.json";
+  std::string alias;
+  std::optional<std::string> display_name;
+  std::optional<PartyMemberRole> role_opt;
+  std::optional<std::string> host;
+  std::optional<std::string> ssh_target;
+  std::optional<std::string> provider;
+  std::optional<std::string> model;
+  std::optional<std::string> remote_session;
+  std::optional<std::string> fingerprint;
+  std::optional<std::string> scope;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party add-leader --alias NAME [--display-name TEXT] "
+                "[--role leader|operator|worker] [--host HOST] [--ssh USER@HOST] "
+                "[--provider ID] [--model NAME] [--remote-session PATH] "
+                "[--fingerprint FP] [--party-file PATH] [--scope SCOPE]\n";
+      return 0;
+    }
+    if (arg == "--alias") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      alias = *v;
+    } else if (arg == "--display-name") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party add-leader: --display-name must not be empty");
+      display_name = *v;
+    } else if (arg == "--role") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed_role = parse_party_member_role(*v);
+      if (!parsed_role.has_value())
+        return fail_usage(io, "party add-leader: invalid --role: " + *v);
+      role_opt = parsed_role.value();
+    } else if (arg == "--host") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      host = *v;
+    } else if (arg == "--ssh") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_party_ssh_target(*v))
+        return fail_usage(io, "party add-leader: invalid --ssh target");
+      ssh_target = *v;
+    } else if (arg == "--provider") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party add-leader: --provider must not be empty");
+      provider = *v;
+    } else if (arg == "--model") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party add-leader: --model must not be empty");
+      model = *v;
+    } else if (arg == "--remote-session") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party add-leader: --remote-session must not be empty");
+      remote_session = *v;
+    } else if (arg == "--fingerprint") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_peer_fingerprint(*v))
+        return fail_usage(io, "party add-leader: invalid --fingerprint");
+      fingerprint = *v;
+    } else if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      party_file = fs::path{*v};
+    } else if (arg == "--scope") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party add-leader: --scope must not be empty");
+      scope = *v;
+    } else {
+      return fail_usage(io, "party add-leader: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (alias.empty())
+    return fail_usage(io, "party add-leader: --alias is required");
+  if (!valid_party_alias(alias))
+    return fail_usage(io, "party add-leader: invalid --alias");
+
+  PartyRosterConfig config{};
+  std::error_code st_ec;
+  const fs::file_status st = fs::symlink_status(party_file, st_ec);
+  if (!st_ec && fs::is_symlink(st))
+    return fail_error(io, "party add-leader", {ErrorCode::io, ELOOP});
+  if (!st_ec && st.type() != fs::file_type::not_found) {
+    auto loaded = load_party_roster_config(party_file);
+    if (!loaded.has_value())
+      return fail_error(io, "party add-leader", loaded.error());
+    config = std::move(loaded).value();
+  } else if (st_ec && st_ec != std::errc::no_such_file_or_directory &&
+             st_ec != std::errc::not_a_directory) {
+    return fail_error(io, "party add-leader", {ErrorCode::io, st_ec.value()});
+  }
+
+  if (scope.has_value())
+    config.room_scope = *scope;
+
+  auto match_alias_ci = [&](const PartyRosterPeerConfig &peer) noexcept -> bool {
+    if (peer.alias.size() != alias.size())
+      return false;
+    for (std::size_t i = 0; i < alias.size(); ++i) {
+      const char a = (peer.alias[i] >= 'A' && peer.alias[i] <= 'Z')
+                         ? static_cast<char>(peer.alias[i] - 'A' + 'a')
+                         : peer.alias[i];
+      const char b = (alias[i] >= 'A' && alias[i] <= 'Z')
+                         ? static_cast<char>(alias[i] - 'A' + 'a')
+                         : alias[i];
+      if (a != b)
+        return false;
+    }
+    return true;
+  };
+
+  PartyRosterPeerConfig *target = nullptr;
+  if (auto it = std::ranges::find_if(config.peers, match_alias_ci);
+      it != config.peers.end()) {
+    target = &(*it);
+    target->alias = alias;
+    if (role_opt.has_value())
+      target->role = *role_opt;
+  } else {
+    PartyRosterPeerConfig peer{};
+    peer.alias = alias;
+    peer.role = role_opt.value_or(PartyMemberRole::platoon_leader);
+    config.peers.push_back(std::move(peer));
+    target = &config.peers.back();
+  }
+
+  if (display_name.has_value())
+    target->display_name = *display_name;
+  if (host.has_value())
+    target->host = *host;
+  if (ssh_target.has_value())
+    target->ssh_target = *ssh_target;
+  if (provider.has_value())
+    target->provider = *provider;
+  if (model.has_value())
+    target->model = *model;
+  if (remote_session.has_value())
+    target->remote_session = *remote_session;
+  if (fingerprint.has_value())
+    target->fingerprint = *fingerprint;
+
+  const PartyMemberRole saved_role = target->role;
+  auto saved = save_party_roster_config(party_file, config);
+  if (!saved.has_value()) {
+    if (saved.error().code == ErrorCode::invalid_range ||
+        saved.error().code == ErrorCode::invalid_identity) {
+      io.err << "blackbird party add-leader: invalid field value ("
+             << error_name(saved.error().code) << ")\n";
+      return 2;
+    }
+    return fail_error(io, "party add-leader", saved.error());
+  }
+
+  return emit_json(io,
+                   Value::object({
+                       {"saved", Value{true}},
+                       {"alias", Value{alias}},
+                       {"role", Value{std::string{party_member_role_name(saved_role)}}},
+                       {"party_file", Value{party_file.string()}},
+                       {"participant_count",
+                        Value{Number{static_cast<std::uint64_t>(config.peers.size())}}},
+                   }));
+}
+
+int run_party_create(std::span<char *> args, CliIo io) {
+  fs::path party_file = fs::path{".blackbird"} / "party.json";
+  std::optional<std::string> room;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party create [--room SCOPE] [--party-file PATH]\n";
+      return 0;
+    }
+    if (arg == "--room" || arg == "--scope") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party create: --room must not be empty");
+      room = *v;
+    } else if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      party_file = fs::path{*v};
+    } else {
+      return fail_usage(io, "party create: unknown option: " + std::string{arg});
+    }
+  }
+
+  PartyRosterConfig config{};
+  const fs::path parent = party_file.parent_path();
+  if (!parent.empty()) {
+    std::error_code parent_ec;
+    const fs::file_status pst = fs::symlink_status(parent, parent_ec);
+    if (!parent_ec && fs::is_symlink(pst))
+      return fail_error(io, "party create", {ErrorCode::io, ELOOP});
+  }
+  std::error_code st_ec;
+  const fs::file_status st = fs::symlink_status(party_file, st_ec);
+  if (!st_ec && fs::is_symlink(st))
+    return fail_error(io, "party create", {ErrorCode::io, ELOOP});
+  if (!st_ec && st.type() != fs::file_type::not_found) {
+    auto loaded = load_party_roster_config(party_file);
+    if (!loaded.has_value())
+      return fail_error(io, "party create", loaded.error());
+    config = std::move(loaded).value();
+  } else if (st_ec && st_ec != std::errc::no_such_file_or_directory &&
+             st_ec != std::errc::not_a_directory) {
+    return fail_error(io, "party create", {ErrorCode::io, st_ec.value()});
+  }
+
+  if (room.has_value())
+    config.room_scope = *room;
+
+  auto saved = save_party_roster_config(party_file, config);
+  if (!saved.has_value()) {
+    if (saved.error().code == ErrorCode::invalid_range ||
+        saved.error().code == ErrorCode::invalid_identity) {
+      io.err << "blackbird party create: invalid room scope ("
+             << error_name(saved.error().code) << ")\n";
+      return 2;
+    }
+    return fail_error(io, "party create", saved.error());
+  }
+
+  return emit_json(io,
+                   Value::object({
+                       {"created", Value{true}},
+                       {"active", Value{true}},
+                       {"room", Value{config.room_scope}},
+                       {"scope", Value{config.room_scope}},
+                       {"party_file", Value{party_file.string()}},
+                       {"participant_count",
+                        Value{Number{static_cast<std::uint64_t>(config.peers.size())}}},
+                   }));
+}
+
+int run_party_leave(std::span<char *> args, CliIo io) {
+  fs::path party_file = fs::path{".blackbird"} / "party.json";
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party leave [--party-file PATH]\n";
+      return 0;
+    }
+    if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      party_file = fs::path{*v};
+    } else {
+      return fail_usage(io, "party leave: unknown option: " + std::string{arg});
+    }
+  }
+
+  const fs::path parent = party_file.parent_path();
+  if (!parent.empty()) {
+    std::error_code parent_ec;
+    const fs::file_status pst = fs::symlink_status(parent, parent_ec);
+    if (!parent_ec && fs::is_symlink(pst))
+      return fail_error(io, "party leave", {ErrorCode::io, ELOOP});
+  }
+
+  std::error_code st_ec;
+  const fs::file_status st = fs::symlink_status(party_file, st_ec);
+  if (st_ec == std::errc::no_such_file_or_directory ||
+      st_ec == std::errc::not_a_directory ||
+      (!st_ec && st.type() == fs::file_type::not_found)) {
+    return emit_json(io, Value::object({
+                             {"left", Value{true}},
+                             {"active", Value{false}},
+                             {"already_solo", Value{true}},
+                             {"party_file", Value{party_file.string()}},
+                         }));
+  }
+  if (st_ec)
+    return fail_error(io, "party leave", {ErrorCode::io, st_ec.value()});
+  if (fs::is_symlink(st))
+    return fail_error(io, "party leave", {ErrorCode::io, ELOOP});
+  if (!fs::is_regular_file(st))
+    return fail_error(io, "party leave", {ErrorCode::io, EINVAL});
+
+  std::string previous_room;
+  if (auto loaded = load_party_roster_config(party_file); loaded.has_value())
+    previous_room = loaded.value().room_scope;
+
+  if (::unlink(party_file.c_str()) != 0) {
+    if (errno == ENOENT) {
+      return emit_json(io, Value::object({
+                               {"left", Value{true}},
+                               {"active", Value{false}},
+                               {"already_solo", Value{true}},
+                               {"party_file", Value{party_file.string()}},
+                           }));
+    }
+    return fail_error(io, "party leave", {ErrorCode::io, errno});
+  }
+
+  return emit_json(io, Value::object({
+                           {"left", Value{true}},
+                           {"active", Value{false}},
+                           {"already_solo", Value{false}},
+                           {"previous_room", Value{previous_room}},
+                           {"party_file", Value{party_file.string()}},
+                       }));
+}
+
+int run_party_remove_leader(std::span<char *> args, CliIo io) {
+  fs::path party_file = fs::path{".blackbird"} / "party.json";
+  std::string alias;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err
+          << "usage: blackbird party remove-leader --alias NAME [--party-file PATH]\n";
+      return 0;
+    }
+    if (arg == "--alias") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      alias = *v;
+    } else if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      party_file = fs::path{*v};
+    } else {
+      return fail_usage(io, "party remove-leader: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (alias.empty())
+    return fail_usage(io, "party remove-leader: --alias is required");
+  if (!valid_party_alias(alias))
+    return fail_usage(io, "party remove-leader: invalid --alias");
+
+  const fs::path parent = party_file.parent_path();
+  if (!parent.empty()) {
+    std::error_code parent_ec;
+    const fs::file_status pst = fs::symlink_status(parent, parent_ec);
+    if (!parent_ec && fs::is_symlink(pst))
+      return fail_error(io, "party remove-leader", {ErrorCode::io, ELOOP});
+  }
+
+  std::error_code st_ec;
+  const fs::file_status st = fs::symlink_status(party_file, st_ec);
+  if (st_ec == std::errc::no_such_file_or_directory ||
+      st_ec == std::errc::not_a_directory ||
+      (!st_ec && st.type() == fs::file_type::not_found)) {
+    return emit_json(io, Value::object({
+                             {"removed", Value{false}},
+                             {"alias", Value{alias}},
+                             {"party_file", Value{party_file.string()}},
+                             {"participant_count", Value{Number{std::uint64_t{0}}}},
+                         }));
+  }
+  if (st_ec)
+    return fail_error(io, "party remove-leader", {ErrorCode::io, st_ec.value()});
+  if (fs::is_symlink(st))
+    return fail_error(io, "party remove-leader", {ErrorCode::io, ELOOP});
+
+  auto loaded = load_party_roster_config(party_file);
+  if (!loaded.has_value())
+    return fail_error(io, "party remove-leader", loaded.error());
+  PartyRosterConfig config = std::move(loaded).value();
+
+  auto match_alias_ci = [&](const PartyRosterPeerConfig &peer) noexcept -> bool {
+    if (peer.alias.size() != alias.size())
+      return false;
+    for (std::size_t i = 0; i < alias.size(); ++i) {
+      const char a = (peer.alias[i] >= 'A' && peer.alias[i] <= 'Z')
+                         ? static_cast<char>(peer.alias[i] - 'A' + 'a')
+                         : peer.alias[i];
+      const char b = (alias[i] >= 'A' && alias[i] <= 'Z')
+                         ? static_cast<char>(alias[i] - 'A' + 'a')
+                         : alias[i];
+      if (a != b)
+        return false;
+    }
+    return true;
+  };
+
+  bool removed = false;
+  if (auto it = std::ranges::find_if(config.peers, match_alias_ci);
+      it != config.peers.end()) {
+    config.peers.erase(it);
+    removed = true;
+    auto saved = save_party_roster_config(party_file, config);
+    if (!saved.has_value())
+      return fail_error(io, "party remove-leader", saved.error());
+  }
+
+  return emit_json(io,
+                   Value::object({
+                       {"removed", Value{removed}},
+                       {"alias", Value{alias}},
+                       {"party_file", Value{party_file.string()}},
+                       {"participant_count",
+                        Value{Number{static_cast<std::uint64_t>(config.peers.size())}}},
+                   }));
+}
+
+int run_party_say(std::span<char *> args, CliIo io) {
+  fs::path platoon_dir = fs::path{".blackbird"} / "platoon";
+  fs::path party_file = fs::path{".blackbird"} / "party.json";
+  fs::path bridge_dir = fs::path{".blackbird"} / "bridge";
+  std::optional<fs::path> peers_dir;
+  std::optional<std::string> scope;
+  std::string from;
+  std::string body;
+  std::optional<std::string> to_target;
+  bool has_body = false;
+
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird party say --from ACTOR --body TEXT [--to TARGET] "
+                "[--platoon DIR] [--party-file PATH] [--scope SCOPE]\n";
+      return 0;
+    }
+    if (arg == "--from") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      from = *v;
+    } else if (arg == "--body") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      body = *v;
+      has_body = true;
+    } else if (arg == "--to") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party say: --to must not be empty");
+      to_target = *v;
+    } else if (arg == "--platoon") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      platoon_dir = fs::path{*v};
+    } else if (arg == "--party-file") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      party_file = fs::path{*v};
+    } else if (arg == "--bridge") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      bridge_dir = fs::path{*v};
+    } else if (arg == "--peers") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      peers_dir = fs::path{*v};
+    } else if (arg == "--scope") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (v->empty())
+        return fail_usage(io, "party say: --scope must not be empty");
+      scope = *v;
+    } else {
+      return fail_usage(io, "party say: unknown option: " + std::string{arg});
+    }
+  }
+
+  if (from.empty() || !has_body)
+    return fail_usage(io, "party say: --from and --body are required");
+  if (!valid_platoon_member_id(from))
+    return fail_usage(io, "party say: invalid --from actor");
+
+  std::string routed_input = body;
+  if (to_target.has_value()) {
+    std::string_view clean_to{*to_target};
+    if (clean_to.starts_with('@'))
+      clean_to.remove_prefix(1);
+    if (clean_to.empty())
+      return fail_usage(io, "party say: invalid --to target");
+    for (const char ch : clean_to) {
+      const auto b = static_cast<unsigned char>(ch);
+      if (b <= 0x20U || b == 0x7fU)
+        return fail_usage(io, "party say: invalid --to target");
+    }
+    routed_input = "@" + std::string{clean_to} + " " + body;
+  }
+
+  PartyConfig cfg;
+  cfg.party_config_path = party_file;
+  cfg.platoon_dir = platoon_dir;
+  cfg.bridge_dir = bridge_dir;
+  if (peers_dir.has_value()) {
+    cfg.known_peers_dir = *peers_dir;
+  } else if (const char *home = std::getenv("HOME");
+             home != nullptr && home[0] != '\0') {
+    cfg.known_peers_dir = fs::path{home} / ".local" / "share" / "blackbird" / "peers";
+  }
+  if (scope.has_value())
+    cfg.room_scope = *scope;
+
+  auto snap_res = load_party_snapshot(cfg);
+  if (!snap_res.has_value())
+    return fail_error(io, "party say", snap_res.error());
+
+  auto parsed_res = parse_party_input(routed_input, snap_res.value());
+  if (!parsed_res.has_value())
+    return fail_usage(io, "party say: empty or invalid message body");
+  const ParsedPartyInput &parsed = parsed_res.value();
+
+  PlatoonPost post;
+  post.from = from;
+  post.kind = PlatoonMessageKind::message;
+  if (!parsed.broadcast && parsed.resolved_targets.size() == 1 &&
+      parsed.unknown_targets.empty() &&
+      valid_platoon_member_id(parsed.resolved_targets[0])) {
+    post.to = parsed.resolved_targets[0];
+    post.text = parsed.body;
+  } else if (!parsed.broadcast && parsed.resolved_targets.empty() &&
+             parsed.unknown_targets.size() == 1 &&
+             valid_platoon_member_id(parsed.unknown_targets[0])) {
+    post.to = parsed.unknown_targets[0];
+    post.text = parsed.body;
+  } else {
+    post.to = "all";
+    post.text = parsed.broadcast ? parsed.body : routed_input;
+  }
+
+  auto board = PlatoonBoard::open(platoon_dir);
+  if (!board.has_value())
+    return fail_error(io, "party say", board.error());
+  auto posted = board.value().post(std::move(post));
+  if (!posted.has_value())
+    return fail_error(io, "party say", posted.error());
+
+  Value::Array targets_arr;
+  targets_arr.reserve(parsed.resolved_targets.size());
+  for (const auto &t : parsed.resolved_targets)
+    targets_arr.emplace_back(t);
+
+  Value::Array unknown_arr;
+  unknown_arr.reserve(parsed.unknown_targets.size());
+  for (const auto &u : parsed.unknown_targets)
+    unknown_arr.emplace_back(u);
+
+  return emit_json(io, Value::object({
+                           {"posted", Value{true}},
+                           {"seq", Value{Number{posted.value().seq}}},
+                           {"from", Value{posted.value().from}},
+                           {"targets", Value{std::move(targets_arr)}},
+                           {"unknown_targets", Value{std::move(unknown_arr)}},
+                           {"mode", Value{std::string{party_mode_name(parsed.mode)}}},
+                       }));
+}
+
+int run_party_cli(std::span<char *> args, CliIo io) {
+  if (args.size() < 2) {
+    return fail_usage(
+        io,
+        "party: expected action (roster|create|leave|add-leader|remove-leader|say)");
+  }
+  const std::string_view action{args[1]};
+  if (action == "--help" || action == "-h") {
+    io.err << "usage: blackbird party {roster|create|leave|add-leader|remove-leader|"
+              "say} [options]\n";
+    return 0;
+  }
+  if (action == "roster")
+    return run_party_roster(args, io);
+  if (action == "create")
+    return run_party_create(args, io);
+  if (action == "leave")
+    return run_party_leave(args, io);
+  if (action == "add-leader")
+    return run_party_add_leader(args, io);
+  if (action == "remove-leader")
+    return run_party_remove_leader(args, io);
+  if (action == "say")
+    return run_party_say(args, io);
+  return fail_usage(io, "party: unknown action: " + std::string{action});
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
-         arg == "bridge" || arg == "join";
+         arg == "bridge" || arg == "join" || arg == "party";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -4635,6 +5379,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_bridge_cli(args, io);
     if (subcommand == "join")
       return run_join_cli(args, io);
+    if (subcommand == "party")
+      return run_party_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

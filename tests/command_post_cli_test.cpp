@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -281,7 +282,7 @@ void spawn_sleep_group(const fs::path &self_exe, SpawnedSleepGroup &out) {
 
 void test_subcommand_dispatch_table() {
   for (const char *name : {"mcp", "platoon", "issues", "memory", "peer", "capabilities",
-                           "metrics", "bridge", "join"}) {
+                           "metrics", "bridge", "join", "party"}) {
     check(is_command_post_subcommand(name), "expected subcommand to be recognized");
   }
   for (const char *other : {"auth", "--version", "--application", "unknown", ""}) {
@@ -1435,6 +1436,280 @@ void test_bridge_checkpoint_and_join(const fs::path &base) {
   }
 }
 
+void test_party_cli_roster_add_leader_and_say(const fs::path &base) {
+  const fs::path sandbox = base / "party-cli-sandbox";
+  const fs::path absent_peers = base / "party-absent-peers";
+  fs::create_directories(sandbox);
+
+  // 1. `--help` works cleanly on `party` and each subcommand.
+  for (const std::vector<std::string> &help_cmd : std::vector<std::vector<std::string>>{
+           {"party", "--help"},
+           {"party", "roster", "--help"},
+           {"party", "create", "--help"},
+           {"party", "leave", "--help"},
+           {"party", "add-leader", "--help"},
+           {"party", "remove-leader", "--help"},
+           {"party", "say", "--help"},
+       }) {
+    const auto help_res = run_cli(help_cmd);
+    check(help_res.exit_code == 0 && help_res.out.empty() && !help_res.err.empty(),
+          "party --help must exit 0 with usage on stderr");
+  }
+
+  // 2. `party roster` and `party leave` on absent `.blackbird` and absent `--peers`
+  //    exit 0 cleanly and create ZERO directories on disk!
+  {
+    ScopedCwd guard{sandbox};
+    const Value empty_roster = parse_stdout_json(
+        run_cli({"party", "roster", "--peers", absent_peers.string()}),
+        "party roster absent");
+    check(req_str(empty_roster, "mode") == "single_operator" &&
+              req_str(empty_roster, "scope") == "party/rollcall" &&
+              req_int(empty_roster, "participant_count") == 0 &&
+              req_int(empty_roster, "message_count") == 0 &&
+              req_field(empty_roster, "participants").array().empty() &&
+              req_field(empty_roster, "conflicts").array().empty(),
+          "absent party roster payload mismatch");
+
+    const Value solo_leave =
+        parse_stdout_json(run_cli({"party", "leave"}), "party leave absent");
+    check(std::get<bool>(req_field(solo_leave, "left").value()) &&
+              !std::get<bool>(req_field(solo_leave, "active").value()) &&
+              std::get<bool>(req_field(solo_leave, "already_solo").value()),
+          "party leave on absent party.json must be a clean already_solo no-op");
+
+    const Value absent_remove =
+        parse_stdout_json(run_cli({"party", "remove-leader", "--alias", "nobody"}),
+                          "party remove-leader absent");
+    check(!std::get<bool>(req_field(absent_remove, "removed").value()) &&
+              req_int(absent_remove, "participant_count") == 0,
+          "party remove-leader on absent party.json must be a clean no-op");
+
+    check(!fs::exists(sandbox / ".blackbird"),
+          "party roster/leave/remove-leader must NEVER create .blackbird directory");
+    check(!fs::exists(absent_peers),
+          "party roster must NEVER create absent --peers directory");
+  }
+
+  // 3. Reject option-injection `--ssh` and secret-like field values (exit 2) before
+  //    creating any files.
+  {
+    ScopedCwd guard{sandbox};
+    for (const char *bad_ssh : {"-oProxyCommand=evil", "patrick@-oProxyCommand=evil",
+                                "patrick@host with space", "patrick@host\nline2"}) {
+      const auto bad =
+          run_cli({"party", "add-leader", "--alias", "evil-ssh", "--ssh", bad_ssh});
+      check(bad.exit_code == 2 && bad.out.empty() && !bad.err.empty(),
+            "hostile --ssh value must fail with exit 2");
+    }
+    const auto secret_dn = run_cli({"party", "add-leader", "--alias", "secret-dn",
+                                    "--display-name", "sk-ant-api03-verysecret"});
+    check(secret_dn.exit_code == 2 && secret_dn.out.empty() && !secret_dn.err.empty(),
+          "secret-like --display-name must fail with exit 2");
+    const auto secret_model = run_cli({"party", "add-leader", "--alias", "secret-model",
+                                       "--model", "ghp_1234567890secret"});
+    check(secret_model.exit_code == 2 && secret_model.out.empty() &&
+              !secret_model.err.empty(),
+          "secret-like --model must fail with exit 2");
+    check(!fs::exists(sandbox / ".blackbird"),
+          "rejected add-leader calls must NOT create .blackbird directory");
+  }
+
+  // 4. `party add-leader` adds `wintermute` and `neuromancer`, verifies
+  // case-insensitive
+  //    upsert, verifies mode 0600 on `.blackbird/party.json`, and `party roster`
+  //    reflects `single_operator` with 2 leaders.
+  {
+    ScopedCwd guard{sandbox};
+    const Value add1 =
+        parse_stdout_json(run_cli({"party", "add-leader", "--alias", "wintermute",
+                                   "--ssh", "patrick@wintermute", "--provider",
+                                   "deepseek", "--model", "deepseek-chat"}),
+                          "party add-leader wintermute");
+    check(std::get<bool>(req_field(add1, "saved").value()) &&
+              req_str(add1, "alias") == "wintermute" &&
+              req_str(add1, "role") == "platoon_leader" &&
+              req_int(add1, "participant_count") == 1,
+          "party add-leader wintermute output mismatch");
+
+    // Case-insensitive upsert updates existing entry instead of duplicating.
+    const Value upsert1 =
+        parse_stdout_json(run_cli({"party", "add-leader", "--alias", "Wintermute",
+                                   "--display-name", "Wintermute Lead"}),
+                          "party add-leader wintermute upsert");
+    check(std::get<bool>(req_field(upsert1, "saved").value()) &&
+              req_int(upsert1, "participant_count") == 1,
+          "case-insensitive upsert must not duplicate participant");
+
+    // Restore canonical lowercase alias and add second leader `neuromancer`.
+    (void)parse_stdout_json(run_cli({"party", "add-leader", "--alias", "wintermute"}),
+                            "party add-leader wintermute canonical");
+    const Value add2 = parse_stdout_json(
+        run_cli({"party", "add-leader", "--alias", "neuromancer", "--provider",
+                 "anthropic", "--model", "claude-sonnet-4-6"}),
+        "party add-leader neuromancer");
+    check(std::get<bool>(req_field(add2, "saved").value()) &&
+              req_str(add2, "alias") == "neuromancer" &&
+              req_str(add2, "role") == "platoon_leader" &&
+              req_int(add2, "participant_count") == 2,
+          "party add-leader neuromancer output mismatch");
+
+    // Verify 0600 permissions on `.blackbird/party.json`.
+    const fs::path party_json = sandbox / ".blackbird" / "party.json";
+    struct stat st{};
+    check(::stat(party_json.c_str(), &st) == 0, "party.json must exist after save");
+    check((st.st_mode & mode_t{0777}) == mode_t{0600},
+          "party.json must have strict 0600 permissions");
+
+    // Verify `party roster` reports single_operator with 2 leaders and preserved
+    // fields.
+    const Value roster = parse_stdout_json(
+        run_cli({"party", "roster", "--peers", absent_peers.string()}),
+        "party roster two leaders");
+    check(req_str(roster, "mode") == "single_operator" &&
+              req_int(roster, "participant_count") == 2,
+          "party roster must reflect single_operator with 2 leaders");
+    const auto &parts = req_field(roster, "participants").array();
+    check(parts.size() == 2, "expected 2 participants in party roster");
+    bool saw_wintermute = false;
+    bool saw_neuromancer = false;
+    for (const Value &p : parts) {
+      check(req_str(p, "role") == "platoon_leader", "expected platoon_leader role");
+      if (req_str(p, "id") == "wintermute") {
+        saw_wintermute = true;
+        check(req_str(p, "ssh_target") == "patrick@wintermute" &&
+                  req_str(p, "provider") == "deepseek" &&
+                  req_str(p, "model") == "deepseek-chat" &&
+                  req_str(p, "display_name") == "Wintermute Lead",
+              "wintermute fields were not preserved across upsert");
+      } else if (req_str(p, "id") == "neuromancer") {
+        saw_neuromancer = true;
+      }
+    }
+    check(saw_wintermute && saw_neuromancer,
+          "expected both wintermute and neuromancer in roster");
+
+    // 5. `party say --from patrick --body "@wintermute status check"` posts to
+    //    PlatoonBoard and returns `targets: ["wintermute"]`.
+    const Value say1 =
+        parse_stdout_json(run_cli({"party", "say", "--from", "patrick", "--body",
+                                   "@wintermute status check"}),
+                          "party say @wintermute");
+    check(std::get<bool>(req_field(say1, "posted").value()) &&
+              req_int(say1, "seq") == 1 && req_str(say1, "from") == "patrick" &&
+              req_str(say1, "mode") == "single_operator",
+          "party say output core fields mismatch");
+    const auto &targets1 = req_field(say1, "targets").array();
+    check(targets1.size() == 1 && targets1[0].string() == "wintermute",
+          "party say targets must be [\"wintermute\"]");
+    check(req_field(say1, "unknown_targets").array().empty(),
+          "party say unknown_targets must be empty for known leader");
+
+    // Also verify `--to` prepending and unknown target reporting.
+    const Value say2 =
+        parse_stdout_json(run_cli({"party", "say", "--from", "patrick", "--to",
+                                   "neuromancer", "--body", "sync check"}),
+                          "party say --to neuromancer");
+    check(req_int(say2, "seq") == 2, "second party say must increment seq to 2");
+    const auto &targets2 = req_field(say2, "targets").array();
+    check(targets2.size() == 1 && targets2[0].string() == "neuromancer",
+          "party say --to neuromancer must resolve target");
+
+    const Value say_unknown = parse_stdout_json(
+        run_cli({"party", "say", "--from", "patrick", "--body", "@ghost ping"}),
+        "party say unknown target");
+    check(req_field(say_unknown, "targets").array().empty(),
+          "unknown target must not appear in resolved targets");
+    const auto &unknowns = req_field(say_unknown, "unknown_targets").array();
+    check(unknowns.size() == 1 && unknowns[0].string() == "ghost",
+          "unknown_targets must report ghost");
+
+    // Verify messages landed on PlatoonBoard and appear in `party roster`
+    // message_count.
+    const Value board_read = parse_stdout_json(
+        run_cli({"platoon", "read", "--board",
+                 (sandbox / ".blackbird" / "platoon").string(), "--after-seq", "0"}),
+        "platoon read after party say");
+    check(req_int(board_read, "count") == 3, "expected 3 messages on PlatoonBoard");
+    const Value &msg0 = req_field(board_read, "messages").array()[0];
+    check(req_str(msg0, "from") == "patrick" && req_str(msg0, "to") == "wintermute" &&
+              req_str(msg0, "text") == "status check",
+          "PlatoonBoard message 1 mismatch");
+
+    const Value roster_after = parse_stdout_json(
+        run_cli({"party", "roster", "--peers", absent_peers.string()}),
+        "party roster after say");
+    check(req_int(roster_after, "message_count") == 3,
+          "party roster message_count must reflect 3 PlatoonBoard messages");
+
+    // 6. `party create`, `party remove-leader`, and `party leave` lifecycle!
+    const Value created = parse_stdout_json(
+        run_cli({"party", "create", "--room", "ops/war-room"}), "party create");
+    check(std::get<bool>(req_field(created, "created").value()) &&
+              std::get<bool>(req_field(created, "active").value()) &&
+              req_str(created, "room") == "ops/war-room" &&
+              req_int(created, "participant_count") == 2,
+          "party create must activate room while preserving existing peers");
+    struct stat create_st{};
+    check(::stat(party_json.c_str(), &create_st) == 0 &&
+              (create_st.st_mode & mode_t{0777}) == mode_t{0600},
+          "party create must keep 0600 permissions on party.json");
+
+    const Value roster_room = parse_stdout_json(
+        run_cli({"party", "roster", "--peers", absent_peers.string()}),
+        "party roster after create");
+    check(req_str(roster_room, "scope") == "ops/war-room" &&
+              req_int(roster_room, "participant_count") == 2,
+          "party roster must reflect updated room scope");
+
+    // Remove `neuromancer` (case-insensitive) and verify 0600 + remaining leader.
+    const Value removed =
+        parse_stdout_json(run_cli({"party", "remove-leader", "--alias", "Neuromancer"}),
+                          "party remove-leader neuromancer");
+    check(std::get<bool>(req_field(removed, "removed").value()) &&
+              req_int(removed, "participant_count") == 1,
+          "party remove-leader must remove neuromancer leaving 1 leader");
+    struct stat rm_st{};
+    check(::stat(party_json.c_str(), &rm_st) == 0 &&
+              (rm_st.st_mode & mode_t{0777}) == mode_t{0600},
+          "party remove-leader must preserve 0600 permissions on party.json");
+
+    const Value removed_again =
+        parse_stdout_json(run_cli({"party", "remove-leader", "--alias", "neuromancer"}),
+                          "party remove-leader duplicate");
+    check(!std::get<bool>(req_field(removed_again, "removed").value()) &&
+              req_int(removed_again, "participant_count") == 1,
+          "removing already-absent alias must report removed=false");
+
+    // `party leave` clears active party without touching platoon history!
+    const Value left = parse_stdout_json(run_cli({"party", "leave"}), "party leave");
+    check(std::get<bool>(req_field(left, "left").value()) &&
+              !std::get<bool>(req_field(left, "active").value()) &&
+              !std::get<bool>(req_field(left, "already_solo").value()) &&
+              req_str(left, "previous_room") == "ops/war-room",
+          "party leave output mismatch");
+    check(!fs::exists(party_json),
+          "party leave must clear active .blackbird/party.json");
+    check(fs::exists(sandbox / ".blackbird" / "platoon" / "board.jsonl"),
+          "party leave must NOT delete PlatoonBoard history");
+
+    const Value roster_left = parse_stdout_json(
+        run_cli({"party", "roster", "--peers", absent_peers.string()}),
+        "party roster after leave");
+    check(req_int(roster_left, "participant_count") == 0 &&
+              req_int(roster_left, "message_count") == 3,
+          "party roster after leave must show 0 roster leaders while preserving 3 "
+          "historical platoon messages");
+
+    // Second `party leave` is an idempotent already_solo no-op.
+    const Value left_again =
+        parse_stdout_json(run_cli({"party", "leave"}), "party leave again");
+    check(std::get<bool>(req_field(left_again, "left").value()) &&
+              std::get<bool>(req_field(left_again, "already_solo").value()),
+          "second party leave must report already_solo=true");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1457,6 +1732,7 @@ int main(int argc, char **argv) {
     test_metrics_subcommand(temp.path());
     test_bridge_subcommand(temp.path());
     test_bridge_checkpoint_and_join(temp.path());
+    test_party_cli_roster_add_leader_and_say(temp.path());
 
     std::cout << "PASS command_post_cli\n";
     return 0;

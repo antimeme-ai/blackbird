@@ -655,6 +655,159 @@ int main() {
     const auto repaired = task_ui.try_observe_tasks({});
     check(repaired.publication == TaskPublicationStatus::ready &&
           repaired.value.revision == 3 && repaired.value.row_count == 3);
+
+    // Wave 7B-1: Party Chat Alt+P / Esc / Alt+Shift+P decoding, docked vs overlay
+    // rendering, ambient status pill, help mentions, and !cmd shell escape.
+    {
+      check(terminal_help().find("/party") != std::string::npos);
+      check(terminal_help().find("Alt+P party") != std::string::npos);
+      check(terminal_help().find("!cmd shell") != std::string::npos);
+      check(terminal_key_help().find("Alt+P party") != std::string::npos);
+      check(terminal_key_help().find("!cmd shell") != std::string::npos);
+
+      Composer party_keys;
+      party_keys.draft("preserved draft");
+      feed(party_keys, "\x1b[D\x1b[D");
+      const auto saved_cursor = party_keys.cursor();
+      check(feed(party_keys, "\x1b"
+                             "p")
+                .action == InputAction::party_toggle);
+      check(party_keys.text() == "preserved draft" &&
+            party_keys.cursor() == saved_cursor);
+      check(feed(party_keys, "\x1b[112;3u").action == InputAction::party_toggle);
+      check(feed(party_keys, "\x1b"
+                             "P")
+                .action == InputAction::party_hide);
+      check(feed(party_keys, "\x1b[80;3u").action == InputAction::party_hide);
+      check(party_keys.text() == "preserved draft" &&
+            party_keys.cursor() == saved_cursor);
+      // Bare Esc decodes cleanly via escape deadline without touching draft.
+      feed(party_keys, "\x1b");
+      const auto esc = terminal_input_dispatch(
+          party_keys, std::chrono::steady_clock::time_point::max(),
+          std::chrono::steady_clock::time_point::min(), 0);
+      check(esc.bare_escape && party_keys.text() == "preserved draft" &&
+            party_keys.cursor() == saved_cursor);
+
+      // Docked (>= 120 cols) vs overlay (< 120 cols) PartyChatPane layout & grid
+      // render.
+      PartySnapshot snap;
+      snap.room_scope = "ops/alpha";
+      snap.party_config_present = true;
+      PartyParticipant op;
+      op.id = "patrick";
+      op.role = PartyMemberRole::operator_human;
+      op.state = PartyParticipantState::online;
+      op.local_self = true;
+      PartyParticipant wm;
+      wm.id = "wintermute";
+      wm.role = PartyMemberRole::platoon_leader;
+      wm.state = PartyParticipantState::working;
+      wm.model = "deepseek-chat";
+      snap.participants = {op, wm};
+      PartyMessage msg;
+      msg.id = "m1";
+      msg.sender_id = "wintermute";
+      msg.sender_role = PartyMemberRole::platoon_leader;
+      msg.target = "@all";
+      msg.body = "docked split ready";
+      snap.messages = {msg};
+
+      PartyChatPane pane{snap};
+      pane.set_open(true);
+      pane.set_focused(true);
+
+      auto grid_plain = [](const ChatGrid &g) {
+        std::string out;
+        for (const auto &cell : g.cells) {
+          if (cell.width == 0)
+            continue;
+          if (cell.scalar < 0x80)
+            out.push_back(static_cast<char>(cell.scalar));
+          else if (cell.scalar == U'│')
+            out += "│";
+          else if (cell.scalar == U'╭')
+            out += "╭";
+          else if (cell.scalar == U'╰')
+            out += "╰";
+        }
+        return out;
+      };
+
+      const auto wide_layout = terminal_party_pane_layout({136, 28});
+      check(wide_layout.docked && wide_layout.width >= 42 && wide_layout.width <= 48 &&
+            wide_layout.main_width + wide_layout.width + 2 == 136 &&
+            wide_layout.col == wide_layout.main_width + 2);
+      ChatGrid wide_grid;
+      wide_grid.reset(136, 28);
+      terminal_render_party_pane(wide_grid, pane, wide_layout);
+      const std::string wide_text = grid_plain(wide_grid);
+      check(wide_text.find("PARTY CHAT") != std::string::npos &&
+            wide_text.find("docked") != std::string::npos &&
+            wide_text.find("split") != std::string::npos &&
+            wide_text.find("ready") != std::string::npos &&
+            wide_grid.cells[wide_layout.main_width].scalar == U'│');
+
+      const auto narrow_layout = terminal_party_pane_layout({92, 24});
+      check(!narrow_layout.docked && narrow_layout.main_width == 92 &&
+            narrow_layout.width < 92 && narrow_layout.height < 24);
+      ChatGrid narrow_grid;
+      narrow_grid.reset(92, 24);
+      terminal_render_party_pane(narrow_grid, pane, narrow_layout);
+      const std::string narrow_text = grid_plain(narrow_grid);
+      check(narrow_text.find("PARTY CHAT") != std::string::npos &&
+            narrow_text.find("Party Chat") != std::string::npos &&
+            narrow_text.find("docked split ready") != std::string::npos &&
+            narrow_text.find("╭") != std::string::npos &&
+            narrow_text.find("╰") != std::string::npos);
+
+      // Ambient Party status badge: active (closed, with & without unread) vs
+      // solo/empty.
+      PartyChatPane closed_active{snap};
+      check(terminal_party_is_active(snap));
+      const std::string active_pill = terminal_party_status_pill(closed_active, false);
+      check(active_pill == "● PARTY ops/alpha · 2 online · Alt+P");
+      PartyMessage msg2 = msg;
+      msg2.id = "m2";
+      closed_active.push_message(msg2);
+      const std::string unread_pill = terminal_party_status_pill(closed_active, false);
+      check(unread_pill == "● PARTY ops/alpha · 2 online (1 unread) · Alt+P");
+
+      PartyChatPane empty_pane;
+      check(!terminal_party_is_active(empty_pane.snapshot()));
+      check(terminal_party_status_pill(empty_pane, false).empty());
+      check(terminal_party_status_pill(empty_pane, true) == "Alt+P party");
+
+      PartySnapshot solo_snap;
+      solo_snap.room_scope = "solo";
+      solo_snap.party_config_present = true;
+      solo_snap.participants = {op};
+      PartyChatPane solo_pane{solo_snap};
+      check(!terminal_party_is_active(solo_snap));
+      check(terminal_party_status_pill(solo_pane, false).empty());
+
+      // TerminalUI::party_chat queues snapshot cleanly.
+      task_ui.party_chat(snap);
+
+      // !cmd interactive shell escape helpers & POSIX fork/exec exit codes.
+      check(terminal_is_bang_shell_command("!blackbird auth key jev"));
+      check(terminal_bang_shell_body("!blackbird auth key jev") ==
+            "blackbird auth key jev");
+      check(terminal_is_bang_shell_command("!  ls -la "));
+      check(terminal_bang_shell_body("!  ls -la ") == "ls -la");
+      check(terminal_is_bang_shell_command("!"));
+      check(terminal_bang_shell_body("!").empty());
+      check(terminal_bang_shell_body("!   ").empty());
+      check(!terminal_is_bang_shell_command("hello!"));
+      check(!terminal_is_bang_shell_command(""));
+      check(terminal_bang_shell_body("hello").empty());
+
+      check(run_interactive_bang_shell("exit 0") == 0);
+      check(run_interactive_bang_shell("exit 7") == 7);
+      check(run_interactive_bang_shell("") == 2);
+      check(run_interactive_bang_shell(std::string_view{"exit 0\0; exit 9", 15}) == 2);
+    }
+
     std::filesystem::remove_all(dir);
 
   } catch (const std::exception &e) {

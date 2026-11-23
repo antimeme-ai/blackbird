@@ -5,6 +5,7 @@
 #include "blackbird/context_workbench.hpp"
 #include "blackbird/display_text.hpp"
 #include "blackbird/hooks_view.hpp"
+#include "blackbird/party_chat.hpp"
 #include "blackbird/raw_ui.hpp"
 #include "blackbird/tasks.hpp"
 #include "blackbird/tui_instrument.hpp"
@@ -52,7 +53,10 @@ enum class InputAction {
   scroll_down,
   mouse_press,
   mouse_drag,
-  mouse_release
+  mouse_release,
+  party_toggle,
+  party_hide,
+  party_send
 };
 struct InputResult {
   InputAction action = InputAction::none;
@@ -86,6 +90,29 @@ struct EditorResult {
 // Synchronous operator-selected foreground editor; caller owns terminal handoff.
 EditorResult edit_terminal_draft(std::string_view draft,
                                  const RawAdapterContext *context = nullptr);
+// `!cmd` interactive cooked-TTY shell escape helpers (never sent to model context).
+bool terminal_is_bang_shell_command(std::string_view draft) noexcept;
+std::string_view terminal_bang_shell_body(std::string_view draft) noexcept;
+int run_interactive_bang_shell(std::string_view command);
+// Party Chat TUI pane layout, ambient status badge, and rendering helpers.
+inline constexpr std::size_t kTerminalPartyDockedMinCols = 120;
+struct TerminalViewport {
+  std::size_t cols = 0;
+  std::size_t rows = 0;
+};
+struct TerminalPartyLayout {
+  bool docked = false;
+  std::size_t col = 0;
+  std::size_t row = 0;
+  std::size_t width = 0;
+  std::size_t height = 0;
+  std::size_t main_width = 0;
+};
+TerminalPartyLayout terminal_party_pane_layout(TerminalViewport viewport) noexcept;
+void terminal_render_party_pane(ChatGrid &grid, const PartyChatPane &pane,
+                                const TerminalPartyLayout &layout);
+bool terminal_party_is_active(const PartySnapshot &snapshot) noexcept;
+std::string terminal_party_status_pill(const PartyChatPane &pane, bool docked);
 // Shared command discovery; local-only commands are labelled in help.
 std::string terminal_help();
 // "◆ CONTEXT compacted −48 KiB": badge text for one published context change.
@@ -226,6 +253,7 @@ public:
   void telemetry(const TelemetrySnapshot &snapshot);
   void context_workbench(ContextWorkbenchSnapshot snapshot);
   void hooks_view(HooksViewSnapshot snapshot);
+  void party_chat(PartySnapshot snapshot);
   void operation_started(bool provider);
   void status(std::string_view text);
   // A published context revision (a1v): kind label, e.g. "compacted", and the
@@ -275,7 +303,8 @@ private:
     context_change,
     telemetry,
     context_workbench,
-    hooks_view
+    hooks_view,
+    party_chat
   };
   struct Message {
     Kind kind;
@@ -289,6 +318,7 @@ private:
     std::shared_ptr<const TelemetrySnapshot> telemetry{};
     std::shared_ptr<const ContextWorkbenchSnapshot> workbench_snapshot{};
     std::shared_ptr<const HooksViewSnapshot> hooks_snapshot{};
+    std::shared_ptr<const PartySnapshot> party_snapshot{};
   };
   bool raw_capture_ = false;
   RawUiSource initial_source_{};

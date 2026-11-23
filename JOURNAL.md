@@ -14072,3 +14072,13 @@ Blackbird must not present itself as another product.
   + `.blackbird/bridge` + optional `0600` `.blackbird/party.json`, `@all`/`@alias` target router,
   responsive split/strip pane renderer, and anti-impersonation/anti-escalation hardening verified by
   `@dentist-2` (`papers/2026-11-23-opus-wave5-remediation-and-wave7a-dentist-review.md`).
+
+## 2026-11-23 — Checkpoint #21 (Wave 7B): Live `Alt+P` Party Chat Pane, Ambient Party Badge, `/party` Lifecycle, `!cmd` TTY Shell Escape, `PartyDispatcher` & `blackbird party` CLI
+
+- **Wave 7B-1 — Live Party Chat TUI & `!cmd` Shell Escape (`include/blackbird/terminal.hpp`, `src/terminal.cpp`, `src/command_post_tui.cpp`, `tests/command_post_tui_test.cpp`, `tests/terminal_test.cpp`):**
+  wired `Alt+P` / `Esc` Party Chat pane (docked right split when `cols >= 120`, overlay when `< 120`, `Alt+Shift+P` hide, `Tab` target cycling, `↑`/`↓` scrolling, Enter submit), always-visible ambient status-bar badge (`● PARTY <scope> · <N> online [(<U> unread)] · Alt+P`, cleanly omitted when solo), full `/party` lifecycle (`create|start`, `join <bbjoin1:...|room>`, `invite`, `leave`, `remove`, `say`, read-only filters), and `!cmd` interactive cooked-TTY shell escape (temporarily leaves raw mode/alt-screen, runs `/bin/sh -c` directly on real TTY without recording secrets in session/composer history, restores TUI frame).
+- **Wave 7B-2 — Unified Onboard/Remote Party Dispatcher & Bridge Auto-Responder (`include/blackbird/party_dispatch.hpp`, `src/party_dispatch.cpp`, `tests/party_dispatch_test.cpp`, `CMakeLists.txt`):**
+  added bounded concurrent (`<= 8` threads, exception-isolated `ThreadJoinGuard`) fan-out across onboard local leaders and remote Tailscale SSH peers (absolute `posix_spawn`, single-quoted POSIX args, secret-free 6-var env, `<= 512 KiB` cap, process-group timeout) plus `PartyBridgeWatcher::poll_and_respond_once()` with durable acknowledged `ReadReceipt` deduplication and untrusted-peer provenance fencing.
+- **Wave 7B-3 — `blackbird party` CLI (`src/command_post_cli.cpp`, `tests/command_post_cli_test.cpp`, `scripts/blackbird`):**
+  added `blackbird party roster|create|leave|add-leader|remove-leader|say` + `scripts/blackbird` direct passthrough.
+- **Linux ASan fix (`tests/party_chat_test.cpp`):** replaced hardcoded `55`-byte literal length with `sizeof(kEvilBody) - 1` after `wintermute` Linux ASan caught global-buffer-overflow (`context/linux/run-758qzwe_`). Archived `@dentist-2` Wave 7B report in `papers/2026-11-23-wave7b-party-ui-dispatch-bang-dentist-review.md`.
