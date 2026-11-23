@@ -136,6 +136,8 @@ def make_synthetic_checkout(checkout: Path) -> None:
     (checkout / "profiles/providers/conservative.lua").write_text("fixture profile\n", encoding="utf-8")
     shutil.copy2(ROOT / "scripts/blackbird", checkout / "scripts/blackbird")
     (checkout / "scripts/blackbird").chmod(0o755)
+    shutil.copy2(ROOT / "scripts/blackbird-phux", checkout / "scripts/blackbird-phux")
+    (checkout / "scripts/blackbird-phux").chmod(0o755)
 
 
 def make_fake_cmake(cmake_path: Path) -> None:
@@ -395,6 +397,7 @@ def main() -> int:
             ):
                 assert f"{top}/bin/{binary}" in names, f"missing bin/{binary}"
             assert f"{top}/scripts/blackbird" in names
+            assert f"{top}/scripts/blackbird-phux" in names
             assert f"{top}/share/blackbird/programs/turn.lua" in names
             assert f"{top}/share/blackbird/assets/sr71.png" in names
             assert f"{top}/share/blackbird/profiles/providers/conservative.lua" in names
