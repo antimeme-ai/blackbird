@@ -279,10 +279,6 @@ Value prepare_colleague(const Value &request, const RawAdapterContext *raw_conte
                               {{"role", Value{"user"}}, {"content", Value{prompt}}})}}},
              {"max_tokens", Value{Number{"8192"}}},
              {"stream", Value{false}}});
-        if (provider == "anthropic" && text(binding, "kind") == "oauth")
-          set(upstream, "system",
-              Value{"You are Claude Code, Anthropic's official CLI for Claude.\n" +
-                    instructions});
       } else {
         upstream = Value::object(
             {{"model", required_field(request, "model")},

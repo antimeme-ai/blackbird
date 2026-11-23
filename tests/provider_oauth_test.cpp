@@ -1,5 +1,6 @@
 #include "../src/native_process.hpp"
 #include "blackbird/json.hpp"
+#include "blackbird/packet.hpp"
 #include "blackbird/provider_auth.hpp"
 #include "blackbird/tools.hpp"
 #include <algorithm>
@@ -118,147 +119,139 @@ template <class F> void rejects_with(F f, ErrorCode code, int detail = 0) {
   }
   throw std::runtime_error{"accepted invalid OAuth transition"};
 }
-std::string account_state(const ProviderAuth &auth) {
+std::string account_state(const ProviderAuth &auth, std::string_view provider,
+                          std::string_view account) {
   const auto status = auth.status();
   const auto *accounts = status.find("accounts");
   check(accounts && accounts->array().size() == 1, "unexpected OAuth accounts");
-  const auto &account = accounts->array().front();
-  check(text(account, "provider") == "anthropic" && text(account, "account") == "max",
+  const auto &entry = accounts->array().front();
+  check(text(entry, "provider") == provider && text(entry, "account") == account,
         "wrong OAuth account");
-  return text(account, "state");
+  return text(entry, "state");
 }
-void anthropic_checks(const std::filesystem::path &directory) {
-  constexpr std::string_view client = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-  constexpr std::string_view token_url = "https://console.anthropic.com/v1/oauth/token";
-  constexpr std::string_view callback =
-      "https://console.anthropic.com/oauth/code/callback";
-  std::int64_t clock = 1000;
-  unsigned exchanges = 0, requests = 0;
-  std::map<std::string, std::string> authorization;
-  ProviderAuthConfig config;
-  config.directory = directory / "anthropic";
-  config.now = [&] { return clock; };
+void replace_field(Value &object, std::string_view key, Value value) {
+  for (auto &[name, existing] : object.object())
+    if (name == key) {
+      existing = std::move(value);
+      return;
+    }
+  object.object().emplace_back(std::string{key}, std::move(value));
+}
+// Anthropic is API-key only. Blackbird has no Anthropic OAuth client of its own and
+// never presents itself to Anthropic as Claude Code.
+void anthropic_key_only_checks(const std::filesystem::path &directory) {
   const auto body = unwrap(parse_json(
       R"({"model":"fixture-model","max_tokens":64,"messages":[{"role":"user","content":"fixture input"}]})"));
-  const auto notice = [&](std::string_view value) {
-    const auto at = value.find("https://claude.ai/oauth/authorize?");
-    if (at == std::string_view::npos)
-      return;
-    const auto line = value.substr(at, value.find('\n', at) - at);
-    authorization = params(line.substr(line.find('?') + 1));
-    check(authorization["code"] == "true",
-          "Anthropic manual authorization missing code=true");
-    check(auth_pkce_challenge(authorization["state"], config) ==
-              authorization["code_challenge"],
-          "Anthropic OAuth state must match pinned OpenCode PKCE verifier");
-    check(authorization["response_type"] == "code" &&
-              authorization["client_id"] == client &&
-              authorization["redirect_uri"] == callback &&
-              authorization["scope"] ==
-                  "org:create_api_key user:profile user:inference" &&
-              authorization["code_challenge_method"] == "S256" &&
-              authorization["state"].size() == 43 &&
-              authorization["code_challenge"].size() == 43,
-          "Anthropic browser authorization differs");
-  };
+  unsigned requests = 0;
+  ProviderAuthConfig config;
+  config.directory = directory / "anthropic";
+  config.now = [] { return std::int64_t{1000}; };
   config.http = [&](const ProviderHttpRequest &request,
                     ProviderHttpResponseLease &response) {
-    check(request.method == "POST" &&
-              header(request, "Content-Type") == "application/json",
-          "Anthropic JSON request differs");
-    if (request.url == token_url) {
-      check(request.headers.size() == 1 && header(request, "Accept").empty(),
-            "Anthropic token headers differ from pinned OpenCode");
-      const auto fields = unwrap(parse_json(request.body));
-      check(text(fields, "client_id") == client, "Anthropic client changed");
-      if (exchanges == 0) {
-        check(fields.object().size() == 6 &&
-                  text(fields, "grant_type") == "authorization_code" &&
-                  text(fields, "code") == "fixture-code" &&
-                  text(fields, "state") == authorization["state"] &&
-                  text(fields, "code_verifier") == authorization["state"] &&
-                  text(fields, "redirect_uri") == callback &&
-                  auth_pkce_challenge(text(fields, "code_verifier"), config) ==
-                      authorization["code_challenge"],
-              "Anthropic browser exchange linkage differs");
-      } else {
-        check(fields.object().size() == 3 &&
-                  text(fields, "grant_type") == "refresh_token" &&
-                  text(fields, "refresh_token") ==
-                      "fixture-refresh-" + std::to_string(exchanges - 1),
-              "Anthropic refresh rotation linkage differs");
-      }
-      const auto generation = std::to_string(exchanges++);
-      return reply(response, 200,
-                   unwrap(dump_json(Value::object(
-                       {{"access_token", Value{"fixture-access-" + generation}},
-                        {"refresh_token", Value{"fixture-refresh-" + generation}},
-                        {"expires_in", Value{Number{"120"}}}}))));
-    }
+    ++requests;
     check(request.url == "https://api.anthropic.com/v1/messages" &&
               unwrap(parse_json(request.body)) == body &&
-              header(request, "Authorization") ==
-                  "Bearer fixture-access-" + std::to_string(exchanges - 1) &&
-              header(request, "x-api-key").empty() &&
+              header(request, "x-api-key") == "fixture-anthropic-key" &&
               header(request, "anthropic-version") == "2023-06-01" &&
-              header(request, "anthropic-beta") ==
-                  "oauth-2025-04-20,claude-code-20250219" &&
-              header(request, "User-Agent") == "claude-cli/2.1.163 (external, cli)" &&
-              header(request, "x-app") == "cli",
-          "owned Anthropic Messages request differs");
-    ++requests;
+              header(request, "Authorization").empty() &&
+              header(request, "anthropic-beta").empty() &&
+              header(request, "User-Agent").empty() && header(request, "x-app").empty(),
+          "Anthropic API-key request differs");
     return reply(response, 200, R"({"fixture":"messages reply"})");
   };
   ProviderAuth auth{config};
-  auth.browser_login("anthropic", "max", notice,
-                     [&] { return "fixture-code#" + authorization["state"]; });
-  check(auth.selected("anthropic") && account_state(auth) == "ready" &&
-            exchanges == 1 && requests == 0,
-        "Anthropic browser account not ready");
-  const auto send = [&] {
-    const auto response = auth.request("anthropic", "messages", body, 10);
-    check(response.status == 200 && response.body == R"({"fixture":"messages reply"})",
-          "Anthropic Messages reply changed");
+  const auto descriptor = auth.descriptor("anthropic");
+  check(text(descriptor, "login") == "none" && text(descriptor, "client_id").empty() &&
+            text(descriptor, "token_url").empty() && text(descriptor, "scope").empty(),
+        "Anthropic catalog still offers subscription OAuth");
+  rejects_with(
+      [&] {
+        auth.browser_login(
+            "anthropic", "max", [](std::string_view) {},
+            [] { return std::string{"fixture-code"}; });
+      },
+      ErrorCode::unsupported);
+  rejects_with([&] { (void)auth.device_begin("anthropic", "max"); },
+               ErrorCode::unsupported);
+  check(requests == 0 && !auth.selected("anthropic"),
+        "refused Anthropic login made a request or selected an account");
+
+  auth.set_key("anthropic", "work", "fixture-anthropic-key");
+  const auto response = auth.request("anthropic", "messages", body, 10);
+  check(response.status == 200 && response.body == R"({"fixture":"messages reply"})" &&
+            requests == 1,
+        "Anthropic API-key request failed");
+
+  // A subscription credential saved by an earlier Blackbird is refused before any
+  // request: it is never sent, never refreshed, and never replaced by an ambient key.
+  std::int64_t clock = 1000;
+  unsigned legacy_requests = 0;
+  auto legacy_config = config;
+  legacy_config.directory = directory / "anthropic-legacy";
+  legacy_config.now = [&] { return clock; };
+  legacy_config.http = [&](const ProviderHttpRequest &,
+                           ProviderHttpResponseLease &legacy_response) {
+    ++legacy_requests;
+    return reply(legacy_response, 200, "{}");
   };
-  send();
-  clock = 1060;
-  send();
-  clock = 1120;
-  send();
-  check(exchanges == 3 && requests == 3, "Anthropic refresh cadence differs");
-  check(unwrap(dump_json(auth.status())).find("fixture-access") == std::string::npos,
-        "Anthropic status exposed credentials");
-
-  // Failed reauthentication must not replace the currently usable account.
-  const auto before = read_file(config.directory / "credentials.bbm");
-  for (unsigned failure = 0; failure != 3; ++failure) {
-    rejects_with(
-        [&] {
-          auth.browser_login("anthropic", "max", notice, [&] {
-            if (failure == 0)
-              return std::string{"fixture-code#wrong-state"};
-            if (failure == 1)
-              return "error=access_denied&state=" + authorization["state"];
-            return "#" + authorization["state"];
-          });
-        },
-        ErrorCode::provider_auth);
-    check(exchanges == 3 && requests == 3 &&
-              read_file(config.directory / "credentials.bbm") == before &&
-              account_state(auth) == "ready",
-          "failed Anthropic callback exchanged or changed credentials");
+  {
+    ProviderAuth seed{legacy_config};
+    seed.set_key("anthropic", "max", "fixture-legacy-access");
   }
-  send();
-  check(exchanges == 3 && requests == 4,
-        "failed Anthropic callback damaged prior credentials");
-
-  // A selected account blocks ambient API-key fallback in every failure state.
+  const auto store = legacy_config.directory / "credentials.bbm";
+  auto data = unwrap(decode_packet_string(read_file(store)));
+  for (auto &[name, accounts] : data.object()) {
+    if (name != "accounts")
+      continue;
+    for (auto &account : accounts.array()) {
+      replace_field(account, "kind", Value{"oauth"});
+      replace_field(account, "refresh", Value{"fixture-legacy-refresh"});
+      replace_field(account, "expires_at", Value{Number{"1120"}});
+      replace_field(account, "scope", Value{"user:inference"});
+      replace_field(account, "client_id", Value{"fixture-legacy-client"});
+      replace_field(account, "token_url",
+                    Value{"https://console.anthropic.com/v1/oauth/token"});
+      replace_field(account, "metadata", Value::object({}));
+    }
+  }
+  {
+    std::ofstream out{store, std::ios::binary | std::ios::trunc};
+    out << unwrap(encode_packet_string(data));
+    check(static_cast<bool>(out), "legacy credential fixture write failed");
+  }
   check(::setenv("ANTHROPIC_API_KEY", "fixture-forbidden-fallback", 1) == 0,
         "fixture environment setup failed");
+  ProviderAuth legacy{legacy_config};
+  check(legacy.selected("anthropic") &&
+            account_state(legacy, "anthropic", "max") == "ready",
+        "legacy Anthropic OAuth fixture not loaded");
+  for (const std::int64_t at : {1000, 1100}) {
+    clock = at;
+    rejects_with([&] { (void)legacy.request("anthropic", "messages", body, 10); },
+                 ErrorCode::provider_auth);
+  }
+  check(legacy_requests == 0,
+        "legacy Anthropic OAuth credential was sent, refreshed or replaced");
+  legacy.logout("anthropic", "max");
+  check(account_state(legacy, "anthropic", "max") == "logged_out" &&
+            legacy_requests == 0,
+        "legacy Anthropic OAuth credential could not be removed locally");
+  check(::unsetenv("ANTHROPIC_API_KEY") == 0, "fixture environment cleanup failed");
+}
+// Refresh failure handling for a provider that does offer OAuth login.
+void oauth_refresh_failure_checks(const std::filesystem::path &directory) {
+  constexpr std::string_view client = "17e5f671-d194-4dfb-9706-5516cb48c098";
+  constexpr std::string_view token_url = "https://auth.kimi.com/api/oauth/token";
+  const auto body = unwrap(parse_json(
+      R"({"model":"fixture-model","max_tokens":64,"messages":[{"role":"user","content":"fixture input"}]})"));
+  std::int64_t clock = 1000;
+  // A selected account blocks ambient API-key fallback in every failure state.
+  check(::setenv("KIMI_API_KEY", "fixture-forbidden-fallback", 1) == 0,
+        "fixture environment setup failed");
   for (const int outcome : {429, 503, 400, 200, 0}) {
-    auto failure_config = config;
-    failure_config.directory =
-        directory / ("anthropic-failure-" + std::to_string(outcome));
+    ProviderAuthConfig failure_config;
+    failure_config.now = [&] { return clock; };
+    failure_config.directory = directory / ("kimi-failure-" + std::to_string(outcome));
     unsigned refreshes = 0, application_requests = 0;
     failure_config.http = [&](const ProviderHttpRequest &request,
                               ProviderHttpResponseLease &response) {
@@ -267,13 +260,15 @@ void anthropic_checks(const std::filesystem::path &directory) {
         return reply(response, 200, "{}");
       }
       ++refreshes;
-      const auto fields = unwrap(parse_json(request.body));
-      check(header(request, "Content-Type") == "application/json" &&
-                request.headers.size() == 1 && header(request, "Accept").empty() &&
-                text(fields, "grant_type") == "refresh_token" &&
-                text(fields, "client_id") == client &&
-                text(fields, "refresh_token") == "fixture-failure-refresh",
-            "Anthropic failure refresh grant differs");
+      auto fields = params(request.body);
+      check(request.method == "POST" &&
+                header(request, "Content-Type") ==
+                    "application/x-www-form-urlencoded" &&
+                header(request, "Accept") == "application/json" && fields.size() == 3 &&
+                fields["grant_type"] == "refresh_token" &&
+                fields["client_id"] == client &&
+                fields["refresh_token"] == "fixture-failure-refresh",
+            "OAuth failure refresh grant differs");
       if (refreshes > 1)
         return reply(
             response, 200,
@@ -289,14 +284,12 @@ void anthropic_checks(const std::filesystem::path &directory) {
     clock = 1000;
     ProviderAuth failed{failure_config};
     failed.save_oauth(
-        "anthropic", "max",
+        "kimi", "coding",
         unwrap(parse_json(
             R"({"access_token":"fixture-failure-access","refresh_token":"fixture-failure-refresh","expires_in":120})")),
         std::string{client}, std::string{token_url});
     clock = 1060;
-    const auto request = [&] {
-      (void)failed.request("anthropic", "messages", body, 10);
-    };
+    const auto request = [&] { (void)failed.request("kimi", "messages", body, 10); };
     const bool transient = outcome == 429 || outcome == 503;
     const auto code = transient        ? ErrorCode::provider_rate_limit
                       : outcome == 0   ? ErrorCode::external_unknown
@@ -304,33 +297,35 @@ void anthropic_checks(const std::filesystem::path &directory) {
                                        : ErrorCode::provider_auth;
     rejects_with(request, code, outcome == 0 ? 77 : outcome == 200 ? 0 : -outcome);
     check(refreshes == 1 && application_requests == 0 &&
-              account_state(failed) == (transient        ? "ready"
-                                        : outcome == 400 ? "reauthorize"
-                                                         : "refresh_unknown"),
-          "Anthropic refresh failure state differs");
+              account_state(failed, "kimi", "coding") == (transient ? "ready"
+                                                          : outcome == 400
+                                                              ? "reauthorize"
+                                                              : "refresh_unknown"),
+          "OAuth refresh failure state differs");
     rejects_with(request,
                  transient ? ErrorCode::provider_rate_limit : ErrorCode::provider_auth,
                  transient ? -429 : 0);
     check(refreshes == 1 && application_requests == 0,
-          "Anthropic failure retried HTTP or fell back to an API key");
+          "OAuth failure retried HTTP or fell back to an API key");
     clock = 1119;
     if (transient) {
       rejects_with(request, ErrorCode::provider_rate_limit, -429);
       check(refreshes == 1 && application_requests == 0,
-            "Anthropic cooldown ended before its boundary");
+            "OAuth cooldown ended before its boundary");
     }
     clock = 1120;
     if (transient) {
       request();
       check(refreshes == 2 && application_requests == 1 &&
-                account_state(failed) == "ready",
-            "Anthropic cooldown did not recover at boundary");
+                account_state(failed, "kimi", "coding") == "ready",
+            "OAuth cooldown did not recover at boundary");
     } else {
       rejects_with(request, ErrorCode::provider_auth);
       check(refreshes == 1 && application_requests == 0,
-            "Anthropic terminal failure silently resumed");
+            "OAuth terminal failure silently resumed");
     }
   }
+  check(::unsetenv("KIMI_API_KEY") == 0, "fixture environment cleanup failed");
 }
 int main() {
   char directory[] = "/tmp/blackbird-oauth-test-XXXXXX";
@@ -498,7 +493,8 @@ int main() {
           Value::object({}),
           {.account_revision = std::stoll(saved.find("revision")->number().text())});
     });
-    anthropic_checks(tmp);
+    anthropic_key_only_checks(tmp);
+    oauth_refresh_failure_checks(tmp);
     std::filesystem::remove_all(tmp);
     std::cout << "provider OAuth checks passed\n";
     return 0;

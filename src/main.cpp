@@ -1723,10 +1723,11 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                            "\n";
                   }
                 }
-                out += "Sign in / add keys from your shell:\n"
-                       "  blackbird auth login kimi | grok | openai | anthropic\n"
-                       "  blackbird auth key gemini | deepseek | jev | kimi | grok | "
-                       "openrouter\n";
+                out +=
+                    "Sign in / add keys from your shell:\n"
+                    "  blackbird auth login kimi | grok | openai\n"
+                    "  blackbird auth key anthropic | gemini | deepseek | jev | kimi | "
+                    "grok | openrouter\n";
                 ui.notice(out);
               }
             } else if (prompt == "/auth providers") {

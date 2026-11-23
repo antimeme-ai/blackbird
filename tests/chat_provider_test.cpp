@@ -209,7 +209,7 @@ void test_catalog_kimi_and_live_provider_swap() {
        {"reasoning", Value::object({{"effort", Value{"medium"}}})},
        {"input", Value{Value::Array{Value::object(
                      {{"role", Value{"user"}}, {"content", Value{"hi"}}})}}}});
-  const auto kimi_wire = export_anthropic_request(kimi_req, 8192, true, false);
+  const auto kimi_wire = export_anthropic_request(kimi_req, 8192, false);
   require(
       !kimi_wire.find("thinking") && !kimi_wire.find("output_config"),
       "non-Anthropic Messages provider omits Claude-specific thinking/output_config");

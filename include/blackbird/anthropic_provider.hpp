@@ -33,7 +33,7 @@ private:
   bool group_ = false, responding_ = false;
 };
 Value export_anthropic_request(const Value &request, std::uint64_t max_tokens = 16384,
-                               bool oauth = false, bool anthropic_native = true);
+                               bool anthropic_native = true);
 void validate_anthropic_route(std::string_view model, std::string_view effort);
 Result<Value> anthropic_completed_response(std::string_view stream,
                                            ValueLimits limits = {},
