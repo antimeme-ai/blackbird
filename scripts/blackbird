@@ -29,7 +29,7 @@ fi
 BLACKBIRD_SPRITE_ASSET=${BLACKBIRD_SPRITE_ASSET:-"$blackbird_root/assets/sr71.png"}
 export BLACKBIRD_SPRITE_ASSET
 case "${1:-}" in
-  auth|mcp|platoon|issues|memory|peer|capabilities|metrics|bridge|join|party|flightdeck|online|upgrade|resume|--resume|--version|-V)
+  auth|mcp|platoon|issues|memory|peer|capabilities|metrics|bridge|join|party|flightdeck|online|upgrade|doctor|resume|--resume|--version|-V)
     exec "$blackbird_executable" "$@"
     ;;
 esac

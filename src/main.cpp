@@ -7,6 +7,8 @@
 #include "blackbird/command_post_tui.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
+#include "blackbird/mp_social_runtime.hpp"
+#include "blackbird/mp_tui_session.hpp"
 #include "blackbird/openrouter.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/party_dispatch.hpp"
@@ -44,6 +46,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 using namespace blackbird;
 namespace {
@@ -738,6 +741,360 @@ std::filesystem::path expand_cwd_argument(std::string_view raw_arg, const char *
     return std::filesystem::path{home} / std::filesystem::path{raw_arg.substr(2)};
   return std::filesystem::path{raw_arg};
 }
+
+struct LiveOnlineEnv {
+  mp::MpClientConfig client_cfg;
+  std::filesystem::path state_dir;
+  std::string relay_url = "https://relay.multiplayer.tech";
+  bool authority_from_env = false;
+  std::string error;
+};
+
+LiveOnlineEnv resolve_live_online_env(const char *home) {
+  LiveOnlineEnv out{};
+  out.client_cfg.authority = std::string{mp::kDefaultMpAuthority};
+  out.client_cfg.port = mp::kDefaultMpPort;
+  if (const char *env_dir = std::getenv("BLACKBIRD_ONLINE_DIR");
+      env_dir != nullptr && env_dir[0] != '\0') {
+    out.state_dir = std::filesystem::path{env_dir};
+  } else if (const char *xdg = std::getenv("XDG_CONFIG_HOME");
+             xdg != nullptr && xdg[0] != '\0') {
+    out.state_dir = std::filesystem::path{xdg} / "blackbird" / "online";
+  } else if (home != nullptr && home[0] != '\0') {
+    out.state_dir = std::filesystem::path{home} / ".config" / "blackbird" / "online";
+  } else {
+    out.error = "Unable to resolve online state directory (HOME unset).\n";
+    return out;
+  }
+  if (const char *env_auth = std::getenv("BLACKBIRD_ONLINE_AUTHORITY");
+      env_auth != nullptr && env_auth[0] != '\0') {
+    out.client_cfg.authority = env_auth;
+    out.authority_from_env = true;
+  }
+  if (const char *env_host = std::getenv("BLACKBIRD_ONLINE_CONNECT_HOST");
+      env_host != nullptr && env_host[0] != '\0') {
+    out.client_cfg.connect_host = env_host;
+  }
+  if (const char *env_ca = std::getenv("BLACKBIRD_ONLINE_CA_BUNDLE");
+      env_ca != nullptr && env_ca[0] != '\0') {
+    out.client_cfg.ca_bundle_path = std::filesystem::path{env_ca};
+  }
+  if (const char *env_relay = std::getenv("BLACKBIRD_ONLINE_RELAY_URL");
+      env_relay != nullptr && env_relay[0] != '\0') {
+    out.relay_url = env_relay;
+  }
+  if (const char *env_port = std::getenv("BLACKBIRD_ONLINE_PORT");
+      env_port != nullptr && env_port[0] != '\0') {
+    const std::string_view sv{env_port};
+    std::uint16_t port_num = 0;
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), port_num);
+    if (ec != std::errc{} || ptr != sv.data() + sv.size() || port_num == 0U) {
+      out.error = "Invalid BLACKBIRD_ONLINE_PORT (expected 1..65535).\n";
+      return out;
+    }
+    out.client_cfg.port = port_num;
+  }
+  return out;
+}
+
+std::pair<std::string_view, std::string_view> split_ws_token(std::string_view text) {
+  text = trim_ascii_ws(text);
+  const std::size_t sp = text.find_first_of(" \t");
+  if (sp == std::string_view::npos)
+    return {text, std::string_view{}};
+  return {text.substr(0, sp), trim_ascii_ws(text.substr(sp + 1))};
+}
+
+class LiveOnlineSessionHub {
+public:
+  LiveOnlineSessionHub(TerminalUI &ui, bool tui, const char *home)
+      : ui_(ui), tui_(tui), home_(home != nullptr ? home : "") {}
+
+  LiveOnlineSessionHub(const LiveOnlineSessionHub &) = delete;
+  LiveOnlineSessionHub &operator=(const LiveOnlineSessionHub &) = delete;
+  ~LiveOnlineSessionHub() { stop_all(); }
+
+  void stop_all() noexcept {
+    detach_party_quiet();
+    stop_social_quiet();
+  }
+
+  bool party_attached() const noexcept {
+    return party_session_ != nullptr && party_session_->is_active();
+  }
+
+  std::optional<std::string> try_handle_party_say(std::string_view say_body) {
+    if (!party_attached())
+      return std::nullopt;
+    const auto trimmed = trim_ascii_ws(say_body);
+    if (trimmed.empty())
+      return std::nullopt;
+    std::string target = "@all";
+    std::string body{trimmed};
+    if (trimmed.starts_with('@')) {
+      const auto [tok, rest] = split_ws_token(trimmed);
+      if (!rest.empty()) {
+        target = std::string{tok};
+        body = std::string{rest};
+      }
+    }
+    const auto res = party_session_->post_chat(body, MpTuiChatTarget{target});
+    if (!res.has_value()) {
+      return "Online party send failed: " +
+             std::string{
+                 mp_tui_session_error_name(mp_tui_session_error_of(res.error()))} +
+             "\n";
+    }
+    if (tui_)
+      ui_.party_chat(party_session_->to_party_snapshot());
+    return "Sent to online party " + party_session_->party_id().to_decimal() + " (" +
+           party_chat_sanitize(target, 48) + "): " + party_chat_sanitize(body, 240) +
+           "\n";
+  }
+
+  std::optional<std::string> try_handle_slash(std::string_view prompt) {
+    const auto trimmed = trim_ascii_ws(prompt);
+    const auto [cmd, args] = split_ws_token(trimmed);
+    std::string_view online_args;
+    if (cmd == "/online") {
+      online_args = args;
+    } else if (cmd == "/party") {
+      const auto [sub, rest] = split_ws_token(args);
+      if (sub != "online")
+        return std::nullopt;
+      online_args = rest;
+    } else {
+      return std::nullopt;
+    }
+
+    const auto [sub, rest] = split_ws_token(online_args);
+    if (sub == "watch")
+      return handle_watch(rest);
+    if (sub == "party") {
+      const auto [action, action_rest] = split_ws_token(rest);
+      if (action == "attach")
+        return handle_party_attach(action_rest);
+      if (action == "detach")
+        return handle_party_detach(action_rest);
+    }
+    return std::nullopt;
+  }
+
+private:
+  void detach_party_quiet() noexcept {
+    if (party_watcher_.joinable()) {
+      party_watcher_.request_stop();
+      if (party_session_ != nullptr)
+        party_session_->stop();
+      party_watcher_.join();
+    } else if (party_session_ != nullptr) {
+      party_session_->stop();
+    }
+    party_session_.reset();
+  }
+
+  void stop_social_quiet() noexcept {
+    if (social_watcher_.joinable()) {
+      social_watcher_.request_stop();
+      social_watcher_.join();
+    }
+    social_running_.store(false, std::memory_order_relaxed);
+    social_online_count_.store(0U, std::memory_order_relaxed);
+    social_tracked_count_.store(0U, std::memory_order_relaxed);
+  }
+
+  std::string handle_party_attach(std::string_view rest) {
+    const auto [id_tok, extra] = split_ws_token(rest);
+    if (id_tok.empty() || !extra.empty())
+      return "Usage: /online party attach <party_id>\n";
+    const auto pid = mp::PartyId::parse_decimal(id_tok);
+    if (!pid.has_value())
+      return "Invalid party_id '" + party_chat_sanitize(id_tok, 48) + "'\n";
+
+    const LiveOnlineEnv env = resolve_live_online_env(home_.c_str());
+    if (!env.error.empty())
+      return env.error;
+    auto store = mp::MpIdentityStore::open_existing(env.state_dir);
+    if (!store.has_value()) {
+      return "Online identity not found in " + env.state_dir.string() +
+             ". Run `blackbird online register` or `blackbird online devices link "
+             "join` "
+             "first.\n";
+    }
+    mp::MpClientConfig ccfg = env.client_cfg;
+    if (!env.authority_from_env && !store.value().state().authority.empty())
+      ccfg.authority = store.value().state().authority;
+
+    detach_party_quiet();
+
+    MpTuiSessionConfig scfg{
+        .runtime_config =
+            MpPartyRuntimeConfig{
+                .client_config = ccfg,
+                .identity = store.value().state(),
+                .party_id = pid.value(),
+                .relay_url = env.relay_url,
+            },
+        .room_scope = "online/" + pid.value().to_decimal(),
+        .local_handle = store.value().state().handle,
+    };
+
+    auto started = MpTuiSession::start(std::move(scfg));
+    if (!started.has_value()) {
+      return "Online party attach failed: " +
+             std::string{error_name(started.error().code)} + "\n";
+    }
+    party_session_ = std::move(started).value();
+    if (tui_)
+      ui_.party_chat(party_session_->to_party_snapshot());
+
+    MpTuiSession *raw_session = party_session_.get();
+    party_watcher_ = std::jthread([this, raw_session](const std::stop_token &stop) {
+      while (!stop.stop_requested() && raw_session->is_active()) {
+        const int wfd = raw_session->wake_fd();
+        if (wfd < 0)
+          break;
+        pollfd pfd{wfd, POLLIN, 0};
+        const int rc = ::poll(&pfd, 1U, 50);
+        if (stop.stop_requested())
+          break;
+        if (rc < 0) {
+          if (errno == EINTR)
+            continue;
+          break;
+        }
+        if (rc == 0)
+          continue;
+        raw_session->drain_wake();
+        const auto snap = raw_session->snapshot();
+        if (tui_) {
+          for (const auto &notice : snap.notices)
+            ui_.notice("\n[online party] " + notice + "\n");
+          ui_.party_chat(raw_session->to_party_snapshot());
+        }
+      }
+    });
+
+    return "Attached to live online party " + pid.value().to_decimal() +
+           " (press Alt+P to chat in the Party pane, or use `/party say <msg>`; "
+           "`/online party detach` disconnects).\n";
+  }
+
+  std::string handle_party_detach(std::string_view rest) {
+    if (!trim_ascii_ws(rest).empty())
+      return "Usage: /online party detach\n";
+    if (party_session_ == nullptr)
+      return "No live online party is currently attached.\n";
+    const std::string pid = party_session_->party_id().to_decimal();
+    detach_party_quiet();
+    return "Detached from online party " + pid + ".\n";
+  }
+
+  std::string handle_watch(std::string_view rest) {
+    const auto [action, extra] = split_ws_token(rest);
+    if (!extra.empty())
+      return "Usage: /online watch [start|stop|status]\n";
+    if (action == "status") {
+      if (!social_running_.load(std::memory_order_relaxed))
+        return "Online watch: stopped (run `/online watch start` for live friend "
+               "presence & request alerts).\n";
+      return "Online watch: active (friends_online=" +
+             std::to_string(social_online_count_.load(std::memory_order_relaxed)) +
+             ", tracked=" +
+             std::to_string(social_tracked_count_.load(std::memory_order_relaxed)) +
+             ").\n";
+    }
+    if (action == "stop") {
+      if (!social_running_.load(std::memory_order_relaxed))
+        return "Online watch is already stopped.\n";
+      stop_social_quiet();
+      return "Stopped live online friend presence & notifications watch.\n";
+    }
+    if (!action.empty() && action != "start")
+      return "Usage: /online watch [start|stop|status]\n";
+
+    const LiveOnlineEnv env = resolve_live_online_env(home_.c_str());
+    if (!env.error.empty())
+      return env.error;
+    auto store = mp::MpIdentityStore::open_existing(env.state_dir);
+    if (!store.has_value()) {
+      return "Online identity not found in " + env.state_dir.string() +
+             ". Run `blackbird online register` or `blackbird online devices link "
+             "join` "
+             "first.\n";
+    }
+    mp::MpClientConfig ccfg = env.client_cfg;
+    if (!env.authority_from_env && !store.value().state().authority.empty())
+      ccfg.authority = store.value().state().authority;
+
+    stop_social_quiet();
+
+    std::unordered_map<std::uint64_t, std::string> handle_map;
+    mp::MpControlClient client{ccfg, store.value().state()};
+    if (auto friends = client.list_friends(); friends.has_value()) {
+      for (const auto &edge : friends.value()) {
+        if (edge.handle.has_value())
+          handle_map.emplace(edge.peer_account_id.value(), *edge.handle);
+      }
+    }
+
+    MpSocialRuntimeConfig rcfg{};
+    rcfg.client_config = ccfg;
+    rcfg.identity = store.value().state();
+    auto connected = MpSocialRuntime::connect(std::move(rcfg));
+    if (!connected.has_value()) {
+      return "Online watch connect failed: " +
+             std::string{error_name(connected.error().code)} + "\n";
+    }
+
+    auto runtime_ptr = std::make_shared<MpSocialRuntime>(std::move(connected).value());
+    social_running_.store(true, std::memory_order_relaxed);
+    social_watcher_ = std::jthread([this, runtime_ptr, handles = std::move(handle_map)](
+                                       const std::stop_token &stop) mutable {
+      auto lookup = [&handles](mp::AccountId id) -> std::optional<std::string> {
+        if (const auto it = handles.find(id.value()); it != handles.end())
+          return it->second;
+        return std::nullopt;
+      };
+      while (!stop.stop_requested() && !runtime_ptr->is_terminated()) {
+        (void)runtime_ptr->pump_once(150U);
+        social_online_count_.store(runtime_ptr->online_friend_count(),
+                                   std::memory_order_relaxed);
+        social_tracked_count_.store(runtime_ptr->tracked_presence_count(),
+                                    std::memory_order_relaxed);
+        const auto events = runtime_ptr->drain_events();
+        for (const auto &ev : events) {
+          if (ev.kind == MpSocialEventKind::hello_acked)
+            continue;
+          if (ev.kind == MpSocialEventKind::presence_snapshot &&
+              runtime_ptr->online_friend_count() == 0U) {
+            continue;
+          }
+          if (tui_) {
+            ui_.notice("\n[online] " + format_mp_social_event_notice(ev, lookup) +
+                       "\n");
+          }
+        }
+      }
+      runtime_ptr->shutdown();
+      social_running_.store(false, std::memory_order_relaxed);
+    });
+
+    return "Live online watch started (connected to " +
+           party_chat_sanitize(ccfg.authority, 96) +
+           "/v1/ws; `/online watch stop` disconnects).\n";
+  }
+
+  TerminalUI &ui_;
+  bool tui_ = false;
+  std::string home_;
+  std::unique_ptr<MpTuiSession> party_session_;
+  std::jthread party_watcher_;
+  std::jthread social_watcher_;
+  std::atomic<bool> social_running_{false};
+  std::atomic<std::size_t> social_online_count_{0U};
+  std::atomic<std::size_t> social_tracked_count_{0U};
+};
 } // namespace
 int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 RawSuccessorHandoff *selected_handoff = nullptr,
@@ -784,6 +1141,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                "[--once] [--halfblock]\n"
                "blackbird upgrade [--check] [--no-ask|-y|--yes] [--version TAG] "
                "[--restart]\n"
+               "blackbird doctor [--offline] [--no-update-check] [--json]\n"
                "blackbird [--version|-V] [--session DIRECTORY] [--provider ID] "
                "[--model NAME] [--workflow FILE] "
                "[--once "
@@ -799,7 +1157,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                "/originals, /restore "
                "ENTRY, /lua CODE, /model NAME, /effort LEVEL, /workflow FILE, "
                "/session, /sessions, /resume, /cwd [PATH], /profile, /new, "
-               "/restart NOTE, /upgrade [--check|--no-ask], /paste (until /send), "
+               "/restart NOTE, /upgrade [--check|--no-ask], /doctor, /paste (until "
+               "/send), "
                "/quit or /exit\n";
         return 0;
       }
@@ -1595,6 +1954,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     TerminalUI ui{"Blackbird · " + provider_name + "/" + model + " · " + effort +
                   (settings.effort_pending ? " (choose effort)" : "") + " · " +
                   session.string()};
+    LiveOnlineSessionHub online_hub{ui, tui, home};
     // After a SIGTERM the loops have decided to stop. Rearm the interrupt so the
     // teardown, and any stop record, runs as on /quit: under the notified wake
     // every raw claim in this scope is refused (check_wait_control).
@@ -3042,43 +3402,68 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 publish_workflows(engine.workflows());
               } else if (prompt.starts_with("/")) {
                 bool handled_remote_party = false;
-                if (const auto say_body = extract_party_say_body(prompt);
-                    say_body.has_value()) {
-                  std::error_code cwd_ec;
-                  const auto cwd = std::filesystem::current_path(cwd_ec);
-                  if (const auto remote_party_file = find_remote_party_config(
-                          cwd_ec ? std::filesystem::path{} : cwd, home);
-                      remote_party_file.has_value()) {
-                    handled_remote_party = true;
-                    const auto party_root =
-                        remote_party_file->parent_path().parent_path();
-                    PartyDispatchConfig dcfg =
-                        PartyDispatchConfig::for_project(party_root);
-                    dcfg.party_config_path = *remote_party_file;
-                    dcfg.local_actor = "operator";
-                    if (!cwd_ec && !cwd.empty())
-                      dcfg.working_dir = cwd;
-                    dcfg.cancelled = engine.cancelled;
-                    if (tui)
-                      ui.status("Dispatching party message to remote peers...");
-                    auto dispatched = dispatch_party_message(*say_body, dcfg);
-                    if (!dispatched.has_value()) {
-                      const std::string err_msg =
-                          "Party dispatch failed: " +
-                          std::string{error_name(dispatched.error().code)} + "\n";
+                if (const auto live_out = online_hub.try_handle_slash(prompt);
+                    live_out.has_value()) {
+                  handled_remote_party = true;
+                  if (tui)
+                    ui.notice("\n" + *live_out);
+                  else
+                    emit(*live_out);
+                }
+                if (!handled_remote_party) {
+                  if (const auto say_body = extract_party_say_body(prompt);
+                      say_body.has_value()) {
+                    if (const auto online_sent =
+                            online_hub.try_handle_party_say(*say_body);
+                        online_sent.has_value()) {
+                      handled_remote_party = true;
                       if (tui)
-                        ui.notice("\n" + err_msg);
+                        ui.notice("\n" + *online_sent);
                       else
-                        emit(err_msg);
-                    } else {
-                      const std::string formatted = format_party_dispatch_report(
-                          dispatched.value(), dcfg.local_actor);
-                      if (tui) {
-                        ui.notice("\n" + formatted);
-                        refresh_tui_party_pane(ui, {.party_root = party_root,
-                                                    .party_file = *remote_party_file});
+                        emit(*online_sent);
+                    }
+                  }
+                }
+                if (!handled_remote_party) {
+                  if (const auto say_body = extract_party_say_body(prompt);
+                      say_body.has_value()) {
+                    std::error_code cwd_ec;
+                    const auto cwd = std::filesystem::current_path(cwd_ec);
+                    if (const auto remote_party_file = find_remote_party_config(
+                            cwd_ec ? std::filesystem::path{} : cwd, home);
+                        remote_party_file.has_value()) {
+                      handled_remote_party = true;
+                      const auto party_root =
+                          remote_party_file->parent_path().parent_path();
+                      PartyDispatchConfig dcfg =
+                          PartyDispatchConfig::for_project(party_root);
+                      dcfg.party_config_path = *remote_party_file;
+                      dcfg.local_actor = "operator";
+                      if (!cwd_ec && !cwd.empty())
+                        dcfg.working_dir = cwd;
+                      dcfg.cancelled = engine.cancelled;
+                      if (tui)
+                        ui.status("Dispatching party message to remote peers...");
+                      auto dispatched = dispatch_party_message(*say_body, dcfg);
+                      if (!dispatched.has_value()) {
+                        const std::string err_msg =
+                            "Party dispatch failed: " +
+                            std::string{error_name(dispatched.error().code)} + "\n";
+                        if (tui)
+                          ui.notice("\n" + err_msg);
+                        else
+                          emit(err_msg);
                       } else {
-                        emit(formatted);
+                        const std::string formatted = format_party_dispatch_report(
+                            dispatched.value(), dcfg.local_actor);
+                        if (tui) {
+                          ui.notice("\n" + formatted);
+                          refresh_tui_party_pane(ui,
+                                                 {.party_root = party_root,
+                                                  .party_file = *remote_party_file});
+                        } else {
+                          emit(formatted);
+                        }
                       }
                     }
                   }
@@ -3184,6 +3569,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     // restart this process recorded stays pending (the guard takes no snapshot),
     // and the next open reports it.
     auto finish_interactive = [&] {
+      online_hub.stop_all();
       if (termination_requested())
         return terminated_status;
       if (!restart_pending.load())

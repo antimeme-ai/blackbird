@@ -3,6 +3,7 @@
 #include "blackbird/board_bridge.hpp"
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
+#include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
@@ -8742,11 +8743,16 @@ int run_online_friends_list(std::span<char *> args, std::size_t start_idx, CliIo
       ++blocked_count;
       break;
     }
-    arr.push_back(Value::object({
+    Value::Object entry{
         {"peer_account_id", Value{Number{edge.peer_account_id.value()}}},
         {"state", Value{std::string{friend_edge_state_name(edge.state)}}},
         {"updated_at_ms", Value{Number{edge.updated_at_ms}}},
-    }));
+    };
+    if (edge.handle.has_value())
+      entry.emplace_back("peer_handle", Value{*edge.handle});
+    if (edge.safety_number.has_value())
+      entry.emplace_back("safety_number", Value{*edge.safety_number});
+    arr.push_back(Value{std::move(entry)});
   }
   return emit_json(
       io, Value::object({
@@ -10320,13 +10326,133 @@ int run_upgrade_cli(std::span<char *> args, CliIo io) {
   return 0;
 }
 
+int run_doctor_cli(std::span<char *> args, CliIo io) {
+  DoctorConfig cfg{};
+#ifdef BLACKBIRD_VERSION_STRING
+  cfg.current_version_string = BLACKBIRD_VERSION_STRING;
+#endif
+  OnlineCommonOpts online_opts{};
+  bool json_out = false;
+  if (const char *env_relay = std::getenv("BLACKBIRD_ONLINE_RELAY_URL");
+      env_relay != nullptr && env_relay[0] != '\0') {
+    cfg.relay_url = env_relay;
+  }
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird doctor [--offline] [--no-update-check] [--json] "
+                "[--state-dir DIR] [--authority HOST] [--connect-host HOST] [--port N] "
+                "[--ca-bundle PATH] [--relay-url URL] [--relay-connect-host HOST] "
+                "[--relay-port N] [--prefix DIR] [--base-url URL] "
+                "[--party-socket PATH] [--help]\n";
+      return 0;
+    }
+    if (arg == "--offline") {
+      cfg.offline = true;
+      continue;
+    }
+    if (arg == "--no-update-check") {
+      cfg.check_update = false;
+      continue;
+    }
+    if (arg == "--json") {
+      json_out = true;
+      continue;
+    }
+    if (arg == "--relay-url") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.relay_url = std::move(*v);
+      continue;
+    }
+    if (arg == "--relay-connect-host") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_host_arg(*v))
+        return fail_usage(io, "doctor: invalid --relay-connect-host");
+      cfg.relay_connect_host = std::move(*v);
+      continue;
+    }
+    if (arg == "--relay-port") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      const auto parsed = parse_u64(*v);
+      if (!parsed.has_value() || *parsed == 0U || *parsed > 65535U)
+        return fail_usage(io, "doctor: --relay-port must be between 1 and 65535");
+      cfg.relay_port = static_cast<std::uint16_t>(*parsed);
+      continue;
+    }
+    if (arg == "--prefix") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_path_arg(*v, /*require_filename=*/false))
+        return fail_usage(io, "doctor: invalid --prefix path");
+      cfg.install_prefix = fs::path{std::move(*v)};
+      continue;
+    }
+    if (arg == "--base-url") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      cfg.upgrade_base_url = std::move(*v);
+      continue;
+    }
+    if (arg == "--party-socket") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_path_arg(*v, /*require_filename=*/true))
+        return fail_usage(io, "doctor: invalid --party-socket path");
+      cfg.party_socket_path = fs::path{std::move(*v)};
+      continue;
+    }
+    const int common = parse_online_common_flag(args, i, online_opts, true, io);
+    if (common == 1)
+      continue;
+    if (common == 2)
+      return 2;
+    return fail_usage(io, "doctor: unknown option: " + std::string{arg});
+  }
+
+  if (online_opts.state_dir.has_value()) {
+    cfg.online_state_dir = *online_opts.state_dir;
+  } else if (const char *env_dir = std::getenv("BLACKBIRD_ONLINE_DIR");
+             env_dir != nullptr && env_dir[0] != '\0') {
+    if (!valid_online_path_arg(env_dir, /*require_filename=*/false))
+      return fail_usage(io, "doctor: invalid BLACKBIRD_ONLINE_DIR path");
+    cfg.online_state_dir = strip_trailing_slashes_party(fs::path{env_dir});
+  }
+
+  const auto client_cfg = resolve_online_client_config(online_opts, "", io);
+  if (!client_cfg.has_value())
+    return 2;
+  cfg.mp_client_config = *client_cfg;
+  if (cfg.mp_client_config.ca_bundle_path.has_value())
+    cfg.relay_ca_bundle_path = cfg.mp_client_config.ca_bundle_path;
+
+  const DoctorReport report = run_blackbird_doctor(cfg);
+  if (json_out) {
+    const int rc = emit_json(io, doctor_report_to_json(report));
+    if (rc != 0)
+      return rc;
+    return report.healthy ? 0 : 1;
+  }
+  io.out << format_doctor_report_human(report);
+  return report.healthy ? 0 : 1;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
   return arg == "mcp" || arg == "platoon" || arg == "issues" || arg == "memory" ||
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
-         arg == "online" || arg == "upgrade";
+         arg == "online" || arg == "upgrade" || arg == "doctor";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -10365,6 +10491,8 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_online_cli(args, io);
     if (subcommand == "upgrade")
       return run_upgrade_cli(args, io);
+    if (subcommand == "doctor")
+      return run_doctor_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

@@ -467,6 +467,122 @@ Result<std::string> extract_tls_hostname(std::string_view authority) {
   return Result<std::string>::success(std::string{authority});
 }
 
+struct ParsedRelayProbeUrl {
+  std::string authority;
+  std::uint16_t port = kDefaultMpPort;
+  std::string probe_path;
+  std::string probed_url;
+};
+
+Result<ParsedRelayProbeUrl> parse_relay_probe_url(std::string_view relay_url) {
+  static constexpr std::string_view kHttpsPrefix = "https://";
+  if (relay_url.empty() || relay_url.size() > 256U ||
+      !relay_url.starts_with(kHttpsPrefix)) {
+    return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                       MpClientError::invalid_config);
+  }
+  for (const char ch : relay_url) {
+    const auto byte = static_cast<std::uint8_t>(ch);
+    if (byte <= 0x20U || byte >= 0x7fU) {
+      return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                         MpClientError::invalid_config);
+    }
+  }
+
+  const std::string_view rest = relay_url.substr(kHttpsPrefix.size());
+  if (rest.empty() || rest.find_first_of("?#@\\") != std::string_view::npos) {
+    return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                       MpClientError::invalid_config);
+  }
+
+  const std::size_t slash = rest.find('/');
+  const std::string_view authority_sv =
+      (slash == std::string_view::npos) ? rest : rest.substr(0U, slash);
+  const std::string_view path_sv =
+      (slash == std::string_view::npos) ? std::string_view{} : rest.substr(slash);
+
+  if (authority_sv.empty()) {
+    return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                       MpClientError::invalid_config);
+  }
+
+  std::string_view host_sv = authority_sv;
+  std::optional<std::string_view> port_sv;
+  if (authority_sv.front() == '[') {
+    const std::size_t close = authority_sv.find(']');
+    if (close == std::string_view::npos || close <= 1U) {
+      return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                         MpClientError::invalid_config);
+    }
+    host_sv = authority_sv.substr(1U, close - 1U);
+    if (close + 1U < authority_sv.size()) {
+      if (authority_sv[close + 1U] != ':') {
+        return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                           MpClientError::invalid_config);
+      }
+      port_sv = authority_sv.substr(close + 2U);
+    }
+  } else if (const std::size_t colon = authority_sv.find(':');
+             colon != std::string_view::npos) {
+    if (authority_sv.find(':', colon + 1U) != std::string_view::npos) {
+      return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                         MpClientError::invalid_config);
+    }
+    host_sv = authority_sv.substr(0U, colon);
+    port_sv = authority_sv.substr(colon + 1U);
+  }
+
+  if (host_sv.empty()) {
+    return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_identity,
+                                       MpClientError::invalid_config);
+  }
+  if (const auto tls_host = extract_tls_hostname(authority_sv); !tls_host.has_value()) {
+    return Result<ParsedRelayProbeUrl>::failure(tls_host.error());
+  }
+
+  std::uint16_t port = kDefaultMpPort;
+  if (port_sv.has_value()) {
+    const std::string_view p = *port_sv;
+    if (p.empty() || p.size() > 5U || p.front() == '0') {
+      return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_range,
+                                         MpClientError::invalid_config);
+    }
+    std::uint32_t parsed_port = 0U;
+    for (const char ch : p) {
+      if (ch < '0' || ch > '9') {
+        return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_range,
+                                           MpClientError::invalid_config);
+      }
+      parsed_port = (parsed_port * 10U) + static_cast<std::uint32_t>(ch - '0');
+    }
+    if (parsed_port == 0U || parsed_port > 65535U) {
+      return fail_c<ParsedRelayProbeUrl>(ErrorCode::invalid_range,
+                                         MpClientError::invalid_config);
+    }
+    port = static_cast<std::uint16_t>(parsed_port);
+  }
+
+  std::string_view base_path = path_sv;
+  while (!base_path.empty() && base_path.back() == '/') {
+    base_path.remove_suffix(1U);
+  }
+  std::string probe_path;
+  if (base_path.empty()) {
+    probe_path = "/ping";
+  } else {
+    probe_path.reserve(base_path.size() + 5U);
+    probe_path.append(base_path);
+    probe_path.append("/ping");
+  }
+
+  ParsedRelayProbeUrl out{};
+  out.authority = std::string{authority_sv};
+  out.port = port;
+  out.probe_path = std::move(probe_path);
+  out.probed_url = "https://" + out.authority + out.probe_path;
+  return Result<ParsedRelayProbeUrl>::success(std::move(out));
+}
+
 // ---------------------------------------------------------------------------
 // Local keystore filesystem primitives (0700 dir, 0600 files, O_NOFOLLOW)
 // ---------------------------------------------------------------------------
@@ -3018,6 +3134,10 @@ Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &r
       return fail_c<MpControlSocket>(ErrorCode::provider_auth,
                                      MpClientError::http_unauthorized);
     }
+    if (parsed.value().status == 403) {
+      return fail_c<MpControlSocket>(ErrorCode::provider_auth,
+                                     MpClientError::http_forbidden);
+    }
     return fail_c<MpControlSocket>(ErrorCode::provider_transport,
                                    MpClientError::ws_upgrade_rejected);
   }
@@ -3374,6 +3494,62 @@ Result<HealthResponse> MpControlClient::health() {
     return Result<HealthResponse>::failure(resp.error());
   }
   return parse_health_response(resp.value());
+}
+
+Result<RelayProbeResponse>
+MpControlClient::probe_relay(std::string_view relay_url,
+                             std::optional<std::string_view> connect_host_override,
+                             std::optional<std::uint16_t> port_override) const {
+  const auto parsed = parse_relay_probe_url(relay_url);
+  if (!parsed.has_value()) {
+    return Result<RelayProbeResponse>::failure(parsed.error());
+  }
+
+  MpClientConfig probe_cfg{};
+  probe_cfg.authority = parsed.value().authority;
+  if (connect_host_override.has_value()) {
+    const std::string_view host_ov = *connect_host_override;
+    if (host_ov.empty() || host_ov.size() > 256U || contains_ctl_or_crlf(host_ov) ||
+        host_ov.find(' ') != std::string_view::npos) {
+      return fail_c<RelayProbeResponse>(ErrorCode::invalid_identity,
+                                        MpClientError::invalid_config);
+    }
+    probe_cfg.connect_host = std::string{host_ov};
+  }
+  if (port_override.has_value()) {
+    if (*port_override == 0U) {
+      return fail_c<RelayProbeResponse>(ErrorCode::invalid_range,
+                                        MpClientError::invalid_config);
+    }
+    probe_cfg.port = *port_override;
+  } else {
+    probe_cfg.port = parsed.value().port;
+  }
+  probe_cfg.ca_bundle_path = config_.ca_bundle_path;
+  probe_cfg.connect_timeout_ms = config_.connect_timeout_ms;
+  probe_cfg.io_timeout_ms = config_.io_timeout_ms;
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::get;
+  req.path = parsed.value().probe_path;
+  req.query = "?";
+
+  const auto start = SteadyClock::now();
+  const auto resp = execute_http_once(probe_cfg, req);
+  const auto end = SteadyClock::now();
+  if (!resp.has_value()) {
+    return Result<RelayProbeResponse>::failure(resp.error());
+  }
+  const auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  const auto rtt_ms = elapsed_ms > 0 ? static_cast<std::uint64_t>(elapsed_ms) : 0U;
+  const int status = resp.value().status;
+  return Result<RelayProbeResponse>::success(RelayProbeResponse{
+      status == 200 || status == 204,
+      status,
+      rtt_ms,
+      parsed.value().probed_url,
+  });
 }
 
 Result<RegisterAccountResponse>
@@ -4514,7 +4690,70 @@ Result<std::vector<FriendEdge>> MpControlClient::list_friends() {
       return fail_c<std::vector<FriendEdge>>(ErrorCode::corrupt,
                                              MpClientError::http_response_schema);
     }
-    edges.push_back(FriendEdge{peer_id.value(), state.value(), updated.value()});
+
+    FriendEdge edge{peer_id.value(), state.value(), updated.value()};
+
+    const auto opt_peer_handle = get_optional_string(item, "peer_handle");
+    const auto opt_alias_handle = get_optional_string(item, "handle");
+    if (!opt_peer_handle.has_value()) {
+      return Result<std::vector<FriendEdge>>::failure(opt_peer_handle.error());
+    }
+    if (!opt_alias_handle.has_value()) {
+      return Result<std::vector<FriendEdge>>::failure(opt_alias_handle.error());
+    }
+    if (opt_peer_handle.value().has_value() && opt_alias_handle.value().has_value() &&
+        *opt_peer_handle.value() != *opt_alias_handle.value()) {
+      return fail_c<std::vector<FriendEdge>>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    const std::optional<std::string> &chosen_handle =
+        opt_peer_handle.value().has_value() ? opt_peer_handle.value()
+                                            : opt_alias_handle.value();
+    if (chosen_handle.has_value()) {
+      const auto parsed_handle = AccountHandle::parse(*chosen_handle);
+      if (!parsed_handle.has_value()) {
+        return fail_c<std::vector<FriendEdge>>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      edge.handle = std::string{parsed_handle.value().display()};
+    }
+
+    const auto opt_peer_rpk_b64 = get_optional_string(item, "peer_root_pubkey_b64");
+    const auto opt_alias_rpk_b64 = get_optional_string(item, "root_pubkey_b64");
+    if (!opt_peer_rpk_b64.has_value()) {
+      return Result<std::vector<FriendEdge>>::failure(opt_peer_rpk_b64.error());
+    }
+    if (!opt_alias_rpk_b64.has_value()) {
+      return Result<std::vector<FriendEdge>>::failure(opt_alias_rpk_b64.error());
+    }
+    if (opt_peer_rpk_b64.value().has_value() && opt_alias_rpk_b64.value().has_value() &&
+        *opt_peer_rpk_b64.value() != *opt_alias_rpk_b64.value()) {
+      return fail_c<std::vector<FriendEdge>>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    const std::optional<std::string> &chosen_rpk_b64 =
+        opt_peer_rpk_b64.value().has_value() ? opt_peer_rpk_b64.value()
+                                             : opt_alias_rpk_b64.value();
+    if (chosen_rpk_b64.has_value()) {
+      const auto decoded = base64_decode(*chosen_rpk_b64);
+      if (!decoded.has_value() || decoded->size() != 32U) {
+        return fail_c<std::vector<FriendEdge>>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      Ed25519PubKey pk{};
+      std::memcpy(pk.data(), decoded->data(), pk.size());
+      if (const auto valid = validate_ed25519_pubkey_strict(pk); !valid.has_value()) {
+        return Result<std::vector<FriendEdge>>::failure(valid.error());
+      }
+      const auto safety = compute_safety_number(peer_id.value(), pk);
+      if (!safety.has_value()) {
+        return Result<std::vector<FriendEdge>>::failure(safety.error());
+      }
+      edge.root_pubkey = pk;
+      edge.safety_number = safety.value();
+    }
+
+    edges.push_back(std::move(edge));
   }
   return Result<std::vector<FriendEdge>>::success(std::move(edges));
 }
@@ -5079,6 +5318,10 @@ Result<MpControlSocket> MpControlClient::connect_account_socket() {
       MpSocketConnectRequest{config_, "/v1/ws", auth.value().account_id,
                              auth.value().device_id, clock_offset_s_},
       auth.value().signing_key);
+}
+
+Result<MpControlSocket> MpControlClient::connect_social_ws() {
+  return connect_account_socket();
 }
 
 Result<MpControlSocket> MpControlClient::connect_party_socket(PartyId party_id) {

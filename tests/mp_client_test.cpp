@@ -389,6 +389,16 @@ struct LoopbackServerState {
   bool ws_received_masked_ping = false;
   bool ws_received_masked_pong = false;
   WsTestMode ws_mode = WsTestMode::normal_party;
+  bool enriched_friends_response = false;
+  bool enriched_friends_alias_keys = false;
+  bool mismatch_friend_handle_keys = false;
+  bool spoof_friend_safety_number = false;
+  bool bad_friend_handle = false;
+  bool bad_friend_pubkey = false;
+  Ed25519PubKey friend_root_pubkey{};
+  std::string friend_handle = "bob_friend";
+  int relay_ping_status = 200;
+  std::string last_relay_ping_path;
 };
 
 class LoopbackTlsServer {
@@ -580,6 +590,29 @@ private:
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     const auto now_s = static_cast<std::int64_t>(now_ms / 1000U);
+
+    // 1a. Unauthenticated relay /ping probe route
+    if (method_str == "GET" && (path == "/ping" || path.ends_with("/ping"))) {
+      int status = 200;
+      {
+        std::lock_guard<std::mutex> lk{state_.mu};
+        state_.last_relay_ping_path = path;
+        status = state_.relay_ping_status;
+      }
+      if (status == 204) {
+        ssl_write_str(ssl, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+      } else if (status == 200) {
+        ssl_write_str(ssl, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                           "Content-Length: 2\r\nConnection: close\r\n\r\nok");
+      } else {
+        ssl_write_str(ssl, "HTTP/1.1 " + std::to_string(status) +
+                               " Service Unavailable\r\nContent-Length: 0\r\n"
+                               "Connection: close\r\n\r\n");
+      }
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      return;
+    }
 
     // 1. Unauthenticated /v1/health
     if (method_str == "GET" && path == "/v1/health") {
@@ -955,10 +988,49 @@ private:
         send_json(ssl, 404, "Not Found", "{\"error\":\"not_found\"}");
       }
     } else if (method_str == "GET" && path == "/v1/friends") {
-      send_json(
-          ssl, 200, "OK",
-          "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
-              std::to_string(now_ms) + "}]}");
+      if (state_.bad_friend_handle) {
+        send_json(
+            ssl, 200, "OK",
+            "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
+                std::to_string(now_ms) + ",\"peer_handle\":\"bad\\u001b[31m\"}]}");
+      } else if (state_.bad_friend_pubkey) {
+        send_json(
+            ssl, 200, "OK",
+            "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
+                std::to_string(now_ms) +
+                ",\"peer_root_pubkey_b64\":"
+                "\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}]}");
+      } else if (state_.mismatch_friend_handle_keys) {
+        send_json(
+            ssl, 200, "OK",
+            "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
+                std::to_string(now_ms) +
+                ",\"peer_handle\":\"bob_friend\",\"handle\":\"mallory\"}]}");
+      } else if (state_.enriched_friends_response) {
+        const std::string h_key =
+            state_.enriched_friends_alias_keys ? "handle" : "peer_handle";
+        const std::string pk_key = state_.enriched_friends_alias_keys
+                                       ? "root_pubkey_b64"
+                                       : "peer_root_pubkey_b64";
+        const std::string sn_key =
+            state_.enriched_friends_alias_keys ? "safety_number" : "peer_safety_number";
+        std::string body =
+            "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
+            std::to_string(now_ms) + ",\"" + h_key + "\":\"" + state_.friend_handle +
+            "\",\"" + pk_key + "\":\"" + base64_encode_test(state_.friend_root_pubkey) +
+            "\"";
+        if (state_.spoof_friend_safety_number) {
+          body += ",\"" + sn_key + "\":\"AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH\"";
+        }
+        body += "},{\"peer_account_id\":1003,\"state\":3,\"updated_at_ms\":" +
+                std::to_string(now_ms) + ",\"" + h_key + "\":\"blocked_peer\"}]}";
+        send_json(ssl, 200, "OK", body);
+      } else {
+        send_json(
+            ssl, 200, "OK",
+            "{\"friends\":[{\"peer_account_id\":1002,\"state\":0,\"updated_at_ms\":" +
+                std::to_string(now_ms) + "}]}");
+      }
     } else if (method_str == "POST" && path == "/v1/friends/requests") {
       send_json(ssl, 202, "Accepted", "{\"target_account_id\":1002,\"state\":1}");
     } else if (method_str == "POST" && path.ends_with("/block")) {
@@ -1799,18 +1871,190 @@ void test_loopback_tls_rest_and_ws() {
     require_ok(mp_client_error_of(err_400.error()) == MpClientError::http_bad_request);
   }
 
-  // 8. Social graph (friends & blocks)
+  // 8. Social graph (friends & blocks): legacy + enriched FriendEdge + relay probe
   const auto bob_id = AccountId::create(1002U).value();
   const auto freq = client.send_or_accept_friend(bob_id);
   require_ok(freq.has_value());
   require_ok(freq.value().http_status == 202);
   require_ok(freq.value().state == FriendEdgeState::invite_sent);
 
+  // 8a. Legacy /v1/friends payload (no handle/root_pubkey_b64 -> nullopt)
   const auto friends = client.list_friends();
   require_ok(friends.has_value());
   require_ok(friends.value().size() == 1U);
   require_ok(friends.value()[0].peer_account_id == bob_id);
   require_ok(friends.value()[0].state == FriendEdgeState::friend_edge);
+  require_ok(!friends.value()[0].handle.has_value());
+  require_ok(!friends.value()[0].root_pubkey.has_value());
+  require_ok(!friends.value()[0].safety_number.has_value());
+
+  // 8b. Enriched /v1/friends payload: live server peer_handle + peer_root_pubkey_b64
+  //     (MUST ignore any spoofed server peer_safety_number; blocked edge has
+  //     peer_handle only without pubkey/safety_number!) plus fallback alias keys.
+  {
+    const auto bob_root_key = Ed25519SigningKey::generate().value();
+    const auto expected_bob_sn =
+        compute_safety_number(bob_id, bob_root_key.public_key()).value();
+    const auto blocked_id = AccountId::create(1003U).value();
+
+    // Live server canonical keys: peer_handle, peer_root_pubkey_b64, peer_safety_number
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.enriched_friends_response = true;
+      srv_state.enriched_friends_alias_keys = false;
+      srv_state.spoof_friend_safety_number = true;
+      srv_state.friend_root_pubkey = bob_root_key.public_key();
+      srv_state.friend_handle = "bob_friend";
+    }
+    const auto enriched = client.list_friends();
+    require_ok(enriched.has_value());
+    require_ok(enriched.value().size() == 2U);
+    require_ok(enriched.value()[0].peer_account_id == bob_id);
+    require_ok(enriched.value()[0].handle == std::optional<std::string>{"bob_friend"});
+    require_ok(enriched.value()[0].root_pubkey ==
+               std::optional<Ed25519PubKey>{bob_root_key.public_key()});
+    require_ok(enriched.value()[0].safety_number ==
+               std::optional<std::string>{expected_bob_sn});
+    // Blocked edge (state == 3): peer_handle present, pubkey/safety_number omitted
+    require_ok(enriched.value()[1].peer_account_id == blocked_id);
+    require_ok(enriched.value()[1].state == FriendEdgeState::blocked);
+    require_ok(enriched.value()[1].handle ==
+               std::optional<std::string>{"blocked_peer"});
+    require_ok(!enriched.value()[1].root_pubkey.has_value());
+    require_ok(!enriched.value()[1].safety_number.has_value());
+
+    // Fallback alias keys: handle + root_pubkey_b64
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.enriched_friends_alias_keys = true;
+    }
+    const auto alias_enriched = client.list_friends();
+    require_ok(alias_enriched.has_value());
+    require_ok(alias_enriched.value().size() == 2U);
+    require_ok(alias_enriched.value()[0].handle ==
+               std::optional<std::string>{"bob_friend"});
+    require_ok(alias_enriched.value()[0].safety_number ==
+               std::optional<std::string>{expected_bob_sn});
+
+    // Negative: conflicting peer_handle vs handle fails closed
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.mismatch_friend_handle_keys = true;
+    }
+    const auto mismatch_h = client.list_friends();
+    require_ok(!mismatch_h.has_value());
+    require_ok(mp_client_error_of(mismatch_h.error()) ==
+               MpClientError::http_response_schema);
+
+    // Negative: bad peer_handle with ANSI escape fails closed
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.mismatch_friend_handle_keys = false;
+      srv_state.bad_friend_handle = true;
+    }
+    const auto bad_h = client.list_friends();
+    require_ok(!bad_h.has_value());
+    require_ok(mp_client_error_of(bad_h.error()) ==
+               MpClientError::http_response_schema);
+
+    // Negative: weak all-zero Ed25519 peer_root_pubkey_b64 fails closed
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.bad_friend_handle = false;
+      srv_state.bad_friend_pubkey = true;
+    }
+    const auto bad_pk = client.list_friends();
+    require_ok(!bad_pk.has_value());
+
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.bad_friend_pubkey = false;
+      srv_state.enriched_friends_response = false;
+      srv_state.enriched_friends_alias_keys = false;
+      srv_state.spoof_friend_safety_number = false;
+    }
+  }
+
+  // 8c. Relay liveness probe (probe_relay: 200, 204, 503, custom base path, bad URLs)
+  {
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.relay_ping_status = 200;
+    }
+    const auto probe_200 = client.probe_relay(
+        "https://localhost", std::string_view{"127.0.0.1"}, server.port());
+    require_ok(probe_200.has_value());
+    require_ok(probe_200.value().ok);
+    require_ok(probe_200.value().http_status == 200);
+    require_ok(probe_200.value().url == "https://localhost/ping");
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      require_ok(srv_state.last_relay_ping_path == "/ping");
+    }
+
+    // Custom base path + 204 No Content
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.relay_ping_status = 204;
+    }
+    const auto probe_204 = client.probe_relay(
+        "https://localhost/relay/", std::string_view{"127.0.0.1"}, server.port());
+    require_ok(probe_204.has_value());
+    require_ok(probe_204.value().ok);
+    require_ok(probe_204.value().http_status == 204);
+    require_ok(probe_204.value().url == "https://localhost/relay/ping");
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      require_ok(srv_state.last_relay_ping_path == "/relay/ping");
+    }
+
+    // 503 Service Unavailable -> Result succeeds with ok == false and http_status ==
+    // 503
+    {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.relay_ping_status = 503;
+    }
+    const auto probe_503 = client.probe_relay(
+        "https://localhost", std::string_view{"127.0.0.1"}, server.port());
+    require_ok(probe_503.has_value());
+    require_ok(!probe_503.value().ok);
+    require_ok(probe_503.value().http_status == 503);
+
+    // Invalid relay URLs MUST be rejected locally before any network I/O!
+    for (const std::string_view bad_url : std::array<std::string_view, 11>{
+             "",
+             "http://localhost",
+             "https://",
+             "https://localhost/bad path",
+             "https://localhost\r\nEvil: 1",
+             "https://localhost?q=1",
+             "https://localhost#frag",
+             "https://user@localhost",
+             "https://localhost:99999",
+             "https://localhost/p\xc3\xa9ng",
+             "https://loc\x80lhost",
+         }) {
+      const auto bad_probe =
+          client.probe_relay(bad_url, std::string_view{"127.0.0.1"}, server.port());
+      require_ok(!bad_probe.has_value());
+      require_ok(mp_client_error_of(bad_probe.error()) ==
+                 MpClientError::invalid_config);
+    }
+    const auto bad_port =
+        client.probe_relay("https://localhost", std::string_view{"127.0.0.1"}, 0U);
+    require_ok(!bad_port.has_value());
+    require_ok(mp_client_error_of(bad_port.error()) == MpClientError::invalid_config);
+  }
+
+  // 8d. connect_social_ws() connects cleanly to GET /v1/ws
+  {
+    auto social_ws = client.connect_social_ws();
+    require_ok(social_ws.has_value());
+    require_ok(social_ws.value().is_open());
+    const auto hello_ev = social_ws.value().poll_event(3000);
+    require_ok(hello_ev.has_value() && hello_ev.value().has_value());
+    require_ok(social_ws.value().close(1000U).has_value());
+  }
 
   require_ok(client.block_account(bob_id).has_value());
   require_ok(client.remove_friend(bob_id).has_value());

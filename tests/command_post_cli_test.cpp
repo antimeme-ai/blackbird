@@ -3890,6 +3890,33 @@ int main(int argc, char **argv) {
           run_cli({"upgrade", "--check", "--base-url", "http://insecure.example"});
       check(up_bad_url.exit_code != 0,
             "upgrade --check must refuse insecure http:// base URL");
+
+      check(is_command_post_subcommand("doctor"),
+            "doctor must be registered as a command_post subcommand");
+      const auto doc_help = run_cli({"doctor", "--help"});
+      check(doc_help.exit_code == 0 &&
+                doc_help.err.find("blackbird doctor") != std::string::npos &&
+                doc_help.err.find("--offline") != std::string::npos,
+            "doctor --help must exit 0 with --offline usage");
+      const auto doc_bad = run_cli({"doctor", "--bogus-flag"});
+      check(doc_bad.exit_code == 2 &&
+                doc_bad.err.find("unknown option") != std::string::npos,
+            "doctor must reject unknown options");
+      const fs::path doc_absent_state = temp.path() / "doctor_absent_online_state";
+      const fs::path doc_absent_sock = temp.path() / "doctor_absent_party.sock";
+      const auto doc_json = run_cli({"doctor", "--offline", "--json", "--state-dir",
+                                     doc_absent_state.string(), "--party-socket",
+                                     doc_absent_sock.string()});
+      check(doc_json.exit_code == 0,
+            "doctor --offline --json must exit 0 when healthy");
+      check(!fs::exists(doc_absent_state),
+            "doctor --offline must never create absent online state dir");
+      const auto doc_val = parse_json(doc_json.out);
+      check(doc_val.has_value() &&
+                std::holds_alternative<Value::Object>(doc_val.value().value()) &&
+                doc_val.value().find("healthy") != nullptr &&
+                doc_val.value().find("checks") != nullptr,
+            "doctor --offline --json must emit valid report JSON");
     }
 
     std::cout << "PASS command_post_cli\n";

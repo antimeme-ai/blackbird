@@ -197,9 +197,12 @@ const std::array builtin_commands{
                 "Open/inspect Party Chat, manage peers, or message @all / @leader",
                 "Command Post"},
     ChatCommand{"/online",
-                "[status|health|whoami|resolve HANDLE|friends|friend add/remove/block|"
-                "party create/info/invite/join/leave/disband]",
-                "Manage multiplayer.tech account, friends, and online P2P parties",
+                "[status|health|whoami|resolve HANDLE|friends|friend add/accept/deny|"
+                "party create/info/invite/join/attach/detach/leave|watch]",
+                "Manage multiplayer.tech account, friends, presence & live P2P parties",
+                "Command Post"},
+    ChatCommand{"/doctor", "[--offline] [--no-update-check]",
+                "Run zero-secret local & online diagnostics (binary, auth, API, relay)",
                 "Command Post"}};
 
 std::shared_ptr<const std::vector<ChatCommand>>

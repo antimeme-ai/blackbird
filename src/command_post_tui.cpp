@@ -1,5 +1,6 @@
 #include "blackbird/command_post_tui.hpp"
 #include "blackbird/bridge_relay.hpp"
+#include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
@@ -2178,8 +2179,13 @@ constexpr std::string_view kOnlineHelpText =
     "  /online party info <party_id>                      Inspect party summary\n"
     "  /online party invite <party_id>                    Create party invite link\n"
     "  /online party join <party_id|mppi1_...>            Join party by ID or invite\n"
+    "  /online party attach <party_id>                    Attach live P2P party to "
+    "/party pane\n"
+    "  /online party detach                               Detach live P2P party\n"
     "  /online party leave <party_id>                     Leave party\n"
     "  /online party disband <party_id> [epoch]           Disband party\n"
+    "  /online watch [start|stop|status]                  Live friend presence & "
+    "notifications\n"
     "  /online web-approve <XXXX-XXXX>                    Approve web portal sign-in\n"
     "  /online help                                       Show this usage summary\n";
 
@@ -3137,9 +3143,18 @@ std::string handle_online(std::string_view args) {
     const std::size_t shown = std::min(order.size(), kMaxListRows);
     for (std::size_t i = 0; i < shown; ++i) {
       const auto &e = edges[order[i]];
-      out += "  account_id=" + e.peer_account_id.to_decimal() + " [" +
-             std::string{friend_edge_state_name(e.state)} +
-             "] updated_ms=" + std::to_string(e.updated_at_ms) + "\n";
+      out += "  ";
+      if (e.handle.has_value()) {
+        out += "@" + sanitize_inline(*e.handle, 32) +
+               " (account_id=" + e.peer_account_id.to_decimal() + ")";
+      } else {
+        out += "account_id=" + e.peer_account_id.to_decimal();
+      }
+      out += " [" + std::string{friend_edge_state_name(e.state)} + "]";
+      if (e.safety_number.has_value()) {
+        out += " safety=" + sanitize_inline(*e.safety_number, 64);
+      }
+      out += " updated_ms=" + std::to_string(e.updated_at_ms) + "\n";
     }
     if (order.size() > shown) {
       out += "  ... (" + std::to_string(order.size() - shown) + " more)\n";
@@ -4063,6 +4078,41 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   return std::string{kPartyUsage};
 }
 
+std::string handle_doctor(std::string_view args) {
+  DoctorConfig cfg{};
+#ifdef BLACKBIRD_VERSION_STRING
+  cfg.current_version_string = BLACKBIRD_VERSION_STRING;
+#endif
+  const OnlineEnvConfig env = load_online_env_config();
+  if (!env.fatal_error.empty())
+    return env.fatal_error;
+  cfg.mp_client_config = env.client_cfg;
+  if (env.state_dir.has_value())
+    cfg.online_state_dir = *env.state_dir;
+  if (cfg.mp_client_config.ca_bundle_path.has_value())
+    cfg.relay_ca_bundle_path = cfg.mp_client_config.ca_bundle_path;
+  if (const char *env_relay = std::getenv("BLACKBIRD_ONLINE_RELAY_URL");
+      env_relay != nullptr && env_relay[0] != '\0') {
+    cfg.relay_url = env_relay;
+  }
+
+  std::string_view rest = trim_view(args);
+  while (!rest.empty()) {
+    const auto [tok, tail] = split_first_token(rest);
+    if (tok == "--offline") {
+      cfg.offline = true;
+    } else if (tok == "--no-update-check") {
+      cfg.check_update = false;
+    } else if (tok == "help" || tok == "--help" || tok == "-h") {
+      return "Usage: /doctor [--offline] [--no-update-check]\n";
+    } else {
+      return "Usage: /doctor [--offline] [--no-update-check]\n";
+    }
+    rest = tail;
+  }
+  return format_doctor_report_human(run_blackbird_doctor(cfg));
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -4092,6 +4142,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_party(args, ctx));
     if (cmd == "/online")
       return bound_output(handle_online(args));
+    if (cmd == "/doctor")
+      return bound_output(handle_doctor(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

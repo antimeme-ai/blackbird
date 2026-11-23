@@ -209,6 +209,14 @@ struct HealthResponse {
   bool operator==(const HealthResponse &) const = default;
 };
 
+struct RelayProbeResponse {
+  bool ok = false;
+  int http_status = 0;
+  std::uint64_t rtt_ms = 0U;
+  std::string url;
+  bool operator==(const RelayProbeResponse &) const = default;
+};
+
 struct RegisterAccountRequest {
   std::string invite_secret;
   std::string handle;
@@ -366,6 +374,8 @@ struct WebSessionApproveResponse {
   bool operator==(const WebSessionApproveResponse &) const = default;
 };
 
+using PresenceStatus = PresenceVisibility;
+
 enum class FriendEdgeState : std::uint8_t {
   friend_edge = 0,
   invite_sent = 1,
@@ -377,6 +387,9 @@ struct FriendEdge {
   AccountId peer_account_id;
   FriendEdgeState state = FriendEdgeState::friend_edge;
   std::uint64_t updated_at_ms = 0U;
+  std::optional<std::string> handle = std::nullopt;
+  std::optional<Ed25519PubKey> root_pubkey = std::nullopt;
+  std::optional<std::string> safety_number = std::nullopt;
   bool operator==(const FriendEdge &) const = default;
 };
 
@@ -539,6 +552,12 @@ public:
   // Unauthenticated liveness & clock sync
   Result<HealthResponse> health();
 
+  // Unauthenticated TLS 1.3 relay liveness probe (GET <path>/ping)
+  Result<RelayProbeResponse>
+  probe_relay(std::string_view relay_url,
+              std::optional<std::string_view> connect_host_override = std::nullopt,
+              std::optional<std::uint16_t> port_override = std::nullopt) const;
+
   // Account onboarding (reg.<hex16> signed by root_signing_key)
   Result<RegisterAccountResponse>
   register_account(const Ed25519SigningKey &root_signing_key,
@@ -590,6 +609,7 @@ public:
 
   // Live RFC 6455 WebSockets (automatically retry once on clock_skew)
   Result<MpControlSocket> connect_account_socket();
+  Result<MpControlSocket> connect_social_ws();
   Result<MpControlSocket> connect_party_socket(PartyId party_id);
 
 private:
