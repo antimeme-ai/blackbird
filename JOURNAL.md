@@ -13721,3 +13721,13 @@ Addressed six operator field notes from live TUI use:
   `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, `flock`-serialized single-buffer `O_APPEND`
   writes + `fsync`, crash-resilient trailing-fragment invalidation, monotonic `seq`
   cursors, recipient filtering, and multi-thread / `fork()` multi-process verification.
+
+## 2026-11-23 — Rock 1.2: Bounded `WorktreeLeaseManager`
+
+- Added `include/blackbird/worktree_lease.hpp`, `src/worktree_lease.cpp`, and
+  `tests/worktree_lease_test.cpp` (registered as `worktree_lease` in `CMakeLists.txt`).
+- Direct argv-only `git` invocation via `detail::Child` (stripped `GIT_*`, no shell),
+  pre-create containment checks against `--git-dir`/`--git-common-dir`, atomic `O_CLOEXEC`
+  lease persistence with rollback, `base_sha` tracking, dirty-worktree refusal on
+  non-forced release, and safe `reclaim_stale()` preserving dirty/corrupt leases in
+  `orphaned_dirty`.
