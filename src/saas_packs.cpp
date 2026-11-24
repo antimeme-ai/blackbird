@@ -484,39 +484,60 @@ int saas_lua_base64url_decode(lua_State *L) {
 }
 
 int saas_lua_json_encode(lua_State *L) {
-  std::size_t nodes = 0;
-  auto val = read_value_from_lua(L, 1, LuaReadBudget{0U, &nodes});
-  if (!val.has_value())
-    return luaL_error(L, "json.encode: unsupported value");
-  auto dumped = dump_json(val.value());
-  if (!dumped.has_value())
-    return luaL_error(L, "json.encode: serialization failed");
-  lua_pushlstring(L, dumped.value().data(), dumped.value().size());
+  const char *err_msg = nullptr;
+  {
+    std::size_t nodes = 0;
+    auto val = read_value_from_lua(L, 1, LuaReadBudget{0U, &nodes});
+    if (!val.has_value()) {
+      err_msg = "json.encode: unsupported value";
+    } else {
+      auto dumped = dump_json(val.value());
+      if (!dumped.has_value()) {
+        err_msg = "json.encode: serialization failed";
+      } else {
+        lua_pushlstring(L, dumped.value().data(), dumped.value().size());
+      }
+    }
+  }
+  if (err_msg != nullptr)
+    return luaL_error(L, "%s", err_msg);
   return 1;
 }
 
 int saas_lua_json_decode(lua_State *L) {
-  std::size_t len = 0;
-  const char *s = luaL_checklstring(L, 1, &len);
-  auto parsed = parse_json(std::string_view{s, len});
-  if (!parsed.has_value())
-    return luaL_error(L, "json.decode: invalid JSON");
-  push_value_to_lua(L, parsed.value());
+  const char *err_msg = nullptr;
+  {
+    std::size_t len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    auto parsed = parse_json(std::string_view{s, len});
+    if (!parsed.has_value()) {
+      err_msg = "json.decode: invalid JSON";
+    } else {
+      push_value_to_lua(L, parsed.value());
+    }
+  }
+  if (err_msg != nullptr)
+    return luaL_error(L, "%s", err_msg);
   return 1;
 }
 
-int saas_lua_http_request(lua_State *L) {
+int saas_lua_http_request_impl(lua_State *L, const char *&err_msg) {
   auto *ctx = *static_cast<LuaSandboxContext **>(lua_getextraspace(L));
   if (ctx->blocked_by_host_pin || ctx->blocked_by_brakes ||
       ctx->instruction_budget_exceeded) {
     lua_sethook(L, saas_lua_instruction_hook, LUA_MASKCOUNT, 1);
-    return luaL_error(L, "sandbox request aborted");
+    err_msg = "sandbox request aborted";
+    return -1;
   }
-  luaL_checktype(L, 1, LUA_TTABLE);
+  if (lua_type(L, 1) != LUA_TTABLE) {
+    err_msg = "http.request expects a table argument";
+    return -1;
+  }
 
   if (ctx->http_requests_made >= kSaasPackMaxHttpRequestsPerCall) {
     ctx->error_detail = "pack exceeded per-call HTTP request limit";
-    return luaL_error(L, "per-call HTTP request limit exceeded");
+    err_msg = "per-call HTTP request limit exceeded";
+    return -1;
   }
 
   // Reject arbitrary URL overrides immediately (SSRF / host-pin enforcement).
@@ -527,7 +548,8 @@ int saas_lua_http_request(lua_State *L) {
     ctx->error_detail =
         "SSRF host-pin violation: Lua packs must use pinned service + relative path, "
         "never arbitrary url";
-    return luaL_error(L, "host-pin violation: arbitrary url rejected");
+    err_msg = "host-pin violation: arbitrary url rejected";
+    return -1;
   }
   lua_pop(L, 1);
 
@@ -538,7 +560,8 @@ int saas_lua_http_request(lua_State *L) {
       lua_pop(L, 1);
       ctx->blocked_by_host_pin = true;
       ctx->error_detail = "invalid service field type";
-      return luaL_error(L, "invalid service field");
+      err_msg = "invalid service field";
+      return -1;
     }
     std::size_t slen = 0;
     const char *sptr = lua_tolstring(L, -1, &slen);
@@ -548,7 +571,8 @@ int saas_lua_http_request(lua_State *L) {
       ctx->blocked_by_host_pin = true;
       ctx->error_detail = "SSRF/credential-isolation violation: pack cannot "
                           "impersonate another service";
-      return luaL_error(L, "host-pin violation: service mismatch");
+      err_msg = "host-pin violation: service mismatch";
+      return -1;
     }
   }
   lua_pop(L, 1);
@@ -561,7 +585,8 @@ int saas_lua_http_request(lua_State *L) {
       lua_pop(L, 1);
       ctx->blocked_by_host_pin = true;
       ctx->error_detail = "host-pin violation: host must be a string";
-      return luaL_error(L, "host-pin violation: invalid host");
+      err_msg = "host-pin violation: invalid host";
+      return -1;
     }
     std::size_t hlen = 0;
     const char *hptr = lua_tolstring(L, -1, &hlen);
@@ -575,7 +600,8 @@ int saas_lua_http_request(lua_State *L) {
     lua_pop(L, 1);
     ctx->blocked_by_host_pin = true;
     ctx->error_detail = "host-pin violation: relative path string required";
-    return luaL_error(L, "host-pin violation: path required");
+    err_msg = "host-pin violation: path required";
+    return -1;
   }
   std::size_t plen = 0;
   const char *pptr = lua_tolstring(L, -1, &plen);
@@ -588,7 +614,8 @@ int saas_lua_http_request(lua_State *L) {
   if (!lua_isnil(L, -1)) {
     if (lua_type(L, -1) != LUA_TTABLE) {
       lua_pop(L, 1);
-      return luaL_error(L, "query must be a table");
+      err_msg = "query must be a table";
+      return -1;
     }
     std::vector<std::pair<std::string, std::string>> q_pairs;
     lua_pushnil(L);
@@ -636,7 +663,8 @@ int saas_lua_http_request(lua_State *L) {
         "SSRF host-pin violation: rejected host/path '" +
         (requested_host.empty() ? std::string{"<default>"} : requested_host) + "' '" +
         rel_path + "'";
-    return luaL_error(L, "host-pin violation");
+    err_msg = "host-pin violation";
+    return -1;
   }
 
   // Validate HTTP method.
@@ -650,7 +678,8 @@ int saas_lua_http_request(lua_State *L) {
   lua_pop(L, 1);
   if (method != "GET" && method != "POST" && method != "PUT" && method != "PATCH" &&
       method != "DELETE") {
-    return luaL_error(L, "unsupported HTTP method");
+    err_msg = "unsupported HTTP method";
+    return -1;
   }
 
   // Read safe Lua headers, strictly blocking Authorization/Cookie/Host.
@@ -668,7 +697,8 @@ int saas_lua_http_request(lua_State *L) {
   if (!lua_isnil(L, -1)) {
     if (lua_type(L, -1) != LUA_TTABLE) {
       lua_pop(L, 1);
-      return luaL_error(L, "headers must be a table");
+      err_msg = "headers must be a table";
+      return -1;
     }
     lua_pushnil(L);
     while (lua_next(L, -2) != 0) {
@@ -686,7 +716,8 @@ int saas_lua_http_request(lua_State *L) {
           ctx->error_detail =
               "security violation: Lua pack attempted to set forbidden header '" + lk +
               "'";
-          return luaL_error(L, "forbidden header rejected");
+          err_msg = "forbidden header rejected";
+          return -1;
         }
         headers.emplace_back(std::string{ksv}, std::string{vsv});
       }
@@ -707,11 +738,15 @@ int saas_lua_http_request(lua_State *L) {
     std::size_t nodes = 0;
     auto val = read_value_from_lua(L, -1, LuaReadBudget{0U, &nodes});
     lua_pop(L, 1);
-    if (!val.has_value())
-      return luaL_error(L, "invalid json body");
+    if (!val.has_value()) {
+      err_msg = "invalid json body";
+      return -1;
+    }
     auto dumped = dump_json(val.value());
-    if (!dumped.has_value())
-      return luaL_error(L, "json serialization failed");
+    if (!dumped.has_value()) {
+      err_msg = "json serialization failed";
+      return -1;
+    }
     body = std::move(dumped.value());
     if (!has_hdr("content-type"))
       headers.emplace_back("Content-Type", "application/json");
@@ -760,9 +795,6 @@ int saas_lua_http_request(lua_State *L) {
     effective_effect = SaasEffectClass::write;
 
   // BrakesGate pre-flight check!
-  // If this invocation already ingested an HTTP response and is now attempting
-  // a mutating/sending request, latch taint immediately before evaluation so a
-  // pack cannot read untrusted data and then write/send in the same call.
   if (ctx->brakes_gate != nullptr) {
     if (effective_effect != SaasEffectClass::read &&
         ctx->pending_http_taint.has_value()) {
@@ -779,7 +811,8 @@ int saas_lua_http_request(lua_State *L) {
       ctx->blocked_by_brakes = true;
       ctx->brakes_decision = dec;
       ctx->error_detail = dec.reason;
-      return luaL_error(L, "blocked by brakes policy");
+      err_msg = "blocked by brakes policy";
+      return -1;
     }
   }
 
@@ -794,7 +827,8 @@ int saas_lua_http_request(lua_State *L) {
 
   if (ctx->http_transport == nullptr || !(*ctx->http_transport)) {
     ctx->error_detail = "PinnedHttpFn transport not configured";
-    return luaL_error(L, "HTTP transport unavailable");
+    err_msg = "HTTP transport unavailable";
+    return -1;
   }
 
   PinnedHttpRequest pinned_req;
@@ -814,7 +848,8 @@ int saas_lua_http_request(lua_State *L) {
   auto resp = (*ctx->http_transport)(pinned_req);
   if (!resp.has_value()) {
     ctx->error_detail = "HTTP transport failure";
-    return luaL_error(L, "HTTP request failed");
+    err_msg = "HTTP request failed";
+    return -1;
   }
 
   // Record raw body & latch Brakes taint immediately upon external HTTP ingest.
@@ -867,6 +902,14 @@ int saas_lua_http_request(lua_State *L) {
     }
   }
   return 1;
+}
+
+int saas_lua_http_request(lua_State *L) {
+  const char *err_msg = nullptr;
+  const int ret = saas_lua_http_request_impl(L, err_msg);
+  if (ret < 0)
+    return luaL_error(L, "%s", err_msg != nullptr ? err_msg : "http.request failed");
+  return ret;
 }
 
 } // extern "C"
