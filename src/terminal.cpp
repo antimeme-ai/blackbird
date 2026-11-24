@@ -5193,13 +5193,19 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (graphics_update || mouse_change || alt_scroll_change || osc52_update ||
               notify_update || flightdeck_cleanup) {
             layout.stage(4);
+            const std::string graphics_load = (graphics_update && placement[2] &&
+                                               placement[3] && !pending_image_loaded)
+                                                  ? blackbird_graphics_load()
+                                                  : std::string{};
             constexpr auto digits = std::numeric_limits<std::size_t>::digits10 + 1;
             const auto image_bound =
                 raw_capture_ && raw_enabled()
-                    ? raw_ui_add(packet.size(),
-                                 4096 + 320 + 4 * digits + mouse_on.size() +
-                                     kTerminalAltScrollOn.size() +
-                                     pending_osc52.size() + pending_notify.size())
+                    ? raw_ui_add(
+                          packet.size(),
+                          raw_ui_add(std::max<std::size_t>(4096U, graphics_load.size()),
+                                     320 + 4 * digits + mouse_on.size() +
+                                         kTerminalAltScrollOn.size() +
+                                         pending_osc52.size() + pending_notify.size()))
                     : 0;
             RawUiFrame image{raw_capture_, image_bound};
             image.run([&] {
@@ -5235,7 +5241,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 packet += blackbird_graphics_erase();
                 if (placement[2] && placement[3]) {
                   if (!pending_image_loaded) {
-                    packet += blackbird_graphics_load();
+                    packet += graphics_load;
                     pending_image_loaded = true;
                   }
                   packet += blackbird_graphics_place(placement[0], placement[1],
