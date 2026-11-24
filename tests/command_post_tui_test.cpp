@@ -2360,16 +2360,36 @@ srv.serve_forever()
     return *res;
   };
 
-  // /online status (registered, valid CWT, root key present)
+  // /online status (default hides crypto/IDs; --debug shows full diagnostics)
   const auto status_res = handle_command_post_slash("/online status", ctx);
   const std::string &status_out = check_safe(status_res, "/online status");
-  require(status_out.find("pilot_one") != std::string::npos &&
-              status_out.find("1001") != std::string::npos &&
-              status_out.find("2001") != std::string::npos &&
+  require(status_out.find("@pilot_one") != std::string::npos &&
               status_out.find("api.multiplayer.tech") != std::string::npos &&
-              status_out.find("Root key:   yes") != std::string::npos &&
-              status_out.find("Local CWT:  valid") != std::string::npos,
-          "/online status renders handle, ids, authority, root key, and valid CWT");
+              status_out.find("Session:    active") != std::string::npos &&
+              status_out.find("Account ID") == std::string::npos &&
+              status_out.find("Device ID") == std::string::npos &&
+              status_out.find("Local CWT") == std::string::npos &&
+              status_out.find("safety_number") == std::string::npos &&
+              status_out.find("relay_policy") == std::string::npos,
+          "/online status hides raw crypto/IDs by default");
+
+  const auto status_dbg_res = handle_command_post_slash("/online status --debug", ctx);
+  const std::string &status_dbg_out =
+      check_safe(status_dbg_res, "/online status --debug");
+  require(status_dbg_out.find("pilot_one") != std::string::npos &&
+              status_dbg_out.find("1001") != std::string::npos &&
+              status_dbg_out.find("2001") != std::string::npos &&
+              status_dbg_out.find("api.multiplayer.tech") != std::string::npos &&
+              status_dbg_out.find("Root key:   yes") != std::string::npos &&
+              status_dbg_out.find("Local CWT:  valid") != std::string::npos,
+          "/online status --debug renders handle, ids, authority, root key, and CWT");
+
+  const auto verify_res = handle_command_post_slash("/online verify @wingman", ctx);
+  const std::string &verify_out = check_safe(verify_res, "/online verify @wingman");
+  require(verify_out.find("Verify @wingman:") != std::string::npos &&
+              verify_out.find("Safety number:") != std::string::npos &&
+              verify_out.find("Root key:      sha256:") != std::string::npos,
+          "/online verify @user renders safety number and root fingerprint");
 
   // /online health & /party online health alias
   const auto health_res = handle_command_post_slash("/online health", ctx);
@@ -2638,8 +2658,9 @@ srv.serve_forever()
     dev_only.root_seed = std::nullopt;
     (void)unwrap(mp::MpIdentityStore::save(dev_only_dir, dev_only));
     ScopedEnvVar set_dev_dir{"BLACKBIRD_ONLINE_DIR", dev_only_dir.string()};
-    const auto dev_status = handle_command_post_slash("/online status", ctx);
-    const std::string &dev_out = check_safe(dev_status, "/online status dev-only");
+    const auto dev_status = handle_command_post_slash("/online status --debug", ctx);
+    const std::string &dev_out =
+        check_safe(dev_status, "/online status --debug dev-only");
     require(dev_out.find("Root key:   no") != std::string::npos &&
                 dev_out.find("root key offline") != std::string::npos,
             "device-only identity reports Root key: no cleanly");
@@ -2652,8 +2673,9 @@ srv.serve_forever()
         mp::DeviceCwtMintRequest{dev_key.public_key(), now_s - 7200, now_s - 3600}));
     (void)unwrap(mp::MpIdentityStore::save(exp_dir, exp_state));
     ScopedEnvVar set_exp_dir{"BLACKBIRD_ONLINE_DIR", exp_dir.string()};
-    const auto exp_status = handle_command_post_slash("/online status", ctx);
-    const std::string &exp_out = check_safe(exp_status, "/online status expired cwt");
+    const auto exp_status = handle_command_post_slash("/online status --debug", ctx);
+    const std::string &exp_out =
+        check_safe(exp_status, "/online status --debug expired");
     require(exp_out.find("Local CWT:  expired") != std::string::npos,
             "expired local CWT reports expired cleanly");
   }
@@ -2668,7 +2690,7 @@ srv.serve_forever()
                 !std::filesystem::exists(xdg_base),
             "XDG_CONFIG_HOME fallback creates zero directories when unregistered");
     (void)unwrap(mp::MpIdentityStore::save(xdg_online, id_state));
-    const auto xdg_reg = handle_command_post_slash("/online status", ctx);
+    const auto xdg_reg = handle_command_post_slash("/online status --debug", ctx);
     const std::string &xdg_out = check_safe(xdg_reg, "XDG_CONFIG_HOME status");
     require(xdg_out.find("pilot_one") != std::string::npos &&
                 xdg_out.find("Local CWT:  valid") != std::string::npos,

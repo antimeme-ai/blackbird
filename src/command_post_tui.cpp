@@ -2169,8 +2169,23 @@ constexpr std::size_t kMaxOnlinePathBytes = 4096U;
 constexpr std::size_t kMaxOnlineHostBytes = 255U;
 
 constexpr std::string_view kOnlineHelpText =
+    "Multiplayer parties & friends (Xbox Live quick commands):\n"
+    "  /login                                             Sign in via browser & go "
+    "online\n"
+    "  /invite [@handle]                                  Start a party & invite a "
+    "friend\n"
+    "  /join [@handle|CODE|url]                           Join a friend, code, or "
+    "latest invite\n"
+    "  /leave                                             Leave the current party\n"
+    "  /friends (or /who)                                 Live friends & pending "
+    "invites\n"
+    "  /add @handle                                       Add or accept a friend\n"
+    "\n"
     "Online control plane (/online or /party online):\n"
-    "  /online [status]                                   Local identity & CWT status\n"
+    "  /online [status] [--debug]                         Account status (--debug for "
+    "crypto)\n"
+    "  /online verify <@handle>                           Verify a friend's safety "
+    "number\n"
     "  /online health                                     Live control-plane health\n"
     "  /online whoami                                     Account, devices & active "
     "parties\n"
@@ -2187,18 +2202,15 @@ constexpr std::string_view kOnlineHelpText =
     "  /online friend remove <handle|account_id>          Remove friend\n"
     "  /online friend block <handle|account_id>           Block account\n"
     "  /online party create [private|friends] [force|allow|no]\n"
-    "                                                     Create, attach & print "
-    "invite\n"
-    "  /online party join <mppi1_...|party_id>            Join & auto-attach party\n"
-    "  /online party attach <party_id|mppi1_...>          Attach live P2P party to "
-    "/party pane\n"
-    "  /online party invite [party_id]                    Create party invite link\n"
-    "  /online party info [party_id]                      Inspect party summary\n"
-    "  /online party detach                               Detach live P2P party\n"
-    "  /online party leave [party_id]                     Leave party\n"
-    "  /online party disband [party_id] [epoch]           Disband party\n"
-    "  /online watch [start|stop|status]                  Live friend presence & "
-    "notifications\n"
+    "                                                     Create & enter a live "
+    "party\n"
+    "  /online party join <@handle|CODE|mppi1_...>        Join a live party\n"
+    "  /online party invite [@handle]                     Invite a friend or get room "
+    "code\n"
+    "  /online party info                                 Inspect current party\n"
+    "  /online party leave                                Leave party\n"
+    "  /online watch [start|stop|status]                  Live friend presence "
+    "status\n"
     "  /online web-approve <XXXX-XXXX>                    Approve web portal sign-in\n"
     "  /online help                                       Show this usage summary\n";
 
@@ -2504,7 +2516,7 @@ parse_online_party_invite_link(std::string_view raw) {
   return ParsedOnlineInviteLink{pid.value(), std::string{raw}};
 }
 
-std::string handle_online_status(const OnlineEnvConfig &env) {
+std::string handle_online_status(const OnlineEnvConfig &env, bool debug) {
   if (!env.state_dir.has_value())
     return env.state_dir_error;
   auto store_res = mp::MpIdentityStore::open_existing(*env.state_dir);
@@ -2522,7 +2534,12 @@ std::string handle_online_status(const OnlineEnvConfig &env) {
           ? env.client_cfg.authority
           : (!st.authority.empty() ? st.authority : env.client_cfg.authority);
 
+  const std::int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
   std::string cwt_summary;
+  bool session_valid = false;
+  bool session_expired = false;
   if (st.device_cwt.empty()) {
     cwt_summary = "absent";
   } else if (st.root_seed.has_value()) {
@@ -2531,10 +2548,6 @@ std::string handle_online_status(const OnlineEnvConfig &env) {
     if (!root_key.has_value() || !dev_key.has_value()) {
       cwt_summary = "invalid (key derivation failed)";
     } else {
-      const std::int64_t now_s =
-          std::chrono::duration_cast<std::chrono::seconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
       const auto ver = mp::verify_device_cwt(mp::DeviceCwtVerifyRequest{
           st.device_cwt,
           root_key.value().public_key(),
@@ -2542,21 +2555,49 @@ std::string handle_online_status(const OnlineEnvConfig &env) {
           now_s,
       });
       if (ver.has_value()) {
+        session_valid = true;
         const std::int64_t rem = ver.value().exp - now_s;
         cwt_summary = "valid (exp=" + std::to_string(ver.value().exp) + ", " +
                       format_duration_seconds(rem) + " left)";
       } else if (mp::mp_error_of(ver.error()) == mp::MpError::cwt_expired) {
+        session_expired = true;
         cwt_summary = "expired";
       } else {
         cwt_summary = "invalid (" + format_mp_error_detail(ver.error()) + ")";
       }
     }
   } else {
+    const auto exp = mp::device_cwt_expiry_unix_seconds(st.device_cwt);
+    if (exp.has_value() && exp.value() > now_s) {
+      session_valid = true;
+    } else if (exp.has_value()) {
+      session_expired = true;
+    }
     cwt_summary = "present (" + std::to_string(st.device_cwt.size()) +
                   " bytes; root key offline)";
   }
 
-  std::string out = "Online status:\n";
+  if (!debug) {
+    std::string out = "Online status:\n";
+    out += "  Signed in:  " +
+           (st.handle.empty() ? std::string{"(not signed in — run /login)"}
+                              : ("@" + sanitize_inline(st.handle, 64))) +
+           "\n";
+    out += "  Server:     " + sanitize_inline(authority, 128) + "\n";
+    out += "  Session:    ";
+    if (session_valid) {
+      out += "active\n";
+    } else if (session_expired) {
+      out += "expired (run /login to refresh)\n";
+    } else {
+      out += "inactive (run /login)\n";
+    }
+    out += "  Tip:        /invite [@handle] · /join · /friends · /online status "
+           "--debug\n";
+    return out;
+  }
+
+  std::string out = "Online status (debug):\n";
   out += "  Handle:     " +
          (st.handle.empty() ? std::string{"(unset)"} : sanitize_inline(st.handle, 64)) +
          "\n";
@@ -2982,9 +3023,42 @@ std::string handle_online(std::string_view args) {
     return env.fatal_error;
 
   if (cmd == "status") {
-    if (!rest.empty())
-      return "Usage: /online [status]\n";
-    return handle_online_status(env);
+    if (rest.empty())
+      return handle_online_status(env, /*debug=*/false);
+    if (rest == "--debug")
+      return handle_online_status(env, /*debug=*/true);
+    return "Usage: /online [status] [--debug]\n";
+  }
+
+  if (cmd == "verify") {
+    const auto [raw_tok, extra] = split_first_token(rest);
+    if (raw_tok.empty() || !extra.empty())
+      return "Usage: /online verify <@handle>\n";
+    std::string_view handle_tok = raw_tok;
+    while (!handle_tok.empty() && handle_tok.front() == '@')
+      handle_tok.remove_prefix(1U);
+    const auto valid_handle = mp::AccountHandle::parse(handle_tok);
+    if (!valid_handle.has_value()) {
+      return "Invalid handle '" + sanitize_inline(raw_tok, 64) +
+             "': " + format_mp_error_detail(valid_handle.error()) + "\n";
+    }
+    auto opened = open_authenticated_online_client(env);
+    if (!opened.client.has_value())
+      return opened.error_output;
+    const auto resolved = opened.client->resolve_handle(handle_tok);
+    if (!resolved.has_value()) {
+      return "Online verify failed (@" + sanitize_inline(handle_tok, 64) +
+             "): " + format_mp_error_detail(resolved.error()) + "\n";
+    }
+    const mp::ResolvedAccount &acc = resolved.value();
+    std::string out = "Verify @" + sanitize_inline(acc.handle, 64) + ":\n";
+    if (const auto sn = mp::compute_safety_number(acc.account_id, acc.root_pubkey);
+        sn.has_value()) {
+      out += "  Safety number: " + sn.value() + "\n";
+    }
+    out +=
+        "  Root key:      sha256:" + format_pubkey_sha256_hex(acc.root_pubkey) + "\n";
+    return out;
   }
 
   if (cmd == "health") {

@@ -11891,6 +11891,525 @@ int run_connect_alias_cli(std::span<char *> args, CliIo io) {
   return run_integrations_connect(rest, io);
 }
 
+// ============================================================================
+// 13. Top-level Xbox Live multiplayer commands (login/invite/join/friends/add)
+// ============================================================================
+
+std::string strip_leading_at_cli(std::string_view raw) {
+  while (!raw.empty() && raw.front() == '@')
+    raw.remove_prefix(1U);
+  return std::string{raw};
+}
+
+std::string default_cli_device_label() {
+  std::array<char, 128> host{};
+  if (::gethostname(host.data(), host.size() - 1U) == 0 && host[0] != '\0') {
+    host.back() = '\0';
+    std::string label{host.data()};
+    if (mp::valid_device_label(label))
+      return label;
+  }
+  return "Blackbird";
+}
+
+bool try_open_browser_cli(std::string_view url) noexcept {
+  if (!url.starts_with("https://") || url.size() > 512U)
+    return false;
+  for (const char ch : url) {
+    const auto u = static_cast<unsigned char>(ch);
+    if (u <= 0x20U || u >= 0x7fU)
+      return false;
+  }
+  if (const char *nb = std::getenv("BLACKBIRD_NO_BROWSER");
+      nb != nullptr && std::string_view{nb} == "1") {
+    return false;
+  }
+#if !defined(__APPLE__)
+  if (std::getenv("SSH_CONNECTION") != nullptr && std::getenv("DISPLAY") == nullptr &&
+      std::getenv("WAYLAND_DISPLAY") == nullptr) {
+    return false;
+  }
+#endif
+  const std::string url_str{url};
+  const pid_t pid = ::fork();
+  if (pid < 0)
+    return false;
+  if (pid == 0) {
+    const int devnull = ::open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+      (void)::dup2(devnull, STDIN_FILENO);
+      (void)::dup2(devnull, STDOUT_FILENO);
+      (void)::dup2(devnull, STDERR_FILENO);
+      if (devnull > STDERR_FILENO)
+        (void)::close(devnull);
+    }
+#if defined(__APPLE__)
+    ::execlp("open", "open", url_str.c_str(), static_cast<char *>(nullptr));
+#else
+    ::execlp("xdg-open", "xdg-open", url_str.c_str(), static_cast<char *>(nullptr));
+#endif
+    ::_exit(127);
+  }
+  return true;
+}
+
+int run_login_cli(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::string device_label;
+  bool no_browser = false;
+  bool json_out = false;
+  std::int64_t timeout_sec = 120;
+
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird login [--label NAME] [--no-browser] "
+                "[--timeout-sec N] [--state-dir DIR] [--authority HOST] "
+                "[--connect-host HOST] [--port N] [--ca-bundle FILE] [--json]\n";
+      return 0;
+    }
+    if (arg == "--no-browser") {
+      no_browser = true;
+    } else if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--label") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_label_arg(*v))
+        return fail_usage(io, "login: invalid --label");
+      device_label = std::move(*v);
+    } else if (arg == "--timeout-sec") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      auto parsed = parse_i64(*v);
+      if (!parsed.has_value() || *parsed < 1 || *parsed > 600)
+        return fail_usage(io, "login: --timeout-sec must be between 1 and 600");
+      timeout_sec = *parsed;
+    } else {
+      const int common =
+          parse_online_common_flag(args, i, opts, /*allow_state_dir=*/true, io);
+      if (common == 1)
+        continue;
+      if (common != 0)
+        return common;
+      return fail_usage(io, "login: unknown option: " + std::string{arg});
+    }
+  }
+
+  const auto state_dir = resolve_online_state_dir(opts, io);
+  if (!state_dir.has_value())
+    return 2;
+  const auto cfg = resolve_online_client_config(opts, mp::kDefaultMpAuthority, io);
+  if (!cfg.has_value())
+    return 2;
+
+  auto store = mp::MpIdentityStore::open_or_init_device(*state_dir, cfg->authority);
+  if (!store.has_value())
+    return fail_mp_error(io, "login", store.error());
+  const auto dev_key = store.value().device_signing_key();
+  if (!dev_key.has_value())
+    return fail_mp_error(io, "login", dev_key.error());
+
+  mp::MpControlClient client{*cfg};
+  const auto started = client.auth_session_start(mp::AuthSessionStartRequest{
+      dev_key.value().public_key(),
+      device_label.empty() ? default_cli_device_label() : device_label,
+      "blackbird",
+  });
+  if (!started.has_value())
+    return fail_mp_error(io, "login", started.error());
+
+  const auto &flow = started.value();
+  const std::string safe_url = party_chat_sanitize(flow.verify_url, 256);
+  const std::string safe_code = party_chat_sanitize(flow.user_code, 32);
+  if (!no_browser)
+    (void)try_open_browser_cli(flow.verify_url);
+  if (!json_out) {
+    io.err << "Sign in at: " << safe_url << "\nCode:       " << safe_code
+           << "\nWaiting for browser approval...\n"
+           << std::flush;
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{timeout_sec};
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto polled = client.auth_session_poll(
+        mp::AuthSessionPollRequest{flow.flow_id, flow.poll_token});
+    if (!polled.has_value())
+      return fail_mp_error(io, "login", polled.error());
+    if (polled.value().approved) {
+      const auto &ap = polled.value();
+      if (!ap.account_id.has_value() || !ap.device_id.has_value() ||
+          !ap.handle.has_value() || ap.device_cwt.empty()) {
+        return fail_message(io, "login: incomplete approval payload from server");
+      }
+      const auto inst = store.value().install_cwt(mp::InstallDeviceCwtRequest{
+          *ap.account_id,
+          *ap.device_id,
+          *ap.handle,
+          ap.device_cwt,
+          cfg->authority,
+          ap.root_pubkey,
+          std::nullopt,
+      });
+      if (!inst.has_value())
+        return fail_mp_error(io, "login", inst.error());
+
+      const std::string clean_handle =
+          party_chat_sanitize(strip_leading_at_cli(*ap.handle), 64);
+      if (json_out) {
+        return emit_json(io, Value::object({
+                                 {"signed_in", Value{true}},
+                                 {"handle", Value{clean_handle}},
+                                 {"authority", Value{cfg->authority}},
+                             }));
+      }
+      io.out << "● Signed in as @" << clean_handle << "\n";
+      return 0;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+  }
+  return fail_message(io, "login: timed out waiting for browser approval");
+}
+
+int run_invite_cli(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::optional<std::string> target_handle;
+  std::optional<std::string> room_name;
+  bool json_out = false;
+
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird invite [@handle] [--name NAME] [--state-dir DIR] "
+                "[--authority HOST] [--connect-host HOST] [--port N] "
+                "[--ca-bundle FILE] [--json]\n";
+      return 0;
+    }
+    if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--name") {
+      auto v = take_flag_value(args, i, arg, io);
+      if (!v.has_value())
+        return 2;
+      if (!valid_online_label_arg(*v))
+        return fail_usage(io, "invite: invalid --name");
+      room_name = std::move(*v);
+    } else {
+      const int common =
+          parse_online_common_flag(args, i, opts, /*allow_state_dir=*/true, io);
+      if (common == 1)
+        continue;
+      if (common != 0)
+        return common;
+      if (!arg.starts_with('-') && !target_handle.has_value()) {
+        const std::string clean = strip_leading_at_cli(arg);
+        const auto valid = mp::AccountHandle::parse(clean);
+        if (!valid.has_value())
+          return fail_usage(io, "invite: invalid @handle");
+        target_handle = std::string{valid.value().display()};
+      } else {
+        return fail_usage(io, "invite: unknown option: " + std::string{arg});
+      }
+    }
+  }
+
+  auto opened = open_online_context(opts, "invite", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  mp::RoomInviteRequest req{};
+  req.handle = target_handle;
+  req.name = room_name;
+  const auto res = opened.ctx->client.room_invite(req);
+  if (!res.has_value())
+    return fail_mp_error(io, "invite", res.error());
+
+  const auto &r = res.value();
+  const std::string code = party_chat_sanitize(r.room_code, 32);
+  const std::string share = party_chat_sanitize(r.share_url, 256);
+  if (json_out) {
+    Value::Object obj{
+        {"room_code", Value{code}},
+        {"share_url", Value{share}},
+        {"ws_path", Value{party_chat_sanitize(r.ws_path, 128)}},
+    };
+    if (r.invited_handle.has_value()) {
+      obj.emplace_back("invited_handle",
+                       Value{party_chat_sanitize(*r.invited_handle, 64)});
+    }
+    return emit_json(io, Value::object(std::move(obj)));
+  }
+  if (target_handle.has_value()) {
+    const std::string who =
+        "@" + party_chat_sanitize(r.invited_handle.value_or(*target_handle), 64);
+    io.out << "Invited " << who << " · Room code: " << code << " · Share: " << share
+           << "\n";
+  } else {
+    io.out << "Party live · Room code: " << code << " · Share: " << share << "\n";
+  }
+  return 0;
+}
+
+int run_join_v2_cli(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::string target;
+  bool has_target = false;
+  bool json_out = false;
+
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird join [@handle|CODE|url] [--state-dir DIR] "
+                "[--authority HOST] [--connect-host HOST] [--port N] "
+                "[--ca-bundle FILE] [--json]\n"
+                "       blackbird join <bbjoin1:...> --alias NAME [--peers DIR] "
+                "[--dry-run] [--allow-expired] [--trust-note TEXT] [--now-ns N]\n";
+      return 0;
+    }
+    if (arg == "--json") {
+      json_out = true;
+    } else {
+      const int common =
+          parse_online_common_flag(args, i, opts, /*allow_state_dir=*/true, io);
+      if (common == 1)
+        continue;
+      if (common != 0)
+        return common;
+      if (!arg.starts_with('-') && !has_target) {
+        target = std::string{arg};
+        has_target = true;
+      } else {
+        return fail_usage(io, "join: unknown option: " + std::string{arg});
+      }
+    }
+  }
+
+  auto opened = open_online_context(opts, "join", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  mp::RoomEnterRequest req{};
+  req.target = target;
+  req.client = "blackbird";
+  req.agent_name = "Blackbird";
+  const auto res = opened.ctx->client.room_enter(req);
+  if (!res.has_value())
+    return fail_mp_error(io, "join", res.error());
+
+  const auto &r = res.value();
+  const std::string code = party_chat_sanitize(r.room_code, 32);
+  const std::string share = party_chat_sanitize(r.share_url, 256);
+  if (json_out) {
+    Value::Array members_json;
+    members_json.reserve(r.members.size());
+    for (const auto &m : r.members) {
+      members_json.emplace_back(Value::object({
+          {"handle", Value{party_chat_sanitize(m.handle, 64)}},
+          {"client", Value{party_chat_sanitize(m.client, 32)}},
+          {"agent_name", Value{party_chat_sanitize(m.agent_name, 48)}},
+          {"status", Value{party_chat_sanitize(m.status, 24)}},
+      }));
+    }
+    return emit_json(io, Value::object({
+                             {"connected", Value{true}},
+                             {"room_code", Value{code}},
+                             {"name", Value{party_chat_sanitize(r.name, 128)}},
+                             {"share_url", Value{share}},
+                             {"members", Value{std::move(members_json)}},
+                         }));
+  }
+  const std::string self_h = strip_leading_at_cli(opened.ctx->store.state().handle);
+  std::string peers;
+  std::size_t peer_n = 0U;
+  for (const auto &m : r.members) {
+    const std::string h = party_chat_sanitize(strip_leading_at_cli(m.handle), 64);
+    if (h.empty() || h == self_h)
+      continue;
+    if (peer_n > 0U)
+      peers += ", ";
+    peers += "@" + h;
+    ++peer_n;
+  }
+  if (peer_n > 0U) {
+    io.out << "● Connected — live with " << peers << " · Room code: " << code << "\n";
+  } else {
+    io.out << "● Connected — party live · Room code: " << code << "\n";
+  }
+  return 0;
+}
+
+bool is_legacy_bbjoin_invocation(std::span<char *> args) noexcept {
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg.starts_with("bbjoin1:") || arg == "--alias" || arg == "--uri" ||
+        arg == "--peers" || arg == "--dry-run" || arg == "--allow-expired" ||
+        arg == "--trust-note" || arg == "--now-ns") {
+      return true;
+    }
+  }
+  return false;
+}
+
+int run_friends_cli(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  bool json_out = false;
+
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird friends [--state-dir DIR] [--authority HOST] "
+                "[--connect-host HOST] [--port N] [--ca-bundle FILE] [--json]\n";
+      return 0;
+    }
+    if (arg == "--json") {
+      json_out = true;
+    } else {
+      const int common =
+          parse_online_common_flag(args, i, opts, /*allow_state_dir=*/true, io);
+      if (common == 1)
+        continue;
+      if (common != 0)
+        return common;
+      return fail_usage(io, "friends: unknown option: " + std::string{arg});
+    }
+  }
+
+  auto opened = open_online_context(opts, "friends", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  const auto live = opened.ctx->client.friends_live();
+  if (!live.has_value())
+    return fail_mp_error(io, "friends", live.error());
+
+  const auto &data = live.value();
+  if (json_out) {
+    Value::Array friends_arr;
+    friends_arr.reserve(data.friends.size());
+    for (const auto &f : data.friends) {
+      Value::Object item{
+          {"handle", Value{party_chat_sanitize(f.handle, 64)}},
+          {"state", Value{party_chat_sanitize(f.state, 24)}},
+          {"presence", Value{party_chat_sanitize(f.presence, 24)}},
+          {"client", Value{party_chat_sanitize(f.client, 32)}},
+          {"joinable", Value{f.joinable}},
+      };
+      if (f.party_room_code.has_value()) {
+        item.emplace_back("party_room_code",
+                          Value{party_chat_sanitize(*f.party_room_code, 32)});
+      }
+      friends_arr.emplace_back(Value::object(std::move(item)));
+    }
+    Value::Array invites_arr;
+    invites_arr.reserve(data.pending_invites.size());
+    for (const auto &inv : data.pending_invites) {
+      invites_arr.emplace_back(Value::object({
+          {"from_handle", Value{party_chat_sanitize(inv.from_handle, 64)}},
+          {"room_code", Value{party_chat_sanitize(inv.room_code, 32)}},
+          {"created_at_ms", Value{Number{inv.created_at_ms}}},
+      }));
+    }
+    return emit_json(io, Value::object({
+                             {"friends", Value{std::move(friends_arr)}},
+                             {"pending_invites", Value{std::move(invites_arr)}},
+                         }));
+  }
+
+  for (const auto &inv : data.pending_invites) {
+    io.out << "★ @" << party_chat_sanitize(strip_leading_at_cli(inv.from_handle), 64)
+           << " invited you — type /join\n";
+  }
+  if (data.friends.empty()) {
+    io.out << "No friends yet — add someone with `blackbird add @handle`.\n";
+    return 0;
+  }
+  for (const auto &f : data.friends) {
+    const std::string who =
+        "@" + party_chat_sanitize(strip_leading_at_cli(f.handle), 64);
+    if (f.presence == "in_party" || f.joinable) {
+      io.out << "● " << who << " — in party";
+      if (f.party_room_code.has_value() && !f.party_room_code->empty())
+        io.out << " (" << party_chat_sanitize(*f.party_room_code, 16) << ")";
+      io.out << " [Join]\n";
+    } else if (f.presence == "online" || f.presence == "idle" || f.presence == "busy") {
+      io.out << "● " << who << " — " << party_chat_sanitize(f.presence, 24)
+             << " [Invite]\n";
+    } else {
+      io.out << "○ " << who << " — offline\n";
+    }
+  }
+  return 0;
+}
+
+int run_add_cli(std::span<char *> args, CliIo io) {
+  OnlineCommonOpts opts{};
+  std::optional<std::string> target_handle;
+  bool json_out = false;
+
+  for (std::size_t i = 1U; i < args.size(); ++i) {
+    const std::string_view arg{args[i]};
+    if (arg == "--help" || arg == "-h") {
+      io.err << "usage: blackbird add @handle [--state-dir DIR] [--authority HOST] "
+                "[--connect-host HOST] [--port N] [--ca-bundle FILE] [--json]\n";
+      return 0;
+    }
+    if (arg == "--json") {
+      json_out = true;
+    } else {
+      const int common =
+          parse_online_common_flag(args, i, opts, /*allow_state_dir=*/true, io);
+      if (common == 1)
+        continue;
+      if (common != 0)
+        return common;
+      if (!arg.starts_with('-') && !target_handle.has_value()) {
+        const std::string clean = strip_leading_at_cli(arg);
+        const auto valid = mp::AccountHandle::parse(clean);
+        if (!valid.has_value())
+          return fail_usage(io, "add: invalid @handle");
+        target_handle = std::string{valid.value().display()};
+      } else {
+        return fail_usage(io, "add: unknown option: " + std::string{arg});
+      }
+    }
+  }
+
+  if (!target_handle.has_value())
+    return fail_usage(io, "add: @handle is required");
+
+  auto opened = open_online_context(opts, "add", io);
+  if (!opened.ctx.has_value())
+    return opened.exit_code;
+
+  const auto resolved = opened.ctx->client.resolve_handle(*target_handle);
+  if (!resolved.has_value())
+    return fail_mp_error(io, "add", resolved.error());
+
+  const auto res =
+      opened.ctx->client.send_or_accept_friend(resolved.value().account_id);
+  if (!res.has_value())
+    return fail_mp_error(io, "add", res.error());
+
+  const std::string clean_handle =
+      party_chat_sanitize(strip_leading_at_cli(resolved.value().handle), 64);
+  const bool now_friends = (res.value().state == mp::FriendEdgeState::friend_edge);
+  if (json_out) {
+    return emit_json(io, Value::object({
+                             {"handle", Value{clean_handle}},
+                             {"friends", Value{now_friends}},
+                         }));
+  }
+  if (now_friends) {
+    io.out << "● @" << clean_handle << " added — you're now friends!\n";
+  } else {
+    io.out << "Friend request sent to @" << clean_handle << ".\n";
+  }
+  return 0;
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
@@ -11899,7 +12418,8 @@ bool is_command_post_subcommand(std::string_view arg) noexcept {
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
          arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan" ||
          arg == "brakes" || arg == "superpowers" || arg == "integrations" ||
-         arg == "connect";
+         arg == "connect" || arg == "login" || arg == "invite" || arg == "friends" ||
+         arg == "add";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -11928,14 +12448,25 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_metrics_cli(args, io);
     if (subcommand == "bridge")
       return run_bridge_cli(args, io);
-    if (subcommand == "join")
-      return run_join_cli(args, io);
+    if (subcommand == "join") {
+      if (is_legacy_bbjoin_invocation(args))
+        return run_join_cli(args, io);
+      return run_join_v2_cli(args, io);
+    }
     if (subcommand == "party")
       return run_party_cli(args, io);
     if (subcommand == "flightdeck")
       return run_flightdeck_cli(args, io);
     if (subcommand == "online")
       return run_online_cli(args, io);
+    if (subcommand == "login")
+      return run_login_cli(args, io);
+    if (subcommand == "invite")
+      return run_invite_cli(args, io);
+    if (subcommand == "friends")
+      return run_friends_cli(args, io);
+    if (subcommand == "add")
+      return run_add_cli(args, io);
     if (subcommand == "upgrade")
       return run_upgrade_cli(args, io);
     if (subcommand == "doctor")
