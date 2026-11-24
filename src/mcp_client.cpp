@@ -203,6 +203,29 @@ std::optional<bool> get_opt_bool(const Value &obj, std::string_view key) {
   return std::nullopt;
 }
 
+// Strict RFC 9110 tchar HTTP header name validator (excludes ':', whitespace,
+// quotes, slashes, and control chars).
+bool valid_mcp_header_name(std::string_view name) noexcept {
+  if (name.empty() || name.size() > 128U)
+    return false;
+  for (const char ch : name) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    const bool is_alnum =
+        (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    const bool is_sym = c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+                        c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+                        c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+    if (!is_alnum && !is_sym)
+      return false;
+  }
+  return true;
+}
+
+bool is_forbidden_mcp_default_header(std::string_view name) noexcept {
+  return ascii_iequals(name, "host") || ascii_iequals(name, "transfer-encoding") ||
+         ascii_iequals(name, "content-length");
+}
+
 bool valid_mcp_header_token(std::string_view text, std::size_t max_len) noexcept {
   if (text.empty() || text.size() > max_len)
     return false;
@@ -223,6 +246,35 @@ bool valid_mcp_header_value(std::string_view text) noexcept {
   return true;
 }
 
+bool valid_mcp_port(std::string_view port_str) noexcept {
+  if (port_str.empty() || port_str.size() > 5U)
+    return false;
+  for (const char ch : port_str) {
+    if (ch < '0' || ch > '9')
+      return false;
+  }
+  std::uint32_t port = 0;
+  const auto res =
+      std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
+  return res.ec == std::errc{} && res.ptr == port_str.data() + port_str.size() &&
+         port >= 1U && port <= 65535U;
+}
+
+bool valid_mcp_hostname(std::string_view host) noexcept {
+  if (host.empty() || host.size() > 253U)
+    return false;
+  if (host.front() == '.' || host.back() == '.')
+    return false;
+  for (const char ch : host) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '.';
+    if (!ok)
+      return false;
+  }
+  return host.find("..") == std::string_view::npos;
+}
+
 bool valid_mcp_endpoint_url(std::string_view url) noexcept {
   if (url.empty() || url.size() > 2048U)
     return false;
@@ -231,8 +283,55 @@ bool valid_mcp_endpoint_url(std::string_view url) noexcept {
     if (c <= 0x20U || c >= 0x7FU)
       return false;
   }
-  return url.starts_with("https://") || url.starts_with("http://127.0.0.1") ||
-         url.starts_with("http://localhost") || url.starts_with("http://[::1]");
+  const bool is_https = url.starts_with("https://");
+  const bool is_http = url.starts_with("http://");
+  if (!is_https && !is_http)
+    return false;
+
+  const std::string_view rest = url.substr(is_https ? 8U : 7U);
+  const std::size_t auth_end = rest.find_first_of("/?#");
+  const std::string_view authority =
+      auth_end == std::string_view::npos ? rest : rest.substr(0U, auth_end);
+  if (authority.empty() || authority.find('@') != std::string_view::npos)
+    return false;
+
+  std::string_view host;
+  if (authority.front() == '[') {
+    const std::size_t close = authority.find(']');
+    if (close == std::string_view::npos || close <= 1U)
+      return false;
+    host = authority.substr(0U, close + 1U);
+    for (std::size_t i = 1U; i < close; ++i) {
+      const char ch = authority[i];
+      const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                      (ch >= 'A' && ch <= 'F') || ch == ':' || ch == '.';
+      if (!ok)
+        return false;
+    }
+    const std::string_view after = authority.substr(close + 1U);
+    if (!after.empty()) {
+      if (after.front() != ':' || !valid_mcp_port(after.substr(1U)))
+        return false;
+    }
+  } else {
+    const std::size_t colon = authority.find(':');
+    if (colon != std::string_view::npos) {
+      if (authority.find(':', colon + 1U) != std::string_view::npos)
+        return false;
+      host = authority.substr(0U, colon);
+      if (!valid_mcp_port(authority.substr(colon + 1U)))
+        return false;
+    } else {
+      host = authority;
+    }
+    if (!valid_mcp_hostname(host))
+      return false;
+  }
+
+  if (is_http) {
+    return ascii_iequals(host, "localhost") || host == "127.0.0.1" || host == "[::1]";
+  }
+  return true;
 }
 
 bool valid_env_entry(std::string_view entry) noexcept {
@@ -1225,8 +1324,10 @@ Result<McpClient> McpClient::connect_http(const McpHttpConfig &config) {
   if (!valid_mcp_header_token(proto, 64U))
     return Result<McpClient>::failure({ErrorCode::invalid_range});
   for (const auto &[k, v] : config.default_headers) {
-    if (!valid_mcp_header_token(k, 128U) || !valid_mcp_header_value(v))
+    if (!valid_mcp_header_name(k) || is_forbidden_mcp_default_header(k) ||
+        !valid_mcp_header_value(v)) {
       return Result<McpClient>::failure({ErrorCode::invalid_range});
+    }
   }
   auto impl = std::make_unique<Impl>();
   impl->transport = McpTransportKind::streamable_http;
@@ -2220,6 +2321,21 @@ McpToolRouter::mcp_resource(const McpResourceParams &params) {
   out.server_id = *sid;
 
   if (params.op == McpResourceOp::list) {
+    if (sit->second.transport == McpTransportKind::streamable_http) {
+      brakes::ToolCallRequest gate_req;
+      gate_req.tool_name = "mcp_resource:" + sit->second.name;
+      gate_req.tool_op = "list";
+      gate_req.effect_class = brakes::ToolEffectClass::read_only;
+      gate_req.requires_network = true;
+      const brakes::BrakesDecision decision =
+          impl_->brakes_gate.evaluate_tool_call(gate_req);
+      if (!decision.allow) {
+        out.blocked_by_brakes = true;
+        out.brakes_decision = decision;
+        return Result<McpResourceOutcome>::success(std::move(out));
+      }
+      out.brakes_decision = decision;
+    }
     auto listed = client.list_all_resources();
     if (!listed.has_value())
       return Result<McpResourceOutcome>::failure(listed.error());
@@ -2278,6 +2394,21 @@ Result<McpPromptOutcome> McpToolRouter::mcp_prompt(const McpPromptParams &params
   McpPromptOutcome out;
   out.server_id = *sid;
   if (params.op == McpPromptOp::list) {
+    if (sit->second.transport == McpTransportKind::streamable_http) {
+      brakes::ToolCallRequest gate_req;
+      gate_req.tool_name = "mcp_prompt:" + sit->second.name;
+      gate_req.tool_op = "list";
+      gate_req.effect_class = brakes::ToolEffectClass::read_only;
+      gate_req.requires_network = true;
+      const brakes::BrakesDecision decision =
+          impl_->brakes_gate.evaluate_tool_call(gate_req);
+      if (!decision.allow) {
+        out.blocked_by_brakes = true;
+        out.brakes_decision = decision;
+        return Result<McpPromptOutcome>::success(std::move(out));
+      }
+      out.brakes_decision = decision;
+    }
     auto listed = client.list_all_prompts();
     if (!listed.has_value())
       return Result<McpPromptOutcome>::failure(listed.error());
@@ -2286,10 +2417,57 @@ Result<McpPromptOutcome> McpToolRouter::mcp_prompt(const McpPromptParams &params
     return Result<McpPromptOutcome>::success(std::move(out));
   }
 
+  brakes::ToolCallRequest gate_req;
+  gate_req.tool_name = "mcp_prompt:" + sit->second.name;
+  gate_req.tool_op = "get:" + params.prompt_name;
+  gate_req.effect_class = brakes::ToolEffectClass::read_only;
+  gate_req.requires_network =
+      (sit->second.transport == McpTransportKind::streamable_http);
+  const brakes::BrakesDecision decision =
+      impl_->brakes_gate.evaluate_tool_call(gate_req);
+  if (!decision.allow) {
+    out.blocked_by_brakes = true;
+    out.brakes_decision = decision;
+    return Result<McpPromptOutcome>::success(std::move(out));
+  }
+
   auto prompt_res = client.get_prompt(params.prompt_name, params.arguments);
   if (!prompt_res.has_value())
     return Result<McpPromptOutcome>::failure(prompt_res.error());
+
+  std::string raw_text;
+  if (!prompt_res.value().description.empty()) {
+    raw_text.append("# ");
+    raw_text.append(prompt_res.value().description);
+  }
+  for (const auto &msg : prompt_res.value().messages) {
+    if (!raw_text.empty())
+      raw_text.push_back('\n');
+    raw_text.append("[");
+    raw_text.append(msg.role);
+    raw_text.append("] ");
+    if (!msg.content.text.empty())
+      raw_text.append(msg.content.text);
+    else if (!msg.content.uri.empty())
+      raw_text.append(msg.content.uri);
+  }
+  if (raw_text.empty())
+    raw_text = prompt_res.value().raw_wire_json;
+
+  const ToolProjectionPolicy proj_policy =
+      params.projection_policy.value_or(impl_->default_projection);
+
+  out.brakes_decision = decision;
+  out.raw_payload = raw_text;
   out.prompt_result = std::move(prompt_res.value());
+
+  auto framed = impl_->frame_and_taint(sit->second, "prompt:" + params.prompt_name,
+                                       raw_text, sit->second.policy.is_open_world,
+                                       proj_policy, out.projection);
+  if (!framed.has_value())
+    return Result<McpPromptOutcome>::failure(framed.error());
+  out.framed_output = std::move(framed.value().first);
+  out.audit_ref = std::move(framed.value().second);
   return Result<McpPromptOutcome>::success(std::move(out));
 }
 

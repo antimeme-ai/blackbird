@@ -818,6 +818,173 @@ void test_untrusted_annotations_and_brakes_taint_oracle(const char *self_exe) {
   }
 }
 
+void test_http_endpoint_and_header_hardening() {
+  auto dummy_transport = [](const McpHttpRequest &) -> Result<McpHttpResponse> {
+    return Result<McpHttpResponse>::success(McpHttpResponse{200, {}, "{}"});
+  };
+
+  // Finding #1: Plaintext HTTP SSRF prefix bypasses & bare https:// must be rejected.
+  for (const char *bad_url : {
+           "http://localhost.attacker.com/mcp",
+           "http://127.0.0.1.attacker.com/mcp",
+           "http://localhost@attacker.com/mcp",
+           "http://[::1]@attacker.com/mcp",
+           "http://127.0.0.1:99999/mcp",
+           "https://",
+           "https:///mcp",
+           "https://user@mcp.linear.app/mcp",
+           "https://..example.com/mcp",
+       }) {
+    McpHttpConfig cfg;
+    cfg.endpoint_url = bad_url;
+    cfg.transport = dummy_transport;
+    require(!McpClient::connect_http(cfg).has_value(),
+            std::string{"hostile MCP endpoint URL must be rejected: "} + bad_url);
+  }
+  for (const char *good_url : {
+           "http://localhost/mcp",
+           "http://localhost:8080/mcp",
+           "http://127.0.0.1:9000/mcp",
+           "http://[::1]:8080/mcp",
+           "https://mcp.linear.app/mcp",
+       }) {
+    McpHttpConfig cfg;
+    cfg.endpoint_url = good_url;
+    cfg.transport = dummy_transport;
+    require(McpClient::connect_http(cfg).has_value(),
+            std::string{"valid MCP endpoint URL must be accepted: "} + good_url);
+  }
+
+  // Finding #2: Header-name smuggling (':', spaces) & forbidden Host/TE/CL headers.
+  for (const char *bad_hdr : {
+           "X-Foo: bar",
+           "Bad Header",
+           "Host",
+           "host",
+           "Transfer-Encoding",
+           "Content-Length",
+       }) {
+    McpHttpConfig cfg;
+    cfg.endpoint_url = "https://mcp.linear.app/mcp";
+    cfg.default_headers.emplace_back(bad_hdr, "val");
+    cfg.transport = dummy_transport;
+    require(!McpClient::connect_http(cfg).has_value(),
+            std::string{"smuggled/forbidden default header must be rejected: "} +
+                bad_hdr);
+  }
+}
+
+void test_prompt_and_http_list_brakes_taint_oracle(const char *self_exe) {
+  // Finding #3a: mcp_prompt(get) MUST enforce Brakes, CSPRNG framing, and taint latch!
+  {
+    McpStdioConfig scfg;
+    scfg.executable = self_exe;
+    scfg.arguments = {"--mock-mcp-server"};
+    auto client = McpClient::connect_stdio(scfg);
+    require(client.has_value(), "connect_stdio must succeed");
+
+    brakes::EffectivePolicy pol;
+    pol.effective_profile = brakes::BrakesProfile::guarded;
+    pol.party_trust.max_peer_override = brakes::PartyTrustProfile::human_gated;
+    McpRouterConfig rcfg;
+    rcfg.brakes_policy = pol;
+    McpToolRouter router{std::move(rcfg)};
+
+    McpServerPolicy sp;
+    sp.trust_profile = brakes::PartyTrustProfile::human_gated;
+    require(router.add_server("mock", std::move(client.value()), sp).has_value(),
+            "add_server must succeed");
+    require(!router.brakes_gate().taint().is_tainted(), "router starts untainted");
+
+    auto got = router.mcp_prompt(McpPromptParams{"mock", McpPromptOp::get, "triage_bug",
+                                                 Value::object({}), std::nullopt});
+    require(got.has_value() && !got.value().blocked_by_brakes,
+            "untainted guarded allows local stdio prompt get");
+    const std::string nonce = extract_nonce(got.value().framed_output);
+    require(got.value().framed_output.find("origin=external_mcp") != std::string::npos,
+            "mcp_prompt(get) must carry origin=external_mcp");
+    require(got.value().framed_output.find("[/UNTRUSTED_PEER_DATA nonce=" + nonce +
+                                           "]") != std::string::npos,
+            "mcp_prompt(get) must match CSPRNG closing nonce");
+    require(router.brakes_gate().taint().is_tainted(),
+            "mcp_prompt(get) MUST latch TurnTaintState");
+
+    brakes::ToolCallRequest self_mod;
+    self_mod.tool_name = "program_config";
+    const auto sm = router.brakes_gate().evaluate_tool_call(self_mod);
+    require(sm.deny && sm.policy_locked,
+            "self_modify MUST be hard-denied after mcp_prompt(get) taint");
+  }
+
+  // Finding #3b: streamable_http resource/prompt list MUST be gated by Brakes!
+  {
+    bool post_list_called = false;
+    bool initialized = false;
+    McpHttpConfig hcfg;
+    hcfg.endpoint_url = "https://mcp.example.com/mcp";
+    hcfg.transport = [&](const McpHttpRequest &req) -> Result<McpHttpResponse> {
+      auto parsed = parse_json(req.body);
+      const std::string method = parsed.value().find("method")->string();
+      if (method == "initialize") {
+        return Result<McpHttpResponse>::success(McpHttpResponse{
+            200,
+            {{"Content-Type", "application/json"}},
+            R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}})"});
+      }
+      if (method == "notifications/initialized")
+        return Result<McpHttpResponse>::success(McpHttpResponse{202, {}, ""});
+      if (method == "tools/list") {
+        return Result<McpHttpResponse>::success(
+            McpHttpResponse{200,
+                            {{"Content-Type", "application/json"}},
+                            R"({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})"});
+      }
+      if (method == "resources/list") {
+        if (initialized)
+          post_list_called = true;
+        return Result<McpHttpResponse>::success(
+            McpHttpResponse{200,
+                            {{"Content-Type", "application/json"}},
+                            R"({"jsonrpc":"2.0","id":3,"result":{"resources":[]}})"});
+      }
+      if (method == "prompts/list") {
+        if (initialized)
+          post_list_called = true;
+        return Result<McpHttpResponse>::success(
+            McpHttpResponse{200,
+                            {{"Content-Type", "application/json"}},
+                            R"({"jsonrpc":"2.0","id":4,"result":{"prompts":[]}})"});
+      }
+      return Result<McpHttpResponse>::failure({ErrorCode::unsupported});
+    };
+    auto client = McpClient::connect_http(hcfg);
+    require(client.has_value(), "connect_http must succeed");
+
+    brakes::EffectivePolicy pol;
+    pol.effective_profile = brakes::BrakesProfile::sandboxed;
+    pol.brakes.allow_escalation = false;
+    McpRouterConfig rcfg;
+    rcfg.brakes_policy = pol;
+    McpToolRouter router{std::move(rcfg)};
+    require(router.add_server("remote", std::move(client.value())).has_value(),
+            "add_server must succeed");
+    initialized = true;
+
+    auto rl = router.mcp_resource(
+        McpResourceParams{"remote", McpResourceOp::list, "", std::nullopt});
+    require(rl.has_value() && rl.value().blocked_by_brakes &&
+                rl.value().brakes_decision.deny,
+            "HTTP resources/list must be gated by sandboxed BrakesGate");
+    auto pl = router.mcp_prompt(McpPromptParams{"remote", McpPromptOp::list, "",
+                                                Value::object({}), std::nullopt});
+    require(pl.has_value() && pl.value().blocked_by_brakes &&
+                pl.value().brakes_decision.deny,
+            "HTTP prompts/list must be gated by sandboxed BrakesGate");
+    require(!post_list_called,
+            "blocked HTTP list operations must never invoke transport");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -831,8 +998,10 @@ int main(int argc, char **argv) {
     test_stdio_loopback_and_env_scrubbing(argv[0]);
     test_stdio_blackbird_command_post_interop(argv[0]);
     test_streamable_http_json_sse_and_401_oauth();
+    test_http_endpoint_and_header_hardening();
     test_bm25_lazy_tool_router_oracle();
     test_untrusted_annotations_and_brakes_taint_oracle(argv[0]);
+    test_prompt_and_http_list_brakes_taint_oracle(argv[0]);
 
     std::cout << "mcp_client_test: ALL PASSED\n";
     return 0;

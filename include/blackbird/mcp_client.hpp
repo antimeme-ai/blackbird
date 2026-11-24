@@ -456,12 +456,20 @@ struct McpPromptParams {
   McpPromptOp op = McpPromptOp::list;
   std::string prompt_name;
   Value arguments = Value::object({});
+  std::optional<ToolProjectionPolicy> projection_policy;
 };
 
 struct McpPromptOutcome {
   McpServerId server_id{};
+  bool blocked_by_brakes = false;
+  brakes::BrakesDecision brakes_decision = brakes::BrakesDecision::make_allow();
   std::vector<McpPromptDescriptor> prompts;
   std::optional<McpPromptGetResult> prompt_result;
+  // Populated on op == get: CSPRNG nonce-framed, projected prompt content.
+  std::string framed_output;
+  ToolProjectionResult projection{};
+  std::string raw_payload;
+  std::string audit_ref;
 };
 
 struct McpRouterConfig {

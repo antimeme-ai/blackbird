@@ -73,7 +73,7 @@ bool valid_relative_path(std::string_view path) noexcept {
   }
   for (const char ch : path) {
     const unsigned char c = static_cast<unsigned char>(ch);
-    if (c <= 0x1FU || c == 0x7FU)
+    if (c <= 0x20U || c >= 0x7FU)
       return false;
   }
   // Reject path traversal segments (".." or "%2e%2e").
@@ -218,21 +218,55 @@ std::string base64url_decode(std::string_view input) {
   return out;
 }
 
-bool graphql_body_has_mutation(std::string_view body) noexcept {
-  const std::string lower = ascii_lower(body);
-  // Look for "mutation" keyword as a GraphQL operation token.
+bool text_contains_keyword_token(std::string_view lower_text,
+                                 std::string_view keyword) noexcept {
   std::size_t pos = 0U;
-  while ((pos = lower.find("mutation", pos)) != std::string::npos) {
+  while ((pos = lower_text.find(keyword, pos)) != std::string_view::npos) {
     const bool left_ok =
-        pos == 0U || std::isalnum(static_cast<unsigned char>(lower[pos - 1U])) == 0;
-    const std::size_t end = pos + 8U;
-    const bool right_ok = end >= lower.size() ||
-                          std::isalnum(static_cast<unsigned char>(lower[end])) == 0;
+        pos == 0U ||
+        (std::isalnum(static_cast<unsigned char>(lower_text[pos - 1U])) == 0 &&
+         lower_text[pos - 1U] != '_');
+    const std::size_t end = pos + keyword.size();
+    const bool right_ok =
+        end >= lower_text.size() ||
+        (std::isalnum(static_cast<unsigned char>(lower_text[end])) == 0 &&
+         lower_text[end] != '_');
     if (left_ok && right_ok)
       return true;
     pos = end;
   }
   return false;
+}
+
+bool graphql_text_is_mutating(std::string_view text) {
+  const std::string lower = ascii_lower(text);
+  return text_contains_keyword_token(lower, "mutation") ||
+         text_contains_keyword_token(lower, "subscription");
+}
+
+struct GraphqlInspectInput {
+  std::string_view relative_path;
+  std::string_view body;
+};
+
+// Inspects both decoded JSON "query" field (defeating \u006dutation Unicode
+// escapes) and raw body. Fails closed (returns true -> upgrade to write) on
+// unparseable or non-object POST bodies targeting a /graphql endpoint.
+bool graphql_body_has_mutation(GraphqlInspectInput input) {
+  if (graphql_text_is_mutating(input.body))
+    return true;
+  const bool is_graphql_path =
+      ascii_lower(input.relative_path).find("graphql") != std::string::npos;
+  auto parsed = parse_json(input.body);
+  if (!parsed.has_value())
+    return is_graphql_path;
+  if (!std::holds_alternative<Value::Object>(parsed.value().value()))
+    return is_graphql_path;
+  if (const Value *q = parsed.value().find("query");
+      q != nullptr && std::holds_alternative<std::string>(q->value())) {
+    return graphql_text_is_mutating(q->string());
+  }
+  return is_graphql_path;
 }
 
 brakes::ToolEffectClass saas_effect_to_brakes(SaasEffectClass effect) noexcept {
@@ -415,6 +449,7 @@ struct LuaSandboxContext {
 
   bool blocked_by_host_pin = false;
   bool blocked_by_brakes = false;
+  bool instruction_budget_exceeded = false;
   brakes::BrakesDecision brakes_decision = brakes::BrakesDecision::make_allow();
   std::string error_detail;
   std::vector<std::string> raw_http_bodies;
@@ -447,9 +482,20 @@ static void *saas_lua_alloc(void *const ud, void *ptr, std::size_t osize,
 void saas_lua_instruction_hook(lua_State *L, lua_Debug *ar) {
   (void)ar;
   auto *ctx = *static_cast<LuaSandboxContext **>(lua_getextraspace(L));
+  if (ctx->blocked_by_host_pin || ctx->blocked_by_brakes ||
+      ctx->instruction_budget_exceeded) {
+    // Keep unwinding every VM instruction (count=1) so nested pcall() loops
+    // cannot swallow security blocks or instruction budget exhaustion.
+    lua_sethook(L, saas_lua_instruction_hook, LUA_MASKCOUNT, 1);
+    luaL_error(L, "%s",
+               ctx->error_detail.empty() ? "sandbox execution aborted"
+                                         : ctx->error_detail.c_str());
+  }
   ctx->instructions += 10000U;
   if (ctx->instructions > ctx->max_instructions) {
+    ctx->instruction_budget_exceeded = true;
     ctx->error_detail = "Lua pack exceeded instruction budget";
+    lua_sethook(L, saas_lua_instruction_hook, LUA_MASKCOUNT, 1);
     luaL_error(L, "instruction budget exceeded");
   }
 }
@@ -502,6 +548,11 @@ int saas_lua_json_decode(lua_State *L) {
 
 int saas_lua_http_request(lua_State *L) {
   auto *ctx = *static_cast<LuaSandboxContext **>(lua_getextraspace(L));
+  if (ctx->blocked_by_host_pin || ctx->blocked_by_brakes ||
+      ctx->instruction_budget_exceeded) {
+    lua_sethook(L, saas_lua_instruction_hook, LUA_MASKCOUNT, 1);
+    return luaL_error(L, "sandbox request aborted");
+  }
   luaL_checktype(L, 1, LUA_TTABLE);
 
   if (ctx->http_requests_made >= kSaasPackMaxHttpRequestsPerCall) {
@@ -746,7 +797,7 @@ int saas_lua_http_request(lua_State *L) {
            effective_effect == SaasEffectClass::read)
     effective_effect = SaasEffectClass::write;
   else if (method == "POST" && effective_effect == SaasEffectClass::read &&
-           graphql_body_has_mutation(body))
+           graphql_body_has_mutation(GraphqlInspectInput{rel_path, body}))
     effective_effect = SaasEffectClass::write;
 
   // BrakesGate pre-flight check!
@@ -984,7 +1035,7 @@ Result<std::string> build_pinned_https_url(const PinnedUrlInput &input,
   if (!input.query_string.empty()) {
     for (const char ch : input.query_string) {
       const unsigned char c = static_cast<unsigned char>(ch);
-      if (c <= 0x1FU || c == 0x7FU || c == '#')
+      if (c <= 0x20U || c >= 0x7FU || c == '#')
         return Result<std::string>::failure({ErrorCode::invalid_range});
     }
     url.push_back('?');
@@ -1324,24 +1375,33 @@ Result<SaasInvokeOutcome> SaasPackHost::invoke(const SaasInvokeParams &params) {
   out.operation = params.operation;
 
   const int call_rc = lua_pcall(guard.L, 1, 1, 0);
+  if (ctx.pending_http_taint.has_value() && !ctx.tainted_via_http &&
+      (call_rc != LUA_OK || ctx.blocked_by_host_pin || ctx.blocked_by_brakes ||
+       ctx.instruction_budget_exceeded)) {
+    (void)impl_->brakes_gate.ingest_peer(*ctx.pending_http_taint);
+    ctx.tainted_via_http = true;
+  }
+  if (ctx.instruction_budget_exceeded)
+    return Result<SaasInvokeOutcome>::failure({ErrorCode::capacity});
+  // Enforce sticky security blocks EVEN IF Lua wrapped the call in pcall() and
+  // returned LUA_OK!
+  if (ctx.blocked_by_host_pin || ctx.blocked_by_brakes) {
+    out.blocked_by_host_pin = ctx.blocked_by_host_pin;
+    out.blocked_by_brakes = ctx.blocked_by_brakes;
+    out.brakes_decision = ctx.brakes_decision;
+    out.error_detail = ctx.error_detail;
+    out.raw_http_bodies = std::move(ctx.raw_http_bodies);
+    return Result<SaasInvokeOutcome>::success(std::move(out));
+  }
   if (call_rc != LUA_OK) {
-    if (ctx.pending_http_taint.has_value() && !ctx.tainted_via_http) {
-      (void)impl_->brakes_gate.ingest_peer(*ctx.pending_http_taint);
-      ctx.tainted_via_http = true;
-    }
     std::string lua_err;
     if (lua_type(guard.L, -1) == LUA_TSTRING) {
       std::size_t len = 0;
       const char *ptr = lua_tolstring(guard.L, -1, &len);
       lua_err.assign(ptr, len);
     }
-    out.blocked_by_host_pin = ctx.blocked_by_host_pin;
-    out.blocked_by_brakes = ctx.blocked_by_brakes;
-    out.brakes_decision = ctx.brakes_decision;
     out.error_detail = !ctx.error_detail.empty() ? ctx.error_detail : lua_err;
     out.raw_http_bodies = std::move(ctx.raw_http_bodies);
-    if (out.blocked_by_host_pin || out.blocked_by_brakes)
-      return Result<SaasInvokeOutcome>::success(std::move(out));
     return Result<SaasInvokeOutcome>::failure({ErrorCode::external_unknown});
   }
 
