@@ -36,6 +36,7 @@ REQUIRED_SOURCE_FILES = (
     "CMakeLists.txt",
     "CMakePresets.json",
     "scripts/blackbird",
+    "scripts/blackbird-phux",
     "programs/turn.lua",
     "programs/instruments/results.lua",
     "assets/sr71.png",
@@ -506,6 +507,15 @@ def run_relocated_smoke(tarball_path: Path, top_name: str, scratch: Path) -> str
             f"scripts/blackbird --version mismatch: {wrapper_proc.stdout.strip()!r} != {version_out!r}"
         )
 
+    phux_proc = run_smoke_cmd(
+        [str(extracted / "scripts/blackbird-phux"), "--help"],
+        env=smoke_env,
+        cwd=smoke_home,
+        label="scripts/blackbird-phux --help",
+    )
+    if "Usage: scripts/blackbird-phux" not in phux_proc.stdout:
+        die(f"unexpected scripts/blackbird-phux --help output: {phux_proc.stdout!r}")
+
     return version_out
 
 
@@ -727,6 +737,10 @@ def main(argv: list[str] | None = None) -> int:
         wrapper_dest = scripts_dir / "blackbird"
         shutil.copy2(source / "scripts/blackbird", wrapper_dest)
         wrapper_dest.chmod(0o755)
+
+        phux_dest = scripts_dir / "blackbird-phux"
+        shutil.copy2(source / "scripts/blackbird-phux", phux_dest)
+        phux_dest.chmod(0o755)
 
         # Query exact binary version string before writing MANIFEST.
         probe_home = scratch / "probe-home"
