@@ -791,7 +791,10 @@ if arguments.case in ('all', 'comfort'):
     with fixture_directory(prefix='arco-comfort-') as work:
         import re
         master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+        # 22 rows guarantees transcript overflow (so PageUp moves LINE_080 off-screen while keeping
+        # LINE_001..003 anchored) on both short Linux /tmp paths and macOS /var/folders paths,
+        # with or without the optional 1-line Party Strip.
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 22, 100, 0, 0))
         child = subprocess.Popen([arguments.executable, '--session', work], stdin=slave,
             stdout=slave, stderr=slave, start_new_session=True)
         observed = Observed()
