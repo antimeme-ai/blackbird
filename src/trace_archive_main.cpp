@@ -2,6 +2,7 @@
 #include "blackbird/journal.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/packet.hpp"
+#include "blackbird/trace_archive.hpp"
 #include "native_process.hpp"
 #include <algorithm>
 #include <charconv>
@@ -810,7 +811,8 @@ int run(int argc, char **argv) {
   } while (true);
 }
 } // namespace
-int main(int argc, char **argv) {
+namespace blackbird {
+int run_archive_main(int argc, char **argv) {
   try {
     return run(argc, argv);
   } catch (const blackbird::Error &error) {
@@ -823,3 +825,7 @@ int main(int argc, char **argv) {
   }
   return 1;
 }
+} // namespace blackbird
+#ifndef BLACKBIRD_ARCHIVE_LIBRARY
+int main(int argc, char **argv) { return blackbird::run_archive_main(argc, argv); }
+#endif

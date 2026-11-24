@@ -82,4 +82,8 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Multicall entry point for the private PTY job runner helper
+// (`--internal-job-runner`).
+int run_command_job_runner_main(int argc, char **argv);
 } // namespace blackbird

@@ -2,6 +2,7 @@
 // (CONTEXT_LIFECYCLE §15.2-§15.4). The schema is one declarative table; validation,
 // basis normalization, merge, projection and the missing-basis report all walk it.
 #include "blackbird/provider_profile.hpp"
+#include "blackbird/embedded_resources.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -1451,139 +1452,180 @@ std::string binding_digest(const ProfileQuery &query) {
                                     {"account_kind", Value{query.account_kind}}}));
 }
 
+namespace {
+ProfileResult<std::vector<ProfileFile>> read_embedded_shipped() {
+  std::vector<ProfileFile> out;
+  const auto resources = embedded_provider_profiles();
+  out.reserve(resources.size());
+  for (const auto &resource : resources) {
+    const std::string file =
+        std::string{embedded_profiles_location} + "/" + std::string{resource.name};
+    auto read = read_profile_text({resource.content, file});
+    if (!read.has_value())
+      return std::unexpected(read.error());
+    auto layer = validate_profile({read.value(), ProfileLayerKind::shipped, file});
+    if (!layer.has_value())
+      return std::unexpected(layer.error());
+    const auto &id = layer.value().find("id")->string();
+    if (id != std::filesystem::path{resource.name}.stem().string())
+      return std::unexpected(
+          ProfileError{file, 0, 0, "id", "`" + id + "` does not match the file name"});
+    out.push_back({file, std::move(layer).value()});
+  }
+  return out;
+}
+
+ProfileResult<ProfileSet>
+assemble_profile_set(std::vector<ProfileFile> shipped_files,
+                     std::string_view shipped_label,
+                     const std::optional<std::filesystem::path> &operator_overrides) {
+  ProfileSet set;
+  bool found = false;
+  for (auto &file : shipped_files) {
+    if (file.layer.find("id")->string() == conservative_profile_id) {
+      set.conservative = std::move(file);
+      found = true;
+    } else {
+      set.shipped.push_back(std::move(file));
+    }
+  }
+  if (!found)
+    return std::unexpected(ProfileError{std::string{shipped_label}, 0, 0,
+                                        "conservative",
+                                        "the shipped set has no conservative profile"});
+  if (auto ok = validate_effective(set.conservative.layer, set.conservative.file);
+      !ok.has_value())
+    return std::unexpected(ok.error());
+  for (const auto &file : set.shipped)
+    if (auto ok = validate_effective(merge_override(set.conservative.layer, file.layer),
+                                     file.file);
+        !ok.has_value())
+      return std::unexpected(ok.error());
+  if (operator_overrides) {
+    const auto &dir = *operator_overrides;
+    std::error_code error;
+    const auto link = std::filesystem::symlink_status(dir, error);
+    if (!error && link.type() == std::filesystem::file_type::symlink &&
+        !std::filesystem::exists(dir, error) && !error)
+      return std::unexpected(ProfileError{
+          dir.string(), 0, 0, "io", "profile directory is a symbolic link to nothing"});
+    error.clear();
+    const auto status = std::filesystem::status(dir, error);
+    const bool absent = error == std::errc::no_such_file_or_directory;
+    if (error && !absent)
+      return std::unexpected(ProfileError{
+          dir.string(), 0, 0, "io", "profile directory is missing or unreadable"});
+    if (!absent) {
+      if (status.type() != std::filesystem::file_type::directory)
+        return std::unexpected(ProfileError{
+            dir.string(), 0, 0, "io", "profile directory is missing or unreadable"});
+      auto overrides = read_directory(dir, ProfileLayerKind::override_layer);
+      if (!overrides.has_value())
+        return std::unexpected(overrides.error());
+      std::map<std::string, std::string, std::less<>> targets;
+      for (auto &file : overrides.value()) {
+        const auto &target = file.layer.find("target")->string();
+        const bool known =
+            target == conservative_profile_id ||
+            std::ranges::any_of(set.shipped, [&](const ProfileFile &candidate) {
+              return candidate.layer.find("id")->string() == target;
+            });
+        if (!known)
+          return std::unexpected(ProfileError{
+              file.file, 0, 0, "target", "`" + target + "` names no shipped profile"});
+        const auto name = std::filesystem::path{file.file}.filename().string();
+        if (const auto [at, inserted] = targets.emplace(target, name); !inserted)
+          return std::unexpected(
+              ProfileError{file.file, 0, 0, "target",
+                           "`" + target + "` is already overridden by " + at->second});
+        set.operator_overrides.push_back(std::move(file));
+      }
+      std::ranges::sort(set.operator_overrides, {},
+                        [](const ProfileFile &f) -> const std::string & {
+                          return f.layer.find("target")->string();
+                        });
+    }
+  }
+  // Every effective profile an override can reach is validated: the conservative
+  // override under conservative and under every shipped profile.
+  const ProfileFile *base_override = override_for(set, conservative_profile_id);
+  auto base = set.conservative.layer;
+  if (base_override) {
+    base = merge_override(base, base_override->layer);
+    if (auto ok = validate_effective(base, base_override->file); !ok.has_value())
+      return std::unexpected(ok.error());
+  }
+  for (const auto &file : set.shipped) {
+    auto effective = merge_override(base, file.layer);
+    if (base_override)
+      if (auto ok = validate_effective(effective, base_override->file); !ok.has_value())
+        return std::unexpected(ok.error());
+    if (const auto *own = override_for(set, file.layer.find("id")->string()))
+      if (auto ok =
+              validate_effective(merge_override(effective, own->layer), own->file);
+          !ok.has_value())
+        return std::unexpected(ok.error());
+  }
+  Value::Array profiles;
+  std::vector<const ProfileFile *> all{&set.conservative};
+  for (const auto &file : set.shipped)
+    all.push_back(&file);
+  std::ranges::sort(all, {}, [](const auto *f) -> const std::string & {
+    return f->layer.find("id")->string();
+  });
+  for (const auto *file : all)
+    profiles.push_back(Value::object({{"id", *file->layer.find("id")},
+                                      {"match", *file->layer.find("match")},
+                                      {"digest", Value{profile_digest(file->layer)}}}));
+  Value::Array overrides;
+  for (const auto &file : set.operator_overrides)
+    overrides.push_back(Value::object({{"id", *file.layer.find("id")},
+                                       {"target", *file.layer.find("target")},
+                                       {"digest", Value{profile_digest(file.layer)}}}));
+  set.digest = digest_text("blackbird.provider-profile-set/1",
+                           Value::object({{"profiles", Value{std::move(profiles)}},
+                                          {"overrides", Value{std::move(overrides)}}}));
+  // Everything, provenance included: basis, sources, revisions and file contents as
+  // loaded, for the trial record of what ran.
+  Value::Array whole_profiles;
+  for (const auto *file : all)
+    whole_profiles.push_back(file->layer);
+  Value::Array whole_overrides;
+  for (const auto &file : set.operator_overrides)
+    whole_overrides.push_back(file.layer);
+  set.content_digest =
+      digest_text("blackbird.provider-profile-set-content/1",
+                  Value::object({{"profiles", Value{std::move(whole_profiles)}},
+                                 {"overrides", Value{std::move(whole_overrides)}}}));
+  return set;
+}
+} // namespace
+
 ProfileResult<ProfileSet> load_profile_set(const ProfileDirectories &directories) {
   try {
     auto shipped = read_directory(directories.shipped, ProfileLayerKind::shipped);
     if (!shipped.has_value())
       return std::unexpected(shipped.error());
-    ProfileSet set;
-    bool found = false;
-    for (auto &file : shipped.value()) {
-      if (file.layer.find("id")->string() == conservative_profile_id) {
-        set.conservative = std::move(file);
-        found = true;
-      } else {
-        set.shipped.push_back(std::move(file));
-      }
-    }
-    if (!found)
-      return std::unexpected(
-          ProfileError{directories.shipped.string(), 0, 0, "conservative",
-                       "the shipped set has no conservative profile"});
-    if (auto ok = validate_effective(set.conservative.layer, set.conservative.file);
-        !ok.has_value())
-      return std::unexpected(ok.error());
-    for (const auto &file : set.shipped)
-      if (auto ok = validate_effective(
-              merge_override(set.conservative.layer, file.layer), file.file);
-          !ok.has_value())
-        return std::unexpected(ok.error());
-    if (directories.operator_overrides) {
-      const auto &dir = *directories.operator_overrides;
-      std::error_code error;
-      const auto link = std::filesystem::symlink_status(dir, error);
-      if (!error && link.type() == std::filesystem::file_type::symlink &&
-          !std::filesystem::exists(dir, error) && !error)
-        return std::unexpected(
-            ProfileError{dir.string(), 0, 0, "io",
-                         "profile directory is a symbolic link to nothing"});
-      error.clear();
-      const auto status = std::filesystem::status(dir, error);
-      const bool absent = error == std::errc::no_such_file_or_directory;
-      if (error && !absent)
-        return std::unexpected(ProfileError{
-            dir.string(), 0, 0, "io", "profile directory is missing or unreadable"});
-      if (!absent) {
-        if (status.type() != std::filesystem::file_type::directory)
-          return std::unexpected(ProfileError{
-              dir.string(), 0, 0, "io", "profile directory is missing or unreadable"});
-        auto overrides = read_directory(dir, ProfileLayerKind::override_layer);
-        if (!overrides.has_value())
-          return std::unexpected(overrides.error());
-        std::map<std::string, std::string, std::less<>> targets;
-        for (auto &file : overrides.value()) {
-          const auto &target = file.layer.find("target")->string();
-          const bool known =
-              target == conservative_profile_id ||
-              std::ranges::any_of(set.shipped, [&](const ProfileFile &candidate) {
-                return candidate.layer.find("id")->string() == target;
-              });
-          if (!known)
-            return std::unexpected(
-                ProfileError{file.file, 0, 0, "target",
-                             "`" + target + "` names no shipped profile"});
-          const auto name = std::filesystem::path{file.file}.filename().string();
-          if (const auto [at, inserted] = targets.emplace(target, name); !inserted)
-            return std::unexpected(ProfileError{
-                file.file, 0, 0, "target",
-                "`" + target + "` is already overridden by " + at->second});
-          set.operator_overrides.push_back(std::move(file));
-        }
-        std::ranges::sort(set.operator_overrides, {},
-                          [](const ProfileFile &f) -> const std::string & {
-                            return f.layer.find("target")->string();
-                          });
-      }
-    }
-    // Every effective profile an override can reach is validated: the conservative
-    // override under conservative and under every shipped profile.
-    const ProfileFile *base_override = override_for(set, conservative_profile_id);
-    auto base = set.conservative.layer;
-    if (base_override) {
-      base = merge_override(base, base_override->layer);
-      if (auto ok = validate_effective(base, base_override->file); !ok.has_value())
-        return std::unexpected(ok.error());
-    }
-    for (const auto &file : set.shipped) {
-      auto effective = merge_override(base, file.layer);
-      if (base_override)
-        if (auto ok = validate_effective(effective, base_override->file);
-            !ok.has_value())
-          return std::unexpected(ok.error());
-      if (const auto *own = override_for(set, file.layer.find("id")->string()))
-        if (auto ok =
-                validate_effective(merge_override(effective, own->layer), own->file);
-            !ok.has_value())
-          return std::unexpected(ok.error());
-    }
-    Value::Array profiles;
-    std::vector<const ProfileFile *> all{&set.conservative};
-    for (const auto &file : set.shipped)
-      all.push_back(&file);
-    std::ranges::sort(all, {}, [](const auto *f) -> const std::string & {
-      return f->layer.find("id")->string();
-    });
-    for (const auto *file : all)
-      profiles.push_back(
-          Value::object({{"id", *file->layer.find("id")},
-                         {"match", *file->layer.find("match")},
-                         {"digest", Value{profile_digest(file->layer)}}}));
-    Value::Array overrides;
-    for (const auto &file : set.operator_overrides)
-      overrides.push_back(
-          Value::object({{"id", *file.layer.find("id")},
-                         {"target", *file.layer.find("target")},
-                         {"digest", Value{profile_digest(file.layer)}}}));
-    set.digest =
-        digest_text("blackbird.provider-profile-set/1",
-                    Value::object({{"profiles", Value{std::move(profiles)}},
-                                   {"overrides", Value{std::move(overrides)}}}));
-    // Everything, provenance included: basis, sources, revisions and file contents as
-    // loaded, for the trial record of what ran.
-    Value::Array whole_profiles;
-    for (const auto *file : all)
-      whole_profiles.push_back(file->layer);
-    Value::Array whole_overrides;
-    for (const auto &file : set.operator_overrides)
-      whole_overrides.push_back(file.layer);
-    set.content_digest =
-        digest_text("blackbird.provider-profile-set-content/1",
-                    Value::object({{"profiles", Value{std::move(whole_profiles)}},
-                                   {"overrides", Value{std::move(whole_overrides)}}}));
-    return set;
+    return assemble_profile_set(std::move(shipped).value(),
+                                directories.shipped.string(),
+                                directories.operator_overrides);
   } catch (const std::bad_alloc &) {
     return std::unexpected(
         ProfileError{directories.shipped.string(), 0, 0, "profile", "out of memory"});
+  }
+}
+
+ProfileResult<ProfileSet> load_embedded_profile_set(
+    const std::optional<std::filesystem::path> &operator_overrides) {
+  try {
+    auto shipped = read_embedded_shipped();
+    if (!shipped.has_value())
+      return std::unexpected(shipped.error());
+    return assemble_profile_set(std::move(shipped).value(), embedded_profiles_location,
+                                operator_overrides);
+  } catch (const std::bad_alloc &) {
+    return std::unexpected(ProfileError{std::string{embedded_profiles_location}, 0, 0,
+                                        "profile", "out of memory"});
   }
 }
 

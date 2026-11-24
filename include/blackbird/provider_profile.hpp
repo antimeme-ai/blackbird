@@ -137,6 +137,10 @@ struct ProfileDirectories {
 // Each override is validated in every effective profile it can reach: one targeting
 // conservative under every shipped profile.
 ProfileResult<ProfileSet> load_profile_set(const ProfileDirectories &directories);
+// Loads the built-in shipped provider profiles embedded in the binary, optionally
+// layering operator overrides from `operator_overrides` (absent directory = none).
+ProfileResult<ProfileSet> load_embedded_profile_set(
+    const std::optional<std::filesystem::path> &operator_overrides = std::nullopt);
 // The most specific matching shipped profile, or the conservative profile. Specificity:
 // constrained dimensions, then an exact model over a prefix, then prefix length.
 // Equal specificity is refused as ambiguous.

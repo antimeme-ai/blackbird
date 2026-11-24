@@ -119,8 +119,35 @@ target_link_libraries(token_usage_test PRIVATE blackbird_foundation)
 add_test(NAME token_usage COMMAND token_usage_test)
 add_executable(blackbird-raw-reader src/raw_reader_main.cpp)
 target_link_libraries(blackbird-raw-reader PRIVATE blackbird_foundation)
+set(BLACKBIRD_EMBEDDED_RESOURCES_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_resources.cpp")
+file(GLOB BLACKBIRD_EMBEDDED_PROFILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/profiles/providers/*.lua")
+file(GLOB BLACKBIRD_EMBEDDED_SAAS_PACKS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/programs/integrations/*.lua")
+list(SORT BLACKBIRD_EMBEDDED_PROFILES)
+list(SORT BLACKBIRD_EMBEDDED_SAAS_PACKS)
+add_custom_command(
+  OUTPUT "${BLACKBIRD_EMBEDDED_RESOURCES_CPP}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_embedded_resources.py"
+    --source-dir "${CMAKE_CURRENT_SOURCE_DIR}"
+    --output "${BLACKBIRD_EMBEDDED_RESOURCES_CPP}"
+  DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_embedded_resources.py"
+    ${BLACKBIRD_EMBEDDED_PROFILES}
+    ${BLACKBIRD_EMBEDDED_SAAS_PACKS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/programs/turn.lua"
+    "${CMAKE_CURRENT_SOURCE_DIR}/programs/instruments/results.lua"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/sr71.png"
+  COMMENT "Generating embedded Lua and PNG resources"
+  VERBATIM)
+add_library(blackbird_embedded_resources STATIC "${BLACKBIRD_EMBEDDED_RESOURCES_CPP}")
+set_target_properties(blackbird_embedded_resources PROPERTIES EXPORT_COMPILE_COMMANDS OFF)
+target_include_directories(blackbird_embedded_resources PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(blackbird_embedded_resources PRIVATE blackbird_build)
+
 add_executable(blackbird-archive src/trace_archive_main.cpp)
 target_link_libraries(blackbird-archive PRIVATE blackbird_foundation)
+add_library(blackbird_archive_lib STATIC src/trace_archive_main.cpp)
+target_compile_definitions(blackbird_archive_lib PRIVATE BLACKBIRD_ARCHIVE_LIBRARY=1)
+target_link_libraries(blackbird_archive_lib PRIVATE blackbird_foundation)
 target_sources(blackbird_foundation PRIVATE src/trace_archive_worker.cpp)
 set_source_files_properties(src/trace_archive_worker.cpp PROPERTIES
   COMPILE_DEFINITIONS BLACKBIRD_ARCHIVE_EXECUTABLE="$<TARGET_FILE:blackbird-archive>")
@@ -145,9 +172,14 @@ target_sources(blackbird_foundation PRIVATE src/context.cpp src/audit.cpp src/ob
 target_sources(blackbird_foundation PRIVATE src/tools.cpp src/beads.cpp src/decision_models.cpp src/tasks.cpp src/raw_tasks.cpp src/raw_auth.cpp)
 add_executable(blackbird-job-runner src/command_job_runner.cpp)
 target_link_libraries(blackbird-job-runner PRIVATE blackbird_build)
+add_library(blackbird_job_runner_lib STATIC src/command_job_runner.cpp)
+target_compile_definitions(blackbird_job_runner_lib PRIVATE BLACKBIRD_COMMAND_JOB_RUNNER_LIBRARY=1)
+target_link_libraries(blackbird_job_runner_lib PRIVATE blackbird_build)
 target_sources(blackbird_foundation PRIVATE src/command_jobs.cpp src/runtime_paths.cpp)
+set_source_files_properties(src/runtime_paths.cpp PROPERTIES
+  COMPILE_DEFINITIONS BLACKBIRD_BUILD_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_JOB_RUNNER="$<TARGET_FILE:blackbird-job-runner>")
-target_link_libraries(blackbird_foundation PUBLIC Threads::Threads)
+target_link_libraries(blackbird_foundation PUBLIC Threads::Threads blackbird_embedded_resources blackbird_job_runner_lib)
 target_sources(blackbird_foundation PRIVATE src/workflow_executor.cpp src/workflow_join.cpp src/workflow_store.cpp src/workflow_host.cpp src/workflow_runtime.cpp)
 add_executable(workflow_host_test tests/workflow_host_test.cpp)
 target_link_libraries(workflow_host_test PRIVATE blackbird_foundation ${CMAKE_DL_LIBS})
@@ -268,7 +300,7 @@ add_executable(request_cache_test tests/request_cache_test.cpp)
 target_link_libraries(request_cache_test PRIVATE blackbird_coding)
 add_test(NAME request_cache COMMAND request_cache_test)
 target_include_directories(blackbird_coding SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(blackbird_coding PUBLIC blackbird_foundation blackbird_profiles Threads::Threads PRIVATE ${BLACKBIRD_LUA_LIBRARIES})
+target_link_libraries(blackbird_coding PUBLIC blackbird_foundation blackbird_profiles blackbird_archive_lib Threads::Threads PRIVATE ${BLACKBIRD_LUA_LIBRARIES})
 add_executable(empty_exec_task_test tests/empty_exec_task_test.cpp)
 target_link_libraries(empty_exec_task_test PRIVATE blackbird_coding)
 add_test(NAME empty_exec_task COMMAND empty_exec_task_test)
@@ -1635,9 +1667,19 @@ add_test(NAME terminal_notify COMMAND terminal_notify_test)
 set_tests_properties(terminal_notify PROPERTIES TIMEOUT 30)
 
 target_sources(blackbird_foundation PRIVATE src/integrations_runtime.cpp)
+set_source_files_properties(src/integrations_runtime.cpp PROPERTIES
+  COMPILE_DEFINITIONS BLACKBIRD_INTEGRATIONS_DIR="${CMAKE_SOURCE_DIR}/programs/integrations")
 add_executable(integrations_runtime_test tests/integrations_runtime_test.cpp)
 target_link_libraries(integrations_runtime_test PRIVATE blackbird_coding OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_compile_definitions(integrations_runtime_test PRIVATE
   BLACKBIRD_INTEGRATIONS_DIR="${CMAKE_SOURCE_DIR}/programs/integrations")
 add_test(NAME integrations_runtime COMMAND integrations_runtime_test)
 set_tests_properties(integrations_runtime PROPERTIES TIMEOUT 60)
+
+add_executable(hermetic_binary_test tests/hermetic_binary_test.cpp)
+target_link_libraries(hermetic_binary_test PRIVATE blackbird_coding Threads::Threads)
+add_dependencies(hermetic_binary_test blackbird)
+target_compile_definitions(hermetic_binary_test PRIVATE
+  BLACKBIRD_BINARY_PATH="$<TARGET_FILE:blackbird>")
+add_test(NAME hermetic_binary COMMAND hermetic_binary_test $<TARGET_FILE:blackbird>)
+set_tests_properties(hermetic_binary PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
