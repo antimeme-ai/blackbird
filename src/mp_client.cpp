@@ -1927,10 +1927,16 @@ Result<FriendEdgeState> parse_friend_edge_state(std::uint64_t raw) {
 // RFC 6455 WebSocket frame helpers
 // ---------------------------------------------------------------------------
 
-Result<void> send_ws_masked_frame(TlsConnection &conn, std::uint8_t opcode,
+struct WsMaskedFrameOptions {
+  std::uint8_t opcode = 0U;
+  int timeout_ms = 10000;
+  std::size_t max_payload = kMaxWsFramePayload;
+};
+
+Result<void> send_ws_masked_frame(TlsConnection &conn,
                                   std::span<const std::uint8_t> payload,
-                                  int timeout_ms) {
-  if (payload.size() > kMaxWsFramePayload) {
+                                  WsMaskedFrameOptions opts) {
+  if (payload.size() > opts.max_payload) {
     return fail_cv(ErrorCode::invalid_range, MpClientError::ws_frame_too_large);
   }
   std::array<std::uint8_t, 4> mask{};
@@ -1940,7 +1946,7 @@ Result<void> send_ws_masked_frame(TlsConnection &conn, std::uint8_t opcode,
 
   std::vector<std::uint8_t> frame;
   frame.reserve(14U + payload.size());
-  frame.push_back(static_cast<std::uint8_t>(0x80U | (opcode & 0x0fU)));
+  frame.push_back(static_cast<std::uint8_t>(0x80U | (opts.opcode & 0x0fU)));
   if (payload.size() <= 125U) {
     frame.push_back(static_cast<std::uint8_t>(0x80U | payload.size()));
   } else if (payload.size() <= 65535U) {
@@ -1959,7 +1965,7 @@ Result<void> send_ws_masked_frame(TlsConnection &conn, std::uint8_t opcode,
   for (std::size_t i = 0U; i < payload.size(); ++i) {
     frame.push_back(static_cast<std::uint8_t>(payload[i] ^ mask[i % 4U]));
   }
-  return conn.write_all(frame, timeout_ms);
+  return conn.write_all(frame, opts.timeout_ms);
 }
 
 constexpr bool is_reserved_ws_close_code(std::uint16_t code) noexcept {
@@ -2796,6 +2802,82 @@ std::optional<char> normalize_crockford_link_char(char ch) noexcept {
 
 } // namespace
 
+Result<std::int64_t>
+device_cwt_expiry_unix_seconds(std::span<const std::uint8_t> device_cwt) {
+  if (device_cwt.empty() || device_cwt.size() > kMaxCwtBytes) {
+    return fail_mp<std::int64_t>(ErrorCode::capacity, MpError::cwt_too_large);
+  }
+  static constexpr std::array<std::uint8_t, 7> kSign1Prefix = {
+      0xd2U, 0x84U, 0x43U, 0xa1U, 0x01U, 0x32U, 0xa0U};
+  if (device_cwt.size() <= kSign1Prefix.size() ||
+      std::memcmp(device_cwt.data(), kSign1Prefix.data(), kSign1Prefix.size()) != 0) {
+    return fail_mp<std::int64_t>(ErrorCode::corrupt,
+                                 MpError::cwt_invalid_envelope_shape);
+  }
+  StrictCwtCborReader outer{device_cwt.subspan(kSign1Prefix.size())};
+  const auto payload_bytes = outer.read_bstr(MpError::cwt_invalid_cbor);
+  if (!payload_bytes.has_value()) {
+    return Result<std::int64_t>::failure(payload_bytes.error());
+  }
+  const auto sig_bytes = outer.read_bstr(MpError::cwt_invalid_cbor);
+  if (!sig_bytes.has_value()) {
+    return Result<std::int64_t>::failure(sig_bytes.error());
+  }
+  if (!outer.at_end() || sig_bytes.value().size() != 64U) {
+    return fail_mp<std::int64_t>(ErrorCode::corrupt, MpError::cwt_invalid_cbor);
+  }
+  StrictCwtCborReader payload_reader{payload_bytes.value()};
+  const auto map_head = payload_reader.read_head(MpError::cwt_invalid_claims);
+  if (!map_head.has_value() || map_head.value().major != 5U ||
+      map_head.value().arg > 16U) {
+    return fail_mp<std::int64_t>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  std::optional<std::int64_t> exp;
+  for (std::uint64_t i = 0U; i < map_head.value().arg; ++i) {
+    const auto key = payload_reader.read_i64(MpError::cwt_invalid_claims);
+    if (!key.has_value()) {
+      return Result<std::int64_t>::failure(key.error());
+    }
+    switch (key.value()) {
+    case 1: {
+      const auto val = payload_reader.read_tstr(MpError::cwt_invalid_claims);
+      if (!val.has_value()) {
+        return Result<std::int64_t>::failure(val.error());
+      }
+      break;
+    }
+    case 4: {
+      const auto val = payload_reader.read_i64(MpError::cwt_invalid_claims);
+      if (!val.has_value()) {
+        return Result<std::int64_t>::failure(val.error());
+      }
+      exp = val.value();
+      break;
+    }
+    case 6: {
+      const auto val = payload_reader.read_i64(MpError::cwt_invalid_claims);
+      if (!val.has_value()) {
+        return Result<std::int64_t>::failure(val.error());
+      }
+      break;
+    }
+    case 8: {
+      const auto val = parse_cwt_cnf_ed25519(payload_reader);
+      if (!val.has_value()) {
+        return Result<std::int64_t>::failure(val.error());
+      }
+      break;
+    }
+    default:
+      return fail_mp<std::int64_t>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+    }
+  }
+  if (!payload_reader.at_end() || !exp.has_value()) {
+    return fail_mp<std::int64_t>(ErrorCode::corrupt, MpError::cwt_invalid_claims);
+  }
+  return Result<std::int64_t>::success(*exp);
+}
+
 Result<MpIdentityStore>
 MpIdentityStore::open_or_init_device(const std::filesystem::path &dir,
                                      std::string_view authority) {
@@ -2989,6 +3071,8 @@ Result<Ed25519SigningKey> MpIdentityStore::root_signing_key() const {
 struct MpControlSocket::Impl {
   TlsConnection conn;
   int io_timeout_ms = 10000;
+  bool is_v2 = false;
+  std::size_t max_frame_payload = kMaxWsFramePayload;
   bool open = true;
   bool close_sent = false;
   std::vector<std::uint8_t> recv_buf;
@@ -3000,9 +3084,10 @@ struct MpControlSocket::Impl {
   std::size_t frag_count = 0U;
   std::vector<std::uint8_t> frag_buf;
 
-  explicit Impl(TlsConnection connection, int timeout_ms,
+  explicit Impl(TlsConnection connection, int timeout_ms, bool v2_mode,
                 std::vector<std::uint8_t> initial_bytes) noexcept
-      : conn(std::move(connection)), io_timeout_ms(timeout_ms),
+      : conn(std::move(connection)), io_timeout_ms(timeout_ms), is_v2(v2_mode),
+        max_frame_payload(v2_mode ? kMaxMp2FrameBytes : kMaxWsFramePayload),
         recv_buf(std::move(initial_bytes)) {}
 
   std::size_t available() const noexcept { return recv_buf.size() - recv_pos; }
@@ -3056,8 +3141,10 @@ MpControlSocket::~MpControlSocket() {
 
 bool MpControlSocket::is_open() const noexcept { return impl_ && impl_->open; }
 
-Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &request,
-                                                 const Ed25519SigningKey &device_key) {
+Result<MpControlSocket>
+MpControlSocket::connect_subprotocol(const MpSocketConnectRequest &request,
+                                     const Ed25519SigningKey &device_key,
+                                     std::string_view subprotocol, bool is_v2) {
   if (request.path.empty() || contains_ctl_or_crlf(request.path)) {
     return fail_c<MpControlSocket>(ErrorCode::invalid_identity,
                                    MpClientError::invalid_config);
@@ -3108,7 +3195,9 @@ Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &r
                      "Sec-WebSocket-Key: ");
   upgrade_req.append(ws_key);
   upgrade_req.append("\r\nSec-WebSocket-Version: 13\r\n"
-                     "Sec-WebSocket-Protocol: mp1\r\nSignature-Input: ");
+                     "Sec-WebSocket-Protocol: ");
+  upgrade_req.append(subprotocol);
+  upgrade_req.append("\r\nSignature-Input: ");
   upgrade_req.append(signed_hdrs.value().signature_input);
   upgrade_req.append("\r\nSignature: ");
   upgrade_req.append(signed_hdrs.value().signature);
@@ -3234,7 +3323,7 @@ Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &r
     return fail_c<MpControlSocket>(ErrorCode::corrupt,
                                    MpClientError::ws_accept_mismatch);
   }
-  if (proto_count != 1U || proto_val != "mp1") {
+  if (proto_count != 1U || proto_val != subprotocol) {
     return fail_c<MpControlSocket>(ErrorCode::corrupt,
                                    MpClientError::ws_subprotocol_mismatch);
   }
@@ -3242,9 +3331,21 @@ Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &r
   std::vector<std::uint8_t> initial_ws_bytes(
       recv_buf.begin() + static_cast<std::ptrdiff_t>(parsed.value().header_end_offset),
       recv_buf.end());
-  auto impl = std::make_unique<Impl>(std::move(conn), request.config.io_timeout_ms,
-                                     std::move(initial_ws_bytes));
+  auto impl = std::make_unique<MpControlSocket::Impl>(
+      std::move(conn), request.config.io_timeout_ms, is_v2,
+      std::move(initial_ws_bytes));
   return Result<MpControlSocket>::success(MpControlSocket{std::move(impl)});
+}
+
+Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &request,
+                                                 const Ed25519SigningKey &device_key) {
+  return connect_subprotocol(request, device_key, "mp1", /*is_v2=*/false);
+}
+
+Result<MpControlSocket>
+MpControlSocket::connect_v2(const MpSocketConnectRequest &request,
+                            const Ed25519SigningKey &device_key) {
+  return connect_subprotocol(request, device_key, "mp2", /*is_v2=*/true);
 }
 
 Result<void> MpControlSocket::send_mp1(std::uint32_t seq, const Mp1Message &message) {
@@ -3255,19 +3356,38 @@ Result<void> MpControlSocket::send_mp1(std::uint32_t seq, const Mp1Message &mess
   if (!encoded.has_value()) {
     return Result<void>::failure(encoded.error());
   }
-  return send_ws_masked_frame(impl_->conn, /*opcode=*/0x02U, encoded.value(),
-                              impl_->io_timeout_ms);
+  return send_ws_masked_frame(
+      impl_->conn, encoded.value(),
+      WsMaskedFrameOptions{0x02U, impl_->io_timeout_ms, impl_->max_frame_payload});
+}
+
+Result<void> MpControlSocket::send_text(std::string_view utf8_json) {
+  if (!impl_ || !impl_->open) {
+    return fail_cv(ErrorCode::provider_transport, MpClientError::ws_not_open);
+  }
+  if (!impl_->is_v2) {
+    return fail_cv(ErrorCode::corrupt, MpClientError::ws_protocol_error);
+  }
+  if (utf8_json.size() > kMaxMp2FrameBytes) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::ws_frame_too_large);
+  }
+  const std::span<const std::uint8_t> text_bytes{
+      reinterpret_cast<const std::uint8_t *>(utf8_json.data()), utf8_json.size()};
+  return send_ws_masked_frame(
+      impl_->conn, text_bytes,
+      WsMaskedFrameOptions{0x01U, impl_->io_timeout_ms, kMaxMp2FrameBytes});
 }
 
 Result<void> MpControlSocket::send_ping() {
   if (!impl_ || !impl_->open) {
     return fail_cv(ErrorCode::provider_transport, MpClientError::ws_not_open);
   }
+  const std::string_view ping = impl_->is_v2 ? kMp2HeartbeatPing : kMp1HeartbeatPing;
   const std::span<const std::uint8_t> ping_bytes{
-      reinterpret_cast<const std::uint8_t *>(kMp1HeartbeatPing.data()),
-      kMp1HeartbeatPing.size()};
-  return send_ws_masked_frame(impl_->conn, /*opcode=*/0x01U, ping_bytes,
-                              impl_->io_timeout_ms);
+      reinterpret_cast<const std::uint8_t *>(ping.data()), ping.size()};
+  return send_ws_masked_frame(
+      impl_->conn, ping_bytes,
+      WsMaskedFrameOptions{0x01U, impl_->io_timeout_ms, impl_->max_frame_payload});
 }
 
 Result<void> MpControlSocket::close(std::uint16_t code) {
@@ -3281,8 +3401,9 @@ Result<void> MpControlSocket::close(std::uint16_t code) {
       payload.push_back(static_cast<std::uint8_t>((code >> 8U) & 0xffU));
       payload.push_back(static_cast<std::uint8_t>(code & 0xffU));
     }
-    const auto send_res = send_ws_masked_frame(impl_->conn, /*opcode=*/0x08U, payload,
-                                               impl_->io_timeout_ms);
+    const auto send_res = send_ws_masked_frame(
+        impl_->conn, payload,
+        WsMaskedFrameOptions{0x08U, impl_->io_timeout_ms, impl_->max_frame_payload});
     impl_->open = false;
     impl_->conn.shutdown_quiet();
     return send_res;
@@ -3398,8 +3519,9 @@ Result<std::optional<MpWsEvent>> MpControlSocket::poll_event(int timeout_ms) {
 
     // Control frames may be interleaved inside fragmented messages (RFC 6455 §5.4).
     if (opcode == 0x09U) { // Ping -> auto Pong
-      const auto pong_res = send_ws_masked_frame(impl_->conn, /*opcode=*/0x0aU,
-                                                 frame_bytes, impl_->io_timeout_ms);
+      const auto pong_res = send_ws_masked_frame(
+          impl_->conn, frame_bytes,
+          WsMaskedFrameOptions{0x0aU, impl_->io_timeout_ms, impl_->max_frame_payload});
       if (!pong_res.has_value()) {
         impl_->open = false;
         return Result<std::optional<MpWsEvent>>::failure(pong_res.error());
@@ -3514,6 +3636,210 @@ Result<std::optional<MpWsEvent>> MpControlSocket::poll_event(int timeout_ms) {
     impl_->open = false;
     return fail_c<std::optional<MpWsEvent>>(ErrorCode::corrupt,
                                             MpClientError::ws_protocol_error);
+  }
+}
+
+Result<std::optional<MpWsV2Event>> MpControlSocket::poll_text_frame(int timeout_ms) {
+  if (!impl_ || !impl_->open) {
+    return fail_c<std::optional<MpWsV2Event>>(ErrorCode::provider_transport,
+                                              MpClientError::ws_not_open);
+  }
+  if (!impl_->is_v2) {
+    return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                              MpClientError::ws_protocol_error);
+  }
+  const auto deadline =
+      SteadyClock::now() + std::chrono::milliseconds{std::max(0, timeout_ms)};
+
+  for (;;) {
+    const auto hdr_ok = impl_->fill_bytes(2U, deadline);
+    if (!hdr_ok.has_value()) {
+      return Result<std::optional<MpWsV2Event>>::failure(hdr_ok.error());
+    }
+    if (!hdr_ok.value()) {
+      return Result<std::optional<MpWsV2Event>>::success(std::nullopt);
+    }
+
+    const std::uint8_t b0 = impl_->recv_buf[impl_->recv_pos];
+    const std::uint8_t b1 = impl_->recv_buf[impl_->recv_pos + 1U];
+    const bool fin = (b0 & 0x80U) != 0U;
+    const std::uint8_t rsv = static_cast<std::uint8_t>(b0 & 0x70U);
+    const std::uint8_t opcode = static_cast<std::uint8_t>(b0 & 0x0fU);
+    const bool masked = (b1 & 0x80U) != 0U;
+    const std::uint8_t len7 = static_cast<std::uint8_t>(b1 & 0x7fU);
+
+    if (rsv != 0U) {
+      impl_->open = false;
+      return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                MpClientError::ws_protocol_error);
+    }
+    if (masked) {
+      impl_->open = false;
+      return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                MpClientError::ws_masked_server_frame);
+    }
+
+    const bool is_control = (opcode & 0x08U) != 0U;
+    if (is_control && !fin) {
+      impl_->open = false;
+      return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                MpClientError::ws_protocol_error);
+    }
+
+    std::size_t header_len = 2U;
+    if (len7 == 126U) {
+      header_len = 4U;
+    } else if (len7 == 127U) {
+      header_len = 10U;
+    }
+    const auto ext_ok = impl_->fill_bytes(header_len, deadline);
+    if (!ext_ok.has_value()) {
+      return Result<std::optional<MpWsV2Event>>::failure(ext_ok.error());
+    }
+    if (!ext_ok.value()) {
+      return Result<std::optional<MpWsV2Event>>::success(std::nullopt);
+    }
+
+    std::uint64_t payload_len64 = len7;
+    if (len7 == 126U) {
+      payload_len64 =
+          (static_cast<std::uint64_t>(impl_->recv_buf[impl_->recv_pos + 2U]) << 8U) |
+          static_cast<std::uint64_t>(impl_->recv_buf[impl_->recv_pos + 3U]);
+    } else if (len7 == 127U) {
+      if ((impl_->recv_buf[impl_->recv_pos + 2U] & 0x80U) != 0U) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                  MpClientError::ws_protocol_error);
+      }
+      payload_len64 = 0U;
+      for (std::size_t i = 0U; i < 8U; ++i) {
+        payload_len64 =
+            (payload_len64 << 8U) |
+            static_cast<std::uint64_t>(impl_->recv_buf[impl_->recv_pos + 2U + i]);
+      }
+    }
+
+    if (is_control && payload_len64 > kMaxWsControlPayload) {
+      impl_->open = false;
+      return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                MpClientError::ws_protocol_error);
+    }
+    if (payload_len64 > impl_->max_frame_payload) {
+      impl_->open = false;
+      return fail_c<std::optional<MpWsV2Event>>(ErrorCode::overflow,
+                                                MpClientError::ws_frame_too_large);
+    }
+    const auto payload_len = static_cast<std::size_t>(payload_len64);
+
+    const auto body_ok = impl_->fill_bytes(header_len + payload_len, deadline);
+    if (!body_ok.has_value()) {
+      return Result<std::optional<MpWsV2Event>>::failure(body_ok.error());
+    }
+    if (!body_ok.value()) {
+      return Result<std::optional<MpWsV2Event>>::success(std::nullopt);
+    }
+
+    const std::span<const std::uint8_t> payload{
+        impl_->recv_buf.data() + impl_->recv_pos + header_len, payload_len};
+    std::vector<std::uint8_t> frame_bytes(payload.begin(), payload.end());
+    impl_->recv_pos += header_len + payload_len;
+    impl_->compact_if_needed();
+
+    if (opcode == 0x09U) { // Ping -> auto Pong
+      const auto pong_res = send_ws_masked_frame(
+          impl_->conn, frame_bytes,
+          WsMaskedFrameOptions{0x0aU, impl_->io_timeout_ms, impl_->max_frame_payload});
+      if (!pong_res.has_value()) {
+        impl_->open = false;
+        return Result<std::optional<MpWsV2Event>>::failure(pong_res.error());
+      }
+      continue;
+    }
+    if (opcode == 0x0aU) { // Pong
+      return Result<std::optional<MpWsV2Event>>::success(MpWsV2Event{MpWsPong{}});
+    }
+    if (opcode == 0x08U) { // Close
+      std::uint16_t code = 1005U;
+      if (frame_bytes.size() == 1U) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                  MpClientError::ws_protocol_error);
+      }
+      if (frame_bytes.size() >= 2U) {
+        code = static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(frame_bytes[0]) << 8U) |
+            static_cast<std::uint16_t>(frame_bytes[1]));
+      }
+      if (!impl_->close_sent) {
+        const std::uint16_t echo_code = is_reserved_ws_close_code(code) ? 1000U : code;
+        (void)close(echo_code);
+      } else {
+        impl_->open = false;
+        impl_->conn.shutdown_quiet();
+      }
+      return Result<std::optional<MpWsV2Event>>::success(MpWsV2Event{MpWsClosed{code}});
+    }
+
+    auto emit_text = [](const std::vector<std::uint8_t> &bytes)
+        -> Result<std::optional<MpWsV2Event>> {
+      std::string text(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+      if (text == kMp2HeartbeatPong) {
+        return Result<std::optional<MpWsV2Event>>::success(MpWsV2Event{MpWsPong{}});
+      }
+      return Result<std::optional<MpWsV2Event>>::success(
+          MpWsV2Event{MpWsTextFrame{std::move(text)}});
+    };
+
+    if (opcode == 0x00U) {
+      if (!impl_->frag_active || impl_->frag_opcode != 0x01U) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                  MpClientError::ws_protocol_error);
+      }
+      ++impl_->frag_count;
+      if (impl_->frag_count > kMaxWsFragmentsPerMessage) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                  MpClientError::ws_protocol_error);
+      }
+      if (impl_->frag_buf.size() + frame_bytes.size() > impl_->max_frame_payload) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::overflow,
+                                                  MpClientError::ws_frame_too_large);
+      }
+      impl_->frag_buf.insert(impl_->frag_buf.end(), frame_bytes.begin(),
+                             frame_bytes.end());
+      if (!fin) {
+        continue;
+      }
+      std::vector<std::uint8_t> msg = std::move(impl_->frag_buf);
+      impl_->frag_buf.clear();
+      impl_->frag_active = false;
+      impl_->frag_opcode = 0U;
+      impl_->frag_count = 0U;
+      return emit_text(msg);
+    }
+
+    if (opcode == 0x01U) {
+      if (impl_->frag_active) {
+        impl_->open = false;
+        return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                                  MpClientError::ws_protocol_error);
+      }
+      if (!fin) {
+        impl_->frag_active = true;
+        impl_->frag_opcode = opcode;
+        impl_->frag_count = 1U;
+        impl_->frag_buf = std::move(frame_bytes);
+        continue;
+      }
+      return emit_text(frame_bytes);
+    }
+
+    // Binary or unknown opcode is invalid on mp2 text-only rooms.
+    impl_->open = false;
+    return fail_c<std::optional<MpWsV2Event>>(ErrorCode::corrupt,
+                                              MpClientError::ws_protocol_error);
   }
 }
 
@@ -5495,6 +5821,707 @@ Result<MpControlSocket> MpControlClient::connect_party_socket(PartyId party_id) 
       MpSocketConnectRequest{config_, path, auth.value().account_id,
                              auth.value().device_id, clock_offset_s_},
       auth.value().signing_key);
+}
+
+namespace {
+
+Result<std::uint64_t> get_required_u64_or_decimal(const Value &obj,
+                                                  std::string_view key) {
+  const Value *field = obj.find(key);
+  if (field == nullptr) {
+    return fail_c<std::uint64_t>(ErrorCode::corrupt,
+                                 MpClientError::http_response_schema);
+  }
+  if (const auto *s = std::get_if<std::string>(&field->value())) {
+    return parse_safe_decimal_id(*s);
+  }
+  return value_as_u64(*field);
+}
+
+Result<std::optional<AccountId>> parse_optional_member_account_id(const Value &obj) {
+  const Value *field = obj.find("account_id");
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::optional<AccountId>>::success(std::nullopt);
+  }
+  std::uint64_t raw = 0U;
+  if (const auto *s = std::get_if<std::string>(&field->value())) {
+    if (*s == "0" || s->empty()) {
+      return Result<std::optional<AccountId>>::success(std::nullopt);
+    }
+    const auto parsed = parse_safe_decimal_id(*s);
+    if (!parsed.has_value()) {
+      return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+    }
+    raw = parsed.value();
+  } else {
+    const auto u = value_as_u64(*field);
+    if (!u.has_value()) {
+      return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+    }
+    raw = u.value();
+  }
+  if (raw == 0U) {
+    return Result<std::optional<AccountId>>::success(std::nullopt);
+  }
+  const auto id = AccountId::create(raw);
+  if (!id.has_value()) {
+    return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  return Result<std::optional<AccountId>>::success(id.value());
+}
+
+Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
+  std::vector<RoomMemberInfo> out;
+  const Value *field = obj.find("members");
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::vector<RoomMemberInfo>>::success(std::move(out));
+  }
+  const auto *arr = std::get_if<Value::Array>(&field->value());
+  if (arr == nullptr || arr->size() > 256U) {
+    return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+  }
+  out.reserve(arr->size());
+  for (const auto &entry : *arr) {
+    if (!std::holds_alternative<Value::Object>(entry.value())) {
+      return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                 MpClientError::http_response_schema);
+    }
+    const auto acct_id = parse_optional_member_account_id(entry);
+    const auto handle = get_required_string(entry, "handle");
+    if (!acct_id.has_value() || !handle.has_value()) {
+      return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                 MpClientError::http_response_schema);
+    }
+    bool is_guest = !acct_id.value().has_value();
+    if (const Value *gf = entry.find("is_guest");
+        gf != nullptr && !std::holds_alternative<std::nullptr_t>(gf->value())) {
+      const auto gb = value_as_bool_or_flag(*gf);
+      if (!gb.has_value()) {
+        return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                   MpClientError::http_response_schema);
+      }
+      is_guest = is_guest || gb.value();
+    }
+    const auto client = get_optional_string(entry, "client");
+    const auto agent_name = get_optional_string(entry, "agent_name");
+    const auto agent_state = get_optional_string(entry, "agent_state");
+    const auto agent_summary = get_optional_string(entry, "agent_summary");
+    const auto status = get_optional_string(entry, "status");
+    if (!client.has_value() || !agent_name.has_value() || !agent_state.has_value() ||
+        !agent_summary.has_value() || !status.has_value()) {
+      return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                 MpClientError::http_response_schema);
+    }
+    out.push_back(RoomMemberInfo{
+        acct_id.value(),
+        is_guest,
+        handle.value(),
+        client.value().value_or(""),
+        agent_name.value().value_or(""),
+        agent_state.value().value_or(""),
+        agent_summary.value().value_or(""),
+        status.value().value_or("live"),
+    });
+  }
+  return Result<std::vector<RoomMemberInfo>>::success(std::move(out));
+}
+
+std::string strip_leading_at(std::string_view raw) {
+  while (!raw.empty() && raw.front() == '@') {
+    raw.remove_prefix(1U);
+  }
+  return std::string{raw};
+}
+
+} // namespace
+
+Result<RoomInviteResponse>
+MpControlClient::room_invite(const RoomInviteRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<RoomInviteResponse>::failure(auth.error());
+  }
+
+  Value::Object body_obj;
+  if (request.handle.has_value() && !request.handle->empty()) {
+    const std::string clean_handle = strip_leading_at(*request.handle);
+    const auto valid = AccountHandle::parse(clean_handle);
+    if (!valid.has_value()) {
+      return Result<RoomInviteResponse>::failure(valid.error());
+    }
+    body_obj.emplace_back("handle", Value{std::string{valid.value().display()}});
+  }
+  if (request.party_id.has_value()) {
+    body_obj.emplace_back("party_id", Value{Number{request.party_id->value()}});
+  }
+  if (request.name.has_value() && !request.name->empty()) {
+    body_obj.emplace_back("name", Value{*request.name});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<RoomInviteResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/rooms/invite";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<RoomInviteResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<RoomInviteResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RoomInviteResponse>::failure(obj.error());
+  }
+  const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
+  const auto room_code = get_required_string(obj.value(), "room_code");
+  const auto share_url = get_required_string(obj.value(), "share_url");
+  const auto ws_path = get_required_string(obj.value(), "ws_path");
+  const auto handle_url = get_optional_string(obj.value(), "handle_url");
+  const auto invited_handle = get_optional_string(obj.value(), "invited_handle");
+  if (!pid_raw.has_value() || !room_code.has_value() || !share_url.has_value() ||
+      !ws_path.has_value() || !handle_url.has_value() || !invited_handle.has_value()) {
+    return fail_c<RoomInviteResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  const auto pid = PartyId::create(pid_raw.value());
+  if (!pid.has_value()) {
+    return fail_c<RoomInviteResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  return Result<RoomInviteResponse>::success(RoomInviteResponse{
+      pid.value(),
+      room_code.value(),
+      share_url.value(),
+      handle_url.value().value_or(""),
+      ws_path.value(),
+      invited_handle.value(),
+  });
+}
+
+Result<RoomEnterResponse> MpControlClient::room_enter(const RoomEnterRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<RoomEnterResponse>::failure(auth.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("target", Value{request.target});
+  body_obj.emplace_back(
+      "client",
+      Value{request.client.empty() ? std::string{"blackbird"} : request.client});
+  if (!request.agent_name.empty()) {
+    body_obj.emplace_back("agent_name", Value{request.agent_name});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<RoomEnterResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/rooms/enter";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<RoomEnterResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<RoomEnterResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RoomEnterResponse>::failure(obj.error());
+  }
+  const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
+  const auto room_code = get_required_string(obj.value(), "room_code");
+  const auto ws_path = get_required_string(obj.value(), "ws_path");
+  const auto name = get_optional_string(obj.value(), "name");
+  const auto share_url = get_optional_string(obj.value(), "share_url");
+  auto members = parse_room_member_list(obj.value());
+  if (!pid_raw.has_value() || !room_code.has_value() || !ws_path.has_value() ||
+      !name.has_value() || !share_url.has_value() || !members.has_value()) {
+    return fail_c<RoomEnterResponse>(ErrorCode::corrupt,
+                                     MpClientError::http_response_schema);
+  }
+  const auto pid = PartyId::create(pid_raw.value());
+  if (!pid.has_value()) {
+    return fail_c<RoomEnterResponse>(ErrorCode::corrupt,
+                                     MpClientError::http_response_schema);
+  }
+  return Result<RoomEnterResponse>::success(RoomEnterResponse{
+      pid.value(),
+      room_code.value(),
+      name.value().value_or(""),
+      share_url.value().value_or(""),
+      ws_path.value(),
+      std::move(members).value(),
+  });
+}
+
+Result<RoomLeaveResponse> MpControlClient::room_leave(PartyId party_id) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<RoomLeaveResponse>::failure(auth.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("party_id", Value{Number{party_id.value()}});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<RoomLeaveResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/rooms/leave";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<RoomLeaveResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<RoomLeaveResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RoomLeaveResponse>::failure(obj.error());
+  }
+  const Value *left_field = obj.value().find("left");
+  if (left_field == nullptr) {
+    return fail_c<RoomLeaveResponse>(ErrorCode::corrupt,
+                                     MpClientError::http_response_schema);
+  }
+  const auto left = value_as_bool_or_flag(*left_field);
+  const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
+  if (!left.has_value() || !pid_raw.has_value()) {
+    return fail_c<RoomLeaveResponse>(ErrorCode::corrupt,
+                                     MpClientError::http_response_schema);
+  }
+  const auto pid = PartyId::create(pid_raw.value());
+  if (!pid.has_value()) {
+    return fail_c<RoomLeaveResponse>(ErrorCode::corrupt,
+                                     MpClientError::http_response_schema);
+  }
+  return Result<RoomLeaveResponse>::success(
+      RoomLeaveResponse{left.value(), pid.value()});
+}
+
+Result<FriendsLiveResponse> MpControlClient::friends_live() {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<FriendsLiveResponse>::failure(auth.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::get;
+  req.path = "/v1/friends/live";
+  req.query = "?";
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<FriendsLiveResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<FriendsLiveResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<FriendsLiveResponse>::failure(obj.error());
+  }
+
+  FriendsLiveResponse out{};
+  if (const Value *friends_field = obj.value().find("friends");
+      friends_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(friends_field->value())) {
+    const auto *arr = std::get_if<Value::Array>(&friends_field->value());
+    if (arr == nullptr) {
+      return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                         MpClientError::http_response_schema);
+    }
+    out.friends.reserve(arr->size());
+    for (const auto &item : *arr) {
+      if (!std::holds_alternative<Value::Object>(item.value())) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      const auto acct_raw = get_required_u64_or_decimal(item, "account_id");
+      const auto handle = get_required_string(item, "handle");
+      const auto state = get_optional_string(item, "state");
+      const auto presence = get_optional_string(item, "presence");
+      const auto client = get_optional_string(item, "client");
+      const auto room_code = get_optional_string(item, "party_room_code");
+      if (!acct_raw.has_value() || !handle.has_value() || !state.has_value() ||
+          !presence.has_value() || !client.has_value() || !room_code.has_value()) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      const auto acct_id = AccountId::create(acct_raw.value());
+      if (!acct_id.has_value()) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      bool joinable = false;
+      if (const Value *jf = item.find("joinable");
+          jf != nullptr && !std::holds_alternative<std::nullptr_t>(jf->value())) {
+        const auto jb = value_as_bool_or_flag(*jf);
+        if (!jb.has_value()) {
+          return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+        }
+        joinable = jb.value();
+      }
+      out.friends.push_back(LiveFriendEntry{
+          acct_id.value(),
+          handle.value(),
+          state.value().value_or("friend"),
+          presence.value().value_or("offline"),
+          client.value().value_or(""),
+          room_code.value(),
+          joinable,
+      });
+    }
+  }
+
+  if (const Value *inv_field = obj.value().find("pending_invites");
+      inv_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(inv_field->value())) {
+    const auto *arr = std::get_if<Value::Array>(&inv_field->value());
+    if (arr == nullptr) {
+      return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                         MpClientError::http_response_schema);
+    }
+    out.pending_invites.reserve(arr->size());
+    for (const auto &item : *arr) {
+      if (!std::holds_alternative<Value::Object>(item.value())) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      const auto pid_raw = get_required_u64_or_decimal(item, "party_id");
+      const auto code = get_optional_string(item, "room_code");
+      const auto from = get_required_string(item, "from_handle");
+      if (!pid_raw.has_value() || !code.has_value() || !from.has_value()) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      const auto pid = PartyId::create(pid_raw.value());
+      if (!pid.has_value()) {
+        return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+      }
+      std::uint64_t created_ms = 0U;
+      if (const Value *cf = item.find("created_at_ms");
+          cf != nullptr && !std::holds_alternative<std::nullptr_t>(cf->value())) {
+        const auto cu = value_as_u64(*cf);
+        if (!cu.has_value()) {
+          return fail_c<FriendsLiveResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+        }
+        created_ms = cu.value();
+      }
+      out.pending_invites.push_back(PendingRoomInvite{
+          pid.value(),
+          code.value().value_or(""),
+          from.value(),
+          created_ms,
+      });
+    }
+  }
+
+  return Result<FriendsLiveResponse>::success(std::move(out));
+}
+
+Result<AuthSessionStartResponse>
+MpControlClient::auth_session_start(const AuthSessionStartRequest &request) {
+  if (const auto pk_ok = validate_ed25519_pubkey_strict(request.device_pubkey);
+      !pk_ok.has_value()) {
+    return Result<AuthSessionStartResponse>::failure(pk_ok.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("device_pubkey_b64",
+                        Value{base64_encode(request.device_pubkey)});
+  body_obj.emplace_back("device_label",
+                        Value{request.device_label.empty() ? std::string{"Blackbird"}
+                                                           : request.device_label});
+  body_obj.emplace_back(
+      "client",
+      Value{request.client.empty() ? std::string{"blackbird"} : request.client});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<AuthSessionStartResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/auth/session/start";
+  req.query = "?";
+  req.headers.emplace_back("Content-Type", "application/json");
+  req.body = std::move(body_bytes).value();
+
+  auto resp = execute_http_once(config_, req);
+  if (!resp.has_value()) {
+    return Result<AuthSessionStartResponse>::failure(resp.error());
+  }
+  CleanseVectorGuard resp_body_cleanse{resp.value().body};
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<AuthSessionStartResponse>::failure(
+        map_http_error(resp.value().status, false));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<AuthSessionStartResponse>::failure(obj.error());
+  }
+  const auto flow_id = get_required_string(obj.value(), "flow_id");
+  const auto poll_token = get_required_string(obj.value(), "poll_token");
+  const auto user_code = get_required_string(obj.value(), "user_code");
+  const auto verify_url = get_required_string(obj.value(), "verify_url");
+  const auto expires_at_ms = get_required_u64(obj.value(), "expires_at_ms");
+  if (!flow_id.has_value() || !poll_token.has_value() || !user_code.has_value() ||
+      !verify_url.has_value() || !expires_at_ms.has_value()) {
+    return fail_c<AuthSessionStartResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  return Result<AuthSessionStartResponse>::success(AuthSessionStartResponse{
+      flow_id.value(),
+      poll_token.value(),
+      user_code.value(),
+      verify_url.value(),
+      expires_at_ms.value(),
+  });
+}
+
+Result<AuthSessionPollResponse>
+MpControlClient::auth_session_poll(const AuthSessionPollRequest &request) {
+  if (request.flow_id.empty() || request.poll_token.empty()) {
+    return fail_c<AuthSessionPollResponse>(ErrorCode::invalid_range,
+                                           MpClientError::invalid_config);
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("flow_id", Value{request.flow_id});
+  body_obj.emplace_back("poll_token", Value{request.poll_token});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<AuthSessionPollResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/auth/session/poll";
+  req.query = "?";
+  req.headers.emplace_back("Content-Type", "application/json");
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  auto resp = execute_http_once(config_, req);
+  if (!resp.has_value()) {
+    return Result<AuthSessionPollResponse>::failure(resp.error());
+  }
+  CleanseVectorGuard resp_body_cleanse{resp.value().body};
+  if (resp.value().status != 200) {
+    return Result<AuthSessionPollResponse>::failure(
+        map_http_error(resp.value().status, false));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<AuthSessionPollResponse>::failure(obj.error());
+  }
+  const auto status_str = get_required_string(obj.value(), "status");
+  if (!status_str.has_value()) {
+    return fail_c<AuthSessionPollResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+  AuthSessionPollResponse out{};
+  if (status_str.value() == "pending") {
+    out.pending = true;
+    return Result<AuthSessionPollResponse>::success(std::move(out));
+  }
+  if (status_str.value() != "approved") {
+    return fail_c<AuthSessionPollResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+
+  const auto acct_raw = get_required_u64_or_decimal(obj.value(), "account_id");
+  const auto dev_raw = get_required_u64_or_decimal(obj.value(), "device_id");
+  const auto handle = get_required_string(obj.value(), "handle");
+  const auto cwt_b64 = get_required_string(obj.value(), "device_cwt_b64");
+  const auto session_tok = get_optional_string(obj.value(), "session_token");
+  if (!acct_raw.has_value() || !dev_raw.has_value() || !handle.has_value() ||
+      !cwt_b64.has_value() || !session_tok.has_value()) {
+    return fail_c<AuthSessionPollResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+  const auto acct_id = AccountId::create(acct_raw.value());
+  const auto dev_id = DeviceId::create(dev_raw.value());
+  const auto cwt_bytes = base64_decode(cwt_b64.value());
+  if (!acct_id.has_value() || !dev_id.has_value() || !cwt_bytes.has_value() ||
+      cwt_bytes->empty() || cwt_bytes->size() > kMaxCwtBytes) {
+    return fail_c<AuthSessionPollResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+
+  out.approved = true;
+  out.account_id = acct_id.value();
+  out.device_id = dev_id.value();
+  out.handle = handle.value();
+  out.device_cwt = std::move(*cwt_bytes);
+  out.session_token = session_tok.value();
+
+  if (const Value *rpk_field = obj.value().find("root_pubkey_b64");
+      rpk_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(rpk_field->value())) {
+    const auto rpk = get_required_pubkey_b64(obj.value(), "root_pubkey_b64");
+    if (!rpk.has_value()) {
+      return Result<AuthSessionPollResponse>::failure(rpk.error());
+    }
+    out.root_pubkey = rpk.value();
+  }
+  if (const Value *exp_field = obj.value().find("cwt_expires_ms");
+      exp_field != nullptr &&
+      !std::holds_alternative<std::nullptr_t>(exp_field->value())) {
+    const auto exp = value_as_u64(*exp_field);
+    if (!exp.has_value()) {
+      return fail_c<AuthSessionPollResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    out.cwt_expires_ms = exp.value();
+  }
+  return Result<AuthSessionPollResponse>::success(std::move(out));
+}
+
+Result<RenewDeviceCwtResponse> MpControlClient::renew_device_cwt() {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<RenewDeviceCwtResponse>::failure(auth.error());
+  }
+
+  auto body_bytes = dump_json_bytes(Value::object({}));
+  if (!body_bytes.has_value()) {
+    return Result<RenewDeviceCwtResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/devices/me/renew";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<RenewDeviceCwtResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<RenewDeviceCwtResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RenewDeviceCwtResponse>::failure(obj.error());
+  }
+  const auto cwt_b64 = get_required_string(obj.value(), "device_cwt_b64");
+  const auto exp_ms = get_required_u64(obj.value(), "cwt_expires_ms");
+  if (!cwt_b64.has_value() || !exp_ms.has_value()) {
+    return fail_c<RenewDeviceCwtResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+  }
+  const auto cwt_bytes = base64_decode(cwt_b64.value());
+  if (!cwt_bytes.has_value() || cwt_bytes->empty() ||
+      cwt_bytes->size() > kMaxCwtBytes) {
+    return fail_c<RenewDeviceCwtResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+  }
+  return Result<RenewDeviceCwtResponse>::success(
+      RenewDeviceCwtResponse{std::move(*cwt_bytes), exp_ms.value()});
+}
+
+Result<MpControlSocket> MpControlClient::connect_ws_v2(std::string_view ws_path) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MpControlSocket>::failure(auth.error());
+  }
+  if (ws_path.empty() || ws_path.front() != '/' || contains_ctl_or_crlf(ws_path)) {
+    return fail_c<MpControlSocket>(ErrorCode::invalid_identity,
+                                   MpClientError::invalid_config);
+  }
+  const std::string path{ws_path};
+  auto sock = MpControlSocket::connect_v2(
+      MpSocketConnectRequest{config_, path, auth.value().account_id,
+                             auth.value().device_id, clock_offset_s_},
+      auth.value().signing_key);
+  if (sock.has_value() ||
+      mp_client_error_of(sock.error()) != MpClientError::http_clock_skew) {
+    return sock;
+  }
+  const auto h = health();
+  if (!h.has_value() || !h.value().ok) {
+    return sock;
+  }
+  const auto next_offset =
+      checked_sub_i64(static_cast<std::int64_t>(h.value().server_now_ms / 1000U),
+                      current_unix_seconds());
+  if (!next_offset.has_value()) {
+    return sock;
+  }
+  clock_offset_s_ = *next_offset;
+  return MpControlSocket::connect_v2(
+      MpSocketConnectRequest{config_, path, auth.value().account_id,
+                             auth.value().device_id, clock_offset_s_},
+      auth.value().signing_key);
+}
+
+Result<MpControlSocket> MpControlClient::connect_party_socket_v2(PartyId party_id) {
+  return connect_ws_v2("/v1/parties/" + party_id.to_decimal() + "/ws");
 }
 
 } // namespace blackbird::mp

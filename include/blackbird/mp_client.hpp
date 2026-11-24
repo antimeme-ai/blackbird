@@ -95,6 +95,15 @@ inline constexpr std::string_view kDefaultMpAuthority = "api.multiplayer.tech";
 inline constexpr std::uint16_t kDefaultMpPort = 443U;
 inline constexpr std::string_view kMp1HeartbeatPing = "MP1:PING";
 inline constexpr std::string_view kMp1HeartbeatPong = "MP1:PONG";
+inline constexpr std::size_t kMaxMp2FrameBytes = 48U * 1024U;
+inline constexpr std::size_t kMaxMp2BodyBytes = 32U * 1024U;
+inline constexpr std::string_view kMp2HeartbeatPing = "MP2:PING";
+inline constexpr std::string_view kMp2HeartbeatPong = "MP2:PONG";
+
+// Extracts the Unix-epoch `exp` claim from a COSE_Sign1 device CWT without requiring
+// the offline root public key (validates CBOR structure and claims).
+Result<std::int64_t>
+device_cwt_expiry_unix_seconds(std::span<const std::uint8_t> device_cwt);
 
 // ---------------------------------------------------------------------------
 // 1. Local device identity store (0700 dir, 0600 files, RAII OPENSSL_cleanse)
@@ -477,12 +486,135 @@ struct PartyMutationResponse {
 };
 
 // ---------------------------------------------------------------------------
+// 2b. Room Protocol v2 (mp2) & Cloud Auth REST DTOs
+// ---------------------------------------------------------------------------
+
+struct RoomInviteRequest {
+  std::optional<std::string> handle;
+  std::optional<PartyId> party_id;
+  std::optional<std::string> name;
+};
+
+struct RoomInviteResponse {
+  PartyId party_id = PartyId::create(1U).value();
+  std::string room_code;
+  std::string share_url;
+  std::string handle_url;
+  std::string ws_path;
+  std::optional<std::string> invited_handle;
+  bool operator==(const RoomInviteResponse &) const = default;
+};
+
+struct RoomMemberInfo {
+  std::optional<AccountId> account_id;
+  bool is_guest = false;
+  std::string handle;
+  std::string client;
+  std::string agent_name;
+  std::string agent_state;
+  std::string agent_summary;
+  std::string status;
+  bool operator==(const RoomMemberInfo &) const = default;
+};
+
+struct RoomEnterRequest {
+  std::string target;
+  std::string client = "blackbird";
+  std::string agent_name = "Blackbird";
+};
+
+struct RoomEnterResponse {
+  PartyId party_id = PartyId::create(1U).value();
+  std::string room_code;
+  std::string name;
+  std::string share_url;
+  std::string ws_path;
+  std::vector<RoomMemberInfo> members;
+  bool operator==(const RoomEnterResponse &) const = default;
+};
+
+struct RoomLeaveResponse {
+  bool left = false;
+  PartyId party_id = PartyId::create(1U).value();
+  bool operator==(const RoomLeaveResponse &) const = default;
+};
+
+struct LiveFriendEntry {
+  AccountId account_id = AccountId::create(1U).value();
+  std::string handle;
+  std::string state;
+  std::string presence;
+  std::string client;
+  std::optional<std::string> party_room_code;
+  bool joinable = false;
+  bool operator==(const LiveFriendEntry &) const = default;
+};
+
+struct PendingRoomInvite {
+  PartyId party_id = PartyId::create(1U).value();
+  std::string room_code;
+  std::string from_handle;
+  std::uint64_t created_at_ms = 0U;
+  bool operator==(const PendingRoomInvite &) const = default;
+};
+
+struct FriendsLiveResponse {
+  std::vector<LiveFriendEntry> friends;
+  std::vector<PendingRoomInvite> pending_invites;
+  bool operator==(const FriendsLiveResponse &) const = default;
+};
+
+struct AuthSessionStartRequest {
+  Ed25519PubKey device_pubkey{};
+  std::string device_label;
+  std::string client = "blackbird";
+};
+
+struct AuthSessionStartResponse {
+  std::string flow_id;
+  std::string poll_token;
+  std::string user_code;
+  std::string verify_url;
+  std::uint64_t expires_at_ms = 0U;
+  bool operator==(const AuthSessionStartResponse &) const = default;
+};
+
+struct AuthSessionPollRequest {
+  std::string flow_id;
+  std::string poll_token;
+};
+
+struct AuthSessionPollResponse {
+  bool pending = false;
+  bool approved = false;
+  std::optional<AccountId> account_id;
+  std::optional<std::string> handle;
+  std::optional<DeviceId> device_id;
+  std::optional<Ed25519PubKey> root_pubkey;
+  std::vector<std::uint8_t> device_cwt;
+  std::optional<std::uint64_t> cwt_expires_ms;
+  std::optional<std::string> session_token;
+  bool operator==(const AuthSessionPollResponse &) const = default;
+};
+
+struct RenewDeviceCwtResponse {
+  std::vector<std::uint8_t> device_cwt;
+  std::uint64_t cwt_expires_ms = 0U;
+  bool operator==(const RenewDeviceCwtResponse &) const = default;
+};
+
+// ---------------------------------------------------------------------------
 // 3. Live RFC 6455 WebSocket Client over TLS 1.3 + HTTP/1.1 ALPN
 // ---------------------------------------------------------------------------
 
 struct MpWsMp1Frame {
   DecodedFrame frame;
   bool operator==(const MpWsMp1Frame &) const = default;
+};
+
+struct MpWsTextFrame {
+  std::string payload;
+  bool operator==(const MpWsTextFrame &) const = default;
 };
 
 struct MpWsPong {
@@ -495,6 +627,7 @@ struct MpWsClosed {
 };
 
 using MpWsEvent = std::variant<MpWsMp1Frame, MpWsPong, MpWsClosed>;
+using MpWsV2Event = std::variant<MpWsTextFrame, MpWsPong, MpWsClosed>;
 
 struct MpSocketConnectRequest {
   MpClientConfig config;
@@ -506,8 +639,12 @@ struct MpSocketConnectRequest {
 
 class MpControlSocket {
 public:
+  // Legacy MP1 binary control socket (Sec-WebSocket-Protocol: mp1).
   static Result<MpControlSocket> connect(const MpSocketConnectRequest &request,
                                          const Ed25519SigningKey &device_key);
+  // Room Protocol v2 UTF-8 JSON text socket (Sec-WebSocket-Protocol: mp2).
+  static Result<MpControlSocket> connect_v2(const MpSocketConnectRequest &request,
+                                            const Ed25519SigningKey &device_key);
 
   MpControlSocket(const MpControlSocket &) = delete;
   MpControlSocket &operator=(const MpControlSocket &) = delete;
@@ -517,13 +654,19 @@ public:
 
   bool is_open() const noexcept;
   Result<void> send_mp1(std::uint32_t seq, const Mp1Message &message);
+  Result<void> send_text(std::string_view utf8_json);
   Result<void> send_ping();
   // Returns std::nullopt when timeout_ms elapses with no complete event.
   Result<std::optional<MpWsEvent>> poll_event(int timeout_ms);
+  Result<std::optional<MpWsV2Event>> poll_text_frame(int timeout_ms);
   Result<void> close(std::uint16_t code = 1000U);
 
 private:
   struct Impl;
+  static Result<MpControlSocket>
+  connect_subprotocol(const MpSocketConnectRequest &request,
+                      const Ed25519SigningKey &device_key, std::string_view subprotocol,
+                      bool is_v2);
   explicit MpControlSocket(std::unique_ptr<Impl> impl) noexcept;
   std::unique_ptr<Impl> impl_;
 };
@@ -610,10 +753,23 @@ public:
   Result<PartyMutationResponse> leave_party(PartyId party_id);
   Result<PartyMutationResponse> disband_party(const DisbandPartyRequest &request);
 
+  // Room Protocol v2 & Cloud Auth REST API
+  Result<RoomInviteResponse> room_invite(const RoomInviteRequest &request);
+  Result<RoomEnterResponse> room_enter(const RoomEnterRequest &request);
+  Result<RoomLeaveResponse> room_leave(PartyId party_id);
+  Result<FriendsLiveResponse> friends_live();
+  Result<AuthSessionStartResponse>
+  auth_session_start(const AuthSessionStartRequest &request);
+  Result<AuthSessionPollResponse>
+  auth_session_poll(const AuthSessionPollRequest &request);
+  Result<RenewDeviceCwtResponse> renew_device_cwt();
+
   // Live RFC 6455 WebSockets (automatically retry once on clock_skew)
   Result<MpControlSocket> connect_account_socket();
   Result<MpControlSocket> connect_social_ws();
   Result<MpControlSocket> connect_party_socket(PartyId party_id);
+  Result<MpControlSocket> connect_ws_v2(std::string_view ws_path);
+  Result<MpControlSocket> connect_party_socket_v2(PartyId party_id);
 
 private:
   MpClientConfig config_;
