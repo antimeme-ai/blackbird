@@ -447,8 +447,9 @@ if arguments.case in ('all', 'input'):
         observed = Observed()
         try:
             wait_for(b"Workflow reloads")
-            # Default startup enables SGR mouse reporting (wheel scroll + chat drag-select).
-            wait_for(mouse_on)
+            # Default startup keeps native drag-selection (mouse reporting OFF, alt-scroll ON).
+            wait_for(b"\x1b[?1007h")
+            assert mouse_on not in bytes(observed), "default startup unexpectedly enabled mouse reporting"
             send(b'/lua print("INPUT_" .. "HISTORY")\r')
             wait_for(b"INPUT_HISTORY")
             send(b"/copy\r")
@@ -460,7 +461,9 @@ if arguments.case in ('all', 'input'):
             wait_for(b'> /copy')
             send(b"\x1b[B")  # Down past the newest returns to the draft.
             wait_for(b"> typed")
-            send(b"\x15/keys\r")
+            send(b"\x15/mouse on\r")
+            wait_for(mouse_on)
+            send(b"/keys\r")
             wait_for(b"Paste ")
             assert b"Alt-Enter    Insert" not in observed.visible(), "precondition: help top scrolled away"
             send(b"WHEELDRAFT")
@@ -472,7 +475,7 @@ if arguments.case in ('all', 'input'):
             wait_for(b"> WHEELDRAFT", predicate=lambda: b"Alt-Enter    Insert" not in observed.visible())
             send(b"\x15/mouse off\r")
             wait_for(mouse_off)
-            wait_for(b"Mouse off")
+            wait_for(b"Mouse mode off")
             send(b"/mouse on\r")
             wait_for(mouse_on)
             send(b"X\x1b[27;2;13~Y\x1b[13;2uZ")
@@ -483,20 +486,21 @@ if arguments.case in ('all', 'input'):
             assert tail.rfind(mouse_off) != -1 and tail.rfind(mouse_off) < tail.rfind(b"\x1b[?1049l"), "exit ends reporting before leaving the screen"
             saved = native_packet.read_packet((Path(work) / 'ui-state.bbm'))
             assert bytes.fromhex(saved['draft']) == b"X\nY\nZ", saved
-            # BLACKBIRD_MOUSE=0 disables mouse reporting from startup.
+            # BLACKBIRD_MOUSE=1 enables mouse reporting from startup.
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
                                      stdout=slave, stderr=slave, start_new_session=True,
-                                     env=dict(os.environ, BLACKBIRD_MOUSE="0"))
+                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
             wait_for(b"Workflow reloads")
-            assert mouse_on not in bytes(observed), "BLACKBIRD_MOUSE=0 enabled mouse reporting"
+            wait_for(mouse_on)
             send(b"\x11")
             assert exit_code() == 0
-            # A launch that starts tiny with default mouse enables reporting through the small frame.
+            # A launch that starts tiny with BLACKBIRD_MOUSE=1 enables reporting through the small frame.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 10, 0, 0))
             observed = Observed()
             child = subprocess.Popen([arguments.executable, "--session", work], stdin=slave,
-                                     stdout=slave, stderr=slave, start_new_session=True)
+                                     stdout=slave, stderr=slave, start_new_session=True,
+                                     env=dict(os.environ, BLACKBIRD_MOUSE="1"))
             wait_for(mouse_on)
             assert b"\x1b[2J" in observed, "first frame was not the small frame"
             send(b"\x11")

@@ -1313,8 +1313,11 @@ private:
         raw_session->drain_wake();
         const auto snap = raw_session->snapshot();
         if (tui_) {
-          for (const auto &notice : snap.notices)
+          for (const auto &notice : snap.notices) {
             ui_.notice("\n[party] " + notice + "\n");
+            ui_.desktop_notify(TerminalNotifyTitle{"Blackbird Party"},
+                               TerminalNotifyBody{notice});
+          }
           ui_.party_chat(raw_session->to_party_snapshot());
         }
       }
@@ -1385,8 +1388,11 @@ private:
                 from.has_value()
                     ? ("@" + party_chat_sanitize(strip_leading_at_live(*from), 48))
                     : std::string{"A friend"};
-            if (tui_)
+            if (tui_) {
               ui_.notice("\n[party] " + who + " invited you to a party — type /join\n");
+              ui_.desktop_notify(TerminalNotifyTitle{"Party Invite"},
+                                 TerminalNotifyBody{who + " invited you — type /join"});
+            }
             continue;
           }
           if (tui_) {

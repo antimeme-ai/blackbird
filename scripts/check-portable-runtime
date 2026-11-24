@@ -159,11 +159,10 @@ try:
             retained_turn = turn.with_suffix('.lua-retained')
             turn.rename(retained_turn)
             try:
-                application('missing-bundle-workflow', expect_ready=False)
+                # Hermetic binary embeds default turn.lua so missing bundle file still opens cleanly.
+                application('missing-bundle-workflow', expect_ready=True)
             finally:
                 retained_turn.rename(turn)
-            # Earlier missing-bundle refusal stops old code before an application
-            # that ignores the new explicit workflow field could request a model.
             application('invalid-workflow-type', expect_ready=False, workflow_override=42)
             application('nul-workflow', expect_ready=False,
                         workflow_override=str(workflow_for(root/'nul-effect'))+'\0suffix')
@@ -173,10 +172,11 @@ try:
             retained_runner = runner.with_suffix('.retained')
             runner.rename(retained_runner)
             try:
-                cli_pty('missing-bundle-helper', succeeds=False)
+                # Hermetic binary falls back to multicall --internal-job-runner when sibling helper is absent.
+                cli_pty('missing-bundle-helper', succeeds=True)
             finally:
                 retained_runner.rename(runner)
-    print('Relocated native ready/host negotiation, owned PTY effect/output, explicit override and missing bundle refusals passed')
+    print('Relocated native ready/host negotiation, owned PTY effect/output, explicit override and hermetic fallbacks passed')
     print(root)
 except BaseException:
     print('Retained portable runtime fixture:', root, flush=True)
