@@ -1,6 +1,7 @@
 #include "blackbird/command_post_tools.hpp"
 
 #include "blackbird/board_bridge.hpp"
+#include "blackbird/cpu_arc.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/jupyter_notebook.hpp"
@@ -3202,6 +3203,241 @@ Value handle_jupyter_nb(const Value &arguments) {
   throw Error{ErrorCode::invalid_range};
 }
 
+// ---------------------------------------------------------------------------
+// Tool 12: cpu_arc (Native CPU-ARC Agentic Reasoning Caching, arXiv:2611.09891)
+// ---------------------------------------------------------------------------
+
+fs::path resolve_cpu_arc_db_path(const Value &arguments) {
+  if (const auto explicit_path =
+          optional_string(arguments, {"db_path", kMaxPathArgBytes, false});
+      explicit_path.has_value()) {
+    return fs::path{*explicit_path};
+  }
+  const auto state_dir = unwrap_or_throw(sqlite::resolve_default_model_state_dir());
+  std::error_code ec;
+  const fs::path project_root = fs::current_path(ec);
+  const std::string hash = sqlite::compute_project_db_hash(
+      project_root.empty() ? fs::path{"/"} : project_root);
+  return state_dir.parent_path() / "cpu_arc" / (hash + ".sqlite");
+}
+
+Value handle_cpu_arc(const Value &arguments) {
+  static constexpr std::array<std::string_view, 16> kAllowedKeys = {
+      "action",      "db_path",         "id",          "description",
+      "lua_source",  "entry_templates", "return_keys", "provenance_trace_hash",
+      "granularity", "is_root",         "query",       "target",
+      "limit",       "payloads",        "compiled",    "save_to_registry",
+  };
+  validate_object_keys(arguments, kAllowedKeys);
+  const std::string action = require_string(arguments, {"action", 32, false});
+
+  if (action == "probe") {
+    const auto caps = arc::probe_cpu_arc_capabilities();
+    return Value::object({
+        {"available", Value{caps.available}},
+        {"lua_version", Value{caps.lua_version}},
+        {"sqlite_version", Value{caps.sqlite_version}},
+        {"supports_fts5", Value{caps.supports_fts5}},
+        {"supports_wal", Value{caps.supports_wal}},
+        {"supports_nofollow", Value{caps.supports_nofollow}},
+        {"supports_compiled_execution", Value{caps.supports_compiled_execution}},
+        {"default_lua_memory_bytes",
+         Value{Number{static_cast<std::uint64_t>(caps.default_lua_memory_bytes)}}},
+        {"default_lua_instructions", Value{Number{caps.default_lua_instructions}}},
+    });
+  }
+
+  if (action == "analyze") {
+    const std::string lua_source =
+        require_string(arguments, {"lua_source", 256U * 1024U, false});
+    const auto analysis = unwrap_or_throw(arc::analyze_lua_source(lua_source));
+    Value::Array do_queries;
+    for (const auto &site : analysis.do_calls)
+      do_queries.emplace_back(site.query_literal);
+    Value::Array load_queries;
+    for (const auto &site : analysis.load_calls)
+      load_queries.emplace_back(site.query_literal);
+    return Value::object({
+        {"syntax_valid", Value{analysis.syntax_valid}},
+        {"defines_semantic_function", Value{analysis.defines_semantic_function}},
+        {"narration_count",
+         Value{Number{static_cast<std::uint64_t>(analysis.narration_count)}}},
+        {"control_flow_complexity",
+         Value{Number{static_cast<std::uint64_t>(analysis.control_flow_complexity)}}},
+        {"narration_commensurate", Value{analysis.narration_commensurate}},
+        {"do_calls", Value{std::move(do_queries)}},
+        {"load_calls", Value{std::move(load_queries)}},
+        {"diagnostic", Value{analysis.diagnostic}},
+    });
+  }
+
+  const fs::path db_path = resolve_cpu_arc_db_path(arguments);
+  const bool readonly_action =
+      (action == "list" || action == "search" || action == "stats");
+  if (readonly_action) {
+    std::error_code ec;
+    if (!fs::exists(db_path, ec) || ec) {
+      if (action == "list") {
+        return Value::object({{"functions", Value{Value::Array{}}}});
+      }
+      if (action == "search") {
+        return Value::object({{"matches", Value{Value::Array{}}}});
+      }
+      return Value::object({
+          {"function_count", Value{Number{0}}},
+          {"root_function_count", Value{Number{0}}},
+          {"compiled_function_count", Value{Number{0}}},
+          {"entry_point_count", Value{Number{0}}},
+          {"total_invocations", Value{Number{0}}},
+          {"total_successes", Value{Number{0}}},
+          {"total_failures", Value{Number{0}}},
+          {"total_fallbacks", Value{Number{0}}},
+      });
+    }
+  }
+
+  auto reg = unwrap_or_throw(arc::ArcRegistry::open(db_path));
+
+  if (action == "register_fn") {
+    arc::ArcFunctionRecord rec{};
+    rec.id = require_string(arguments, {"id", 64, false});
+    rec.description = require_string(arguments, {"description", 4096, false});
+    rec.lua_source = require_string(arguments, {"lua_source", 256U * 1024U, false});
+    rec.entry_templates = require_string_array(arguments, "entry_templates", 32U, true);
+    rec.return_keys = require_string_array(arguments, "return_keys", 64U, true);
+    rec.provenance_trace_hash =
+        optional_string(arguments, {"provenance_trace_hash", 128, true}).value_or("");
+    if (const auto g = optional_string(arguments, {"granularity", 16, false});
+        g.has_value()) {
+      rec.granularity = unwrap_or_throw(arc::parse_arc_granularity(*g));
+    }
+    rec.is_root = optional_bool(arguments, "is_root", false);
+    unwrap_or_throw(reg.register_function(rec));
+    return Value::object({
+        {"registered", Value{true}},
+        {"id", Value{rec.id}},
+        {"db_path", Value{db_path.string()}},
+    });
+  }
+
+  if (action == "list") {
+    const auto fns = unwrap_or_throw(reg.list_functions());
+    Value::Array arr;
+    for (const auto &f : fns) {
+      arr.push_back(Value::object({
+          {"id", Value{f.id}},
+          {"description", Value{f.description}},
+          {"is_root", Value{f.is_root}},
+          {"compiled", Value{f.compiled_lua.has_value()}},
+          {"invocation_count", Value{Number{f.invocation_count}}},
+          {"success_count", Value{Number{f.success_count}}},
+          {"failure_count", Value{Number{f.failure_count}}},
+          {"fallback_count", Value{Number{f.fallback_count}}},
+      }));
+    }
+    return Value::object({{"functions", Value{std::move(arr)}}});
+  }
+
+  if (action == "search") {
+    const std::string query = require_string(arguments, {"query", 4096, false});
+    const std::string target =
+        optional_string(arguments, {"target", 32, false}).value_or("functions");
+    std::size_t limit = 5U;
+    if (const auto *lv = arguments.find("limit");
+        lv != nullptr && !is_null_or_false_sentinel(*lv)) {
+      const auto *n = std::get_if<Number>(&lv->value());
+      if (n == nullptr || !std::holds_alternative<std::int64_t>(n->storage()))
+        throw Error{ErrorCode::invalid_range};
+      const auto iv = std::get<std::int64_t>(n->storage());
+      if (iv < 1 || iv > 50)
+        throw Error{ErrorCode::invalid_range};
+      limit = static_cast<std::size_t>(iv);
+    }
+    const auto matches = target == "entries"
+                             ? unwrap_or_throw(reg.search_entry_points(query, limit))
+                             : unwrap_or_throw(reg.search_functions(query, limit));
+    Value::Array arr;
+    for (const auto &m : matches) {
+      arr.push_back(Value::object({
+          {"id", Value{m.id}},
+          {"function_id", Value{m.function_id}},
+          {"matched_text", Value{m.matched_text}},
+          {"score", Value{Number{m.score}}},
+      }));
+    }
+    return Value::object({{"matches", Value{std::move(arr)}}});
+  }
+
+  if (action == "compile") {
+    const std::string id = require_string(arguments, {"id", 64, false});
+    const bool save = optional_bool(arguments, "save_to_registry", true);
+    const auto mod = unwrap_or_throw(reg.compile_network(id, save));
+    Value::Array included;
+    for (const auto &fid : mod.included_function_ids)
+      included.emplace_back(fid);
+    return Value::object({
+        {"root_function_id", Value{mod.root_function_id}},
+        {"included_function_ids", Value{std::move(included)}},
+        {"resolved_do_sites",
+         Value{Number{static_cast<std::uint64_t>(mod.resolved_do_sites)}}},
+        {"resolved_load_sites",
+         Value{Number{static_cast<std::uint64_t>(mod.resolved_load_sites)}}},
+        {"compiled_lua", Value{mod.lua_source}},
+    });
+  }
+
+  if (action == "invoke") {
+    const std::string id = require_string(arguments, {"id", 64, false});
+    const Value *pv = arguments.find("payloads");
+    Value payloads =
+        (pv != nullptr && !is_null_or_false_sentinel(*pv)) ? *pv : Value::object({});
+    if (!std::holds_alternative<Value::Object>(payloads.value()))
+      throw Error{ErrorCode::invalid_range};
+    const bool use_compiled = optional_bool(arguments, "compiled", false);
+    const auto res = use_compiled ? unwrap_or_throw(reg.invoke_compiled(id, payloads))
+                                  : unwrap_or_throw(reg.invoke_function(id, payloads));
+    return Value::object({
+        {"output", res.output},
+        {"narration_trace", Value{res.narration_trace}},
+        {"root_function_id", Value{res.root_function_id}},
+        {"used_compiled", Value{res.used_compiled}},
+        {"do_calls", Value{Number{static_cast<std::uint64_t>(res.do_calls)}}},
+        {"search_calls", Value{Number{res.search_calls}}},
+        {"load_search_calls", Value{Number{res.load_search_calls}}},
+        {"lua_instructions", Value{Number{res.lua_instructions}}},
+        {"duration_ns", Value{Number{res.duration_ns}}},
+    });
+  }
+
+  if (action == "stats") {
+    const auto s = unwrap_or_throw(reg.stats());
+    return Value::object({
+        {"function_count", Value{Number{static_cast<std::uint64_t>(s.function_count)}}},
+        {"root_function_count",
+         Value{Number{static_cast<std::uint64_t>(s.root_function_count)}}},
+        {"compiled_function_count",
+         Value{Number{static_cast<std::uint64_t>(s.compiled_function_count)}}},
+        {"entry_point_count",
+         Value{Number{static_cast<std::uint64_t>(s.entry_point_count)}}},
+        {"total_invocations", Value{Number{s.total_invocations}}},
+        {"total_successes", Value{Number{s.total_successes}}},
+        {"total_failures", Value{Number{s.total_failures}}},
+        {"total_fallbacks", Value{Number{s.total_fallbacks}}},
+        {"total_source_cost_usd", Value{Number{s.total_source_cost_usd}}},
+        {"total_builder_cost_usd", Value{Number{s.total_builder_cost_usd}}},
+        {"total_target_cost_usd", Value{Number{s.total_target_cost_usd}}},
+    });
+  }
+
+  if (action == "remove") {
+    const std::string id = require_string(arguments, {"id", 64, false});
+    unwrap_or_throw(reg.remove_function(id));
+    return Value::object({{"removed", Value{true}}, {"id", Value{id}}});
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
 } // namespace
 
 bool is_command_post_tool(std::string_view name) noexcept {
@@ -3209,7 +3445,7 @@ bool is_command_post_tool(std::string_view name) noexcept {
          name == "project_issues" || name == "project_memory" ||
          name == "companion_timing" || name == "local_swarm" || name == "sqlite_db" ||
          name == "measure_script" || name == "nvim_ast" || name == "code_intel" ||
-         name == "jupyter_nb";
+         name == "jupyter_nb" || name == "cpu_arc";
 }
 
 Value command_post_tool_definitions() {
@@ -3700,6 +3936,64 @@ Value command_post_tool_definitions() {
                {"additionalProperties", Value{false}},
            })},
       }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"cpu_arc"}},
+          {"description",
+           Value{"Native CPU-ARC (Agentic Reasoning Caching, arXiv:2611.09891): "
+                 "register, search, invoke, and statically compile reusable Lua 5.5.1 "
+                 "semantic-function caches backed by embedded SQLite 3.54.1 FTS5 for "
+                 "deterministic on-CPU reasoning reuse."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action",
+                     Value::object({
+                         {"type", Value{"string"}},
+                         {"enum", Value{Value::Array{Value{"probe"}, Value{"analyze"},
+                                                     Value{"register_fn"},
+                                                     Value{"list"}, Value{"search"},
+                                                     Value{"compile"}, Value{"invoke"},
+                                                     Value{"stats"}, Value{"remove"}}}},
+                     })},
+                    {"db_path", Value::object({{"type", Value{"string"}}})},
+                    {"id", Value::object({{"type", Value{"string"}}})},
+                    {"description", Value::object({{"type", Value{"string"}}})},
+                    {"lua_source", Value::object({{"type", Value{"string"}}})},
+                    {"entry_templates",
+                     Value::object(
+                         {{"type", Value{"array"}},
+                          {"items", Value::object({{"type", Value{"string"}}})}})},
+                    {"return_keys",
+                     Value::object(
+                         {{"type", Value{"array"}},
+                          {"items", Value::object({{"type", Value{"string"}}})}})},
+                    {"provenance_trace_hash",
+                     Value::object({{"type", Value{"string"}}})},
+                    {"granularity",
+                     Value::object(
+                         {{"type", Value{"string"}},
+                          {"enum", Value{Value::Array{Value{"fine"}, Value{"medium"},
+                                                      Value{"coarse"}}}}})},
+                    {"is_root", Value::object({{"type", Value{"boolean"}}})},
+                    {"query", Value::object({{"type", Value{"string"}}})},
+                    {"target",
+                     Value::object({{"type", Value{"string"}},
+                                    {"enum", Value{Value::Array{Value{"functions"},
+                                                                Value{"entries"}}}}})},
+                    {"limit", Value::object({{"type", Value{"integer"}},
+                                             {"minimum", Value{Number{1}}},
+                                             {"maximum", Value{Number{50}}}})},
+                    {"payloads", Value::object({{"type", Value{"object"}}})},
+                    {"compiled", Value::object({{"type", Value{"boolean"}}})},
+                    {"save_to_registry", Value::object({{"type", Value{"boolean"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
   }};
 }
 
@@ -3727,6 +4021,8 @@ Value run_command_post_tool(std::string_view name, const Value &arguments,
     return handle_code_intel(arguments);
   if (name == "jupyter_nb")
     return handle_jupyter_nb(arguments);
+  if (name == "cpu_arc")
+    return handle_cpu_arc(arguments);
   throw Error{ErrorCode::unsupported};
 }
 

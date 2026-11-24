@@ -1584,3 +1584,12 @@ add_executable(jupyter_notebook_test tests/jupyter_notebook_test.cpp)
 target_link_libraries(jupyter_notebook_test PRIVATE blackbird_foundation OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 add_test(NAME jupyter_notebook COMMAND jupyter_notebook_test)
 set_tests_properties(jupyter_notebook PROPERTIES TIMEOUT 60)
+
+# Native CPU-ARC (Agentic Reasoning Caching, arXiv:2611.09891): C++23 + Lua 5.5.1 + SQLite 3.54.1 FTS5.
+target_sources(blackbird_foundation PRIVATE src/cpu_arc.cpp)
+target_include_directories(blackbird_foundation SYSTEM PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(blackbird_foundation PRIVATE ${BLACKBIRD_LUA_LIBRARIES})
+add_executable(cpu_arc_test tests/cpu_arc_test.cpp)
+target_link_libraries(cpu_arc_test PRIVATE blackbird_foundation OpenSSL::Crypto Threads::Threads)
+add_test(NAME cpu_arc COMMAND cpu_arc_test)
+set_tests_properties(cpu_arc PROPERTIES TIMEOUT 60)

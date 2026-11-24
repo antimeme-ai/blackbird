@@ -118,13 +118,13 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 11, "all 11 command-post tools must be registered");
+  require(found.size() == 12, "all 12 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
               found.contains("companion_timing") && found.contains("local_swarm") &&
               found.contains("sqlite_db") && found.contains("measure_script") &&
               found.contains("nvim_ast") && found.contains("code_intel") &&
-              found.contains("jupyter_nb"),
+              found.contains("jupyter_nb") && found.contains("cpu_arc"),
           "missing expected command-post tool names");
 }
 
@@ -200,7 +200,56 @@ void test_superpower_tools_smoke(const fs::path &sandbox) {
                                    {"new_source", Value{"x = 42\n"}}}));
   require(string_field(jup_edit, "notebook_json").find("x = 42") != std::string::npos,
           "jupyter_nb replace_cell must serialize updated source");
-  (void)sandbox;
+  // 6. cpu_arc probe + analyze + register_fn + search + compile + invoke (dynamic &
+  // compiled)
+  const Value arc_probe =
+      run_command_post_tool("cpu_arc", Value::object({{"action", Value{"probe"}}}));
+  require(std::get<bool>(field(arc_probe, "available").value()) &&
+              std::get<bool>(field(arc_probe, "supports_fts5").value()),
+          "cpu_arc probe must report embedded Lua+SQLite FTS5 ready");
+  const fs::path arc_db = sandbox / "cpu_arc_smoke.sqlite";
+  const std::string arc_src = "function semantic_function(ctx)\n"
+                              "  local n = arc.load(ctx, 'input integer x', 'int')\n"
+                              "  arc.narrate(ctx, 'squaring ' .. tostring(n))\n"
+                              "  return { ['squared value'] = n * n }\n"
+                              "end\n";
+  const Value arc_reg = run_command_post_tool(
+      "cpu_arc",
+      Value::object({
+          {"action", Value{"register_fn"}},
+          {"db_path", Value{arc_db.string()}},
+          {"id", Value{"square_int"}},
+          {"description", Value{"Compute the square of an integer x"}},
+          {"lua_source", Value{arc_src}},
+          {"entry_templates", Value{Value::Array{Value{"Square integer x"}}}},
+          {"is_root", Value{true}},
+      }));
+  require(std::get<bool>(field(arc_reg, "registered").value()),
+          "cpu_arc register_fn must succeed");
+  const Value arc_comp = run_command_post_tool(
+      "cpu_arc", Value::object({{"action", Value{"compile"}},
+                                {"db_path", Value{arc_db.string()}},
+                                {"id", Value{"square_int"}}}));
+  require(string_field(arc_comp, "root_function_id") == "square_int",
+          "cpu_arc compile must return compiled module");
+  const Value arc_inv = run_command_post_tool(
+      "cpu_arc",
+      Value::object(
+          {{"action", Value{"invoke"}},
+           {"db_path", Value{arc_db.string()}},
+           {"id", Value{"square_int"}},
+           {"compiled", Value{true}},
+           {"payloads", Value::object({{"input integer x", Value{Number{9}}}})}}));
+  require(std::get<bool>(field(arc_inv, "used_compiled").value()),
+          "cpu_arc invoke compiled=true must execute compiled module");
+  require(string_field(arc_inv, "narration_trace").find("squaring 9") !=
+              std::string::npos,
+          "cpu_arc invoke must capture narration_trace");
+  const Value arc_stats = run_command_post_tool(
+      "cpu_arc",
+      Value::object({{"action", Value{"stats"}}, {"db_path", Value{arc_db.string()}}}));
+  require(field(arc_stats, "function_count").value().index() != 0U,
+          "cpu_arc stats must report function_count");
 }
 
 void test_readonly_no_dir_creation(const fs::path &sandbox) {

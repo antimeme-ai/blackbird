@@ -1,6 +1,7 @@
 #include "blackbird/command_post_tui.hpp"
 #include "blackbird/brakes_policy.hpp"
 #include "blackbird/bridge_relay.hpp"
+#include "blackbird/cpu_arc.hpp"
 #include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_view.hpp"
 #include "blackbird/issues.hpp"
@@ -17,6 +18,7 @@
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/sqlite_embedded.hpp"
 #include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/swarmboard_view.hpp"
 #include "blackbird/token_usage.hpp"
@@ -4250,9 +4252,9 @@ std::string handle_superpowers(std::string_view args) {
   if (!rest.empty() || (!sub.empty() && sub != "status" && sub != "probe")) {
     return "Usage: /superpowers [status|probe|help]\n";
   }
-  const auto sql_res = sqlite::probe_sqlite_capabilities();
   const sqlite::SqliteCapabilities sql_caps =
-      sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
+      sqlite::probe_embedded_sqlite_capabilities();
+  const arc::ArcCapabilities arc_caps = arc::probe_cpu_arc_capabilities();
   const NvimCapabilities nvim_caps = probe_nvim_capabilities();
   const JupyterCapabilities jup_caps = probe_jupyter_capabilities();
   const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
@@ -4260,13 +4262,14 @@ std::string handle_superpowers(std::string_view args) {
   std::string out = "Blackbird Model Superpowers:\n";
   out += "  SQLite Workbench:   ";
   if (sql_caps.available) {
-    out += "ready (" + sql_caps.version +
-           std::string{sql_caps.supports_safe_flag ? ", -safe" : ""} +
+    out += "ready (embedded " + sql_caps.version +
            std::string{sql_caps.supports_fts5 ? ", FTS5" : ""} +
-           std::string{sql_caps.supports_json1 ? ", JSON1" : ""} + ")\n";
+           std::string{sql_caps.supports_json1 ? ", JSON1" : ""} + ", authorizer)\n";
   } else {
-    out += "unavailable (sqlite3 not found)\n";
+    out += "unavailable\n";
   }
+  out += "  Native CPU-ARC:     ready (Lua " + arc_caps.lua_version + " + SQLite " +
+         arc_caps.sqlite_version + ", static O(1) compiler, tool: cpu_arc)\n";
   out += "  Neovim Tree-sitter: ";
   if (nvim_caps.available) {
     out += "ready (" + nvim_caps.version_string + ", " +

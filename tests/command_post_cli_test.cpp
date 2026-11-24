@@ -3981,11 +3981,12 @@ int main(int argc, char **argv) {
       check(spv.has_value() &&
                 std::holds_alternative<Value::Object>(spv.value().value()) &&
                 spv.value().find("sqlite") != nullptr &&
+                spv.value().find("cpu_arc") != nullptr &&
                 spv.value().find("nvim_treesitter") != nullptr &&
                 spv.value().find("lsp_servers") != nullptr &&
                 spv.value().find("jupyter") != nullptr &&
                 spv.value().find("measure_harness") != nullptr,
-            "superpowers status --json must include all 5 superpower families");
+            "superpowers status --json must include all 6 superpower families");
     }
 
     std::cout << "PASS command_post_cli\n";

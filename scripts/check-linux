@@ -52,6 +52,7 @@ def main():
 
     paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime", "papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md"]
     paths += ["crates/blackbird-p2p/Cargo.toml", "crates/blackbird-p2p/Cargo.lock", "crates/blackbird-p2p/src", "crates/blackbird-p2p/include"]
+    paths += ["third_party/sqlite3/sqlite3.c", "third_party/sqlite3/sqlite3.h", "third_party/sqlite3/sqlite3ext.h", "third_party/sqlite3/README.md"]
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
         for name in paths:
@@ -114,7 +115,7 @@ for name, mode, instrumentation in [('debug', 'Debug', 'none'), ('release', 'Rel
     if name == 'fuzz' and not selected_profiles:
         continue
     build = root / 'build' / name
-    configure = ['/usr/bin/cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja', '-DCMAKE_CXX_COMPILER=/usr/bin/clang++', '-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja', '-DBLACKBIRD_COMPILER_PROFILE=linux-llvm23', '-DCMAKE_BUILD_TYPE='+mode, '-DBLACKBIRD_DEBUG='+('OFF' if mode == 'Release' else 'ON'), '-DBLACKBIRD_INSTRUMENTATION='+instrumentation, '-DLUA_INCLUDE_DIR=/usr/include', '-DLUA_LIBRARY=/usr/lib/liblua.so', '-DBLACKBIRD_CARGO_TARGET_DIR=' + str(root / 'build/cargo-target')]
+    configure = ['/usr/bin/cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja', '-DCMAKE_C_COMPILER=/usr/bin/clang', '-DCMAKE_CXX_COMPILER=/usr/bin/clang++', '-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja', '-DBLACKBIRD_COMPILER_PROFILE=linux-llvm23', '-DCMAKE_BUILD_TYPE='+mode, '-DBLACKBIRD_DEBUG='+('OFF' if mode == 'Release' else 'ON'), '-DBLACKBIRD_INSTRUMENTATION='+instrumentation, '-DLUA_INCLUDE_DIR=/usr/include', '-DLUA_LIBRARY=/usr/lib/liblua.so', '-DBLACKBIRD_CARGO_TARGET_DIR=' + str(root / 'build/cargo-target')]
     if instrumentation == 'address':
         configure.append('-DCMAKE_CXX_FLAGS_DEBUG=-g -O1')
     subprocess.run(configure, check=True)

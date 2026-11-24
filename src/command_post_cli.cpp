@@ -4,6 +4,7 @@
 #include "blackbird/brakes_policy.hpp"
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/capabilities.hpp"
+#include "blackbird/cpu_arc.hpp"
 #include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/issues.hpp"
@@ -25,6 +26,7 @@
 #include "blackbird/platoon_runner.hpp"
 #include "blackbird/project_memory.hpp"
 #include "blackbird/self_upgrade.hpp"
+#include "blackbird/sqlite_embedded.hpp"
 #include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/value.hpp"
 #include "blackbird/worktree_lease.hpp"
@@ -11256,9 +11258,9 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
     return fail_usage(io, "superpowers: unknown subcommand: " + std::string{sub});
   }
 
-  const auto sql_res = sqlite::probe_sqlite_capabilities();
   const sqlite::SqliteCapabilities sql_caps =
-      sql_res.has_value() ? sql_res.value() : sqlite::SqliteCapabilities{};
+      sqlite::probe_embedded_sqlite_capabilities();
+  const arc::ArcCapabilities arc_caps = arc::probe_cpu_arc_capabilities();
   const NvimCapabilities nvim_caps = probe_nvim_capabilities();
   const JupyterCapabilities jupyter_caps = probe_jupyter_capabilities();
   const auto sandbox_caps = sandbox::probe_os_sandbox_capabilities();
@@ -11287,12 +11289,21 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
         Value::object({
             {"sqlite", Value::object({
                            {"available", Value{sql_caps.available}},
+                           {"backend", Value{"embedded-sqlite3"}},
                            {"binary", Value{sql_caps.binary_path.string()}},
                            {"version", Value{sql_caps.version}},
                            {"safe_flag", Value{sql_caps.supports_safe_flag}},
                            {"fts5", Value{sql_caps.supports_fts5}},
                            {"json1", Value{sql_caps.supports_json1}},
                        })},
+            {"cpu_arc",
+             Value::object({
+                 {"available", Value{arc_caps.available}},
+                 {"lua_version", Value{arc_caps.lua_version}},
+                 {"sqlite_version", Value{arc_caps.sqlite_version}},
+                 {"fts5", Value{arc_caps.supports_fts5}},
+                 {"compiled_execution", Value{arc_caps.supports_compiled_execution}},
+             })},
             {"nvim_treesitter", Value::object({
                                     {"available", Value{nvim_caps.available}},
                                     {"binary", Value{nvim_caps.executable_path}},
@@ -11318,12 +11329,15 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
 
   io.out << "Blackbird Model Superpowers\n"
          << "  SQLite Workbench:  "
-         << (sql_caps.available ? ("ready (" + sql_caps.version +
-                                   (sql_caps.supports_safe_flag ? ", -safe" : "") +
-                                   (sql_caps.supports_fts5 ? ", FTS5" : "") +
-                                   (sql_caps.supports_json1 ? ", JSON1" : "") + ")")
-                                : "unavailable (sqlite3 not found)")
+         << (sql_caps.available
+                 ? ("ready (embedded " + sql_caps.version +
+                    (sql_caps.supports_fts5 ? ", FTS5" : "") +
+                    (sql_caps.supports_json1 ? ", JSON1" : "") + ", authorizer)")
+                 : "unavailable")
          << '\n'
+         << "  Native CPU-ARC:    ready (Lua " << arc_caps.lua_version << " + SQLite "
+         << arc_caps.sqlite_version << (arc_caps.supports_fts5 ? " FTS5" : "")
+         << ", static O(1) compiler)\n"
          << "  Neovim Tree-sitter:"
          << (nvim_caps.available
                  ? (" ready (" + nvim_caps.version_string + ", " +
