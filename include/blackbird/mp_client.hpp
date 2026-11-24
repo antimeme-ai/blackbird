@@ -506,7 +506,8 @@ struct RoomInviteResponse {
 };
 
 struct RoomMemberInfo {
-  AccountId account_id = AccountId::create(1U).value();
+  std::optional<AccountId> account_id;
+  bool is_guest = false;
   std::string handle;
   std::string client;
   std::string agent_name;

@@ -90,7 +90,8 @@ struct MpRoomV2StatusUpdate {
 };
 
 struct MpRoomV2Member {
-  mp::AccountId account_id = mp::AccountId::create(1U).value();
+  std::optional<mp::AccountId> account_id;
+  bool is_guest = false;
   std::string handle;
   std::string client;
   std::string agent_name;
@@ -255,6 +256,9 @@ private:
   void signal_wake() noexcept;
   void close_wake_pipe() noexcept;
 
+  void remember_seen_seq_locked(std::uint64_t seq);
+  void remember_seen_client_msg_id_locked(const std::string &client_msg_id);
+
   // Owned exclusively by worker_thread_ once started.
   mp::MpControlClient client_;
   std::optional<mp::MpControlSocket> socket_;
@@ -286,7 +290,9 @@ private:
   std::vector<MpRoomV2Member> members_;
   std::deque<MpRoomV2Message> messages_;
   std::unordered_set<std::uint64_t> seen_seqs_;
+  std::deque<std::uint64_t> seen_seq_order_;
   std::unordered_set<std::string> seen_client_msg_ids_;
+  std::deque<std::string> seen_client_msg_id_order_;
   std::deque<OutboundMessage> outbox_;
   std::optional<MpRoomV2StatusUpdate> pending_status_;
   std::deque<std::string> notices_;

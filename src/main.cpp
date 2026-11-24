@@ -48,6 +48,7 @@
 #include <stdexcept>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -915,6 +916,32 @@ std::string default_live_device_label() {
   return "Blackbird";
 }
 
+struct CleanseLiveStringGuard {
+  std::string &text;
+  ~CleanseLiveStringGuard() noexcept {
+    if (!text.empty()) {
+      volatile char *ptr = text.data();
+      for (std::size_t i = 0U; i < text.size(); ++i)
+        ptr[i] = '\0';
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+      text.clear();
+    }
+  }
+};
+
+struct CleanseLiveOptStringGuard {
+  std::optional<std::string> &text;
+  ~CleanseLiveOptStringGuard() noexcept {
+    if (text.has_value() && !text->empty()) {
+      volatile char *ptr = text->data();
+      for (std::size_t i = 0U; i < text->size(); ++i)
+        ptr[i] = '\0';
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+      text->clear();
+    }
+  }
+};
+
 bool try_open_browser_url_live(std::string_view url) noexcept {
   if (!url.starts_with("https://") || url.size() > 512U)
     return false;
@@ -938,6 +965,13 @@ bool try_open_browser_url_live(std::string_view url) noexcept {
   if (pid < 0)
     return false;
   if (pid == 0) {
+    // Double-fork so the browser launcher is reparented to PID 1 and never leaves
+    // a <defunct> zombie child in this long-lived TUI process.
+    const pid_t grand = ::fork();
+    if (grand < 0)
+      ::_exit(127);
+    if (grand > 0)
+      ::_exit(0);
     const int devnull = ::open("/dev/null", O_RDWR);
     if (devnull >= 0) {
       (void)::dup2(devnull, STDIN_FILENO);
@@ -952,6 +986,9 @@ bool try_open_browser_url_live(std::string_view url) noexcept {
     ::execlp("xdg-open", "xdg-open", url_str.c_str(), static_cast<char *>(nullptr));
 #endif
     ::_exit(127);
+  }
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
   }
   return true;
 }
@@ -1363,7 +1400,7 @@ private:
       cfg.authority = store.value().state().authority;
     mp::MpControlClient client{cfg};
 
-    const auto started = client.auth_session_start(mp::AuthSessionStartRequest{
+    auto started = client.auth_session_start(mp::AuthSessionStartRequest{
         dev_key.value().public_key(),
         default_live_device_label(),
         "blackbird",
@@ -1371,7 +1408,8 @@ private:
     if (!started.has_value()) {
       return "Login failed: " + format_live_mp_error(started.error()) + "\n";
     }
-    const auto &flow = started.value();
+    auto &flow = started.value();
+    const CleanseLiveStringGuard poll_token_guard{flow.poll_token};
     const std::string safe_url = party_chat_sanitize(flow.verify_url, 256);
     const std::string safe_code = party_chat_sanitize(flow.user_code, 32);
     const bool opened_browser = try_open_browser_url_live(flow.verify_url);
@@ -1388,15 +1426,16 @@ private:
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{120};
     while (std::chrono::steady_clock::now() < deadline &&
            !interrupted.load(std::memory_order_relaxed)) {
-      const auto polled = client.auth_session_poll(
+      auto polled = client.auth_session_poll(
           mp::AuthSessionPollRequest{flow.flow_id, flow.poll_token});
       if (!polled.has_value()) {
         if (mp::mp_client_error_of(polled.error()) == mp::MpClientError::http_gone)
           return "Login code expired — run `/login` again.\n";
         return "Login failed: " + format_live_mp_error(polled.error()) + "\n";
       }
-      if (polled.value().approved) {
-        const auto &ap = polled.value();
+      auto &ap = polled.value();
+      const CleanseLiveOptStringGuard session_token_guard{ap.session_token};
+      if (ap.approved) {
         if (!ap.account_id.has_value() || !ap.device_id.has_value() ||
             !ap.handle.has_value() || ap.device_cwt.empty()) {
           return "Login failed: incomplete approval response from server.\n";
@@ -1696,13 +1735,22 @@ private:
     if (!opened.client.has_value() || !opened.store.has_value())
       return opened.error;
 
+    auto detach_if_matching = [&]() noexcept {
+      const bool match_v2 =
+          room_v2_session_ != nullptr && room_v2_session_->party_id() == *pid;
+      const bool match_v1 =
+          party_session_ != nullptr && party_session_->party_id() == *pid;
+      if (match_v2 || match_v1)
+        detach_party_quiet();
+    };
+
     std::uint64_t expected_epoch = 0;
     if (explicit_epoch.has_value()) {
       expected_epoch = *explicit_epoch;
     } else {
       const auto summary = opened.client->get_party(*pid);
       if (!summary.has_value()) {
-        detach_party_quiet();
+        detach_if_matching();
         return "Party disband failed: " + format_live_mp_error(summary.error()) + "\n";
       }
       expected_epoch = summary.value().party_epoch;
@@ -1710,7 +1758,7 @@ private:
 
     const auto disbanded =
         opened.client->disband_party(mp::DisbandPartyRequest{*pid, expected_epoch});
-    detach_party_quiet();
+    detach_if_matching();
     if (!disbanded.has_value()) {
       return "Party disband failed: " + format_live_mp_error(disbanded.error()) + "\n";
     }

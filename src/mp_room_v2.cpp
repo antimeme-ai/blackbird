@@ -127,7 +127,9 @@ std::string render_agent_card_body(std::string_view body) {
 
 std::string format_member_display_name(const MpRoomV2Member &m) {
   const std::string handle = party_chat_sanitize(strip_at(m.handle), 64U);
-  std::string out = "@" + (handle.empty() ? std::string{"member"} : handle);
+  std::string out =
+      m.is_guest ? ((handle.empty() ? std::string{"guest"} : handle) + " [guest]")
+                 : ("@" + (handle.empty() ? std::string{"member"} : handle));
   const std::string client = party_chat_sanitize(m.client, 32U);
   const std::string agent = party_chat_sanitize(m.agent_name, 48U);
   if (!client.empty() && !agent.empty() && agent != client &&
@@ -165,6 +167,30 @@ PartyMessageKind map_message_kind(std::string_view kind) noexcept {
   return PartyMessageKind::chat;
 }
 
+std::optional<mp::AccountId> json_optional_account_id(const Value &obj,
+                                                      std::string_view key) {
+  const auto raw = json_u64_or_decimal(obj, key);
+  if (!raw.has_value() || *raw == 0U) {
+    return std::nullopt;
+  }
+  const auto id = mp::AccountId::create(*raw);
+  if (!id.has_value()) {
+    return std::nullopt;
+  }
+  return id.value();
+}
+
+bool json_opt_bool(const Value &obj, std::string_view key) noexcept {
+  const Value *f = obj.find(key);
+  if (f == nullptr) {
+    return false;
+  }
+  if (const auto *b = std::get_if<bool>(&f->value())) {
+    return *b;
+  }
+  return false;
+}
+
 std::vector<MpRoomV2Member>
 parse_members_array(const Value &obj, std::optional<mp::AccountId> self_account_id) {
   std::vector<MpRoomV2Member> out;
@@ -183,19 +209,16 @@ parse_members_array(const Value &obj, std::optional<mp::AccountId> self_account_
     if (!std::holds_alternative<Value::Object>(item.value())) {
       continue;
     }
-    const auto acct_raw = json_u64_or_decimal(item, "account_id");
-    const auto acct_id = acct_raw.has_value() ? mp::AccountId::create(*acct_raw)
-                                              : mp::AccountId::create(1U);
-    if (!acct_id.has_value()) {
-      continue;
-    }
+    const auto acct_id = json_optional_account_id(item, "account_id");
+    const bool is_guest = !acct_id.has_value() || json_opt_bool(item, "is_guest");
     const std::string raw_handle = json_opt_string(item, "handle").value_or("");
     const std::string clean_handle = party_chat_sanitize(strip_at(raw_handle), 64U);
     if (clean_handle.empty()) {
       continue;
     }
     MpRoomV2Member m{};
-    m.account_id = acct_id.value();
+    m.account_id = acct_id;
+    m.is_guest = is_guest;
     m.handle = clean_handle;
     m.client = party_chat_sanitize(json_opt_string(item, "client").value_or(""), 32U);
     m.agent_name =
@@ -206,7 +229,8 @@ parse_members_array(const Value &obj, std::optional<mp::AccountId> self_account_
         party_chat_sanitize(json_opt_string(item, "agent_summary").value_or(""), 128U);
     m.status =
         party_chat_sanitize(json_opt_string(item, "status").value_or("live"), 24U);
-    m.is_self = self_account_id.has_value() && m.account_id == *self_account_id;
+    m.is_self = !m.is_guest && self_account_id.has_value() &&
+                m.account_id.has_value() && *m.account_id == *self_account_id;
     out.push_back(std::move(m));
   }
   return out;
@@ -378,6 +402,7 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
     }
     MpRoomV2Member m{};
     m.account_id = im.account_id;
+    m.is_guest = im.is_guest || !im.account_id.has_value();
     m.handle = clean_h;
     m.client = party_chat_sanitize(im.client, 32U);
     m.agent_name = party_chat_sanitize(im.agent_name, 48U);
@@ -385,7 +410,8 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
     m.agent_summary = party_chat_sanitize(im.agent_summary, 128U);
     m.status =
         im.status.empty() ? std::string{"live"} : party_chat_sanitize(im.status, 24U);
-    m.is_self = local_account_id_.has_value() && m.account_id == *local_account_id_;
+    m.is_self = !m.is_guest && local_account_id_.has_value() &&
+                m.account_id.has_value() && *m.account_id == *local_account_id_;
     initial.push_back(std::move(m));
   }
   apply_members_locked(initial);
@@ -556,6 +582,9 @@ Result<std::string> MpRoomV2Session::send_agent_card(const MpRoomV2AgentCard &ca
   }
   if (target.value.empty()) {
     target.value = "@all";
+  }
+  if (target.value.size() > kMaxRoomTargetBytes) {
+    return fail<std::string>(ErrorCode::capacity, MpRoomV2Error::field_too_large);
   }
 
   Value::Object card_obj;
@@ -741,18 +770,57 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
 // Internal state helpers
 // ---------------------------------------------------------------------------
 
+void MpRoomV2Session::remember_seen_seq_locked(std::uint64_t seq) {
+  if (seq == 0U) {
+    return;
+  }
+  const auto [it, inserted] = seen_seqs_.insert(seq);
+  (void)it;
+  if (!inserted) {
+    return;
+  }
+  seen_seq_order_.push_back(seq);
+  const std::size_t cap = std::max<std::size_t>(max_retained_messages_ * 4U, 2048U);
+  while (seen_seq_order_.size() > cap) {
+    seen_seqs_.erase(seen_seq_order_.front());
+    seen_seq_order_.pop_front();
+  }
+}
+
+void MpRoomV2Session::remember_seen_client_msg_id_locked(
+    const std::string &client_msg_id) {
+  if (client_msg_id.empty()) {
+    return;
+  }
+  const auto [it, inserted] = seen_client_msg_ids_.insert(client_msg_id);
+  (void)it;
+  if (!inserted) {
+    return;
+  }
+  seen_client_msg_id_order_.push_back(client_msg_id);
+  const std::size_t cap = std::max<std::size_t>(max_retained_messages_ * 4U, 2048U);
+  while (seen_client_msg_id_order_.size() > cap) {
+    seen_client_msg_ids_.erase(seen_client_msg_id_order_.front());
+    seen_client_msg_id_order_.pop_front();
+  }
+}
+
 void MpRoomV2Session::apply_members_locked(const std::vector<MpRoomV2Member> &members) {
   members_ = members;
   bool has_self = false;
   for (auto &m : members_) {
-    if (local_account_id_.has_value() && m.account_id == *local_account_id_) {
+    if (!m.is_guest && local_account_id_.has_value() && m.account_id.has_value() &&
+        *m.account_id == *local_account_id_) {
       m.is_self = true;
       has_self = true;
+    } else {
+      m.is_self = false;
     }
   }
   if (!has_self && local_account_id_.has_value()) {
     MpRoomV2Member self{};
     self.account_id = *local_account_id_;
+    self.is_guest = false;
     self.handle = local_handle_;
     self.client = client_name_;
     self.agent_name = agent_name_;
@@ -780,7 +848,7 @@ void MpRoomV2Session::upsert_message_locked(MpRoomV2Message msg) {
       if (existing.client_msg_id == msg.client_msg_id) {
         if (msg.seq > 0U) {
           existing.seq = msg.seq;
-          seen_seqs_.insert(msg.seq);
+          remember_seen_seq_locked(msg.seq);
           if (msg.seq > latest_seq_) {
             latest_seq_ = msg.seq;
             latest_seq_atomic_.store(latest_seq_, std::memory_order_release);
@@ -802,18 +870,30 @@ void MpRoomV2Session::upsert_message_locked(MpRoomV2Message msg) {
     if (seen_client_msg_ids_.contains(msg.client_msg_id)) {
       return;
     }
-    seen_client_msg_ids_.insert(msg.client_msg_id);
+    remember_seen_client_msg_id_locked(msg.client_msg_id);
   }
 
   if (msg.seq > 0U) {
-    seen_seqs_.insert(msg.seq);
+    remember_seen_seq_locked(msg.seq);
     if (msg.seq > latest_seq_) {
       latest_seq_ = msg.seq;
       latest_seq_atomic_.store(latest_seq_, std::memory_order_release);
     }
+    // Preserve ascending `seq` ordering when resume backfills gaps before newer
+    // `hello.history` entries, keeping pending `seq == 0` optimistic items at the tail.
+    auto insert_pos = messages_.end();
+    while (insert_pos != messages_.begin()) {
+      const auto prev = std::prev(insert_pos);
+      if (prev->seq == 0U || prev->seq > msg.seq) {
+        insert_pos = prev;
+      } else {
+        break;
+      }
+    }
+    messages_.insert(insert_pos, std::move(msg));
+  } else {
+    messages_.push_back(std::move(msg));
   }
-
-  messages_.push_back(std::move(msg));
   while (messages_.size() > max_retained_messages_) {
     messages_.pop_front();
   }
@@ -885,6 +965,7 @@ void MpRoomV2Session::rebuild_status_summary_locked() {
 // ---------------------------------------------------------------------------
 
 void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action) {
+  const std::uint64_t prev_latest_seq = latest_seq_;
   if (const auto rc = json_opt_string(obj, "room_code");
       rc.has_value() && !rc->empty()) {
     room_code_ = party_chat_sanitize(*rc, 32U);
@@ -918,9 +999,9 @@ void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action)
 
   const std::uint64_t server_latest =
       json_u64_or_decimal(obj, "latest_seq").value_or(0U);
-  if (connected_once_ && latest_seq_ > 0U) {
+  if (connected_once_ && prev_latest_seq > 0U) {
     action.need_send_resume = true;
-    action.resume_seq = latest_seq_;
+    action.resume_seq = prev_latest_seq;
   } else if (server_latest > latest_seq_) {
     action.need_send_resume = true;
     action.resume_seq = latest_seq_;
@@ -1017,7 +1098,7 @@ void MpRoomV2Session::handle_ack_locked(const Value &obj) {
         m.delivered = true;
         if (seq > 0U) {
           m.seq = seq;
-          seen_seqs_.insert(seq);
+          remember_seen_seq_locked(seq);
         }
         if (ts_ms > 0U) {
           m.ts_ms = ts_ms;
@@ -1045,9 +1126,12 @@ void MpRoomV2Session::handle_error_locked(const Value &obj, FrameAction &action)
   const std::string code =
       party_chat_sanitize(json_opt_string(obj, "code").value_or("error"), 48U);
   const std::uint64_t retry_ms = json_u64_or_decimal(obj, "retry_ms").value_or(0U);
-  if (retry_ms > 0U) {
-    action.retry_backoff_ms =
-        static_cast<std::uint32_t>(std::min<std::uint64_t>(retry_ms, 30000U));
+  if (retry_ms > 0U || code == "rate_limited") {
+    action.retry_backoff_ms = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(retry_ms > 0U ? retry_ms : 1000U, 30000U));
+    for (auto &pending : outbox_) {
+      pending.sent_on_current_socket = false;
+    }
   }
   if (!message.empty()) {
     push_notice_locked(message);

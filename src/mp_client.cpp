@@ -5838,6 +5838,41 @@ Result<std::uint64_t> get_required_u64_or_decimal(const Value &obj,
   return value_as_u64(*field);
 }
 
+Result<std::optional<AccountId>> parse_optional_member_account_id(const Value &obj) {
+  const Value *field = obj.find("account_id");
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::optional<AccountId>>::success(std::nullopt);
+  }
+  std::uint64_t raw = 0U;
+  if (const auto *s = std::get_if<std::string>(&field->value())) {
+    if (*s == "0" || s->empty()) {
+      return Result<std::optional<AccountId>>::success(std::nullopt);
+    }
+    const auto parsed = parse_safe_decimal_id(*s);
+    if (!parsed.has_value()) {
+      return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+    }
+    raw = parsed.value();
+  } else {
+    const auto u = value_as_u64(*field);
+    if (!u.has_value()) {
+      return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+    }
+    raw = u.value();
+  }
+  if (raw == 0U) {
+    return Result<std::optional<AccountId>>::success(std::nullopt);
+  }
+  const auto id = AccountId::create(raw);
+  if (!id.has_value()) {
+    return fail_c<std::optional<AccountId>>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  return Result<std::optional<AccountId>>::success(id.value());
+}
+
 Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
   std::vector<RoomMemberInfo> out;
   const Value *field = obj.find("members");
@@ -5855,16 +5890,21 @@ Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
       return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
                                                  MpClientError::http_response_schema);
     }
-    const auto acct_raw = get_required_u64_or_decimal(entry, "account_id");
+    const auto acct_id = parse_optional_member_account_id(entry);
     const auto handle = get_required_string(entry, "handle");
-    if (!acct_raw.has_value() || !handle.has_value()) {
+    if (!acct_id.has_value() || !handle.has_value()) {
       return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
                                                  MpClientError::http_response_schema);
     }
-    const auto acct_id = AccountId::create(acct_raw.value());
-    if (!acct_id.has_value()) {
-      return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
-                                                 MpClientError::http_response_schema);
+    bool is_guest = !acct_id.value().has_value();
+    if (const Value *gf = entry.find("is_guest");
+        gf != nullptr && !std::holds_alternative<std::nullptr_t>(gf->value())) {
+      const auto gb = value_as_bool_or_flag(*gf);
+      if (!gb.has_value()) {
+        return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                   MpClientError::http_response_schema);
+      }
+      is_guest = is_guest || gb.value();
     }
     const auto client = get_optional_string(entry, "client");
     const auto agent_name = get_optional_string(entry, "agent_name");
@@ -5878,6 +5918,7 @@ Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
     }
     out.push_back(RoomMemberInfo{
         acct_id.value(),
+        is_guest,
         handle.value(),
         client.value().value_or(""),
         agent_name.value().value_or(""),
@@ -6257,10 +6298,11 @@ MpControlClient::auth_session_start(const AuthSessionStartRequest &request) {
   req.headers.emplace_back("Content-Type", "application/json");
   req.body = std::move(body_bytes).value();
 
-  const auto resp = execute_http_once(config_, req);
+  auto resp = execute_http_once(config_, req);
   if (!resp.has_value()) {
     return Result<AuthSessionStartResponse>::failure(resp.error());
   }
+  CleanseVectorGuard resp_body_cleanse{resp.value().body};
   if (resp.value().status != 200 && resp.value().status != 201) {
     return Result<AuthSessionStartResponse>::failure(
         map_http_error(resp.value().status, false));
@@ -6314,10 +6356,11 @@ MpControlClient::auth_session_poll(const AuthSessionPollRequest &request) {
   req.body = std::move(body_bytes).value();
   CleanseVectorGuard body_cleanse{req.body};
 
-  const auto resp = execute_http_once(config_, req);
+  auto resp = execute_http_once(config_, req);
   if (!resp.has_value()) {
     return Result<AuthSessionPollResponse>::failure(resp.error());
   }
+  CleanseVectorGuard resp_body_cleanse{resp.value().body};
   if (resp.value().status != 200) {
     return Result<AuthSessionPollResponse>::failure(
         map_http_error(resp.value().status, false));

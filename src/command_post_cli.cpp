@@ -64,6 +64,7 @@
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -11912,6 +11913,26 @@ std::string default_cli_device_label() {
   return "Blackbird";
 }
 
+struct CleanseCliStringGuard {
+  std::string &text;
+  ~CleanseCliStringGuard() noexcept {
+    if (!text.empty()) {
+      OPENSSL_cleanse(text.data(), text.size());
+      text.clear();
+    }
+  }
+};
+
+struct CleanseCliOptStringGuard {
+  std::optional<std::string> &text;
+  ~CleanseCliOptStringGuard() noexcept {
+    if (text.has_value() && !text->empty()) {
+      OPENSSL_cleanse(text->data(), text->size());
+      text->clear();
+    }
+  }
+};
+
 bool try_open_browser_cli(std::string_view url) noexcept {
   if (!url.starts_with("https://") || url.size() > 512U)
     return false;
@@ -11935,6 +11956,11 @@ bool try_open_browser_cli(std::string_view url) noexcept {
   if (pid < 0)
     return false;
   if (pid == 0) {
+    const pid_t grand = ::fork();
+    if (grand < 0)
+      ::_exit(127);
+    if (grand > 0)
+      ::_exit(0);
     const int devnull = ::open("/dev/null", O_RDWR);
     if (devnull >= 0) {
       (void)::dup2(devnull, STDIN_FILENO);
@@ -11949,6 +11975,9 @@ bool try_open_browser_cli(std::string_view url) noexcept {
     ::execlp("xdg-open", "xdg-open", url_str.c_str(), static_cast<char *>(nullptr));
 #endif
     ::_exit(127);
+  }
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
   }
   return true;
 }
@@ -12013,7 +12042,7 @@ int run_login_cli(std::span<char *> args, CliIo io) {
     return fail_mp_error(io, "login", dev_key.error());
 
   mp::MpControlClient client{*cfg};
-  const auto started = client.auth_session_start(mp::AuthSessionStartRequest{
+  auto started = client.auth_session_start(mp::AuthSessionStartRequest{
       dev_key.value().public_key(),
       device_label.empty() ? default_cli_device_label() : device_label,
       "blackbird",
@@ -12021,7 +12050,8 @@ int run_login_cli(std::span<char *> args, CliIo io) {
   if (!started.has_value())
     return fail_mp_error(io, "login", started.error());
 
-  const auto &flow = started.value();
+  auto &flow = started.value();
+  const CleanseCliStringGuard poll_token_guard{flow.poll_token};
   const std::string safe_url = party_chat_sanitize(flow.verify_url, 256);
   const std::string safe_code = party_chat_sanitize(flow.user_code, 32);
   if (!no_browser)
@@ -12035,12 +12065,13 @@ int run_login_cli(std::span<char *> args, CliIo io) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{timeout_sec};
   while (std::chrono::steady_clock::now() < deadline) {
-    const auto polled = client.auth_session_poll(
+    auto polled = client.auth_session_poll(
         mp::AuthSessionPollRequest{flow.flow_id, flow.poll_token});
     if (!polled.has_value())
       return fail_mp_error(io, "login", polled.error());
-    if (polled.value().approved) {
-      const auto &ap = polled.value();
+    auto &ap = polled.value();
+    const CleanseCliOptStringGuard session_token_guard{ap.session_token};
+    if (ap.approved) {
       if (!ap.account_id.has_value() || !ap.device_id.has_value() ||
           !ap.handle.has_value() || ap.device_cwt.empty()) {
         return fail_message(io, "login: incomplete approval payload from server");

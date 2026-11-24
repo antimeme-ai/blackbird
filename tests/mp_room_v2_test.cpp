@@ -353,6 +353,12 @@ public:
   std::uint16_t port() const noexcept { return port_; }
 
   void request_drop_ws_once() { drop_ws_once_.store(true, std::memory_order_release); }
+  void request_rate_limit_next_send_once() {
+    rate_limit_next_send_once_.store(true, std::memory_order_release);
+  }
+  int rate_limited_rejections() const noexcept {
+    return rate_limit_reject_count_.load(std::memory_order_acquire);
+  }
 
   int ws_connections() const noexcept {
     return ws_conn_count_.load(std::memory_order_acquire);
@@ -519,7 +525,7 @@ private:
     if (method == "POST" && path == "/v1/rooms/enter") {
       send_http_json(
           ssl.get(), 200,
-          R"({"party_id":1234567890,"room_code":"KAIH","name":"antimeme's party","share_url":"https://multiplayer.tech/p/KAIH","ws_path":"/v1/parties/1234567890/ws","members":[{"account_id":3541107795115782,"handle":"antimeme","client":"blackbird","agent_name":"Blackbird","status":"live"},{"account_id":285954035275878,"handle":"phall","client":"outpost","agent_name":"Claude Code","status":"live"}]})");
+          R"({"party_id":1234567890,"room_code":"KAIH","name":"antimeme's party","share_url":"https://multiplayer.tech/p/KAIH","ws_path":"/v1/parties/1234567890/ws","members":[{"account_id":3541107795115782,"handle":"antimeme","client":"blackbird","agent_name":"Blackbird","status":"live"},{"account_id":285954035275878,"handle":"phall","client":"outpost","agent_name":"Claude Code","status":"live"},{"account_id":"0","is_guest":true,"handle":"webguest","client":"web","agent_name":"","status":"live"}]})");
       return;
     }
 
@@ -547,19 +553,22 @@ private:
     if (conn_num == 1) {
       send_server_text_ws_frame(
           ssl,
-          R"({"v":2,"t":"hello","party_id":"1234567890","room_code":"KAIH","name":"antimeme's party","self":{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird"},"latest_seq":1,"members":[{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird","agent_state":"idle","status":"live"},{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code","agent_state":"working","status":"live"}],"history":[{"v":2,"t":"event","seq":1,"ts_ms":1795495430000,"client_msg_id":"phall-1","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"chat","body_encoding":"utf8","body":"yo can you see this?"}]})");
+          R"({"v":2,"t":"hello","party_id":"1234567890","room_code":"KAIH","name":"antimeme's party","self":{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird"},"latest_seq":1,"members":[{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird","agent_state":"idle","status":"live"},{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code","agent_state":"working","status":"live"},{"account_id":"0","is_guest":true,"handle":"webguest","client":"web","agent_name":"","agent_state":"","status":"live"}],"history":[{"v":2,"t":"event","seq":1,"ts_ms":1795495430000,"client_msg_id":"phall-1","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"chat","body_encoding":"utf8","body":"yo can you see this?"}]})");
       // Also push an agent_card event at seq=2 right away.
       send_server_text_ws_frame(
           ssl,
           R"({"v":2,"t":"event","seq":2,"ts_ms":1795495431000,"client_msg_id":"phall-card-1","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"agent_card","body_encoding":"utf8","body":"{\"title\":\"Fixed auth test\",\"summary\":\"2 files changed\",\"files\":[\"src/auth.ts\",\"tests/auth.test.ts\"]}"})");
-      // Push a plain-English recoverable error notice.
+      // Push a presence update containing a browser guest with account_id:"0".
       send_server_text_ws_frame(
           ssl,
-          R"({"v":2,"t":"error","code":"rate_limited","message":"Slow down — retrying in 50ms","retry_ms":50})");
+          R"({"v":2,"t":"presence","members":[{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird","agent_state":"idle","status":"live"},{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code","agent_state":"working","status":"live"},{"account_id":"0","is_guest":true,"handle":"webguest","client":"web","agent_name":"","agent_state":"","status":"live"}]})");
     } else {
+      // On reconnect, send a non-empty `hello.history` starting at seq=11 (leaving
+      // seq=10 as a gap before history[0]!) to verify client resumes from its
+      // pre-history `prev_latest_seq`, NOT from seq=11!
       send_server_text_ws_frame(
           ssl,
-          R"({"v":2,"t":"hello","party_id":"1234567890","room_code":"KAIH","name":"antimeme's party","self":{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird"},"latest_seq":10,"members":[{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird","agent_state":"idle","status":"live"},{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code","agent_state":"idle","status":"live"}],"history":[]})");
+          R"({"v":2,"t":"hello","party_id":"1234567890","room_code":"KAIH","name":"antimeme's party","self":{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird"},"latest_seq":11,"members":[{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird","agent_state":"idle","status":"live"},{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code","agent_state":"idle","status":"live"},{"account_id":"0","is_guest":true,"handle":"webguest","client":"web","agent_name":"","agent_state":"","status":"live"}],"history":[{"v":2,"t":"event","seq":11,"ts_ms":1795495451000,"client_msg_id":"phall-tail-11","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"chat","body_encoding":"utf8","body":"newest tail after gap"}]})");
     }
 
     while (!stop_.load(std::memory_order_acquire)) {
@@ -593,6 +602,13 @@ private:
       const std::string &t = std::get<std::string>(t_field->value());
 
       if (t == "send") {
+        if (rate_limit_next_send_once_.exchange(false, std::memory_order_acq_rel)) {
+          rate_limit_reject_count_.fetch_add(1, std::memory_order_acq_rel);
+          send_server_text_ws_frame(
+              ssl,
+              R"({"v":2,"t":"error","code":"rate_limited","message":"Slow down — retrying in 50ms","retry_ms":50})");
+          continue;
+        }
         const std::string cid =
             std::get<std::string>(obj.find("client_msg_id")->value());
         std::uint64_t assigned_seq = 0U;
@@ -641,6 +657,8 @@ private:
   std::uint16_t port_ = 0U;
   std::atomic<bool> stop_{false};
   std::atomic<bool> drop_ws_once_{false};
+  std::atomic<bool> rate_limit_next_send_once_{false};
+  std::atomic<int> rate_limit_reject_count_{0};
   std::atomic<int> ws_conn_count_{0};
   std::atomic<int> resume_count_{0};
   std::atomic<int> ping_count_{0};
@@ -760,8 +778,10 @@ int main() {
       client.room_enter(RoomEnterRequest{"@phall", "blackbird", "Blackbird"}));
   require_ok(entered.party_id.value() == 1234567890ULL);
   require_ok(entered.room_code == "KAIH");
-  require_ok(entered.members.size() == 2U);
-  require_ok(entered.members[1].handle == "phall");
+  require_ok(entered.members.size() == 3U);
+  require_ok(entered.members[1].handle == "phall" && !entered.members[1].is_guest);
+  require_ok(entered.members[2].handle == "webguest" && entered.members[2].is_guest &&
+             !entered.members[2].account_id.has_value());
 
   const auto flive = require_val(client.friends_live());
   require_ok(flive.friends.size() == 3U);
@@ -799,14 +819,15 @@ int main() {
     session->drain_wake();
   }
 
-  // Verify PartySnapshot has real @handle (client) names, structured agent_card,
-  // and ZERO peer_<device_id> or 16-digit IDs!
+  // Verify PartySnapshot has real @handle (client) names, browser guest badge,
+  // structured agent_card, and ZERO peer_<device_id> or 16-digit IDs!
   {
     const PartySnapshot ps = session->to_party_snapshot();
     require_ok(ps.room_scope == "room/KAIH");
-    require_ok(ps.participants.size() == 2U);
+    require_ok(ps.participants.size() == 3U);
     bool saw_phall = false;
     bool saw_antimeme = false;
+    bool saw_guest = false;
     for (const auto &p : ps.participants) {
       require_ok(p.id.find("peer_") == std::string::npos);
       require_ok(p.display_name.find("peer_") == std::string::npos);
@@ -819,8 +840,22 @@ int main() {
           p.display_name.find("@antimeme (blackbird)") != std::string::npos) {
         saw_antimeme = true;
       }
+      if (p.id == "webguest" && !p.local_self &&
+          p.display_name.find("webguest [guest] (web)") != std::string::npos) {
+        saw_guest = true;
+      }
     }
-    require_ok(saw_phall && saw_antimeme);
+    require_ok(saw_phall && saw_antimeme && saw_guest);
+
+    const auto snap_members = session->snapshot().members;
+    bool verified_guest_member = false;
+    for (const auto &m : snap_members) {
+      if (m.handle == "webguest") {
+        require_ok(m.is_guest && !m.account_id.has_value() && !m.is_self);
+        verified_guest_member = true;
+      }
+    }
+    require_ok(verified_guest_member);
 
     bool saw_chat = false;
     bool saw_card = false;
@@ -836,18 +871,9 @@ int main() {
     require_ok(saw_chat && saw_card);
   }
 
-  // Verify plain-English error notice was captured
-  {
-    const auto snap = session->snapshot();
-    bool saw_rate_msg = false;
-    for (const auto &n : snap.notices) {
-      if (n.find("Slow down") != std::string::npos)
-        saw_rate_msg = true;
-    }
-    require_ok(saw_rate_msg);
-  }
-
-  // 5. Optimistic send_chat + ack -> delivered ✓
+  // 5. Optimistic send_chat with rate_limited error -> automatic retry-after-backoff
+  //    delivers on the SAME socket without disconnecting!
+  srv.request_rate_limit_next_send_once();
   const std::string cid1 = require_val(
       session->send_chat("hello from blackbird v2", MpRoomV2Target{"@all"}));
   require_ok(!cid1.empty());
@@ -861,8 +887,10 @@ int main() {
     }
     require_ok(found_opt);
   }
-  // Wait for server ack -> delivered ✓
+  // Wait for server rate_limited rejection + automatic retry + ack -> delivered ✓
   require_ok(wait_until([&]() {
+    if (srv.rate_limited_rejections() < 1)
+      return false;
     const PartySnapshot ps = session->to_party_snapshot();
     for (const auto &m : ps.messages) {
       if (m.id == cid1 && m.body.find("✓") != std::string::npos)
@@ -870,8 +898,26 @@ int main() {
     }
     return false;
   }));
+  require_ok(srv.ws_connections() == 1); // delivered via retry on same socket!
+  {
+    const auto snap = session->snapshot();
+    bool saw_rate_msg = false;
+    for (const auto &n : snap.notices) {
+      if (n.find("Slow down") != std::string::npos)
+        saw_rate_msg = true;
+    }
+    require_ok(saw_rate_msg);
+  }
 
-  // 6. Local send_agent_card + ack
+  // 6. Local send_agent_card target bound enforcement + valid ack
+  {
+    const auto bad_card =
+        session->send_agent_card(MpRoomV2AgentCard{"Title", "Summary", {}},
+                                 MpRoomV2Target{std::string(200U, 'x')});
+    require_ok(!bad_card.has_value());
+    require_ok(bad_card.error().code == ErrorCode::capacity);
+    require_ok(mp_room_v2_error_of(bad_card.error()) == MpRoomV2Error::field_too_large);
+  }
   const std::string card_cid = require_val(session->send_agent_card(
       MpRoomV2AgentCard{"Shipped mp2", "Zero iroh required", {"src/mp_room_v2.cpp"}}));
   require_ok(wait_until([&]() {
@@ -886,22 +932,33 @@ int main() {
   // 7. Heartbeat MP2:PING / MP2:PONG
   require_ok(wait_until([&]() { return srv.ping_frames_received() >= 1; }, 3000));
 
-  // 8. Abrupt server disconnect -> automatic reconnect -> resume(last_seq) -> dedup +
-  //    missed seq=10 catch-up + queued send delivery!
+  // 8. Abrupt server disconnect -> automatic reconnect with non-empty hello.history
+  //    starting at seq=11 -> must STILL resume from pre-history seq_before_drop,
+  //    backfill gap seq=10 before seq=11, and dedup seq=1!
   const std::uint64_t seq_before_drop = session->latest_seq();
-  require_ok(seq_before_drop >= 4U);
+  require_ok(seq_before_drop >= 4U && seq_before_drop < 10U);
   srv.request_drop_ws_once();
 
-  // Wait for reconnect + resume
   require_ok(wait_until(
       [&]() {
-        return srv.ws_connections() >= 2 && srv.resume_frames_received() >= 1 &&
-               session->latest_seq() >= 10U;
+        if (srv.ws_connections() < 2 || srv.resume_frames_received() < 1)
+          return false;
+        const auto snap = session->snapshot();
+        bool has_10 = false;
+        bool has_11 = false;
+        for (const auto &m : snap.messages) {
+          if (m.seq == 10U)
+            has_10 = true;
+          if (m.seq == 11U)
+            has_11 = true;
+        }
+        return has_10 && has_11;
       },
       5000));
   require_ok(srv.last_resume_seq() == seq_before_drop);
 
-  // Queue another message right after reconnect and verify delivery + dedup of seq=1
+  // Queue another message right after reconnect and verify ordering (seq 10 before 11)
+  // + dedup of seq=1
   const std::string cid2 = require_val(session->send_chat("after reconnect!"));
   require_ok(wait_until([&]() {
     const PartySnapshot ps = session->to_party_snapshot();
@@ -915,17 +972,20 @@ int main() {
   {
     const auto snap = session->snapshot();
     int phall_1_count = 0;
-    bool saw_missed_10 = false;
-    for (const auto &m : snap.messages) {
+    std::size_t idx_10 = snap.messages.size();
+    std::size_t idx_11 = snap.messages.size();
+    for (std::size_t i = 0U; i < snap.messages.size(); ++i) {
+      const auto &m = snap.messages[i];
       if (m.client_msg_id == "phall-1")
         ++phall_1_count;
-      if (m.client_msg_id == "phall-missed-10" &&
-          m.rendered_body == "missed while laptop slept") {
-        saw_missed_10 = true;
-      }
+      if (m.seq == 10U && m.rendered_body == "missed while laptop slept")
+        idx_10 = i;
+      if (m.seq == 11U && m.rendered_body == "newest tail after gap")
+        idx_11 = i;
     }
     require_ok(phall_1_count == 1); // deduped across resume replay!
-    require_ok(saw_missed_10);
+    require_ok(idx_10 < snap.messages.size() && idx_11 < snap.messages.size() &&
+               idx_10 < idx_11); // backfilled gap ordered before history tail!
   }
 
   // 9. Clean stop & room_leave
