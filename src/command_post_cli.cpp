@@ -11416,11 +11416,18 @@ default_hosts_for_integration_service(std::string_view service) {
   return hosts;
 }
 
+std::string_view strip_flag_value(std::string_view arg) noexcept {
+  const std::size_t eq = arg.find('=');
+  return eq == std::string_view::npos ? arg : arg.substr(0U, eq);
+}
+
 bool is_forbidden_secret_argv_flag(std::string_view arg) noexcept {
-  return arg == "--token" || arg == "--secret" || arg == "--api-key" ||
-         arg == "--password" || arg.starts_with("--token=") ||
-         arg.starts_with("--secret=") || arg.starts_with("--api-key=") ||
-         arg.starts_with("--password=");
+  const std::string_view flag = strip_flag_value(arg);
+  return flag == "--token" || flag == "--secret" || flag == "--api-key" ||
+         flag == "--apikey" || flag == "--password" || flag == "--bearer" ||
+         flag == "--pat" || flag == "--access-token" || flag == "--refresh-token" ||
+         flag == "--client-secret" || flag == "--auth" || flag == "-t" ||
+         flag == "-p" || flag == "-k";
 }
 
 int run_integrations_connect(std::span<const std::string_view> sub_args, CliIo io) {
@@ -11467,8 +11474,8 @@ int run_integrations_connect(std::span<const std::string_view> sub_args, CliIo i
         return fail_usage(io, "--vault-dir requires a directory path");
       vault_dir = fs::path{sub_args[++i]};
     } else if (arg.starts_with('-')) {
-      return fail_usage(io,
-                        "unknown flag for integrations connect: " + std::string{arg});
+      return fail_usage(io, "unknown flag for integrations connect: " +
+                                std::string{strip_flag_value(arg)});
     } else if (service.empty()) {
       service = std::string{arg};
     } else {
@@ -11587,8 +11594,8 @@ int run_integrations_cli(std::span<char *> args, CliIo io) {
       if (arg == "--json") {
         json_out = true;
       } else {
-        return fail_usage(io,
-                          "unknown flag for integrations presets: " + std::string{arg});
+        return fail_usage(io, "unknown flag for integrations presets: " +
+                                  std::string{strip_flag_value(arg)});
       }
     }
     const auto &presets = builtin_mcp_presets();
@@ -11627,8 +11634,8 @@ int run_integrations_cli(std::span<char *> args, CliIo io) {
       if (arg == "--json") {
         json_out = true;
       } else {
-        return fail_usage(io,
-                          "unknown flag for integrations packs: " + std::string{arg});
+        return fail_usage(io, "unknown flag for integrations packs: " +
+                                  std::string{strip_flag_value(arg)});
       }
     }
     const auto &manifests = builtin_saas_pack_manifests();
@@ -11685,7 +11692,7 @@ int run_integrations_cli(std::span<char *> args, CliIo io) {
         vault_dir = fs::path{args[++i]};
       } else {
         return fail_usage(io, "unknown flag for integrations " + std::string{sub} +
-                                  ": " + std::string{arg});
+                                  ": " + std::string{strip_flag_value(arg)});
       }
     }
 

@@ -4019,14 +4019,37 @@ int main(int argc, char **argv) {
       check(kval.has_value() && req_int(kval.value(), "count") == 7,
             "integrations packs must list 7 builtin Lua 5.5.1 SaaS packs");
 
-      // Refuse secrets on argv!
+      // Refuse secrets on argv (and never echo =VALUE on unknown flags)!
       const auto argv_refuse =
           run_cli({"connect", "linear", "--token", "secret_never_argv", "--vault-dir",
                    absent_vault.string()});
       check(argv_refuse.exit_code == 2 &&
                 argv_refuse.err.find("refusing secret on argv") != std::string::npos &&
+                argv_refuse.err.find("secret_never_argv") == std::string::npos &&
                 !fs::exists(absent_vault),
             "connect must refuse --token secret on argv without writing disk");
+
+      for (const std::string &flag :
+           {"--pat=ghp_NEVER_LEAK_1", "--bearer=bb_NEVER_LEAK_2",
+            "--access-token=at_NEVER_LEAK_3", "--client-secret=cs_NEVER_LEAK_4",
+            "--auth=auth_NEVER_LEAK_5"}) {
+        const auto res =
+            run_cli({"connect", "linear", flag, "--vault-dir", absent_vault.string()});
+        check(res.exit_code == 2 &&
+                  res.err.find("refusing secret on argv") != std::string::npos &&
+                  res.err.find("NEVER_LEAK") == std::string::npos &&
+                  res.out.find("NEVER_LEAK") == std::string::npos,
+              "connect must refuse expanded secret flags without echoing value");
+      }
+
+      const auto unknown_eq =
+          run_cli({"connect", "linear", "--custom-flag=SUPER_SECRET_VALUE_999",
+                   "--vault-dir", absent_vault.string()});
+      check(unknown_eq.exit_code == 2 &&
+                unknown_eq.err.find("--custom-flag") != std::string::npos &&
+                unknown_eq.err.find("SUPER_SECRET_VALUE_999") == std::string::npos &&
+                unknown_eq.out.find("SUPER_SECRET_VALUE_999") == std::string::npos,
+            "unknown --flag=VALUE must strip secret value from stderr");
 
       // Connect via --token-stdin using top-level `connect` alias; zero secret echo!
       const std::string test_secret = "lin_api_cli_secret_value_8899";

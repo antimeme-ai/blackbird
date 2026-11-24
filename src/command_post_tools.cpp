@@ -3235,9 +3235,8 @@ brakes::EffectivePolicy load_brakes_policy_fail_closed() {
 }
 
 Value handle_saas_pack(const Value &arguments) {
-  static constexpr std::array<std::string_view, 7> kAllowed{
-      "action",  "service",   "operation", "arguments_json",
-      "account", "vault_dir", "packs_dir"};
+  static constexpr std::array<std::string_view, 5> kAllowed{
+      "action", "service", "operation", "arguments_json", "account"};
   validate_object_keys(arguments, kAllowed);
 
   const std::string action = require_string(
@@ -3304,12 +3303,6 @@ Value handle_saas_pack(const Value &arguments) {
         arguments, {.key = "arguments_json", .max_bytes = 65536, .allow_empty = true});
     const auto account = optional_string(
         arguments, {.key = "account", .max_bytes = 128, .allow_empty = true});
-    const auto vault_dir = optional_string(
-        arguments,
-        {.key = "vault_dir", .max_bytes = kMaxPathArgBytes, .allow_empty = true});
-    const auto packs_dir = optional_string(
-        arguments,
-        {.key = "packs_dir", .max_bytes = kMaxPathArgBytes, .allow_empty = true});
 
     Value op_args = Value::object({});
     if (args_json.has_value() && !args_json->empty()) {
@@ -3321,15 +3314,13 @@ Value handle_saas_pack(const Value &arguments) {
       op_args = std::move(parsed.value());
     }
 
+    // Security invariant: vault_dir and packs_dir are NEVER model-controllable;
+    // execute_live_saas_pack_impl always resolves them from trusted process paths.
     SaasPackLiveCallRequest req;
     req.service = service;
     req.operation = operation;
     req.arguments = std::move(op_args);
     req.account = account.value_or("");
-    if (vault_dir.has_value() && !vault_dir->empty())
-      req.vault_dir = fs::path{*vault_dir};
-    if (packs_dir.has_value() && !packs_dir->empty())
-      req.packs_dir = fs::path{*packs_dir};
     req.brakes_policy = load_brakes_policy_fail_closed();
 
     auto res = invoke_registered_saas_pack_live(req);
@@ -4048,8 +4039,6 @@ Value command_post_tool_definitions() {
                     {"operation", Value::object({{"type", Value{"string"}}})},
                     {"arguments_json", Value::object({{"type", Value{"string"}}})},
                     {"account", Value::object({{"type", Value{"string"}}})},
-                    {"vault_dir", Value::object({{"type", Value{"string"}}})},
-                    {"packs_dir", Value::object({{"type", Value{"string"}}})},
                 })},
                {"required", Value{Value::Array{Value{"action"}}}},
                {"additionalProperties", Value{false}},

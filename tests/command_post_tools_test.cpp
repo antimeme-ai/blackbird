@@ -2352,6 +2352,40 @@ void test_integrations_model_tools() {
               field(desc_res, "allowed_hosts").array().size() == 1U,
           "saas_pack describe linear must return pinned host metadata");
 
+  // Security invariant: model-supplied packs_dir & vault_dir must be absent from
+  // saas_pack schema and hard-rejected at runtime.
+  const Value defs = tool_definitions();
+  for (const auto &entry : defs.array()) {
+    if (string_field(entry, "name") == "saas_pack") {
+      const Value &props = field(field(entry, "parameters"), "properties");
+      require(props.find("packs_dir") == nullptr && props.find("vault_dir") == nullptr,
+              "saas_pack schema must never expose packs_dir or vault_dir to the model");
+    }
+  }
+  bool rejected_packs_dir = false;
+  try {
+    (void)run_command_post_tool(
+        "saas_pack", Value::object({{"action", Value{"invoke"}},
+                                    {"service", Value{"linear"}},
+                                    {"operation", Value{"search_issues"}},
+                                    {"packs_dir", Value{"/tmp/evil_packs"}}}));
+  } catch (const Error &e) {
+    rejected_packs_dir = (e.code == ErrorCode::invalid_range);
+  }
+  require(rejected_packs_dir, "saas_pack must reject model-supplied packs_dir");
+
+  bool rejected_vault_dir = false;
+  try {
+    (void)run_command_post_tool(
+        "saas_pack", Value::object({{"action", Value{"invoke"}},
+                                    {"service", Value{"linear"}},
+                                    {"operation", Value{"search_issues"}},
+                                    {"vault_dir", Value{"/tmp/evil_vault"}}}));
+  } catch (const Error &e) {
+    rejected_vault_dir = (e.code == ErrorCode::invalid_range);
+  }
+  require(rejected_vault_dir, "saas_pack must reject model-supplied vault_dir");
+
   // 2. mcp_router: presets, manifest & BM25 search with non-downgrading readOnlyHint
   const Value presets_res = run_command_post_tool(
       "mcp_router", Value::object({{"action", Value{"presets"}}}));
