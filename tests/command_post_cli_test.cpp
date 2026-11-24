@@ -3833,8 +3833,14 @@ finally:
           "online party attach --help must exit 0 with usage");
     const auto attach_no_id = run_cli({"online", "party", "attach"});
     check(attach_no_id.exit_code == 2 &&
-              attach_no_id.err.find("<party_id> is required") != std::string::npos,
+              attach_no_id.err.find("<party_id|mppi1_...> is required") !=
+                  std::string::npos,
           "online party attach without party_id must fail usage");
+    const auto attach_bad_invite =
+        run_cli({"online", "party", "attach", "mppi1_notanid_secretleak99"});
+    check(attach_bad_invite.exit_code == 2 &&
+              attach_bad_invite.err.find("secretleak99") == std::string::npos,
+          "online party attach must reject malformed invite without echoing secret");
     const auto attach_bad_mode =
         run_cli({"online", "party", "attach", "5001", "--mode", "bogus"});
     check(attach_bad_mode.exit_code == 2 &&

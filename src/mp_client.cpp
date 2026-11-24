@@ -941,73 +941,55 @@ Result<void> wait_socket_ready(const PollWaitRequest &req) noexcept {
   }
 }
 
-Result<ScopedFd> tcp_connect_bounded(const std::string &host, std::uint16_t port,
-                                     int timeout_ms) {
-  if (host.empty() || port == 0U || timeout_ms <= 0) {
-    return fail_c<ScopedFd>(ErrorCode::invalid_range, MpClientError::invalid_config);
+Result<ScopedFd> tcp_connect_addr(const addrinfo *ai,
+                                  SteadyClock::time_point deadline) {
+  if (ai == nullptr) {
+    return fail_c<ScopedFd>(ErrorCode::provider_transport,
+                            MpClientError::connect_failed);
   }
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_protocol = IPPROTO_TCP;
-
-  const std::string port_str = std::to_string(port);
-  addrinfo *raw_res = nullptr;
-  if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &raw_res) != 0 ||
-      raw_res == nullptr) {
-    return fail_c<ScopedFd>(ErrorCode::provider_transport, MpClientError::dns_failed);
+  const int sock = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (sock < 0) {
+    return fail_c<ScopedFd>(ErrorCode::provider_transport,
+                            MpClientError::connect_failed);
   }
-  UniqueAddrInfo res{raw_res};
+  ScopedFd owned{sock};
 
-  const auto deadline = SteadyClock::now() + std::chrono::milliseconds{timeout_ms};
-  MpClientError last_err = MpClientError::connect_failed;
-
-  for (const addrinfo *ai = res.get(); ai != nullptr; ai = ai->ai_next) {
-    const int sock = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (sock < 0) {
-      continue;
-    }
-    ScopedFd owned{sock};
-
-    const int flags = ::fcntl(owned.get(), F_GETFL, 0);
-    if (flags < 0 || ::fcntl(owned.get(), F_SETFL, flags | O_NONBLOCK) != 0) {
-      continue;
-    }
-    const int fd_flags = ::fcntl(owned.get(), F_GETFD, 0);
-    if (fd_flags >= 0) {
-      (void)::fcntl(owned.get(), F_SETFD, fd_flags | FD_CLOEXEC);
-    }
-    const int one = 1;
-    (void)::setsockopt(owned.get(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  const int flags = ::fcntl(owned.get(), F_GETFL, 0);
+  if (flags < 0 || ::fcntl(owned.get(), F_SETFL, flags | O_NONBLOCK) != 0) {
+    return fail_c<ScopedFd>(ErrorCode::provider_transport,
+                            MpClientError::connect_failed);
+  }
+  const int fd_flags = ::fcntl(owned.get(), F_GETFD, 0);
+  if (fd_flags >= 0) {
+    (void)::fcntl(owned.get(), F_SETFD, fd_flags | FD_CLOEXEC);
+  }
+  const int one = 1;
+  (void)::setsockopt(owned.get(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #ifdef SO_NOSIGPIPE
-    (void)::setsockopt(owned.get(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  (void)::setsockopt(owned.get(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
 
-    const int rc = ::connect(owned.get(), ai->ai_addr, ai->ai_addrlen);
-    if (rc == 0) {
-      return Result<ScopedFd>::success(std::move(owned));
-    }
-    if (errno != EINPROGRESS) {
-      last_err = MpClientError::connect_failed;
-      continue;
-    }
-
-    const auto ready = wait_socket_ready({owned.get(), POLLOUT, deadline});
-    if (!ready.has_value()) {
-      last_err = mp_client_error_of(ready.error());
-      continue;
-    }
-    int so_err = 0;
-    socklen_t so_len = sizeof(so_err);
-    if (::getsockopt(owned.get(), SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0 ||
-        so_err != 0) {
-      last_err = MpClientError::connect_failed;
-      continue;
-    }
+  const int rc = ::connect(owned.get(), ai->ai_addr, ai->ai_addrlen);
+  if (rc == 0) {
     return Result<ScopedFd>::success(std::move(owned));
   }
+  if (errno != EINPROGRESS) {
+    return fail_c<ScopedFd>(ErrorCode::provider_transport,
+                            MpClientError::connect_failed);
+  }
 
-  return fail_c<ScopedFd>(ErrorCode::provider_transport, last_err);
+  const auto ready = wait_socket_ready({owned.get(), POLLOUT, deadline});
+  if (!ready.has_value()) {
+    return Result<ScopedFd>::failure(ready.error());
+  }
+  int so_err = 0;
+  socklen_t so_len = sizeof(so_err);
+  if (::getsockopt(owned.get(), SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0 ||
+      so_err != 0) {
+    return fail_c<ScopedFd>(ErrorCode::provider_transport,
+                            MpClientError::connect_failed);
+  }
+  return Result<ScopedFd>::success(std::move(owned));
 }
 
 class TlsConnection {
@@ -1067,101 +1049,139 @@ public:
                                    MpClientError::tls_init_failed);
     }
 
-    auto fd_res = tcp_connect_bounded(tcp_host, config.port, config.connect_timeout_ms);
-    if (!fd_res.has_value()) {
-      return Result<TlsConnection>::failure(fd_res.error());
-    }
-    ScopedFd fd = std::move(fd_res).value();
-
-    UniqueSsl ssl{SSL_new(ctx.get())};
-    if (!ssl) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    const std::string port_str = std::to_string(config.port);
+    addrinfo *raw_res = nullptr;
+    if (::getaddrinfo(tcp_host.c_str(), port_str.c_str(), &hints, &raw_res) != 0 ||
+        raw_res == nullptr) {
       return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_init_failed);
+                                   MpClientError::dns_failed);
     }
-    if (SSL_set_fd(ssl.get(), fd.get()) != 1) {
-      return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_init_failed);
-    }
+    UniqueAddrInfo addrs{raw_res};
 
     const bool ip_host = is_ip_literal(tls_host);
-    if (!ip_host) {
-      if (SSL_ctrl(ssl.get(), SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
-                   const_cast<char *>(tls_host.c_str())) != 1) {
-        return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                     MpClientError::tls_init_failed);
-      }
-    }
-    X509_VERIFY_PARAM *param = SSL_get0_param(ssl.get());
-    if (param == nullptr) {
-      return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_init_failed);
-    }
-    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (ip_host) {
-      if (X509_VERIFY_PARAM_set1_ip_asc(param, tls_host.c_str()) != 1) {
-        return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                     MpClientError::tls_init_failed);
-      }
-    } else {
-      if (X509_VERIFY_PARAM_set1_host(param, tls_host.c_str(), tls_host.size()) != 1) {
-        return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                     MpClientError::tls_init_failed);
-      }
-    }
-
     const auto deadline =
         SteadyClock::now() + std::chrono::milliseconds{config.connect_timeout_ms};
-    for (;;) {
-      ERR_clear_error();
-      int rc = 0;
-      {
-        const ScopedSigpipeGuard sigpipe_guard;
-        rc = SSL_connect(ssl.get());
-      }
-      if (rc == 1) {
+    Error last_error{ErrorCode::provider_transport,
+                     static_cast<std::int64_t>(MpClientError::connect_failed)};
+
+    for (const addrinfo *ai = addrs.get(); ai != nullptr; ai = ai->ai_next) {
+      if (remaining_timeout_ms(deadline) == 0) {
+        last_error = Error{ErrorCode::provider_transport,
+                           static_cast<std::int64_t>(MpClientError::timeout)};
         break;
       }
-      const int ssl_err = SSL_get_error(ssl.get(), rc);
-      if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-        const short ev = (ssl_err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
-        const auto wait_res = wait_socket_ready({fd.get(), ev, deadline});
-        if (!wait_res.has_value()) {
-          return Result<TlsConnection>::failure(wait_res.error());
-        }
+
+      auto fd_res = tcp_connect_addr(ai, deadline);
+      if (!fd_res.has_value()) {
+        last_error = fd_res.error();
         continue;
       }
-      if (SSL_get_verify_result(ssl.get()) != X509_V_OK) {
+      ScopedFd fd = std::move(fd_res).value();
+
+      UniqueSsl ssl{SSL_new(ctx.get())};
+      if (!ssl) {
+        return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                     MpClientError::tls_init_failed);
+      }
+      if (SSL_set_fd(ssl.get(), fd.get()) != 1) {
+        return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                     MpClientError::tls_init_failed);
+      }
+
+      if (!ip_host) {
+        if (SSL_ctrl(ssl.get(), SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
+                     const_cast<char *>(tls_host.c_str())) != 1) {
+          return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                       MpClientError::tls_init_failed);
+        }
+      }
+      X509_VERIFY_PARAM *param = SSL_get0_param(ssl.get());
+      if (param == nullptr) {
+        return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                     MpClientError::tls_init_failed);
+      }
+      X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (ip_host) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(param, tls_host.c_str()) != 1) {
+          return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                       MpClientError::tls_init_failed);
+        }
+      } else {
+        if (X509_VERIFY_PARAM_set1_host(param, tls_host.c_str(), tls_host.size()) !=
+            1) {
+          return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                       MpClientError::tls_init_failed);
+        }
+      }
+
+      bool handshake_ok = false;
+      for (;;) {
+        ERR_clear_error();
+        int rc = 0;
+        {
+          const ScopedSigpipeGuard sigpipe_guard;
+          rc = SSL_connect(ssl.get());
+        }
+        if (rc == 1) {
+          handshake_ok = true;
+          break;
+        }
+        const int ssl_err = SSL_get_error(ssl.get(), rc);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+          const short ev = (ssl_err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+          const auto wait_res = wait_socket_ready({fd.get(), ev, deadline});
+          if (!wait_res.has_value()) {
+            last_error = wait_res.error();
+            break;
+          }
+          continue;
+        }
+        // Fail fast on certificate verification failures; never mask security errors.
+        if (SSL_get_verify_result(ssl.get()) != X509_V_OK) {
+          return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                       MpClientError::tls_verify_failed);
+        }
+        last_error =
+            Error{ErrorCode::provider_transport,
+                  static_cast<std::int64_t>(MpClientError::tls_handshake_failed)};
+        break;
+      }
+
+      if (!handshake_ok) {
+        continue;
+      }
+
+      if (SSL_version(ssl.get()) < TLS1_3_VERSION) {
+        return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                     MpClientError::tls_handshake_failed);
+      }
+      UniqueX509 peer_cert{SSL_get1_peer_certificate(ssl.get())};
+      if (!peer_cert || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
         return fail_c<TlsConnection>(ErrorCode::provider_transport,
                                      MpClientError::tls_verify_failed);
       }
-      return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_handshake_failed);
-    }
 
-    if (SSL_version(ssl.get()) < TLS1_3_VERSION) {
-      return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_handshake_failed);
-    }
-    UniqueX509 peer_cert{SSL_get1_peer_certificate(ssl.get())};
-    if (!peer_cert || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
-      return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                   MpClientError::tls_verify_failed);
-    }
-
-    const unsigned char *alpn_proto = nullptr;
-    unsigned int alpn_len = 0U;
-    SSL_get0_alpn_selected(ssl.get(), &alpn_proto, &alpn_len);
-    if (alpn_len > 0U) {
-      const std::string_view negotiated{reinterpret_cast<const char *>(alpn_proto),
-                                        alpn_len};
-      if (negotiated != "http/1.1") {
-        return fail_c<TlsConnection>(ErrorCode::provider_transport,
-                                     MpClientError::tls_alpn_mismatch);
+      const unsigned char *alpn_proto = nullptr;
+      unsigned int alpn_len = 0U;
+      SSL_get0_alpn_selected(ssl.get(), &alpn_proto, &alpn_len);
+      if (alpn_len > 0U) {
+        const std::string_view negotiated{reinterpret_cast<const char *>(alpn_proto),
+                                          alpn_len};
+        if (negotiated != "http/1.1") {
+          return fail_c<TlsConnection>(ErrorCode::provider_transport,
+                                       MpClientError::tls_alpn_mismatch);
+        }
       }
+
+      return Result<TlsConnection>::success(
+          TlsConnection{std::move(ctx), std::move(ssl), std::move(fd)});
     }
 
-    return Result<TlsConnection>::success(
-        TlsConnection{std::move(ctx), std::move(ssl), std::move(fd)});
+    return Result<TlsConnection>::failure(last_error);
   }
 
   TlsConnection(const TlsConnection &) = delete;
@@ -3137,6 +3157,28 @@ Result<MpControlSocket> MpControlSocket::connect(const MpSocketConnectRequest &r
     if (parsed.value().status == 403) {
       return fail_c<MpControlSocket>(ErrorCode::provider_auth,
                                      MpClientError::http_forbidden);
+    }
+    if (parsed.value().status == 404) {
+      return fail_c<MpControlSocket>(ErrorCode::invalid_identity,
+                                     MpClientError::http_not_found);
+    }
+    if (parsed.value().status == 400) {
+      return fail_c<MpControlSocket>(ErrorCode::invalid_range,
+                                     MpClientError::http_bad_request);
+    }
+    if (parsed.value().status == 409) {
+      return fail_c<MpControlSocket>(ErrorCode::conflict, MpClientError::http_conflict);
+    }
+    if (parsed.value().status == 410) {
+      return fail_c<MpControlSocket>(ErrorCode::stale_handle, MpClientError::http_gone);
+    }
+    if (parsed.value().status == 429) {
+      return fail_c<MpControlSocket>(ErrorCode::provider_rate_limit,
+                                     MpClientError::http_rate_limited);
+    }
+    if (parsed.value().status >= 500) {
+      return fail_c<MpControlSocket>(ErrorCode::provider_transport,
+                                     MpClientError::http_server_error);
     }
     return fail_c<MpControlSocket>(ErrorCode::provider_transport,
                                    MpClientError::ws_upgrade_rejected);

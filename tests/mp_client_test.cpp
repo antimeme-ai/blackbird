@@ -338,6 +338,8 @@ enum class WsTestMode : std::uint8_t {
   duplicate_subprotocol = 6,
   unsolicited_extensions = 7,
   zero_byte_continuation_flood = 8,
+  http_not_found_404 = 9,
+  http_server_error_503 = 10,
 };
 
 enum class HealthTestMode : std::uint8_t {
@@ -1117,6 +1119,18 @@ private:
     const std::string &ws_key = headers.at("sec-websocket-key");
     std::string accept = ws_accept_for(ws_key);
     std::string proto = "mp1";
+    if (mode == WsTestMode::http_not_found_404) {
+      ssl_write_str(ssl, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                         "Content-Length: 21\r\nConnection: close\r\n\r\n"
+                         "{\"error\":\"not_found\"}");
+      return;
+    }
+    if (mode == WsTestMode::http_server_error_503) {
+      ssl_write_str(ssl, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                         "Connection: close\r\n\r\n");
+      return;
+    }
+
     if (mode == WsTestMode::bad_accept) {
       accept = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     } else if (mode == WsTestMode::bad_subprotocol) {
@@ -2307,6 +2321,32 @@ void test_loopback_tls_rest_and_ws() {
     const auto ws_bad = client.connect_party_socket(created.value().party_id);
     require_ok(!ws_bad.has_value());
     require_ok(mp_client_error_of(ws_bad.error()) == MpClientError::ws_protocol_error);
+  }
+
+  // (g) HTTP 404 / 503 on WebSocket upgrade map to http_not_found / http_server_error!
+  {
+    std::lock_guard<std::mutex> lk{srv_state.mu};
+    srv_state.ws_mode = WsTestMode::http_not_found_404;
+  }
+  {
+    const auto ws_404 = client.connect_party_socket(created.value().party_id);
+    require_ok(!ws_404.has_value());
+    require_ok(ws_404.error().code == ErrorCode::invalid_identity);
+    require_ok(mp_client_error_of(ws_404.error()) == MpClientError::http_not_found);
+  }
+  {
+    std::lock_guard<std::mutex> lk{srv_state.mu};
+    srv_state.ws_mode = WsTestMode::http_server_error_503;
+  }
+  {
+    const auto ws_503 = client.connect_party_socket(created.value().party_id);
+    require_ok(!ws_503.has_value());
+    require_ok(ws_503.error().code == ErrorCode::provider_transport);
+    require_ok(mp_client_error_of(ws_503.error()) == MpClientError::http_server_error);
+  }
+  {
+    std::lock_guard<std::mutex> lk{srv_state.mu};
+    srv_state.ws_mode = WsTestMode::normal_party;
   }
 
   // (f) 0-byte continuation frame flood (> 64 fragments) rejected!

@@ -9568,7 +9568,7 @@ int run_online_party_attach(std::span<char *> args, CliIo io) {
   for (std::size_t i = 3; i < args.size(); ++i) {
     const std::string_view arg{args[i]};
     if (arg == "--help" || arg == "-h") {
-      io.err << "usage: blackbird online party attach <party_id> "
+      io.err << "usage: blackbird online party attach <party_id|mppi1_...> "
                 "[--mode jsonl|plain] [--plain] [--relay-policy allow|force|no] "
                 "[--relay-url URL] [--room-scope SCOPE] "
                 "[--party-socket PATH --party-room ROOM] [--listen-only] "
@@ -9642,11 +9642,15 @@ int run_online_party_attach(std::span<char *> args, CliIo io) {
     }
   }
 
+  OnlineCleanseOptStringGuard party_arg_guard{party_arg};
   if (!party_arg.has_value())
-    return fail_usage(io, "online party attach: <party_id> is required");
-  const auto pid = mp::PartyId::parse_decimal(*party_arg);
-  if (!pid.has_value())
-    return fail_usage(io, "online party attach: invalid <party_id>");
+    return fail_usage(io, "online party attach: <party_id|mppi1_...> is required");
+  const auto target = parse_party_join_target(*party_arg);
+  if (!target.has_value())
+    return fail_usage(io, "online party attach: invalid <party_id|mppi1_...>");
+  const mp::PartyId pid = target->party_id;
+  std::optional<std::string> attach_invite = target->invite_link;
+  OnlineCleanseOptStringGuard attach_invite_guard{attach_invite};
   if (party_socket.has_value() != party_room.has_value()) {
     return fail_usage(
         io,
@@ -9659,24 +9663,58 @@ int run_online_party_attach(std::span<char *> args, CliIo io) {
 
   mp::RelayPolicy local_policy = mp::RelayPolicy::force_relays;
   std::optional<std::string> relay_url = explicit_relay_url;
+  std::optional<mp::PartySummary> fetched_summary;
+  std::optional<Error> party_info_err;
+  auto party_info = opened.ctx->client.get_party(pid);
+  if (!party_info.has_value() && attach_invite.has_value()) {
+    const auto err_detail = mp::mp_client_error_of(party_info.error());
+    if (err_detail == mp::MpClientError::http_not_found ||
+        err_detail == mp::MpClientError::http_forbidden) {
+      const std::string join_relay =
+          explicit_relay_url.value_or(std::string{kDefaultOnlineRelayUrl});
+      const mp::EndpointDescriptor join_ep{
+          mp::TransportKind::iroh_quic, join_relay, {}};
+      mp::JoinPartyRequest jreq{pid, join_ep, std::move(attach_invite)};
+      OnlineCleanseOptStringGuard jreq_guard{jreq.invite_link};
+      const auto joined = opened.ctx->client.join_party(jreq);
+      if (!joined.has_value())
+        return fail_mp_error(io, "online party attach (join)", joined.error());
+      if (joined.value().pending_approval) {
+        return fail_message(
+            io, "online party attach: join request is pending leader approval");
+      }
+      party_info = opened.ctx->client.get_party(pid);
+    }
+  }
+  if (party_info.has_value()) {
+    fetched_summary = std::move(party_info).value();
+  } else {
+    party_info_err = party_info.error();
+  }
+
   if (explicit_relay_policy.has_value()) {
     local_policy = *explicit_relay_policy;
     if (local_policy == mp::RelayPolicy::no_relays) {
       relay_url = std::nullopt;
     } else if (!relay_url.has_value()) {
-      relay_url = std::string{kDefaultOnlineRelayUrl};
+      relay_url =
+          (fetched_summary.has_value() && !fetched_summary->pinned_relay_url.empty())
+              ? fetched_summary->pinned_relay_url
+              : std::string{kDefaultOnlineRelayUrl};
     }
   } else {
-    const auto summary = opened.ctx->client.get_party(pid.value());
-    if (!summary.has_value())
-      return fail_mp_error(io, "online party attach", summary.error());
-    local_policy = summary.value().relay_policy;
+    if (!fetched_summary.has_value()) {
+      return fail_mp_error(
+          io, "online party attach",
+          party_info_err.value_or(Error{ErrorCode::provider_transport}));
+    }
+    local_policy = fetched_summary->relay_policy;
     if (local_policy == mp::RelayPolicy::no_relays) {
       relay_url = std::nullopt;
     } else if (!relay_url.has_value()) {
-      relay_url = summary.value().pinned_relay_url.empty()
+      relay_url = fetched_summary->pinned_relay_url.empty()
                       ? std::string{kDefaultOnlineRelayUrl}
-                      : summary.value().pinned_relay_url;
+                      : fetched_summary->pinned_relay_url;
     }
   }
 
@@ -9688,17 +9726,27 @@ int run_online_party_attach(std::span<char *> args, CliIo io) {
   MpPartyRuntimeConfig rt_cfg{
       .client_config = *resolved_cfg,
       .identity = opened.ctx->store.state(),
-      .party_id = pid.value(),
+      .party_id = pid,
       .local_relay_policy = local_policy,
       .relay_url = relay_url,
   };
 
   auto runtime = MpPartyRuntime::attach(std::move(rt_cfg));
   if (!runtime.has_value()) {
+    const auto &err = runtime.error();
+    std::string detail_name;
+    if (err.detail >= 2000) {
+      detail_name =
+          std::string{mp_party_runtime_error_name(mp_party_runtime_error_of(err))};
+    } else if (err.detail >= 1000) {
+      detail_name = std::string{mp::mp_client_error_name(mp::mp_client_error_of(err))};
+    } else if (err.detail >= 100) {
+      detail_name = std::string{mp::mp_error_name(mp::mp_error_of(err))};
+    } else {
+      detail_name = std::string{error_name(err.code)};
+    }
     return fail_message(io, "online party attach: failed to attach (" +
-                                std::string{error_name(runtime.error().code)} + ", " +
-                                std::string{mp_party_runtime_error_name(
-                                    mp_party_runtime_error_of(runtime.error()))} +
+                                std::string{error_name(err.code)} + ", " + detail_name +
                                 ")");
   }
 
