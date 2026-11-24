@@ -1,4 +1,5 @@
 #include "blackbird/sqlite_workbench.hpp"
+#include "blackbird/sqlite_embedded.hpp"
 
 #include "blackbird/json.hpp"
 #include "blackbird/project_memory.hpp"
@@ -1948,6 +1949,11 @@ Result<fs::path> resolve_default_model_state_dir(const lan::EnvLookupFn &env_loo
 Result<SqliteCapabilities>
 probe_sqlite_capabilities(const std::optional<fs::path> &binary_override,
                           const lan::EnvLookupFn &env_lookup) {
+#if defined(BLACKBIRD_HAS_EMBEDDED_SQLITE3) && BLACKBIRD_HAS_EMBEDDED_SQLITE3
+  if (!binary_override.has_value() && !env_lookup) {
+    return Result<SqliteCapabilities>::success(probe_embedded_sqlite_capabilities());
+  }
+#endif
   auto resolved = resolve_sqlite3_binary(binary_override, env_lookup);
   if (!resolved.has_value()) {
     return Result<SqliteCapabilities>::failure(resolved.error());
@@ -2188,6 +2194,12 @@ SqliteWorkbench::SqliteWorkbench(SqliteWorkbenchConfig config,
                                  std::unique_ptr<ISqliteBackend> backend)
     : config_(std::move(config)), backend_(std::move(backend)) {
   if (!backend_) {
+#if defined(BLACKBIRD_HAS_EMBEDDED_SQLITE3) && BLACKBIRD_HAS_EMBEDDED_SQLITE3
+    if (!config_.sqlite_binary_override.has_value()) {
+      backend_ = std::make_unique<EmbeddedSqliteBackend>();
+      return;
+    }
+#endif
     CliSqliteBackendConfig cli_cfg{};
     cli_cfg.binary_override = config_.sqlite_binary_override;
     cli_cfg.env_lookup = config_.env_lookup;
@@ -2605,6 +2617,7 @@ Result<void> SqliteWorkbench::persist_taint_entry(DbEntry &entry,
   req.sql = sql;
   req.limits = config_.default_limits;
   req.expect_rows = false;
+  req.internal_taint_registry_write = true;
   auto res = backend_->execute(req);
   tighten_sidecars_locked(entry);
   if (!res.has_value()) {

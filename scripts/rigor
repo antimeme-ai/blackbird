@@ -84,7 +84,7 @@ def build(profile):
 def sources(extension):
     result = []
     excluded = {"quarantine", "papers", "context", ".context", ".git", ".beads",
-                "build", "target", ".dolt", "__pycache__"}
+                "build", "target", ".dolt", "__pycache__", "third_party"}
     for base, folders, names in os.walk(ROOT):
         if Path(base) == ROOT:
             folders[:] = [name for name in folders if name not in excluded]
@@ -124,7 +124,10 @@ def lint():
         run([LLVM / "clang-format", "--dry-run", "--Werror", *cpp])
     database = json.loads((ROOT / "build/debug/compile_commands.json").read_text())
     fault_probe = ROOT / "tooling/probes/instrumentation_fault.cpp"
-    units = [entry for entry in database if Path(entry["file"]).resolve() != fault_probe]
+    third_party_dir = (ROOT / "third_party").resolve()
+    units = [entry for entry in database
+             if Path(entry["file"]).resolve() != fault_probe
+             and not Path(entry["file"]).resolve().is_relative_to(third_party_dir)]
     if not units:
         raise RuntimeError("no actual translation units to analyze")
     compiled = {Path(entry["file"]).resolve() for entry in units}

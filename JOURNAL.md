@@ -14270,3 +14270,12 @@ Blackbird must not present itself as another product.
 - **Linux Wave 19 ASan Fix (`tests/measure_harness_test.cpp`):**
   updated `--child-read` helper exit path to flush and `_exit(rc)` so atexit LeakSanitizer does not invoke `ptrace` inside the seccomp-jailed child while parent LSan stays active.
 - **Review Trail:** archived `@dentist-2`'s Wave 20 verification report in `papers/2026-11-23-wave20-jupyter-notebook-dentist-review.md`.
+
+## 2026-11-23 — Checkpoint #38 (Stage 2 Embedded SQLite 3.54.1 & Live `v0.4.0` Release): In-Process SQLite 3.54.1 Amalgamation, `sqlite3_set_authorizer`, and Zero-Copy Virtual Tables
+
+- **Live `v0.4.0` Release & Linux Wave 20 Verification (`context/linux/run-vky58a8w`):**
+  verified 100% Linux `debug`/`release`/`asan` pass on `wintermute` across `jupyter_notebook`, `command_post_tools`, `command_post_cli`, and `command_post_tui`; published prebuilt `v0.4.0` (`darwin-arm64` + `linux-x86_64`, commit `7b89c75f9bc8`) to GitHub Releases; verified live `blackbird upgrade --no-ask`, `blackbird doctor`, `blackbird brakes status`, and `blackbird superpowers status` on BOTH `laptop` (`darwin-arm64`, Seatbelt airgap-ready) and `neuromancer` (`linux-x86_64`, Landlock+seccomp airgap-ready).
+- **Operator-Approved Stage 2 Embedded SQLite 3.54.1 (`third_party/sqlite3/`, `include/blackbird/sqlite_embedded.hpp`, `src/sqlite_embedded.cpp`, `tests/sqlite_embedded_test.cpp`, `CMakeLists.txt`, `CMakePresets.json`, `scripts/rigor`):**
+  - Vendored official public-domain SQLite `3.54.1` amalgamation (`sqlite-amalgamation-3540100.zip`, SHA3-256 `92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30`) compiled as static library `blackbird_sqlite3` with `FTS5`, `JSON1`, `RTREE`, `SQLITE_OMIT_LOAD_EXTENSION=1`, `SQLITE_DQS=0`, `SQLITE_TRUSTED_SCHEMA=0`, `SQLITE_USE_URI=0`.
+  - Implemented `EmbeddedSqliteBackend` (`ISqliteBackend`) as the default backend for `SqliteWorkbench` (10–50µs in-process queries, `SQLITE_OPEN_NOFOLLOW`, `SQLITE_DBCONFIG_DEFENSIVE`, bytecode-level `sqlite3_set_authorizer` blocking `ATTACH`/`DETACH`/`load_extension`/dangerous `PRAGMA`s/taint-registry tampering/read-only writes, `sqlite3_progress_handler` deadline interruption, and zero-copy read-only Virtual Tables `blackbird_vtab` over live in-memory snapshots).
+  - Updated `scripts/rigor` to exclude `third_party/` from owned C++ formatting/tidy while keeping 100% full checks on all owned C++/Lua sources (340 total ctests).

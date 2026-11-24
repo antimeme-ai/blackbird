@@ -142,6 +142,7 @@ struct SqliteBackendRequest {
   std::string sql;
   SqliteExecLimits limits{};
   bool expect_rows = true;
+  bool internal_taint_registry_write = false;
 };
 
 struct SqliteBackendResponse {

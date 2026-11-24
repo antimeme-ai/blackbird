@@ -7,6 +7,7 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/Cellar/llvm/23.1.2/bin/clang",
         "CMAKE_CXX_COMPILER": "/opt/homebrew/Cellar/llvm/23.1.2/bin/clang++",
         "CMAKE_MAKE_PROGRAM": "/opt/homebrew/anaconda3/bin/ninja",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"

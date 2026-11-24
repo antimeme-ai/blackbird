@@ -1,4 +1,19 @@
 cmake_minimum_required(VERSION 3.28)
+if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
+  if(CMAKE_HOST_APPLE)
+    foreach(_bb_llvm_c IN ITEMS "/opt/homebrew/opt/llvm/bin/clang" "/usr/local/opt/llvm/bin/clang")
+      if(EXISTS "${_bb_llvm_c}")
+        set(CMAKE_C_COMPILER "${_bb_llvm_c}")
+        break()
+      endif()
+    endforeach()
+  elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    find_program(_bb_clang_c clang)
+    if(_bb_clang_c)
+      set(CMAKE_C_COMPILER "${_bb_clang_c}")
+    endif()
+  endif()
+endif()
 if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
   if(CMAKE_HOST_APPLE)
     foreach(_bb_llvm IN ITEMS "/opt/homebrew/opt/llvm/bin/clang++" "/usr/local/opt/llvm/bin/clang++")
@@ -14,7 +29,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
     endif()
   endif()
 endif()
-project(blackbird LANGUAGES CXX)
+project(blackbird LANGUAGES C CXX)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(BLACKBIRD_DEFAULT_COMPILER_PROFILE "linux-llvm23")
@@ -1511,11 +1526,46 @@ target_link_libraries(lsp_client_test PRIVATE blackbird_foundation Threads::Thre
 add_test(NAME lsp_client COMMAND lsp_client_test)
 set_tests_properties(lsp_client PROPERTIES TIMEOUT 60)
 
-target_sources(blackbird_foundation PRIVATE src/sqlite_workbench.cpp)
+# Vendored Public-Domain SQLite 3.54.1 Amalgamation (operator-approved 2026-11-23).
+add_library(blackbird_sqlite3 STATIC third_party/sqlite3/sqlite3.c)
+set_target_properties(blackbird_sqlite3 PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  EXPORT_COMPILE_COMMANDS OFF
+)
+target_include_directories(blackbird_sqlite3 SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite3")
+target_compile_definitions(blackbird_sqlite3 PUBLIC
+  BLACKBIRD_HAS_EMBEDDED_SQLITE3=1
+)
+target_compile_definitions(blackbird_sqlite3 PRIVATE
+  SQLITE_ENABLE_FTS5=1
+  SQLITE_ENABLE_JSON1=1
+  SQLITE_ENABLE_RTREE=1
+  SQLITE_OMIT_LOAD_EXTENSION=1
+  SQLITE_DQS=0
+  SQLITE_THREADSAFE=1
+  SQLITE_DEFAULT_MEMSTATUS=0
+  SQLITE_DEFAULT_FOREIGN_KEYS=1
+  SQLITE_TRUSTED_SCHEMA=0
+  SQLITE_USE_URI=0
+)
+target_compile_options(blackbird_sqlite3 PRIVATE -w)
+target_link_libraries(blackbird_sqlite3 PRIVATE Threads::Threads)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(blackbird_sqlite3 PRIVATE m)
+endif()
+
+target_sources(blackbird_foundation PRIVATE src/sqlite_workbench.cpp src/sqlite_embedded.cpp)
+target_link_libraries(blackbird_foundation PUBLIC blackbird_sqlite3)
 add_executable(sqlite_workbench_test tests/sqlite_workbench_test.cpp)
 target_link_libraries(sqlite_workbench_test PRIVATE blackbird_foundation OpenSSL::Crypto)
 add_test(NAME sqlite_workbench COMMAND sqlite_workbench_test)
 set_tests_properties(sqlite_workbench PROPERTIES TIMEOUT 60)
+
+add_executable(sqlite_embedded_test tests/sqlite_embedded_test.cpp)
+target_link_libraries(sqlite_embedded_test PRIVATE blackbird_foundation OpenSSL::Crypto)
+add_test(NAME sqlite_embedded COMMAND sqlite_embedded_test)
+set_tests_properties(sqlite_embedded PROPERTIES TIMEOUT 60)
 
 target_sources(blackbird_foundation PRIVATE src/measure_harness.cpp)
 add_executable(measure_harness_test tests/measure_harness_test.cpp)
