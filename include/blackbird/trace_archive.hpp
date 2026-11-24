@@ -21,4 +21,7 @@ private:
   int process_ = -1;
 };
 
+// Multicall entry point for the trace archive helper (`--internal-archive`).
+int run_archive_main(int argc, char **argv);
+
 } // namespace blackbird

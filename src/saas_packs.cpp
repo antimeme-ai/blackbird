@@ -1,4 +1,5 @@
 #include "blackbird/saas_packs.hpp"
+#include "blackbird/embedded_resources.hpp"
 #include "blackbird/integrations_runtime.hpp"
 #include "blackbird/json.hpp"
 
@@ -986,7 +987,7 @@ execute_live_saas_pack_impl(const SaasPackLiveCallRequest &req) {
       req.vault_dir.empty() ? default_integrations_vault_dir() : req.vault_dir;
   const std::filesystem::path packs_dir =
       req.packs_dir.empty() ? default_integrations_packs_dir() : req.packs_dir;
-  if (vault_dir.empty() || packs_dir.empty())
+  if (vault_dir.empty())
     return Result<SaasInvokeOutcome>::failure({ErrorCode::invalid_range});
 
   IntegrationVaultConfig vcfg;
@@ -1007,8 +1008,22 @@ execute_live_saas_pack_impl(const SaasPackLiveCallRequest &req) {
                           req.allow_loopback_for_testing, false});
   SaasPackHost host{std::move(scfg)};
 
-  const std::filesystem::path pack_file = packs_dir / (manifest->service + ".lua");
-  auto pid = host.load_pack_file(*manifest, pack_file);
+  Result<SaasPackId> pid = Result<SaasPackId>::failure({ErrorCode::io});
+  bool disk_present = false;
+  if (!packs_dir.empty()) {
+    const std::filesystem::path pack_file = packs_dir / (manifest->service + ".lua");
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(pack_file, ec)) {
+      disk_present = true;
+      pid = host.load_pack_file(*manifest, pack_file);
+    }
+  }
+  if (!disk_present) {
+    if (const auto embedded = find_embedded_saas_pack(manifest->service);
+        embedded.has_value()) {
+      pid = host.register_pack_source(*manifest, *embedded);
+    }
+  }
   if (!pid.has_value())
     return Result<SaasInvokeOutcome>::failure(pid.error());
 
@@ -1160,9 +1175,29 @@ Result<SaasPackId> SaasPackHost::load_pack_file(SaasPackManifest manifest,
 Result<std::vector<SaasPackId>>
 SaasPackHost::load_builtin_packs(const std::filesystem::path &integrations_dir) {
   std::vector<SaasPackId> ids;
+  const bool has_dir = [&] {
+    if (integrations_dir.empty())
+      return false;
+    std::error_code ec;
+    return std::filesystem::is_directory(integrations_dir, ec);
+  }();
   for (const auto &manifest : builtin_saas_pack_manifests()) {
-    const std::filesystem::path file = integrations_dir / (manifest.service + ".lua");
-    auto id = load_pack_file(manifest, file);
+    Result<SaasPackId> id = Result<SaasPackId>::failure({ErrorCode::io});
+    bool disk_present = false;
+    if (has_dir) {
+      const std::filesystem::path file = integrations_dir / (manifest.service + ".lua");
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(file, ec)) {
+        disk_present = true;
+        id = load_pack_file(manifest, file);
+      }
+    }
+    if (!disk_present) {
+      if (const auto embedded = find_embedded_saas_pack(manifest.service);
+          embedded.has_value()) {
+        id = register_pack_source(manifest, *embedded);
+      }
+    }
     if (!id.has_value())
       return Result<std::vector<SaasPackId>>::failure(id.error());
     ids.push_back(id.value());

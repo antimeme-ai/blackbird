@@ -453,7 +453,12 @@ std::filesystem::path default_integrations_packs_dir() {
       override_dir != nullptr && override_dir[0] != '\0') {
     return std::filesystem::path{override_dir};
   }
+#ifdef BLACKBIRD_INTEGRATIONS_DIR
+  return runtime_resource(
+      {.relative = "programs/integrations", .development = BLACKBIRD_INTEGRATIONS_DIR});
+#else
   return runtime_resource({.relative = "programs/integrations", .development = {}});
+#endif
 }
 
 void register_saas_pack_live_executor(SaasPackLiveExecutorFn fn) noexcept {

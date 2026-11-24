@@ -679,10 +679,14 @@ void CommandJobs::Impl::run(const std::shared_ptr<Job> &job) noexcept {
           throw Error{ErrorCode::io, errno};
         pipe_fds(boot_read, boot_write);
         arguments.insert(arguments.begin(), slave);
-        arguments.insert(arguments.begin(),
-                         runtime_helper({.relative = "blackbird-job-runner",
-                                         .development = BLACKBIRD_JOB_RUNNER})
-                             .string());
+        const auto helper = runtime_helper(
+            {.relative = "blackbird-job-runner", .development = BLACKBIRD_JOB_RUNNER});
+        if (!helper.empty()) {
+          arguments.insert(arguments.begin(), helper.string());
+        } else {
+          arguments.insert(arguments.begin(), "--internal-job-runner");
+          arguments.insert(arguments.begin(), runtime_executable().string());
+        }
       } else {
         pipe_fds(input_read, input_write);
         pipe_fds(output_read, output_write);

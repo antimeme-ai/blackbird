@@ -41,22 +41,61 @@ bool bundle(const std::filesystem::path &directory) {
   return directory.filename() == "MacOS" &&
          directory.parent_path().filename() == "Contents";
 }
+bool in_build_tree() {
+#ifdef BLACKBIRD_BUILD_DIR
+  std::error_code ec;
+  const auto build_dir = std::filesystem::weakly_canonical(BLACKBIRD_BUILD_DIR, ec);
+  if (ec || build_dir.empty())
+    return false;
+  const auto exe_dir = executable().parent_path();
+  if (exe_dir == build_dir)
+    return true;
+  const auto rel = exe_dir.lexically_relative(build_dir);
+  return !rel.empty() && *rel.begin() != "..";
+#else
+  return false;
+#endif
+}
 } // namespace
+const std::filesystem::path &runtime_executable() { return executable(); }
 std::filesystem::path runtime_resource(const RuntimePath &path) {
   const auto directory = executable().parent_path();
-  if (bundle(directory))
-    return directory.parent_path() / "Resources/Blackbird" / path.relative;
+  std::error_code ec;
+  if (bundle(directory)) {
+    const auto candidate =
+        directory.parent_path() / "Resources/Blackbird" / path.relative;
+    if (std::filesystem::exists(candidate, ec))
+      return candidate;
+    return {};
+  }
   for (const auto &root :
-       {directory / "../share/blackbird", directory / "../../share/blackbird"})
-    if (std::filesystem::is_directory(root))
-      return (root / path.relative).lexically_normal();
-  return path.development;
+       {directory / "../share/blackbird", directory / "../../share/blackbird"}) {
+    ec.clear();
+    if (std::filesystem::is_directory(root, ec)) {
+      const auto candidate = (root / path.relative).lexically_normal();
+      ec.clear();
+      if (std::filesystem::exists(candidate, ec))
+        return candidate;
+    }
+  }
+  if (in_build_tree() && !path.development.empty()) {
+    ec.clear();
+    if (std::filesystem::exists(path.development, ec))
+      return path.development;
+  }
+  return {};
 }
 std::filesystem::path runtime_helper(const RuntimePath &path) {
   const auto directory = executable().parent_path();
   const auto sibling = directory / path.relative;
-  if (bundle(directory) || std::filesystem::is_regular_file(sibling))
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(sibling, ec))
     return sibling;
-  return path.development;
+  if (in_build_tree() && !path.development.empty()) {
+    ec.clear();
+    if (std::filesystem::is_regular_file(path.development, ec))
+      return path.development;
+  }
+  return {};
 }
 } // namespace blackbird

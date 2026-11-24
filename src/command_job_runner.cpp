@@ -8,9 +8,10 @@
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
+namespace blackbird {
 // Spawned without SETPGROUP. This fresh executable, not a forked C++ thread,
 // establishes the private terminal before replacing itself with the command.
-int main(int argc, char **argv) {
+int run_command_job_runner_main(int argc, char **argv) {
   unsigned char stage = 1;
   auto failure = [&](int error) {
     const unsigned char tag = 2;
@@ -63,4 +64,12 @@ int main(int argc, char **argv) {
   stage = 9;
   ::execvp(target.front(), target.data());
   failure(errno);
+  return 127;
 }
+} // namespace blackbird
+
+#ifndef BLACKBIRD_COMMAND_JOB_RUNNER_LIBRARY
+int main(int argc, char **argv) {
+  return blackbird::run_command_job_runner_main(argc, argv);
+}
+#endif

@@ -4,8 +4,10 @@
 #include "blackbird/backstop.hpp"
 #include "blackbird/chat_provider.hpp"
 #include "blackbird/coding.hpp"
+#include "blackbird/command_jobs.hpp"
 #include "blackbird/command_post_cli.hpp"
 #include "blackbird/command_post_tui.hpp"
+#include "blackbird/embedded_resources.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
 #include "blackbird/mp_social_runtime.hpp"
@@ -148,12 +150,18 @@ struct LoadedProfiles {
   // Set when BLACKBIRD_PROFILE_SET_DIGEST names another content digest.
   std::string pin_refusal;
 };
+std::string read_workflow_source(const std::filesystem::path &path,
+                                 const RawAdapterContext *capture = nullptr,
+                                 RawEventRef *original = nullptr) {
+  if (path == embedded_turn_workflow_id)
+    return std::string{embedded_turn_workflow()};
+  return read_file(path, 16 * 1024 * 1024, capture, original);
+}
 std::expected<LoadedProfiles, std::string> load_profiles(const char *home) {
   LoadedProfiles loaded;
-  loaded.directories.shipped = runtime_resource(
-      {.relative = "profiles/providers", .development = BLACKBIRD_PROFILE_DIRECTORY});
   loaded.directories.operator_overrides =
       std::filesystem::path{home} / ".local/share/blackbird/profiles";
+  bool explicit_profiles = false;
   if (const char *chosen = std::getenv("BLACKBIRD_PROFILES")) {
     if (*chosen == '\0')
       return std::unexpected(
@@ -161,8 +169,21 @@ std::expected<LoadedProfiles, std::string> load_profiles(const char *home) {
           "profile directory, or unset it to use this Blackbird's profiles; no session "
           "was opened.\n");
     loaded.directories.shipped = std::filesystem::absolute(chosen).lexically_normal();
+    explicit_profiles = true;
+  } else {
+    loaded.directories.shipped = runtime_resource(
+        {.relative = "profiles/providers", .development = BLACKBIRD_PROFILE_DIRECTORY});
   }
-  auto set = load_profile_set(loaded.directories);
+  ProfileResult<ProfileSet> set = [&]() -> ProfileResult<ProfileSet> {
+    if (explicit_profiles)
+      return load_profile_set(loaded.directories);
+    std::error_code ec;
+    if (!loaded.directories.shipped.empty() &&
+        std::filesystem::is_directory(loaded.directories.shipped, ec))
+      return load_profile_set(loaded.directories);
+    loaded.directories.shipped = std::filesystem::path{embedded_profiles_location};
+    return load_embedded_profile_set(loaded.directories.operator_overrides);
+  }();
   if (!set.has_value())
     return std::unexpected(
         "Provider profiles refused: " + set.error().message() +
@@ -1694,6 +1715,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     const auto session_root = std::filesystem::path{home} / ".local/state/blackbird";
     std::filesystem::path workflow = runtime_resource(
         {.relative = "programs/turn.lua", .development = BLACKBIRD_WORKFLOW});
+    if (workflow.empty())
+      workflow = embedded_turn_workflow_id;
     std::string model = "gpt-6.1-sol", once, seed_path, backstop_path, station_path;
     Value backstop_mission;
     bool one = false, inspect = false, plain = false, rebuild_session = false,
@@ -2269,8 +2292,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       settings.effort = effort;
     if (workflow_option || settings.workflow.empty())
       settings.workflow =
-          std::filesystem::absolute(workflow).lexically_normal().string();
-    (void)read_file(settings.workflow, 16 * 1024 * 1024, &session_capture);
+          workflow == embedded_turn_workflow_id
+              ? std::string{embedded_turn_workflow_id}
+              : std::filesystem::absolute(workflow).lexically_normal().string();
+    (void)read_workflow_source(settings.workflow, &session_capture);
     const bool tui = station_path.empty() && !plain && !one && !application &&
                      isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     const auto route_efforts = [&](const SessionSettings &candidate,
@@ -3086,8 +3111,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               }
               resume_requested = false;
               resume_turn = false;
-              engine.turn(
-                  {"", read_file(workflow, 16 * 1024 * 1024, &command_context)});
+              engine.turn({"", read_workflow_source(workflow, &command_context)});
             } else if (prompt == "/tasks" || prompt.starts_with("/tasks ")) {
               raw_main_branch(dispatch, 7);
               const auto command =
@@ -3557,11 +3581,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             } else if (prompt.starts_with("/workflow ")) {
               raw_main_branch(dispatch, 26);
               auto candidate = session_store.settings();
+              const auto chosen = std::string{prompt.substr(10)};
               candidate.workflow =
-                  std::filesystem::absolute(std::string{prompt.substr(10)})
-                      .lexically_normal()
-                      .string();
-              (void)read_file(candidate.workflow, 16 * 1024 * 1024, &command_context);
+                  chosen == embedded_turn_workflow_id
+                      ? chosen
+                      : std::filesystem::absolute(chosen).lexically_normal().string();
+              (void)read_workflow_source(candidate.workflow, &command_context);
               session_store.save(candidate, &command_context);
               workflow = candidate.workflow;
             } else if (prompt == "/context") {
@@ -3980,10 +4005,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             } else {
               raw_main_branch(dispatch, 40);
               if (engine.operator_turn(
-                      prompt,
-                      prompt.starts_with("/")
-                          ? ""
-                          : read_file(workflow, 16 * 1024 * 1024, &command_context))) {
+                      prompt, prompt.starts_with("/")
+                                  ? ""
+                                  : read_workflow_source(workflow, &command_context))) {
                 publish_workflows(engine.workflows());
               } else if (prompt.starts_with("/")) {
                 bool handled_remote_party = false;
@@ -4421,8 +4445,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                         station.prompt(event, &station_context, &prompt_source);
                     station_call.stage(12);
                     RawEventRef workflow_source{};
-                    const auto program = read_file(workflow, 16 * 1024 * 1024,
-                                                   &station_context, &workflow_source);
+                    const auto program = read_workflow_source(
+                        workflow, &station_context, &workflow_source);
                     station_call.stage(13);
                     RawSessionCall invoke{
                         4637, 4638, &station_context,
@@ -4548,16 +4572,24 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       const auto initial_length = initial.size();
       std::optional<InstrumentSource> instrument_source;
       try {
-        const auto instrument_path =
-            runtime_resource(
-                {.relative = "programs/turn.lua", .development = BLACKBIRD_WORKFLOW})
-                .parent_path() /
-            "instruments/results.lua";
+        const auto instrument_path = runtime_resource(
+            {.relative = "programs/instruments/results.lua",
+             .development = std::filesystem::path{BLACKBIRD_WORKFLOW}.parent_path() /
+                            "instruments/results.lua"});
         RawEventRef original;
-        auto script = unwrap(tui::lua::Script::create(read_file(
-            instrument_path, tui::lua::source_limit, &session_capture, &original)));
+        std::string source_text;
+        std::string source_label;
+        if (!instrument_path.empty()) {
+          source_text = read_file(instrument_path, tui::lua::source_limit,
+                                  &session_capture, &original);
+          source_label = instrument_path.string();
+        } else {
+          source_text = std::string{embedded_results_instrument()};
+          source_label = std::string{embedded_results_instrument_id};
+        }
+        auto script = unwrap(tui::lua::Script::create(source_text));
         instrument_source.emplace(InstrumentSource{
-            std::move(script), instrument_path.string(), original, {}, false});
+            std::move(script), std::move(source_label), original, {}, false});
       } catch (const Error &error) {
         ui.notice(std::string{"Instrument source unavailable: "} +
                   error_name(error.code));
@@ -4781,6 +4813,10 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
 }
 
 int main(int argc, char **argv) {
+  if (argc > 1 && std::string_view{argv[1]} == "--internal-job-runner")
+    return blackbird::run_command_job_runner_main(argc - 1, argv + 1);
+  if (argc > 1 && std::string_view{argv[1]} == "--internal-archive")
+    return blackbird::run_archive_main(argc - 1, argv + 1);
   // scripts/blackbird starts this process as an asynchronous child, which POSIX
   // shells start with SIGINT and SIGQUIT ignored. The wrapper marks that child;
   // undo exactly that, so Ctrl-C and Ctrl-\ act as without the wrapper and no

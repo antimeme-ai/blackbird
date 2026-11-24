@@ -7,6 +7,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 extern char **environ;
 namespace blackbird {
@@ -54,15 +55,22 @@ TraceArchiveWorker::start(const std::filesystem::path &session) {
           &actions, STDERR_FILENO, (session / "trace-archive.log").c_str(),
           O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
     pid_t process = -1;
+    const auto helper = runtime_helper(
+        {.relative = "blackbird-archive", .development = BLACKBIRD_ARCHIVE_EXECUTABLE});
     std::string executable =
-        runtime_helper({.relative = "blackbird-archive",
-                        .development = BLACKBIRD_ARCHIVE_EXECUTABLE})
-            .string();
+        helper.empty() ? runtime_executable().string() : helper.string();
+    std::string internal_flag = "--internal-archive";
     std::string operation = "watch", path = session.string();
-    char *args[]{executable.data(), operation.data(), path.data(), nullptr};
+    std::vector<char *> args;
+    args.push_back(executable.data());
+    if (helper.empty())
+      args.push_back(internal_flag.data());
+    args.push_back(operation.data());
+    args.push_back(path.data());
+    args.push_back(nullptr);
     if (code == 0)
-      code = ::posix_spawn(&process, executable.c_str(), &actions, &attributes, args,
-                           environ);
+      code = ::posix_spawn(&process, executable.c_str(), &actions, &attributes,
+                           args.data(), environ);
     if (attributes_ready)
       (void)::posix_spawnattr_destroy(&attributes);
     (void)::posix_spawn_file_actions_destroy(&actions);

@@ -19,9 +19,12 @@ std::vector<std::string> blackbird_startup(std::size_t columns, std::size_t rows
 } // namespace blackbird
 
 namespace blackbird {
-// Local-file Kitty graphics; the terminal owns decoding and cached pixel storage.
+// Kitty graphics; uses local-file transmission when present, or chunked inline
+// t=d base64 frames from the embedded SR-71 PNG when no disk asset exists.
 bool blackbird_graphics_available();
 std::string blackbird_graphics_load();
+std::string blackbird_graphics_load_inline();
+std::size_t blackbird_graphics_load_bound() noexcept;
 std::string blackbird_graphics_place(std::size_t row, std::size_t column,
                                      std::size_t columns, std::size_t rows);
 std::string_view blackbird_graphics_erase(bool release = false);

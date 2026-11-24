@@ -50,7 +50,7 @@ def main():
     paths.append("scripts/check-tui-instrument")
     paths += ["scripts/check-terminal-edge", "scripts/check-tui-viewport", "scripts/check-main-input"]
 
-    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime", "papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md"]
+    paths += ["scripts/check-anthropic", "scripts/install-blackbird", "scripts/check-install-blackbird", "scripts/check-portable-runtime", "scripts/gen_embedded_resources.py", "papers/clm-a1v-2026-10-19/design-tribunal/provider_protocol.md"]
     paths += ["crates/blackbird-p2p/Cargo.toml", "crates/blackbird-p2p/Cargo.lock", "crates/blackbird-p2p/src", "crates/blackbird-p2p/include"]
     paths += ["third_party/sqlite3/sqlite3.c", "third_party/sqlite3/sqlite3.h", "third_party/sqlite3/sqlite3ext.h", "third_party/sqlite3/README.md"]
     archive = io.BytesIO()

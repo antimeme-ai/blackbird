@@ -1,7 +1,10 @@
 #include "blackbird/sprite.hpp"
+#include "blackbird/embedded_resources.hpp"
 #include "blackbird/runtime_paths.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <unistd.h>
@@ -113,21 +116,47 @@ std::string image_path() {
                    .string()
              : std::string{override_path};
 }
-std::string base64_path(std::string_view path) {
+std::string base64_encode(std::string_view bytes) {
   constexpr std::string_view alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string result;
-  result.reserve((path.size() + 2) / 3 * 4);
-  for (std::size_t i = 0; i < path.size(); i += 3) {
-    const auto a = static_cast<unsigned char>(path[i]);
-    const auto b = i + 1 < path.size() ? static_cast<unsigned char>(path[i + 1]) : 0U;
-    const auto c = i + 2 < path.size() ? static_cast<unsigned char>(path[i + 2]) : 0U;
+  result.reserve((bytes.size() + 2) / 3 * 4);
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const auto a = static_cast<unsigned char>(bytes[i]);
+    const auto b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0U;
+    const auto c = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0U;
     result += alphabet[a >> 2];
     result += alphabet[((a & 3U) << 4) | (b >> 4)];
-    result += i + 1 < path.size() ? alphabet[((b & 15U) << 2) | (c >> 6)] : '=';
-    result += i + 2 < path.size() ? alphabet[c & 63U] : '=';
+    result += i + 1 < bytes.size() ? alphabet[((b & 15U) << 2) | (c >> 6)] : '=';
+    result += i + 2 < bytes.size() ? alphabet[c & 63U] : '=';
   }
   return result;
+}
+std::string encode_kitty_inline_png(std::span<const std::byte> png_bytes) {
+  const std::string encoded = base64_encode(std::string_view{
+      reinterpret_cast<const char *>(png_bytes.data()), png_bytes.size()});
+  if (encoded.empty())
+    return {};
+  constexpr std::size_t kChunkSize = 4096U;
+  std::string out;
+  out.reserve(encoded.size() + (encoded.size() / kChunkSize + 1U) * 48U);
+  std::size_t offset = 0U;
+  bool first = true;
+  while (offset < encoded.size()) {
+    const std::size_t len = std::min(kChunkSize, encoded.size() - offset);
+    const bool is_last = (offset + len >= encoded.size());
+    if (first) {
+      out += "\x1b_Ga=t,f=100,t=d,i=72171,q=2,";
+      out += is_last ? "m=0;" : "m=1;";
+      first = false;
+    } else {
+      out += is_last ? "\x1b_Gm=0;" : "\x1b_Gm=1;";
+    }
+    out.append(encoded.data() + offset, len);
+    out += "\x1b\\";
+    offset += len;
+  }
+  return out;
 }
 } // namespace
 bool blackbird_graphics_available() {
@@ -142,15 +171,48 @@ bool blackbird_graphics_available() {
         setting("TERM") != "xterm-kitty")
       return false;
   }
+  const auto override_path = setting("BLACKBIRD_SPRITE_ASSET");
+  if (!override_path.empty()) {
+    return override_path.size() <= 3072 &&
+           ::access(std::string{override_path}.c_str(), R_OK) == 0;
+  }
   const auto path = image_path();
-  return !path.empty() && path.size() <= 3072 &&
-         ::access(std::string{path}.c_str(), R_OK) == 0;
+  if (!path.empty() && path.size() <= 3072 && ::access(path.c_str(), R_OK) == 0)
+    return true;
+  return !embedded_sr71_png().empty();
+}
+std::string blackbird_graphics_load_inline() {
+  return encode_kitty_inline_png(embedded_sr71_png());
+}
+std::size_t blackbird_graphics_load_bound() noexcept {
+  const auto override_path = setting("BLACKBIRD_SPRITE_ASSET");
+  if (!override_path.empty())
+    return 4096U;
+  const auto path = image_path();
+  if (!path.empty() && ::access(path.c_str(), R_OK) == 0)
+    return 4096U;
+  const std::size_t raw_bytes = embedded_sr71_png().size();
+  if (raw_bytes == 0U)
+    return 0U;
+  const std::size_t encoded = ((raw_bytes + 2U) / 3U) * 4U;
+  constexpr std::size_t kChunkSize = 4096U;
+  const std::size_t chunks = (encoded + kChunkSize - 1U) / kChunkSize;
+  return encoded + 64U + (chunks > 1U ? (chunks - 1U) * 16U : 0U);
 }
 std::string blackbird_graphics_load() {
+  const auto override_path = setting("BLACKBIRD_SPRITE_ASSET");
+  if (!override_path.empty()) {
+    if (override_path.size() > 3072)
+      throw std::length_error("graphics image path exceeds 3072 bytes");
+    return "\x1b_Ga=t,f=100,t=f,i=72171,q=2;" + base64_encode(override_path) + "\x1b\\";
+  }
   const auto path = image_path();
-  if (path.size() > 3072)
-    throw std::length_error("graphics image path exceeds 3072 bytes");
-  return "\x1b_Ga=t,f=100,t=f,i=72171,q=2;" + base64_path(path) + "\x1b\\";
+  if (!path.empty() && ::access(path.c_str(), R_OK) == 0) {
+    if (path.size() > 3072)
+      throw std::length_error("graphics image path exceeds 3072 bytes");
+    return "\x1b_Ga=t,f=100,t=f,i=72171,q=2;" + base64_encode(path) + "\x1b\\";
+  }
+  return blackbird_graphics_load_inline();
 }
 std::string_view blackbird_graphics_erase(bool release) {
   return release ? "\x1b_Ga=d,d=I,i=72171,q=2;\x1b\\"

@@ -8,6 +8,7 @@ struct RuntimePath {
   std::filesystem::path relative;
   std::filesystem::path development;
 };
+const std::filesystem::path &runtime_executable();
 std::filesystem::path runtime_resource(const RuntimePath &path);
 std::filesystem::path runtime_helper(const RuntimePath &path);
 } // namespace blackbird
