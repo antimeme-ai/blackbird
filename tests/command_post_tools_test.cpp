@@ -118,13 +118,14 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 11, "all 11 command-post tools must be registered");
+  require(found.size() == 13, "all 13 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
               found.contains("companion_timing") && found.contains("local_swarm") &&
               found.contains("sqlite_db") && found.contains("measure_script") &&
               found.contains("nvim_ast") && found.contains("code_intel") &&
-              found.contains("jupyter_nb"),
+              found.contains("jupyter_nb") && found.contains("saas_pack") &&
+              found.contains("mcp_router"),
           "missing expected command-post tool names");
 }
 
@@ -2336,6 +2337,55 @@ end
   }
 }
 
+void test_integrations_model_tools() {
+  // 1. saas_pack: list_packs & describe (passive metadata-only)
+  const Value list_res = run_command_post_tool(
+      "saas_pack", Value::object({{"action", Value{"list_packs"}}}));
+  require(field(list_res, "count") == Value{Number{std::uint64_t{7}}} &&
+              field(list_res, "packs").array().size() == 7U,
+          "saas_pack list_packs must return 7 builtin Lua packs");
+
+  const Value desc_res = run_command_post_tool(
+      "saas_pack",
+      Value::object({{"action", Value{"describe"}}, {"service", Value{"linear"}}}));
+  require(string_field(desc_res, "service") == "linear" &&
+              field(desc_res, "allowed_hosts").array().size() == 1U,
+          "saas_pack describe linear must return pinned host metadata");
+
+  // 2. mcp_router: presets, manifest & BM25 search with non-downgrading readOnlyHint
+  const Value presets_res = run_command_post_tool(
+      "mcp_router", Value::object({{"action", Value{"presets"}}}));
+  require(field(presets_res, "count") == Value{Number{std::uint64_t{6}}} &&
+              field(presets_res, "presets").array().size() == 6U,
+          "mcp_router presets must return 6 official remote MCP presets");
+
+  const Value manifest_res = run_command_post_tool(
+      "mcp_router",
+      Value::object({{"action", Value{"manifest"}}, {"server", Value{"linear"}}}));
+  require(string_field(manifest_res, "endpoint_url") == "https://mcp.linear.app/mcp",
+          "mcp_router manifest linear mismatch");
+
+  const std::string custom_tools = R"([
+    {"server":"linear","name":"delete_everything","title":"Delete Workspace","description":"Permanently wipe workspace data","read_only_hint":true,"destructive_hint":true},
+    {"server":"linear","name":"search_issues","title":"Search Issues","description":"Query Linear issues","read_only_hint":true,"destructive_hint":false}
+  ])";
+  const Value search_res =
+      run_command_post_tool("mcp_router", Value::object({
+                                              {"action", Value{"search"}},
+                                              {"query", Value{"wipe workspace"}},
+                                              {"tools_json", Value{custom_tools}},
+                                              {"limit", Value{Number{2}}},
+                                          }));
+  const auto &hits = field(search_res, "hits").array();
+  require(!hits.empty(), "mcp_router search must return ranked hit");
+  require(string_field(hits[0], "tool") == "delete_everything",
+          "BM25 must rank delete_everything first");
+  require(std::get<bool>(field(hits[0], "tightened_by_destructive_hint").value()),
+          "destructiveHint=true must tighten authoritative effect");
+  require(string_field(hits[0], "authoritative_effect") != "read_only",
+          "untrusted readOnlyHint=true must NEVER downgrade authoritative effect");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2350,6 +2400,7 @@ int main(int argc, char **argv) {
 
   try {
     test_tool_definitions();
+    test_integrations_model_tools();
     test_superpower_tools_smoke(sandbox);
     test_readonly_no_dir_creation(sandbox);
     test_platoon_board_and_framing(sandbox);

@@ -1,3 +1,4 @@
+#include "blackbird/acp_agent.hpp"
 #include "blackbird/anthropic_provider.hpp"
 #include "blackbird/application.hpp"
 #include "blackbird/backstop.hpp"
@@ -23,6 +24,7 @@
 #include "blackbird/raw_storage.hpp"
 #include "blackbird/responses_provider.hpp"
 #include "blackbird/runtime_paths.hpp"
+#include "blackbird/saas_packs.hpp"
 #include "blackbird/saved_state.hpp"
 #include "blackbird/self_upgrade.hpp"
 #include "blackbird/sprite.hpp"
@@ -276,6 +278,76 @@ ApplicationCli parse_application_cli(int argc, char **argv) {
     }
   }
   return cli;
+}
+
+struct AcpCli {
+  bool enabled = false;
+  bool valid = true;
+};
+
+AcpCli parse_acp_cli(int argc, char **argv) {
+  AcpCli cli;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg = argv[i];
+    if (arg == "--acp") {
+      if (cli.enabled)
+        cli.valid = false;
+      cli.enabled = true;
+    } else {
+      cli.valid = false;
+    }
+  }
+  return cli;
+}
+
+int run_acp_stdio_mode() {
+  AcpAgentConfig cfg;
+  cfg.agent_name = "blackbird";
+  cfg.agent_version = BLACKBIRD_VERSION_STRING;
+  cfg.prompt_runner = [](const AcpPromptRequest &req, const AcpSessionEmitter &emitter,
+                         const std::atomic<bool> &cancelled) -> AcpPromptResult {
+    if (cancelled.load(std::memory_order_acquire))
+      return AcpPromptResult{AcpStopReason::cancelled, std::nullopt};
+
+    std::string combined;
+    for (const auto &block : req.blocks) {
+      if (cancelled.load(std::memory_order_acquire))
+        return AcpPromptResult{AcpStopReason::cancelled, std::nullopt};
+      if (!block.text.empty()) {
+        if (!combined.empty())
+          combined.push_back('\n');
+        combined.append(block.text);
+      }
+    }
+    if (combined.size() > 1024U)
+      combined.resize(1024U);
+
+    if (cancelled.load(std::memory_order_acquire))
+      return AcpPromptResult{AcpStopReason::cancelled, std::nullopt};
+
+    std::string reply =
+        "Blackbird ACP session " + format_acp_session_id(req.session_id) +
+        " ready (cwd=" + (req.cwd.empty() ? std::string{"."} : req.cwd) + "). ";
+    if (combined.empty()) {
+      reply += "Received empty prompt; configure a Blackbird provider session for full "
+               "autonomous turns.";
+    } else {
+      reply += "Received prompt (" + std::to_string(combined.size()) +
+               " bytes) in headless ACP stdio transport.";
+    }
+    emitter.emit_agent_message_chunk(reply);
+    if (cancelled.load(std::memory_order_acquire))
+      return AcpPromptResult{AcpStopReason::cancelled, std::nullopt};
+    return AcpPromptResult{AcpStopReason::end_turn, std::nullopt};
+  };
+
+  auto server = AcpAgentServer::create(std::move(cfg));
+  if (!server.has_value()) {
+    std::cerr << "blackbird: failed to initialize ACP server: "
+              << error_name(server.error().code) << '\n';
+    return 1;
+  }
+  return server.value().run_stdio(std::cin, std::cout);
 }
 
 std::string_view trim_ascii_ws(std::string_view text) noexcept {
@@ -4217,6 +4289,7 @@ int main(int argc, char **argv) {
       }
     }
   }
+  ensure_saas_pack_live_executor_registered();
   if (argc > 1 && std::string_view{argv[1]} == "auth")
     return provider_auth_cli(argc - 1, argv + 1);
   if (argc > 1 && is_command_post_subcommand(argv[1]))
@@ -4225,6 +4298,13 @@ int main(int argc, char **argv) {
       (std::string_view{argv[1]} == "--version" || std::string_view{argv[1]} == "-V")) {
     std::cout << BLACKBIRD_VERSION_STRING << '\n';
     return 0;
+  }
+  if (const auto acp_cli = parse_acp_cli(argc, argv); acp_cli.enabled) {
+    if (!acp_cli.valid) {
+      std::cerr << "Usage: blackbird --acp (cannot be combined with other flags)\n";
+      return 2;
+    }
+    return run_acp_stdio_mode();
   }
   if (const auto app_cli = parse_application_cli(argc, argv); app_cli.enabled) {
     ApplicationConnection application;

@@ -3,10 +3,13 @@
 #include "blackbird/bridge_relay.hpp"
 #include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_view.hpp"
+#include "blackbird/integration_vault.hpp"
+#include "blackbird/integrations_runtime.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/lan_party_runtime.hpp"
+#include "blackbird/mcp_client.hpp"
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
@@ -17,6 +20,7 @@
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/saas_packs.hpp"
 #include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/swarmboard_view.hpp"
 #include "blackbird/token_usage.hpp"
@@ -4282,6 +4286,92 @@ std::string handle_superpowers(std::string_view args) {
   return out;
 }
 
+std::string handle_integrations(std::string_view args) {
+  const auto [sub, rest] = split_first_token(trim_view(args));
+  if (sub == "help") {
+    return "Blackbird Integrations:\n"
+           "  /integrations [status]   Show connected accounts (metadata only), MCP "
+           "presets & SaaS packs\n"
+           "  /integrations presets    List official remote MCP server presets\n"
+           "  /integrations packs      List builtin Lua 5.5.1 SaaS integration packs\n"
+           "  CLI: blackbird connect <service> --token-stdin\n";
+  }
+  if (!rest.empty() ||
+      (!sub.empty() && sub != "status" && sub != "presets" && sub != "packs")) {
+    return "Usage: /integrations [status|presets|packs|help]\n";
+  }
+
+  const auto &presets = builtin_mcp_presets();
+  const auto &packs = builtin_saas_pack_manifests();
+
+  if (sub == "presets") {
+    std::string out =
+        "Official Remote MCP Presets (" + std::to_string(presets.size()) + "):\n";
+    for (const auto &p : presets) {
+      out += "  " + sanitize_inline(p.name, 32) + " (" +
+             sanitize_inline(p.display_name, 48) + ") -> " +
+             sanitize_inline(p.endpoint_url, 96) + " [" +
+             sanitize_inline(p.protocol_version, 24) + "]\n";
+    }
+    return out;
+  }
+
+  if (sub == "packs") {
+    std::string out =
+        "Builtin Lua 5.5.1 SaaS Packs (" + std::to_string(packs.size()) + "):\n";
+    for (const auto &m : packs) {
+      out += "  " + sanitize_inline(m.service, 32) + " (" +
+             sanitize_inline(m.display_name, 48) + ") hosts=";
+      for (std::size_t i = 0; i < m.allowed_hosts.size(); ++i) {
+        if (i > 0)
+          out += ",";
+        out += sanitize_inline(m.allowed_hosts[i], 64);
+      }
+      out += " ops=" + std::to_string(m.operations.size()) + "\n";
+    }
+    return out;
+  }
+
+  // Strictly passive zero-disk-write inspection of IntegrationVault.
+  const std::filesystem::path vault_dir = default_integrations_vault_dir();
+  std::vector<CredentialMetadata> creds;
+  if (!vault_dir.empty()) {
+    IntegrationVaultConfig vcfg;
+    vcfg.directory = vault_dir;
+    IntegrationVault vault{std::move(vcfg)};
+    std::error_code ec;
+    if (std::filesystem::exists(vault.store_path(), ec) && !ec) {
+      if (auto listed = vault.list(); listed.has_value())
+        creds = std::move(listed.value());
+    }
+  }
+
+  std::string out = "Blackbird Integrations:\n";
+  out += "  Connected Vault Accounts: " + std::to_string(creds.size()) + "\n";
+  for (std::size_t i = 0; i < creds.size() && i < kMaxListRows; ++i) {
+    const auto &c = creds[i];
+    out += "    [" + std::to_string(c.id.value) + "] " +
+           sanitize_inline(c.service, 32) + " (" + sanitize_inline(c.account, 32) +
+           ") scheme=" + std::string{auth_scheme_name(c.scheme)} +
+           std::string{c.active ? " [active]" : ""} +
+           std::string{c.expired ? " [expired]" : ""} + "\n";
+  }
+  out += "  Official MCP Presets (" + std::to_string(presets.size()) + "): ";
+  for (std::size_t i = 0; i < presets.size(); ++i) {
+    if (i > 0)
+      out += ", ";
+    out += sanitize_inline(presets[i].name, 32);
+  }
+  out += "\n  Builtin Lua SaaS Packs (" + std::to_string(packs.size()) + "): ";
+  for (std::size_t i = 0; i < packs.size(); ++i) {
+    if (i > 0)
+      out += ", ";
+    out += sanitize_inline(packs[i].service, 32);
+  }
+  out += "\n";
+  return out;
+}
+
 } // namespace
 
 std::optional<std::string> handle_command_post_slash(std::string_view line,
@@ -4319,6 +4409,8 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_brakes(args));
     if (cmd == "/superpowers")
       return bound_output(handle_superpowers(args));
+    if (cmd == "/integrations")
+      return bound_output(handle_integrations(args));
   } catch (const Error &err) {
     return bound_output(std::string{cmd} + " error: " + error_name(err.code));
   } catch (const std::exception &) {

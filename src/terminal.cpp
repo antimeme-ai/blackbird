@@ -216,6 +216,9 @@ const std::array builtin_commands{
         "/superpowers", "[status|probe|help]",
         "Probe native model superpowers (SQLite, Neovim/Tree-sitter, LSP, Measure)",
         "Command Post"},
+    ChatCommand{"/integrations", "[status|presets|packs|help]",
+                "Inspect connected SaaS/MCP integrations, official presets, and packs",
+                "Command Post"},
     ChatCommand{"/rail",
                 "[toggle|show|hide|auto|escalations|tokenomics|tasks|anchors|"
                 "multiplayer|next|prev|refresh]",

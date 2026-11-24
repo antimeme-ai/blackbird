@@ -3988,6 +3988,90 @@ int main(int argc, char **argv) {
             "superpowers status --json must include all 5 superpower families");
     }
 
+    // Integrations & connect subcommands (passive zero-disk-write + secret safety)
+    {
+      check(is_command_post_subcommand("integrations") &&
+                is_command_post_subcommand("connect"),
+            "integrations and connect must be registered command_post subcommands");
+
+      const fs::path absent_vault = temp.path() / "integrations_absent_vault";
+      const auto status_absent = run_cli(
+          {"integrations", "status", "--vault-dir", absent_vault.string(), "--json"});
+      check(status_absent.exit_code == 0 && !fs::exists(absent_vault),
+            "integrations status must be strictly passive zero-disk-write");
+      const auto sval = parse_json(status_absent.out);
+      check(sval.has_value() &&
+                !std::get<bool>(req_field(sval.value(), "vault_present").value()) &&
+                req_int(sval.value(), "connected_count") == 0 &&
+                req_int(sval.value(), "mcp_presets_count") == 6 &&
+                req_int(sval.value(), "saas_packs_count") == 7,
+            "integrations status JSON must report 0 connected, 6 presets, 7 packs");
+
+      const auto presets_res = run_cli({"integrations", "presets", "--json"});
+      check(presets_res.exit_code == 0, "integrations presets --json exits 0");
+      const auto pval = parse_json(presets_res.out);
+      check(pval.has_value() && req_int(pval.value(), "count") == 6,
+            "integrations presets must list 6 official remote MCP presets");
+
+      const auto packs_res = run_cli({"integrations", "packs", "--json"});
+      check(packs_res.exit_code == 0, "integrations packs --json exits 0");
+      const auto kval = parse_json(packs_res.out);
+      check(kval.has_value() && req_int(kval.value(), "count") == 7,
+            "integrations packs must list 7 builtin Lua 5.5.1 SaaS packs");
+
+      // Refuse secrets on argv!
+      const auto argv_refuse =
+          run_cli({"connect", "linear", "--token", "secret_never_argv", "--vault-dir",
+                   absent_vault.string()});
+      check(argv_refuse.exit_code == 2 &&
+                argv_refuse.err.find("refusing secret on argv") != std::string::npos &&
+                !fs::exists(absent_vault),
+            "connect must refuse --token secret on argv without writing disk");
+
+      // Connect via --token-stdin using top-level `connect` alias; zero secret echo!
+      const std::string test_secret = "lin_api_cli_secret_value_8899";
+      const auto conn_res =
+          run_cli({"connect", "linear", "--token-stdin", "--account", "ops",
+                   "--vault-dir", absent_vault.string(), "--json"},
+                  test_secret + "\n");
+      check(conn_res.exit_code == 0, "connect linear --token-stdin must exit 0");
+      check(conn_res.out.find(test_secret) == std::string::npos &&
+                conn_res.err.find(test_secret) == std::string::npos,
+            "connect must NEVER echo secret to stdout or stderr");
+      const auto cval = parse_json(conn_res.out);
+      check(cval.has_value() &&
+                std::get<bool>(req_field(cval.value(), "connected").value()) &&
+                req_str(req_field(cval.value(), "credential"), "service") == "linear" &&
+                req_str(req_field(cval.value(), "credential"), "account") == "ops",
+            "connect JSON must report connected metadata");
+
+      // List shows connected account metadata and ZERO secrets.
+      const auto list_res = run_cli(
+          {"integrations", "list", "--vault-dir", absent_vault.string(), "--json"});
+      check(list_res.exit_code == 0 &&
+                list_res.out.find(test_secret) == std::string::npos,
+            "integrations list must succeed and leak zero secrets");
+      const auto lval = parse_json(list_res.out);
+      check(lval.has_value() && req_int(lval.value(), "connected_count") == 1,
+            "integrations list must report 1 connected account");
+
+      // Disconnect removes credential cleanly.
+      const auto disc_res =
+          run_cli({"integrations", "disconnect", "linear", "--account", "ops",
+                   "--vault-dir", absent_vault.string(), "--json"});
+      check(disc_res.exit_code == 0, "integrations disconnect must exit 0");
+      const auto dval = parse_json(disc_res.out);
+      check(dval.has_value() &&
+                std::get<bool>(req_field(dval.value(), "disconnected").value()),
+            "integrations disconnect must confirm removal");
+
+      const auto after_disc = run_cli(
+          {"integrations", "list", "--vault-dir", absent_vault.string(), "--json"});
+      const auto aval = parse_json(after_disc.out);
+      check(aval.has_value() && req_int(aval.value(), "connected_count") == 0,
+            "integrations list must report 0 accounts after disconnect");
+    }
+
     std::cout << "PASS command_post_cli\n";
     return 0;
   } catch (const Error &e) {

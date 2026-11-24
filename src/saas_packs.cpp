@@ -1,4 +1,5 @@
 #include "blackbird/saas_packs.hpp"
+#include "blackbird/integrations_runtime.hpp"
 #include "blackbird/json.hpp"
 
 extern "C" {
@@ -54,48 +55,6 @@ bool valid_hostname(std::string_view host) noexcept {
       return false;
   }
   return host.find("..") == std::string_view::npos;
-}
-
-bool valid_relative_path(std::string_view path) noexcept {
-  if (path.empty() || path.front() != '/')
-    return false;
-  if (path.size() >= 2U && path[0] == '/' && path[1] == '/')
-    return false;
-  if (path.find("://") != std::string_view::npos)
-    return false;
-  if (path.find('\\') != std::string_view::npos)
-    return false;
-  if (path.find('@') != std::string_view::npos)
-    return false;
-  if (path.find('?') != std::string_view::npos ||
-      path.find('#') != std::string_view::npos) {
-    return false;
-  }
-  for (const char ch : path) {
-    const unsigned char c = static_cast<unsigned char>(ch);
-    if (c <= 0x20U || c >= 0x7FU)
-      return false;
-  }
-  // Reject path traversal segments (".." or "%2e%2e").
-  const std::string lower = ascii_lower(path);
-  if (lower.find("%2e") != std::string::npos ||
-      lower.find("%2f") != std::string::npos ||
-      lower.find("%5c") != std::string::npos) {
-    return false;
-  }
-  std::size_t pos = 0U;
-  while (pos < path.size()) {
-    const std::size_t next = path.find('/', pos);
-    const std::string_view seg = next == std::string_view::npos
-                                     ? path.substr(pos)
-                                     : path.substr(pos, next - pos);
-    if (seg == "..")
-      return false;
-    if (next == std::string_view::npos)
-      break;
-    pos = next + 1U;
-  }
-  return true;
 }
 
 bool valid_header_token(std::string_view text) noexcept {
@@ -969,200 +928,68 @@ void open_sandboxed_libs(lua_State *L) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Public Helpers
+// Live Executor Registration (bridges command_post_tools -> Lua SaasPackHost)
 // ---------------------------------------------------------------------------
 
-std::string_view saas_effect_class_name(SaasEffectClass effect) noexcept {
-  switch (effect) {
-  case SaasEffectClass::read:
-    return "read";
-  case SaasEffectClass::write:
-    return "write";
-  case SaasEffectClass::send:
-    return "send";
-  case SaasEffectClass::del:
-    return "delete";
-  }
-  return "write";
+namespace {
+
+Result<SaasInvokeOutcome>
+execute_live_saas_pack_impl(const SaasPackLiveCallRequest &req) {
+  const auto manifest = find_builtin_saas_pack_manifest(req.service);
+  if (!manifest.has_value())
+    return Result<SaasInvokeOutcome>::failure({ErrorCode::invalid_identity});
+
+  const std::filesystem::path vault_dir =
+      req.vault_dir.empty() ? default_integrations_vault_dir() : req.vault_dir;
+  const std::filesystem::path packs_dir =
+      req.packs_dir.empty() ? default_integrations_packs_dir() : req.packs_dir;
+  if (vault_dir.empty() || packs_dir.empty())
+    return Result<SaasInvokeOutcome>::failure({ErrorCode::invalid_range});
+
+  IntegrationVaultConfig vcfg;
+  vcfg.directory = vault_dir;
+  IntegrationVault vault{std::move(vcfg)};
+
+  net::HttpClientConfig hcfg =
+      req.http_config_override.value_or(net::HttpClientConfig{});
+  hcfg.host_policy = net::AllowedHostPolicy::pinned(manifest->allowed_hosts);
+  hcfg.host_policy.allow_loopback = req.allow_loopback_for_testing;
+  net::HttpClient http{std::move(hcfg)};
+
+  SaasHostConfig scfg;
+  scfg.brakes_policy = req.brakes_policy;
+  scfg.http_transport = make_live_saas_http_transport(
+      http, vault,
+      LiveTransportTarget{manifest->service, req.account,
+                          req.allow_loopback_for_testing, false});
+  SaasPackHost host{std::move(scfg)};
+
+  const std::filesystem::path pack_file = packs_dir / (manifest->service + ".lua");
+  auto pid = host.load_pack_file(*manifest, pack_file);
+  if (!pid.has_value())
+    return Result<SaasInvokeOutcome>::failure(pid.error());
+
+  return host.invoke(SaasInvokeParams{
+      manifest->service,
+      req.operation,
+      req.arguments,
+      req.account,
+      std::nullopt,
+  });
 }
 
-Result<SaasEffectClass> parse_saas_effect_class(std::string_view name) noexcept {
-  if (name == "read" || name == "read_only")
-    return Result<SaasEffectClass>::success(SaasEffectClass::read);
-  if (name == "write")
-    return Result<SaasEffectClass>::success(SaasEffectClass::write);
-  if (name == "send")
-    return Result<SaasEffectClass>::success(SaasEffectClass::send);
-  if (name == "delete" || name == "del")
-    return Result<SaasEffectClass>::success(SaasEffectClass::del);
-  return Result<SaasEffectClass>::failure({ErrorCode::invalid_range});
-}
-
-Result<std::string> build_pinned_https_url(const PinnedUrlInput &input,
-                                           std::string *resolved_host_out) {
-  if (input.allowed_hosts.empty())
-    return Result<std::string>::failure({ErrorCode::invalid_range});
-
-  std::string chosen_host;
-  if (input.requested_host.empty()) {
-    chosen_host = ascii_lower(input.allowed_hosts.front());
-    if (!valid_hostname(chosen_host))
-      return Result<std::string>::failure({ErrorCode::invalid_range});
-  } else {
-    const std::string lower_req = ascii_lower(input.requested_host);
-    if (!valid_hostname(lower_req))
-      return Result<std::string>::failure({ErrorCode::invalid_range});
-    bool matched = false;
-    for (const std::string &allowed : input.allowed_hosts) {
-      if (ascii_lower(allowed) == lower_req) {
-        chosen_host = lower_req;
-        matched = true;
-        break;
-      }
-    }
-    if (!matched)
-      return Result<std::string>::failure({ErrorCode::unsupported});
+struct SaasLiveExecutorRegistrar {
+  SaasLiveExecutorRegistrar() noexcept {
+    register_saas_pack_live_executor(&execute_live_saas_pack_impl);
   }
+};
 
-  if (!valid_relative_path(input.relative_path))
-    return Result<std::string>::failure({ErrorCode::invalid_range});
+const SaasLiveExecutorRegistrar kSaasLiveExecutorRegistrar{};
 
-  if (resolved_host_out != nullptr)
-    *resolved_host_out = chosen_host;
+} // namespace
 
-  std::string url = "https://" + chosen_host;
-  url.append(input.relative_path);
-  if (!input.query_string.empty()) {
-    for (const char ch : input.query_string) {
-      const unsigned char c = static_cast<unsigned char>(ch);
-      if (c <= 0x20U || c >= 0x7FU || c == '#')
-        return Result<std::string>::failure({ErrorCode::invalid_range});
-    }
-    url.push_back('?');
-    url.append(input.query_string);
-  }
-  return Result<std::string>::success(std::move(url));
-}
-
-const std::vector<SaasPackManifest> &builtin_saas_pack_manifests() {
-  static const std::vector<SaasPackManifest> manifests = {
-      SaasPackManifest{
-          "linear",
-          "Linear",
-          {"api.linear.app"},
-          {{"Accept", "application/json"}},
-          {
-              {"search_issues", SaasEffectClass::read},
-              {"get_issue", SaasEffectClass::read},
-              {"create_issue", SaasEffectClass::write},
-              {"comment_issue", SaasEffectClass::send},
-              {"update_issue", SaasEffectClass::write},
-          },
-          false,
-          brakes::PartyTrustProfile::human_gated,
-          "saas:linear:api.linear.app",
-      },
-      SaasPackManifest{
-          "slack",
-          "Slack",
-          {"slack.com"},
-          {{"Accept", "application/json"}},
-          {
-              {"list_channels", SaasEffectClass::read},
-              {"channel_history", SaasEffectClass::read},
-              {"read_thread", SaasEffectClass::read},
-              {"post_message", SaasEffectClass::send},
-          },
-          true,
-          brakes::PartyTrustProfile::human_gated,
-          "saas:slack:slack.com",
-      },
-      SaasPackManifest{
-          "gmail",
-          "Gmail",
-          {"gmail.googleapis.com"},
-          {{"Accept", "application/json"}},
-          {
-              {"search_threads", SaasEffectClass::read},
-              {"read_thread", SaasEffectClass::read},
-              {"create_draft", SaasEffectClass::write},
-              {"send_message", SaasEffectClass::send},
-          },
-          true,
-          brakes::PartyTrustProfile::advisory,
-          "saas:gmail:gmail.googleapis.com",
-      },
-      SaasPackManifest{
-          "gcal",
-          "Google Calendar",
-          {"www.googleapis.com"},
-          {{"Accept", "application/json"}},
-          {
-              {"list_events", SaasEffectClass::read},
-              {"create_event", SaasEffectClass::write},
-              {"free_busy", SaasEffectClass::read},
-          },
-          false,
-          brakes::PartyTrustProfile::human_gated,
-          "saas:gcal:www.googleapis.com",
-      },
-      SaasPackManifest{
-          "notion",
-          "Notion",
-          {"api.notion.com"},
-          {{"Notion-Version", "2025-09-03"}, {"Accept", "application/json"}},
-          {
-              {"search", SaasEffectClass::read},
-              {"read_page", SaasEffectClass::read},
-              {"append_block", SaasEffectClass::write},
-          },
-          false,
-          brakes::PartyTrustProfile::human_gated,
-          "saas:notion:api.notion.com",
-      },
-      SaasPackManifest{
-          "github",
-          "GitHub",
-          {"api.github.com"},
-          {{"Accept", "application/vnd.github+json"},
-           {"X-GitHub-Api-Version", "2022-11-28"},
-           {"User-Agent", "Blackbird/1.0"}},
-          {
-              {"list_items", SaasEffectClass::read},
-              {"view_item", SaasEffectClass::read},
-              {"create_issue", SaasEffectClass::write},
-              {"comment_item", SaasEffectClass::send},
-          },
-          true,
-          brakes::PartyTrustProfile::advisory,
-          "saas:github:api.github.com",
-      },
-      SaasPackManifest{
-          "discord",
-          "Discord",
-          {"discord.com"},
-          {{"Accept", "application/json"}, {"User-Agent", "Blackbird/1.0"}},
-          {
-              {"list_channels", SaasEffectClass::read},
-              {"get_messages", SaasEffectClass::read},
-              {"send_message", SaasEffectClass::send},
-          },
-          true,
-          brakes::PartyTrustProfile::advisory,
-          "saas:discord:discord.com",
-      },
-  };
-  return manifests;
-}
-
-std::optional<SaasPackManifest>
-find_builtin_saas_pack_manifest(std::string_view service) {
-  const std::string lower = ascii_lower(service);
-  for (const auto &m : builtin_saas_pack_manifests()) {
-    if (m.service == lower)
-      return m;
-  }
-  return std::nullopt;
+void ensure_saas_pack_live_executor_registered() noexcept {
+  register_saas_pack_live_executor(&execute_live_saas_pack_impl);
 }
 
 // ---------------------------------------------------------------------------

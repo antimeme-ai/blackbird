@@ -1569,3 +1569,11 @@ add_executable(terminal_notify_test tests/terminal_notify_test.cpp)
 target_link_libraries(terminal_notify_test PRIVATE blackbird_foundation)
 add_test(NAME terminal_notify COMMAND terminal_notify_test)
 set_tests_properties(terminal_notify PROPERTIES TIMEOUT 30)
+
+target_sources(blackbird_foundation PRIVATE src/integrations_runtime.cpp)
+add_executable(integrations_runtime_test tests/integrations_runtime_test.cpp)
+target_link_libraries(integrations_runtime_test PRIVATE blackbird_coding OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_compile_definitions(integrations_runtime_test PRIVATE
+  BLACKBIRD_INTEGRATIONS_DIR="${CMAKE_SOURCE_DIR}/programs/integrations")
+add_test(NAME integrations_runtime COMMAND integrations_runtime_test)
+set_tests_properties(integrations_runtime PROPERTIES TIMEOUT 60)

@@ -189,4 +189,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// Explicitly registers the Lua 5.5.1 SaasPackHost executor into the foundation
+// runtime bridge so static-archive linking never dead-strips it.
+void ensure_saas_pack_live_executor_registered() noexcept;
+
 } // namespace blackbird

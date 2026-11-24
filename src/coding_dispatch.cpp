@@ -7,6 +7,7 @@
 #include "blackbird/raw_restart.hpp"
 #include "blackbird/raw_runtime.hpp"
 #include "blackbird/request_cache.hpp"
+#include "blackbird/saas_packs.hpp"
 #include "coding_internal.hpp"
 #include <algorithm>
 #include <charconv>
@@ -1882,6 +1883,7 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           return context_read(arguments);
         if (name == "hooks")
           return hooks_tool(arguments);
+        ensure_saas_pack_live_executor_registered();
         if (auto cp = try_dispatch_command_post_tool(
                 name, arguments,
                 CommandPostToolContext{.decision_models = &decision_models_,
