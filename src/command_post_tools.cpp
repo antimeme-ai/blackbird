@@ -1,17 +1,21 @@
 #include "blackbird/command_post_tools.hpp"
 
 #include "blackbird/board_bridge.hpp"
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/cpu_arc.hpp"
+#include "blackbird/integrations_runtime.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/local_swarm.hpp"
 #include "blackbird/lsp_client.hpp"
+#include "blackbird/mcp_client.hpp"
 #include "blackbird/measure_harness.hpp"
 #include "blackbird/nvim_rpc.hpp"
 #include "blackbird/peer_identity.hpp"
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/saas_packs.hpp"
 #include "blackbird/sqlite_workbench.hpp"
 
 #include <algorithm>
@@ -3438,6 +3442,318 @@ Value handle_cpu_arc(const Value &arguments) {
   throw Error{ErrorCode::invalid_range};
 }
 
+std::string_view brakes_effect_name(brakes::ToolEffectClass effect) noexcept {
+  switch (effect) {
+  case brakes::ToolEffectClass::auto_classify:
+    return "auto_classify";
+  case brakes::ToolEffectClass::read_only:
+    return "read_only";
+  case brakes::ToolEffectClass::workspace_write:
+    return "workspace_write";
+  case brakes::ToolEffectClass::exec:
+    return "exec";
+  case brakes::ToolEffectClass::outbound_network:
+    return "outbound_network";
+  case brakes::ToolEffectClass::peer_spawn:
+    return "peer_spawn";
+  case brakes::ToolEffectClass::self_modify:
+    return "self_modify";
+  }
+  return "outbound_network";
+}
+
+brakes::EffectivePolicy load_brakes_policy_fail_closed() {
+  if (auto loaded = brakes::load_effective_policy(); loaded.has_value())
+    return loaded.value();
+  brakes::EffectivePolicy fallback;
+  fallback.effective_profile = brakes::BrakesProfile::guarded;
+  return fallback;
+}
+
+Value handle_saas_pack(const Value &arguments) {
+  static constexpr std::array<std::string_view, 5> kAllowed{
+      "action", "service", "operation", "arguments_json", "account"};
+  validate_object_keys(arguments, kAllowed);
+
+  const std::string action = require_string(
+      arguments, {.key = "action", .max_bytes = 32, .allow_empty = false});
+
+  if (action == "list_packs") {
+    Value::Array packs;
+    for (const auto &m : builtin_saas_pack_manifests()) {
+      Value::Array hosts;
+      for (const auto &h : m.allowed_hosts)
+        hosts.emplace_back(h);
+      Value::Array ops;
+      for (const auto &op : m.operations) {
+        ops.push_back(Value::object({
+            {"name", Value{op.name}},
+            {"effect", Value{std::string{saas_effect_class_name(op.effect)}}},
+        }));
+      }
+      packs.push_back(Value::object({
+          {"service", Value{m.service}},
+          {"display_name", Value{m.display_name}},
+          {"allowed_hosts", Value{std::move(hosts)}},
+          {"operations", Value{std::move(ops)}},
+          {"is_open_world", Value{m.is_open_world}},
+      }));
+    }
+    return Value::object({
+        {"count", Value{Number{packs.size()}}},
+        {"packs", Value{std::move(packs)}},
+    });
+  }
+
+  if (action == "describe") {
+    const std::string service = require_string(
+        arguments, {.key = "service", .max_bytes = 64, .allow_empty = false});
+    const auto manifest = find_builtin_saas_pack_manifest(service);
+    if (!manifest.has_value())
+      throw Error{ErrorCode::invalid_identity};
+    Value::Array hosts;
+    for (const auto &h : manifest->allowed_hosts)
+      hosts.emplace_back(h);
+    Value::Array ops;
+    for (const auto &op : manifest->operations) {
+      ops.push_back(Value::object({
+          {"name", Value{op.name}},
+          {"effect", Value{std::string{saas_effect_class_name(op.effect)}}},
+      }));
+    }
+    return Value::object({
+        {"service", Value{manifest->service}},
+        {"display_name", Value{manifest->display_name}},
+        {"allowed_hosts", Value{std::move(hosts)}},
+        {"operations", Value{std::move(ops)}},
+        {"is_open_world", Value{manifest->is_open_world}},
+    });
+  }
+
+  if (action == "invoke") {
+    const std::string service = require_string(
+        arguments, {.key = "service", .max_bytes = 64, .allow_empty = false});
+    const std::string operation = require_string(
+        arguments, {.key = "operation", .max_bytes = 128, .allow_empty = false});
+    const auto args_json = optional_string(
+        arguments, {.key = "arguments_json", .max_bytes = 65536, .allow_empty = true});
+    const auto account = optional_string(
+        arguments, {.key = "account", .max_bytes = 128, .allow_empty = true});
+
+    Value op_args = Value::object({});
+    if (args_json.has_value() && !args_json->empty()) {
+      auto parsed = parse_json(*args_json);
+      if (!parsed.has_value() ||
+          !std::holds_alternative<Value::Object>(parsed.value().value())) {
+        throw Error{ErrorCode::invalid_range};
+      }
+      op_args = std::move(parsed.value());
+    }
+
+    // Security invariant: vault_dir and packs_dir are NEVER model-controllable;
+    // execute_live_saas_pack_impl always resolves them from trusted process paths.
+    SaasPackLiveCallRequest req;
+    req.service = service;
+    req.operation = operation;
+    req.arguments = std::move(op_args);
+    req.account = account.value_or("");
+    req.brakes_policy = load_brakes_policy_fail_closed();
+
+    auto res = invoke_registered_saas_pack_live(req);
+    if (!res.has_value())
+      throw res.error();
+
+    const SaasInvokeOutcome &out = res.value();
+    const std::size_t omitted_bytes =
+        out.projection.original_bytes > out.projection.projected_bytes
+            ? (out.projection.original_bytes - out.projection.projected_bytes)
+            : 0U;
+    return Value::object({
+        {"pack_id", Value{Number{out.pack_id.value}}},
+        {"service", Value{out.service}},
+        {"operation", Value{out.operation}},
+        {"blocked_by_brakes", Value{out.blocked_by_brakes}},
+        {"blocked_by_host_pin", Value{out.blocked_by_host_pin}},
+        {"brakes_reason", Value{out.brakes_decision.reason}},
+        {"framed_output", Value{out.framed_output}},
+        {"truncated", Value{out.projection.was_compacted}},
+        {"omitted_bytes", Value{Number{omitted_bytes}}},
+        {"untrusted_external_data", Value{true}},
+        {"error_detail", Value{out.error_detail}},
+    });
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
+Value handle_mcp_router(const Value &arguments) {
+  static constexpr std::array<std::string_view, 5> kAllowed{"action", "query", "server",
+                                                            "limit", "tools_json"};
+  validate_object_keys(arguments, kAllowed);
+
+  const std::string action = require_string(
+      arguments, {.key = "action", .max_bytes = 32, .allow_empty = false});
+
+  if (action == "presets") {
+    Value::Array presets;
+    for (const auto &p : builtin_mcp_presets()) {
+      presets.push_back(Value::object({
+          {"preset_id", Value{Number{p.preset_id.value}}},
+          {"name", Value{p.name}},
+          {"display_name", Value{p.display_name}},
+          {"endpoint_url", Value{p.endpoint_url}},
+          {"readonly_endpoint_url", Value{p.readonly_endpoint_url}},
+          {"protocol_version", Value{p.protocol_version}},
+          {"is_open_world", Value{p.is_open_world}},
+          {"description", Value{p.description}},
+      }));
+    }
+    return Value::object({
+        {"count", Value{Number{presets.size()}}},
+        {"presets", Value{std::move(presets)}},
+    });
+  }
+
+  if (action == "manifest") {
+    const std::string server = require_string(
+        arguments, {.key = "server", .max_bytes = 64, .allow_empty = false});
+    const auto preset = find_mcp_preset(server);
+    if (!preset.has_value())
+      throw Error{ErrorCode::invalid_identity};
+    return Value::object({
+        {"preset_id", Value{Number{preset->preset_id.value}}},
+        {"name", Value{preset->name}},
+        {"display_name", Value{preset->display_name}},
+        {"endpoint_url", Value{preset->endpoint_url}},
+        {"readonly_endpoint_url", Value{preset->readonly_endpoint_url}},
+        {"protocol_version", Value{preset->protocol_version}},
+        {"is_open_world", Value{preset->is_open_world}},
+        {"description", Value{preset->description}},
+    });
+  }
+
+  if (action == "search") {
+    const std::string query = require_string(
+        arguments, {.key = "query", .max_bytes = 512, .allow_empty = false});
+    const auto server_filter = optional_string(
+        arguments, {.key = "server", .max_bytes = 64, .allow_empty = false});
+    std::size_t limit = kMcpClientDefaultSearchLimit;
+    if (const Value *lim = arguments.find("limit");
+        lim != nullptr && !std::holds_alternative<std::nullptr_t>(lim->value())) {
+      const auto parsed = parse_strict_uint64(
+          *lim, {.key = "limit", .min_value = 1U, .max_value = 32U});
+      limit = static_cast<std::size_t>(parsed);
+    }
+    const auto tools_json = optional_string(
+        arguments, {.key = "tools_json", .max_bytes = 131072, .allow_empty = true});
+
+    McpRouterConfig rcfg;
+    rcfg.brakes_policy = load_brakes_policy_fail_closed();
+    McpToolRouter router{std::move(rcfg)};
+
+    if (tools_json.has_value() && !tools_json->empty()) {
+      auto parsed = parse_json(*tools_json);
+      if (!parsed.has_value() ||
+          !std::holds_alternative<Value::Array>(parsed.value().value())) {
+        throw Error{ErrorCode::invalid_range};
+      }
+      std::map<std::string, std::vector<McpToolDescriptor>> grouped;
+      for (const Value &item : parsed.value().array()) {
+        if (!std::holds_alternative<Value::Object>(item.value()))
+          throw Error{ErrorCode::invalid_range};
+        const std::string srv = require_string(
+            item, {.key = "server", .max_bytes = 64, .allow_empty = false});
+        McpToolDescriptor desc;
+        desc.name = require_string(
+            item, {.key = "name", .max_bytes = 128, .allow_empty = false});
+        desc.title = optional_string(
+                         item, {.key = "title", .max_bytes = 256, .allow_empty = true})
+                         .value_or("");
+        desc.description =
+            optional_string(
+                item, {.key = "description", .max_bytes = 2048, .allow_empty = true})
+                .value_or("");
+        if (const Value *ro = item.find("read_only_hint");
+            ro != nullptr && std::holds_alternative<bool>(ro->value())) {
+          desc.annotations.read_only_hint = std::get<bool>(ro->value());
+        }
+        if (const Value *dest = item.find("destructive_hint");
+            dest != nullptr && std::holds_alternative<bool>(dest->value())) {
+          desc.annotations.destructive_hint = std::get<bool>(dest->value());
+        }
+        if (const Value *ow = item.find("open_world_hint");
+            ow != nullptr && std::holds_alternative<bool>(ow->value())) {
+          desc.annotations.open_world_hint = std::get<bool>(ow->value());
+        }
+        grouped[srv].push_back(std::move(desc));
+      }
+      for (const auto &[srv, tools] : grouped) {
+        McpServerPolicy pol;
+        pol.default_effect = brakes::ToolEffectClass::outbound_network;
+        if (const auto preset = find_mcp_preset(srv); preset.has_value()) {
+          pol.default_effect = preset->default_effect;
+          pol.is_open_world = preset->is_open_world;
+        }
+        auto added = router.add_catalog_snapshot(srv, tools, std::move(pol), srv);
+        if (!added.has_value())
+          throw added.error();
+      }
+    } else {
+      // Index built-in official presets + SaaS operation catalog for instant discovery.
+      for (const auto &preset : builtin_mcp_presets()) {
+        std::vector<McpToolDescriptor> descs;
+        if (const auto saas = find_builtin_saas_pack_manifest(preset.name);
+            saas.has_value()) {
+          for (const auto &op : saas->operations) {
+            McpToolDescriptor d;
+            d.name = op.name;
+            d.title = preset.display_name + " " + op.name;
+            d.description = preset.description;
+            descs.push_back(std::move(d));
+          }
+        } else {
+          McpToolDescriptor d;
+          d.name = "discover";
+          d.title = preset.display_name;
+          d.description = preset.description;
+          descs.push_back(std::move(d));
+        }
+        McpServerPolicy pol;
+        pol.default_effect = preset.default_effect;
+        pol.is_open_world = preset.is_open_world;
+        (void)router.add_catalog_snapshot(preset.name, descs, std::move(pol),
+                                          preset.endpoint_url);
+      }
+    }
+
+    const auto hits = router.mcp_search(McpSearchQuery{query, server_filter, limit});
+    Value::Array arr;
+    arr.reserve(hits.size());
+    for (const auto &h : hits) {
+      arr.push_back(Value::object({
+          {"server_id", Value{Number{h.server_id.value}}},
+          {"tool_id", Value{Number{h.tool_id.value}}},
+          {"server", Value{h.server_name}},
+          {"tool", Value{h.tool_name}},
+          {"title", Value{h.title}},
+          {"description", Value{h.description}},
+          {"bm25_score", Value{Number{h.bm25_score}}},
+          {"authoritative_effect",
+           Value{std::string{brakes_effect_name(h.effect.effect_class)}}},
+          {"tightened_by_destructive_hint",
+           Value{h.effect.tightened_by_destructive_hint}},
+      }));
+    }
+    return Value::object({
+        {"count", Value{Number{arr.size()}}},
+        {"manifest_summary", Value{router.manifest_summary()}},
+        {"hits", Value{std::move(arr)}},
+    });
+  }
+
+  throw Error{ErrorCode::invalid_range};
+}
+
 } // namespace
 
 bool is_command_post_tool(std::string_view name) noexcept {
@@ -3445,7 +3761,8 @@ bool is_command_post_tool(std::string_view name) noexcept {
          name == "project_issues" || name == "project_memory" ||
          name == "companion_timing" || name == "local_swarm" || name == "sqlite_db" ||
          name == "measure_script" || name == "nvim_ast" || name == "code_intel" ||
-         name == "jupyter_nb" || name == "cpu_arc";
+         name == "jupyter_nb" || name == "cpu_arc" || name == "saas_pack" ||
+         name == "mcp_router";
 }
 
 Value command_post_tool_definitions() {
@@ -3994,6 +4311,63 @@ Value command_post_tool_definitions() {
                {"additionalProperties", Value{false}},
            })},
       }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"saas_pack"}},
+          {"description",
+           Value{"Inspect or invoke service-pinned Lua 5.5.1 SaaS Integration Packs "
+                 "(linear, slack, gmail, gcal, notion, github, discord) gated by "
+                 "BrakesGate, IntegrationVault host pinning (zero secrets to Lua), "
+                 "ContextHygiene projection, and CSPRNG untrusted-data framing."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action", Value::object({
+                                   {"type", Value{"string"}},
+                                   {"enum", Value{Value::Array{Value{"list_packs"},
+                                                               Value{"describe"},
+                                                               Value{"invoke"}}}},
+                               })},
+                    {"service", Value::object({{"type", Value{"string"}}})},
+                    {"operation", Value::object({{"type", Value{"string"}}})},
+                    {"arguments_json", Value::object({{"type", Value{"string"}}})},
+                    {"account", Value::object({{"type", Value{"string"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
+      Value::object({
+          {"type", Value{"function"}},
+          {"name", Value{"mcp_router"}},
+          {"description",
+           Value{"Inspect official remote MCP server presets and run BM25 lazy tool "
+                 "discovery via McpToolRouter (integer ServerId/ToolId keys) with "
+                 "authoritative Brakes effect classification."}},
+          {"parameters",
+           Value::object({
+               {"type", Value{"object"}},
+               {"properties",
+                Value::object({
+                    {"action", Value::object({
+                                   {"type", Value{"string"}},
+                                   {"enum", Value{Value::Array{Value{"presets"},
+                                                               Value{"manifest"},
+                                                               Value{"search"}}}},
+                               })},
+                    {"query", Value::object({{"type", Value{"string"}}})},
+                    {"server", Value::object({{"type", Value{"string"}}})},
+                    {"limit", Value::object({{"type", Value{"integer"}},
+                                             {"minimum", Value{Number{1}}},
+                                             {"maximum", Value{Number{32}}}})},
+                    {"tools_json", Value::object({{"type", Value{"string"}}})},
+                })},
+               {"required", Value{Value::Array{Value{"action"}}}},
+               {"additionalProperties", Value{false}},
+           })},
+      }),
   }};
 }
 
@@ -4023,6 +4397,10 @@ Value run_command_post_tool(std::string_view name, const Value &arguments,
     return handle_jupyter_nb(arguments);
   if (name == "cpu_arc")
     return handle_cpu_arc(arguments);
+  if (name == "saas_pack")
+    return handle_saas_pack(arguments);
+  if (name == "mcp_router")
+    return handle_mcp_router(arguments);
   throw Error{ErrorCode::unsupported};
 }
 

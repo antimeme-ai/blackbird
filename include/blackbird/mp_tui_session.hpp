@@ -1,5 +1,6 @@
 #pragma once
 
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/foundation.hpp"
 #include "blackbird/mp_party_bridge.hpp"
 #include "blackbird/mp_party_runtime.hpp"
@@ -82,6 +83,13 @@ struct MpTuiSessionConfig {
   std::size_t max_retained_messages = kMpTuiDefaultMaxRetainedMessages;
   // Optional wall-clock override for deterministic tests (nullopt = live clock).
   std::optional<std::int64_t> now_s_override = std::nullopt;
+  // Optional org-party metadata & external guest trust clamping.
+  std::optional<std::string> org_id = std::nullopt;
+  std::optional<std::string> group_id = std::nullopt;
+  std::vector<mp::AccountId> external_guest_account_ids{};
+  brakes::PartyTrustSectionPolicy party_trust_policy{};
+  std::optional<brakes::PartyTrustProfile> org_default_trust = std::nullopt;
+  brakes::TurnTaintState *turn_taint = nullptr;
 };
 
 struct MpTuiSessionSnapshot {
@@ -94,6 +102,9 @@ struct MpTuiSessionSnapshot {
   std::vector<PartyMessage> messages;
   std::vector<std::string> notices;
   std::string status_summary;
+  std::optional<std::string> org_id = std::nullopt;
+  std::optional<std::string> group_id = std::nullopt;
+  std::vector<mp::AccountId> external_guest_account_ids{};
 
   bool operator==(const MpTuiSessionSnapshot &) const = default;
 };
@@ -137,6 +148,13 @@ private:
     std::uint32_t pump_tick_ms = kMpTuiDefaultPumpTickMs;
     std::size_t max_retained_messages = kMpTuiDefaultMaxRetainedMessages;
     std::optional<std::int64_t> now_s_override = std::nullopt;
+    std::optional<std::string> org_id = std::nullopt;
+    std::optional<std::string> group_id = std::nullopt;
+    std::optional<std::uint64_t> parsed_org_id_u64 = std::nullopt;
+    std::vector<mp::AccountId> external_guest_account_ids{};
+    brakes::PartyTrustSectionPolicy party_trust_policy{};
+    std::optional<brakes::PartyTrustProfile> org_default_trust = std::nullopt;
+    brakes::TurnTaintState *turn_taint = nullptr;
     int wake_read_fd = -1;
     int wake_write_fd = -1;
   };
@@ -179,6 +197,14 @@ public:
   // signals wake_fd().
   void update_peer_metadata(mp::DeviceId device_id, MpPeerDisplayMetadata meta);
 
+  // Thread-safe update of org-scoped external guest AccountIds. Rebuilds
+  // participants immediately and signals wake_fd().
+  void update_external_guests(std::vector<mp::AccountId> external_guest_account_ids);
+  bool is_external_guest_account(mp::AccountId account_id) const noexcept;
+  brakes::TurnTaintState turn_taint_snapshot() const;
+  const std::optional<std::string> &org_id() const noexcept { return org_id_; }
+  const std::optional<std::string> &group_id() const noexcept { return group_id_; }
+
   // Returns a mutex-protected snapshot of current participants, bounded message
   // ring, status summary, and DRAINS any accumulated lifecycle notices.
   MpTuiSessionSnapshot snapshot();
@@ -210,6 +236,7 @@ private:
   std::string resolve_authenticated_peer_handle_locked(mp::DeviceId device_id) const;
   std::string resolve_authenticated_peer_label_locked(mp::DeviceId device_id) const;
   std::string format_peer_label_locked(std::optional<mp::DeviceId> device_id) const;
+  bool is_external_guest_account_locked(mp::AccountId account_id) const noexcept;
   void fail_pending_commands_locked() noexcept;
   bool try_acquire_wake_user() noexcept;
   void release_wake_user() noexcept;
@@ -220,17 +247,23 @@ private:
   MpPartyRuntime runtime_;
 
   // Immutable session configuration / identity metadata set during start().
+  // Ordered by alignment (8-byte members grouped before 4-byte/1-byte members)
+  // to minimize struct padding while keeping runtime_ first and worker_thread_
+  // last for destruction safety.
   mp::PartyId party_id_;
   std::optional<mp::DeviceId> local_device_id_;
-  std::optional<P2pPubkey> local_pubkey_;
   std::string local_fingerprint_;
   std::string room_scope_;
   std::string sanitized_room_scope_;
   std::string local_wire_handle_;
   std::string local_display_handle_;
-  std::uint32_t pump_tick_ms_ = kMpTuiDefaultPumpTickMs;
   std::size_t max_retained_messages_ = kMpTuiDefaultMaxRetainedMessages;
   std::optional<std::int64_t> now_s_override_;
+  std::optional<std::string> org_id_;
+  std::optional<std::string> group_id_;
+  std::optional<std::uint64_t> parsed_org_id_u64_;
+  brakes::PartyTrustSectionPolicy party_trust_policy_{};
+  brakes::TurnTaintState *turn_taint_ = nullptr;
 
   // Lifecycle & wakeup pipe state.
   // `wake_users_` encodes a high closing bit + active in-flight non-blocking
@@ -238,27 +271,34 @@ private:
   // in-flight ::read()/::write() without risking FD-reuse corruption.
   std::mutex lifecycle_mu_;
   std::atomic<std::uint64_t> wake_users_{0U};
-  std::atomic<int> wake_read_fd_{-1};
-  std::atomic<int> wake_write_fd_{-1};
-  std::atomic<bool> stop_requested_{false};
-  std::atomic<bool> stopped_{false};
 
   // Shared TUI <-> worker state protected by state_mu_.
   mutable std::mutex state_mu_;
-  MpRuntimeState state_ = MpRuntimeState::attaching;
   std::uint64_t party_epoch_ = 0U;
   std::optional<mp::DeviceId> leader_device_id_;
   std::optional<mp::EndpointDescriptor> local_endpoint_;
   MpPeerMetadataMap peer_metadata_;
+  std::vector<mp::AccountId> external_guest_account_ids_;
+  brakes::TurnTaintState internal_turn_taint_{};
   std::vector<P2pPartyPeer> last_roster_;
   std::unordered_map<std::uint64_t, PeerPulseInfo> peer_pulses_;
-  P2pPartyActivityState local_activity_state_ = P2pPartyActivityState::online;
   std::vector<PartyParticipant> participants_;
   std::deque<PartyMessage> messages_;
   std::deque<std::string> notices_;
   std::string status_summary_;
   std::uint64_t next_message_seq_ = 1U;
   std::deque<PendingCommand> pending_commands_;
+
+  // Packed 4-byte and 1-byte aligned members.
+  std::uint32_t pump_tick_ms_ = kMpTuiDefaultPumpTickMs;
+  std::atomic<int> wake_read_fd_{-1};
+  std::atomic<int> wake_write_fd_{-1};
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stopped_{false};
+  MpRuntimeState state_ = MpRuntimeState::attaching;
+  P2pPartyActivityState local_activity_state_ = P2pPartyActivityState::online;
+  std::optional<brakes::PartyTrustProfile> org_default_trust_;
+  std::optional<P2pPubkey> local_pubkey_;
 
   // Declared last so it is destroyed first if anything bypasses stop().
   std::jthread worker_thread_;

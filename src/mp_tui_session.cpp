@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -140,6 +141,77 @@ bool is_terminated_runtime_state(MpRuntimeState st) noexcept {
 std::string compute_fingerprint_safe(const P2pPubkey &pubkey) {
   const auto fp = mp::compute_device_fingerprint(pubkey);
   return fp.has_value() ? fp.value() : std::string{};
+}
+
+std::string compute_optional_fingerprint_safe(const std::optional<P2pPubkey> &pubkey) {
+  return pubkey.has_value() ? compute_fingerprint_safe(*pubkey) : std::string{};
+}
+
+std::string base64_encode_pubkey(const P2pPubkey &pubkey) {
+  static constexpr char kAlpha[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(44U);
+  std::size_t i = 0U;
+  while (i + 3U <= pubkey.size()) {
+    const std::uint32_t triple = (static_cast<std::uint32_t>(pubkey[i]) << 16U) |
+                                 (static_cast<std::uint32_t>(pubkey[i + 1U]) << 8U) |
+                                 static_cast<std::uint32_t>(pubkey[i + 2U]);
+    out.push_back(kAlpha[(triple >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(triple >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(triple >> 6U) & 0x3fU]);
+    out.push_back(kAlpha[triple & 0x3fU]);
+    i += 3U;
+  }
+  const std::size_t rem = pubkey.size() - i;
+  if (rem == 1U) {
+    const std::uint32_t triple = static_cast<std::uint32_t>(pubkey[i]) << 16U;
+    out.push_back(kAlpha[(triple >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(triple >> 12U) & 0x3fU]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2U) {
+    const std::uint32_t triple = (static_cast<std::uint32_t>(pubkey[i]) << 16U) |
+                                 (static_cast<std::uint32_t>(pubkey[i + 1U]) << 8U);
+    out.push_back(kAlpha[(triple >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(triple >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(triple >> 6U) & 0x3fU]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+void dedup_account_ids_in_place(std::vector<mp::AccountId> &ids) {
+  std::size_t write = 0U;
+  for (std::size_t read = 0U; read < ids.size(); ++read) {
+    const auto id = ids[read];
+    bool seen = false;
+    for (std::size_t j = 0U; j < write; ++j) {
+      if (ids[j] == id) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      ids[write++] = id;
+    }
+  }
+  ids.erase(ids.begin() + static_cast<std::ptrdiff_t>(write), ids.end());
+}
+
+std::optional<std::uint64_t>
+parse_optional_u64_decimal(const std::optional<std::string> &text) noexcept {
+  if (!text.has_value() || text->empty()) {
+    return std::nullopt;
+  }
+  std::uint64_t val = 0U;
+  const char *begin = text->data();
+  const char *end = begin + text->size();
+  const auto res = std::from_chars(begin, end, val, 10);
+  if (res.ec != std::errc{} || res.ptr != end || val == 0U) {
+    return std::nullopt;
+  }
+  return val;
 }
 
 PartyParticipantState
@@ -289,6 +361,27 @@ Result<std::unique_ptr<MpTuiSession>> MpTuiSession::start(MpTuiSessionConfig con
     }
   }
 
+  std::optional<std::string> sanitized_org_id;
+  std::optional<std::uint64_t> parsed_org_id_u64;
+  if (config.org_id.has_value()) {
+    if (const auto ok = validate_text_field(*config.org_id, kPartyMaxFieldBytes, false);
+        !ok.has_value()) {
+      return Result<std::unique_ptr<MpTuiSession>>::failure(ok.error());
+    }
+    parsed_org_id_u64 = parse_optional_u64_decimal(config.org_id);
+    sanitized_org_id = party_chat_sanitize(*config.org_id, kPartyMaxFieldBytes);
+  }
+
+  std::optional<std::string> sanitized_group_id;
+  if (config.group_id.has_value()) {
+    if (const auto ok =
+            validate_text_field(*config.group_id, kPartyMaxFieldBytes, false);
+        !ok.has_value()) {
+      return Result<std::unique_ptr<MpTuiSession>>::failure(ok.error());
+    }
+    sanitized_group_id = party_chat_sanitize(*config.group_id, kPartyMaxFieldBytes);
+  }
+
   const std::string local_wire_handle = resolve_local_wire_handle(config);
   std::string local_display_handle =
       party_chat_sanitize(local_wire_handle, kPartyMaxAliasBytes);
@@ -319,6 +412,8 @@ Result<std::unique_ptr<MpTuiSession>> MpTuiSession::start(MpTuiSessionConfig con
     return Result<std::unique_ptr<MpTuiSession>>::failure(runtime_res.error());
   }
 
+  dedup_account_ids_in_place(config.external_guest_account_ids);
+
   InitParams init{
       .runtime = std::move(runtime_res).value(),
       .room_scope = std::move(scope),
@@ -328,6 +423,13 @@ Result<std::unique_ptr<MpTuiSession>> MpTuiSession::start(MpTuiSessionConfig con
       .pump_tick_ms = tick_ms,
       .max_retained_messages = max_messages,
       .now_s_override = config.now_s_override,
+      .org_id = std::move(sanitized_org_id),
+      .group_id = std::move(sanitized_group_id),
+      .parsed_org_id_u64 = parsed_org_id_u64,
+      .external_guest_account_ids = std::move(config.external_guest_account_ids),
+      .party_trust_policy = config.party_trust_policy,
+      .org_default_trust = config.org_default_trust,
+      .turn_taint = config.turn_taint,
       .wake_read_fd = read_end.release(),
       .wake_write_fd = write_end.release(),
   };
@@ -339,22 +441,27 @@ Result<std::unique_ptr<MpTuiSession>> MpTuiSession::start(MpTuiSessionConfig con
 MpTuiSession::MpTuiSession(PrivateTag, InitParams params)
     : runtime_(std::move(params.runtime)), party_id_(runtime_.party_id()),
       local_device_id_(runtime_.config().identity.device_id),
-      local_pubkey_(runtime_.local_pubkey()),
-      local_fingerprint_(local_pubkey_.has_value()
-                             ? compute_fingerprint_safe(*local_pubkey_)
-                             : std::string{}),
+      local_fingerprint_(compute_optional_fingerprint_safe(runtime_.local_pubkey())),
       room_scope_(std::move(params.room_scope)),
       sanitized_room_scope_(
           party_chat_sanitize(room_scope_, kP2pPartyMaxRoomScopeBytes)),
       local_wire_handle_(std::move(params.local_wire_handle)),
       local_display_handle_(std::move(params.local_display_handle)),
-      pump_tick_ms_(params.pump_tick_ms),
       max_retained_messages_(params.max_retained_messages),
-      now_s_override_(params.now_s_override), wake_read_fd_(params.wake_read_fd),
-      wake_write_fd_(params.wake_write_fd), state_(runtime_.state()),
+      now_s_override_(params.now_s_override), org_id_(std::move(params.org_id)),
+      group_id_(std::move(params.group_id)),
+      parsed_org_id_u64_(params.parsed_org_id_u64),
+      party_trust_policy_(params.party_trust_policy), turn_taint_(params.turn_taint),
       party_epoch_(runtime_.party_epoch()),
       leader_device_id_(runtime_.leader_device_id()),
-      peer_metadata_(std::move(params.peer_metadata)) {
+      peer_metadata_(std::move(params.peer_metadata)),
+      external_guest_account_ids_(std::move(params.external_guest_account_ids)),
+      internal_turn_taint_(turn_taint_ != nullptr ? *turn_taint_
+                                                  : brakes::TurnTaintState{}),
+      pump_tick_ms_(params.pump_tick_ms), wake_read_fd_(params.wake_read_fd),
+      wake_write_fd_(params.wake_write_fd), state_(runtime_.state()),
+      org_default_trust_(params.org_default_trust),
+      local_pubkey_(runtime_.local_pubkey()) {
   if (const auto ep = runtime_.local_endpoint_descriptor(); ep.has_value()) {
     local_endpoint_ = ep.value();
   }
@@ -622,6 +729,27 @@ void MpTuiSession::update_peer_metadata(mp::DeviceId device_id,
   signal_wake();
 }
 
+void MpTuiSession::update_external_guests(
+    std::vector<mp::AccountId> external_guest_account_ids) {
+  dedup_account_ids_in_place(external_guest_account_ids);
+  {
+    std::lock_guard<std::mutex> lock{state_mu_};
+    external_guest_account_ids_ = std::move(external_guest_account_ids);
+    rebuild_participants_locked();
+  }
+  signal_wake();
+}
+
+bool MpTuiSession::is_external_guest_account(mp::AccountId account_id) const noexcept {
+  std::lock_guard<std::mutex> lock{state_mu_};
+  return is_external_guest_account_locked(account_id);
+}
+
+brakes::TurnTaintState MpTuiSession::turn_taint_snapshot() const {
+  std::lock_guard<std::mutex> lock{state_mu_};
+  return internal_turn_taint_;
+}
+
 MpTuiSessionSnapshot MpTuiSession::snapshot() {
   std::lock_guard<std::mutex> lock{state_mu_};
   MpTuiSessionSnapshot out{};
@@ -636,6 +764,9 @@ MpTuiSessionSnapshot MpTuiSession::snapshot() {
   out.notices.assign(notices_.begin(), notices_.end());
   notices_.clear();
   out.status_summary = status_summary_;
+  out.org_id = org_id_;
+  out.group_id = group_id_;
+  out.external_guest_account_ids = external_guest_account_ids_;
   return out;
 }
 
@@ -1003,13 +1134,57 @@ void MpTuiSession::handle_runtime_event_locked(const MpRuntimeEvent &event) {
       return;
     }
     const mp::DeviceId sender_dev = *event.sender_device_id;
+    const auto roster_peer = runtime_.find_peer(sender_dev);
+    std::optional<mp::AccountId> sender_account = event.sender_account_id;
+    if (!sender_account.has_value() && roster_peer.has_value()) {
+      sender_account = roster_peer->account_id;
+    }
+    const bool is_ext_guest =
+        sender_account.has_value() && is_external_guest_account_locked(*sender_account);
+
+    const std::string sender_fp = compute_fingerprint_safe(event.peer_pubkey);
+    std::string safety_number = sender_fp;
+    if (roster_peer.has_value()) {
+      if (const auto sn = mp::compute_safety_number(roster_peer->account_id,
+                                                    roster_peer->root_pubkey);
+          sn.has_value()) {
+        safety_number = sn.value();
+      }
+    }
+
+    brakes::PeerProvenance provenance{};
+    provenance.origin = brakes::PeerOriginKind::online_peer;
+    provenance.peer_pubkey_b64 = base64_encode_pubkey(event.peer_pubkey);
+    provenance.safety_number = std::move(safety_number);
+    provenance.account_id = sender_account.has_value() ? sender_account->value() : 0U;
+    provenance.org_id = parsed_org_id_u64_;
+    provenance.is_external_guest = is_ext_guest;
+    provenance.effective_trust =
+        org_default_trust_.has_value()
+            ? std::min(*org_default_trust_, party_trust_policy_.max_default_profile)
+            : party_trust_policy_.max_default_profile;
+
+    brakes::EffectivePolicy eff_policy{};
+    eff_policy.party_trust = party_trust_policy_;
+    brakes::BrakesGate gate{eff_policy, turn_taint_ != nullptr ? *turn_taint_
+                                                               : internal_turn_taint_};
+    const brakes::PartyTrustProfile clamped_trust = gate.ingest_peer(provenance);
+    internal_turn_taint_ = gate.taint();
+    if (turn_taint_ != nullptr) {
+      *turn_taint_ = gate.taint();
+    }
+
     PartyMessage msg{};
     msg.timestamp_ns =
         event.chat->timestamp_ns > 0 ? event.chat->timestamp_ns : current_unix_ns();
     msg.sender_id = resolve_authenticated_peer_handle_locked(sender_dev);
     msg.sender_role = PartyMemberRole::operator_human;
     msg.sender_host = resolve_authenticated_peer_label_locked(sender_dev);
-    msg.sender_fingerprint = compute_fingerprint_safe(event.peer_pubkey);
+    if (is_ext_guest) {
+      msg.sender_model = "[EXT-GUEST]";
+      msg.sender_host += " [EXT-GUEST]";
+    }
+    msg.sender_fingerprint = sender_fp;
     msg.verified_peer = true;
     msg.untrusted_remote = true;
     const std::string_view raw_target =
@@ -1019,6 +1194,11 @@ void MpTuiSession::handle_runtime_event_locked(const MpRuntimeEvent &event) {
     msg.target = party_chat_sanitize(raw_target, kP2pPartyMaxTargetSelectorBytes);
     msg.kind = PartyMessageKind::chat;
     msg.body = party_chat_sanitize(event.chat->body, kPartyMaxMessageBytes);
+    if (is_ext_guest) {
+      push_notice_locked(
+          "external guest message clamped: " + msg.sender_id + " (trust=" +
+          std::string{brakes::party_trust_profile_name(clamped_trust)} + ")");
+    }
     push_message_locked(std::move(msg));
     return;
   }
@@ -1112,6 +1292,9 @@ void MpTuiSession::rebuild_participants_locked() {
     const bool is_leader =
         leader_device_id_.has_value() && *leader_device_id_ == peer.device_id;
     p.model = is_leader ? "online/leader" : "online";
+    if (is_external_guest_account_locked(peer.account_id)) {
+      p.model += " [EXT-GUEST]";
+    }
     p.fingerprint = compute_fingerprint_safe(peer.device_pubkey);
 
     if (peer.connection_state == P2pPeerConnectionState::connected) {
@@ -1193,6 +1376,13 @@ MpTuiSession::format_peer_label_locked(std::optional<mp::DeviceId> device_id) co
     return local_display_handle_;
   }
   return resolve_authenticated_peer_handle_locked(*device_id);
+}
+
+bool MpTuiSession::is_external_guest_account_locked(
+    mp::AccountId account_id) const noexcept {
+  return std::find(external_guest_account_ids_.begin(),
+                   external_guest_account_ids_.end(),
+                   account_id) != external_guest_account_ids_.end();
 }
 
 void MpTuiSession::fail_pending_commands_locked() noexcept {

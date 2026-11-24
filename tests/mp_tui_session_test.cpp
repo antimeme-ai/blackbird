@@ -1049,6 +1049,22 @@ void test_config_validation_and_failed_attach() {
                "empty local_handle override must fail");
   }
   {
+    auto cfg = base_cfg();
+    cfg.org_id = "";
+    const auto res = MpTuiSession::start(std::move(cfg));
+    require_ok(!res.has_value() && mp_tui_session_error_of(res.error()) ==
+                                       MpTuiSessionError::invalid_field,
+               "empty org_id must fail");
+  }
+  {
+    auto cfg = base_cfg();
+    cfg.group_id = std::string{"bad\xffgroup"};
+    const auto res = MpTuiSession::start(std::move(cfg));
+    require_ok(!res.has_value() && mp_tui_session_error_of(res.error()) ==
+                                       MpTuiSessionError::invalid_utf8,
+               "invalid utf-8 group_id must fail");
+  }
+  {
     // Missing identity -> MpPartyRuntime::attach fails closed without leaking FDs.
     MpPartyRuntimeConfig rt_cfg{MpClientConfig{}, MpIdentityState{}, party_id};
     MpTuiSessionConfig cfg{std::move(rt_cfg)};
@@ -1102,8 +1118,19 @@ void test_control_lifecycle_wake_fd_and_party_snapshot() {
     cfg.room_scope = "party/ops";
     cfg.pump_tick_ms = 10U;
     cfg.max_retained_messages = 32U;
+    cfg.org_id = "org_42";
+    cfg.group_id = "grp_ops";
+    cfg.external_guest_account_ids = {carol.account_id};
 
     auto session = require_val(MpTuiSession::start(std::move(cfg)), "start alice");
+    require_ok(session->org_id() == std::optional<std::string>{"org_42"},
+               "org_id exposed");
+    require_ok(session->group_id() == std::optional<std::string>{"grp_ops"},
+               "group_id exposed");
+    require_ok(session->is_external_guest_account(carol.account_id),
+               "carol initially marked external guest");
+    require_ok(!session->is_external_guest_account(bob.account_id),
+               "bob not initially external guest");
 
     // Verify wake_fd is non-blocking & close-on-exec.
     const int wfd = session->wake_fd();
@@ -1172,6 +1199,36 @@ void test_control_lifecycle_wake_fd_and_party_snapshot() {
                "unknown peer falls back to peer_<device_id>");
     require_ok(snap1.participants[1].fingerprint == expected_bob_fp,
                "peer fingerprint computed from authenticated pubkey");
+    require_ok(snap1.org_id == std::optional<std::string>{"org_42"},
+               "snapshot org_id preserved");
+    require_ok(snap1.group_id == std::optional<std::string>{"grp_ops"},
+               "snapshot group_id preserved");
+    require_ok(snap1.external_guest_account_ids.size() == 1U &&
+                   snap1.external_guest_account_ids[0] == carol.account_id,
+               "snapshot external_guest_account_ids preserved");
+
+    // Dynamic update_external_guests tags participant model & wakes wake_fd.
+    session->drain_wake();
+    session->update_external_guests({bob.account_id, bob.account_id});
+    pollfd guest_pfd{wfd, POLLIN, 0};
+    require_ok(::poll(&guest_pfd, 1U, 100) > 0 && (guest_pfd.revents & POLLIN) != 0,
+               "update_external_guests signaled wake_fd");
+    session->drain_wake();
+    require_ok(session->is_external_guest_account(bob.account_id),
+               "bob marked external guest dynamically");
+    require_ok(!session->is_external_guest_account(carol.account_id),
+               "carol removed from external guest list");
+    {
+      const auto guest_snap = session->snapshot();
+      require_ok(guest_snap.external_guest_account_ids.size() == 1U &&
+                     guest_snap.external_guest_account_ids[0] == bob.account_id,
+                 "external_guest_account_ids deduplicated");
+      require_ok(guest_snap.participants[1].model.find("[EXT-GUEST]") !=
+                     std::string::npos,
+                 "external guest participant model carries [EXT-GUEST]");
+    }
+    session->update_external_guests({});
+    session->drain_wake();
 
     // Update peer metadata with hostile escapes -> immediately sanitized & wakes!
     session->drain_wake();
@@ -1614,6 +1671,203 @@ void test_live_two_peer_iroh_e2e() {
   std::cout << "PASS test_live_two_peer_iroh_e2e\n";
 }
 
+// ---------------------------------------------------------------------------
+// Test 3b: Live Org External Guest Trust Clamping (MpTuiSession -> BrakesGate)
+//          Proves external org guest chat frames latch TurnTaintState with
+//          external_guest_seen == true and clamp trust tier to
+//          max_external_guest_profile even when org_default_trust is higher!
+// ---------------------------------------------------------------------------
+
+void test_org_external_guest_trust_clamping() {
+  TempDir tmp{"tui_org_guest"};
+  const auto cert = generate_self_signed_cert(tmp.path / "ca.pem", "localhost");
+  MockPartyDoServer server{cert, "localhost"};
+
+  const std::int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+  const auto party_id = require_val(PartyId::create(5022U), "party_id");
+  const auto alice_id = make_test_identity(
+      PeerIdentitySpec{1001U, 601U, 0x81U, "alice", now_s - 30, now_s + 3600});
+  const auto bob_id = make_test_identity(
+      PeerIdentitySpec{2002U, 602U, 0x82U, "bob", now_s - 30, now_s + 3600});
+  server.register_device(to_registered_device(alice_id));
+  server.register_device(to_registered_device(bob_id));
+
+  brakes::TurnTaintState bob_taint{};
+  brakes::PartyTrustSectionPolicy trust_policy{};
+  trust_policy.max_default_profile = brakes::PartyTrustProfile::black_flag;
+  trust_policy.max_peer_override = brakes::PartyTrustProfile::black_flag;
+  trust_policy.max_external_guest_profile = brakes::PartyTrustProfile::advisory;
+
+  MpPartyRuntimeConfig a_rt{
+      make_client_config(server.port(), cert.pem_path),
+      to_identity_state(alice_id),
+      party_id,
+  };
+  a_rt.local_relay_policy = RelayPolicy::no_relays;
+  a_rt.allow_loopback_direct_addrs = true;
+  MpTuiSessionConfig a_cfg{std::move(a_rt)};
+  a_cfg.room_scope = "org/777001/party";
+  a_cfg.local_handle = "alice_org";
+  a_cfg.peer_metadata[bob_id.device_id.value()] =
+      MpPeerDisplayMetadata{"bob_host", "bob-mac"};
+  a_cfg.pump_tick_ms = 10U;
+
+  MpPartyRuntimeConfig b_rt{
+      make_client_config(server.port(), cert.pem_path),
+      to_identity_state(bob_id),
+      party_id,
+  };
+  b_rt.local_relay_policy = RelayPolicy::no_relays;
+  b_rt.allow_loopback_direct_addrs = true;
+  MpTuiSessionConfig b_cfg{std::move(b_rt)};
+  b_cfg.room_scope = "org/777001/party";
+  b_cfg.local_handle = "bob_host";
+  b_cfg.peer_metadata[alice_id.device_id.value()] =
+      MpPeerDisplayMetadata{"alice_guest", "alice-mac"};
+  b_cfg.pump_tick_ms = 10U;
+  b_cfg.org_id = "777001";
+  b_cfg.group_id = "grp_platform";
+  // Internal org peers default to peer_trusted (strictly higher than advisory).
+  b_cfg.party_trust_policy = trust_policy;
+  b_cfg.org_default_trust = brakes::PartyTrustProfile::peer_trusted;
+  b_cfg.turn_taint = &bob_taint;
+
+  auto alice = require_val(MpTuiSession::start(std::move(a_cfg)), "start alice");
+  auto bob = require_val(MpTuiSession::start(std::move(b_cfg)), "start bob");
+
+  const auto alice_ep = require_opt(
+      server.wait_for_endpoint_update(alice_id.device_id, 1U), "alice endpoint update");
+  const auto bob_ep = require_opt(server.wait_for_endpoint_update(bob_id.device_id, 1U),
+                                  "bob endpoint update");
+
+  const PartySnapshotMessage snap{
+      party_id,
+      1U,
+      bob_id.account_id,
+      bob_id.device_id,
+      PartyVisibility::private_party,
+      PartyJoinMode::invite_only,
+      RelayPolicy::no_relays,
+      4U,
+      "",
+      {
+          make_member_record(bob_id, bob_ep, 1U),
+          make_member_record(alice_id, alice_ep, 2U),
+      },
+  };
+  server.push_mp1(bob_id.device_id, Mp1Message{snap});
+  server.push_mp1(alice_id.device_id, Mp1Message{snap});
+
+  auto peer_online = [](const PartySnapshot &ps, std::string_view peer_id) {
+    for (const auto &p : ps.participants) {
+      if (!p.local_self && p.id == peer_id &&
+          p.state == PartyParticipantState::online) {
+        return true;
+      }
+    }
+    return false;
+  };
+  require_ok(wait_via_wake_fd(
+                 *bob,
+                 [&]() { return peer_online(bob->to_party_snapshot(), "alice_guest"); },
+                 10000),
+             "bob sees alice online");
+  require_ok(wait_via_wake_fd(
+                 *alice,
+                 [&]() { return peer_online(alice->to_party_snapshot(), "bob_host"); },
+                 10000),
+             "alice sees bob online");
+
+  // 1. Before marking Alice as an external guest: internal org peer message
+  //    latches peer_trusted and external_guest_seen == false, with no [EXT-GUEST] tag.
+  require_void(alice->post_chat("internal org update"), "alice internal chat");
+  require_ok(
+      wait_via_wake_fd(
+          *bob, [&]() { return bob->to_party_snapshot().messages.size() >= 1U; }),
+      "bob received internal org message");
+  {
+    const auto bob_snap = bob->snapshot();
+    require_ok(bob_snap.messages.size() == 1U, "1 internal message");
+    const auto &m = bob_snap.messages[0];
+    require_ok(m.verified_peer && m.untrusted_remote,
+               "internal remote peer keeps verified_peer + untrusted_remote");
+    require_ok(m.sender_model.empty(), "internal peer has no [EXT-GUEST] model badge");
+    require_ok(m.sender_host.find("[EXT-GUEST]") == std::string::npos,
+               "internal peer host has no [EXT-GUEST] badge");
+    const auto taint_snap = bob->turn_taint_snapshot();
+    require_ok(taint_snap.has_peer_data(), "internal peer latched peer_ingested");
+    require_ok(taint_snap.effective_trust() == brakes::PartyTrustProfile::peer_trusted,
+               "internal org peer keeps org_default_trust (peer_trusted)");
+    require_ok(!taint_snap.external_guest_seen(),
+               "internal org peer must not set external_guest_seen");
+  }
+
+  // 2. Mark Alice's AccountId as an external guest via live update_external_guests()
+  //    and send another message: TurnTaintState MUST clamp strictly to advisory
+  //    even though org_default_trust == peer_trusted!
+  bob->update_external_guests({alice_id.account_id});
+  require_ok(bob->is_external_guest_account(alice_id.account_id),
+             "alice marked external guest");
+  require_void(alice->post_chat("external contractor request"), "alice guest chat");
+  require_ok(
+      wait_via_wake_fd(
+          *bob, [&]() { return bob->to_party_snapshot().messages.size() >= 2U; }),
+      "bob received external guest message");
+
+  const auto guest_snap = bob->snapshot();
+  require_ok(guest_snap.messages.size() == 2U, "2 messages total");
+  const auto &guest_msg = guest_snap.messages.back();
+  require_ok(guest_msg.verified_peer && guest_msg.untrusted_remote,
+             "external guest keeps verified_peer + untrusted_remote");
+  require_ok(guest_msg.sender_model == "[EXT-GUEST]",
+             "external guest message tagged with [EXT-GUEST] sender_model");
+  require_ok(guest_msg.sender_host.find("[EXT-GUEST]") != std::string::npos,
+             "external guest message host tagged with [EXT-GUEST]");
+  bool saw_clamp_notice = false;
+  for (const auto &n : guest_snap.notices) {
+    if (n.find("external guest message clamped:") != std::string::npos &&
+        n.find("advisory") != std::string::npos) {
+      saw_clamp_notice = true;
+    }
+  }
+  require_ok(saw_clamp_notice, "external guest clamping notice emitted");
+
+  // PartyChatPane renders [EXT-GUEST] badge visibly!
+  PartyChatPane pane{bob->to_party_snapshot()};
+  const std::string rendered = pane.render(100, 22, false);
+  require_ok(rendered.find("[EXT-GUEST]") != std::string::npos,
+             "PartyChatPane displays [EXT-GUEST] badge");
+
+  // Stop sessions before reading external bob_taint directly for strict race-freedom.
+  alice->stop();
+  bob->stop();
+
+  require_ok(bob_taint.has_peer_data(), "TurnTaintState latched peer data");
+  require_ok(bob_taint.is_tainted(), "TurnTaintState tainted by external guest");
+  require_ok(bob_taint.external_guest_seen(),
+             "TurnTaintState recorded external_guest_seen == true");
+  require_ok(bob_taint.effective_trust() == brakes::PartyTrustProfile::advisory,
+             "external guest clamped strictly to advisory despite peer_trusted "
+             "org_default_trust");
+  require_ok(bob_taint.ingested_count() == 2U, "both remote messages ingested");
+
+  // Verify BrakesGate denies workspace write & exec under the clamped taint state!
+  brakes::EffectivePolicy gate_policy{};
+  gate_policy.effective_profile = brakes::BrakesProfile::black_flag;
+  gate_policy.party_trust = trust_policy;
+  brakes::BrakesGate gate{gate_policy, bob_taint};
+  brakes::ToolCallRequest write_req{};
+  write_req.tool_name = "write_file";
+  write_req.effect_class = brakes::ToolEffectClass::workspace_write;
+  const auto write_dec = gate.evaluate_tool_call(write_req);
+  require_ok(write_dec.deny, "BrakesGate denies workspace_write after external guest "
+                             "advisory clamp");
+
+  std::cout << "PASS test_org_external_guest_trust_clamping\n";
+}
+
 #else
 
 void test_without_iroh_post_chat_fails_gracefully() {
@@ -1775,6 +2029,7 @@ int main() {
   test_concurrent_metadata_drain_and_stop_race();
 #if defined(BLACKBIRD_HAS_IROH) && BLACKBIRD_HAS_IROH
   test_live_two_peer_iroh_e2e();
+  test_org_external_guest_trust_clamping();
 #else
   test_without_iroh_post_chat_fails_gracefully();
 #endif

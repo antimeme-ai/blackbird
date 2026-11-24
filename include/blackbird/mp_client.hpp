@@ -427,6 +427,9 @@ struct PartySummary {
   std::string pinned_relay_url;
   std::uint8_t max_members = 2U;
   std::uint8_t member_count = 0U;
+  std::optional<std::string> org_id = std::nullopt;
+  std::optional<std::string> group_id = std::nullopt;
+  std::vector<AccountId> external_guest_account_ids{};
   bool operator==(const PartySummary &) const = default;
 };
 

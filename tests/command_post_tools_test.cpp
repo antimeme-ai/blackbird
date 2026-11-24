@@ -118,13 +118,14 @@ void test_tool_definitions() {
     require(!std::get<bool>(field(params, "additionalProperties").value()),
             "schema must forbid additionalProperties");
   }
-  require(found.size() == 12, "all 12 command-post tools must be registered");
+  require(found.size() == 14, "all 14 command-post tools must be registered");
   require(found.contains("platoon_board") && found.contains("bridge_guard") &&
               found.contains("project_issues") && found.contains("project_memory") &&
               found.contains("companion_timing") && found.contains("local_swarm") &&
               found.contains("sqlite_db") && found.contains("measure_script") &&
               found.contains("nvim_ast") && found.contains("code_intel") &&
-              found.contains("jupyter_nb") && found.contains("cpu_arc"),
+              found.contains("jupyter_nb") && found.contains("cpu_arc") &&
+              found.contains("saas_pack") && found.contains("mcp_router"),
           "missing expected command-post tool names");
 }
 
@@ -2385,6 +2386,89 @@ end
   }
 }
 
+void test_integrations_model_tools() {
+  // 1. saas_pack: list_packs & describe (passive metadata-only)
+  const Value list_res = run_command_post_tool(
+      "saas_pack", Value::object({{"action", Value{"list_packs"}}}));
+  require(field(list_res, "count") == Value{Number{std::uint64_t{7}}} &&
+              field(list_res, "packs").array().size() == 7U,
+          "saas_pack list_packs must return 7 builtin Lua packs");
+
+  const Value desc_res = run_command_post_tool(
+      "saas_pack",
+      Value::object({{"action", Value{"describe"}}, {"service", Value{"linear"}}}));
+  require(string_field(desc_res, "service") == "linear" &&
+              field(desc_res, "allowed_hosts").array().size() == 1U,
+          "saas_pack describe linear must return pinned host metadata");
+
+  // Security invariant: model-supplied packs_dir & vault_dir must be absent from
+  // saas_pack schema and hard-rejected at runtime.
+  const Value defs = tool_definitions();
+  for (const auto &entry : defs.array()) {
+    if (string_field(entry, "name") == "saas_pack") {
+      const Value &props = field(field(entry, "parameters"), "properties");
+      require(props.find("packs_dir") == nullptr && props.find("vault_dir") == nullptr,
+              "saas_pack schema must never expose packs_dir or vault_dir to the model");
+    }
+  }
+  bool rejected_packs_dir = false;
+  try {
+    (void)run_command_post_tool(
+        "saas_pack", Value::object({{"action", Value{"invoke"}},
+                                    {"service", Value{"linear"}},
+                                    {"operation", Value{"search_issues"}},
+                                    {"packs_dir", Value{"/tmp/evil_packs"}}}));
+  } catch (const Error &e) {
+    rejected_packs_dir = (e.code == ErrorCode::invalid_range);
+  }
+  require(rejected_packs_dir, "saas_pack must reject model-supplied packs_dir");
+
+  bool rejected_vault_dir = false;
+  try {
+    (void)run_command_post_tool(
+        "saas_pack", Value::object({{"action", Value{"invoke"}},
+                                    {"service", Value{"linear"}},
+                                    {"operation", Value{"search_issues"}},
+                                    {"vault_dir", Value{"/tmp/evil_vault"}}}));
+  } catch (const Error &e) {
+    rejected_vault_dir = (e.code == ErrorCode::invalid_range);
+  }
+  require(rejected_vault_dir, "saas_pack must reject model-supplied vault_dir");
+
+  // 2. mcp_router: presets, manifest & BM25 search with non-downgrading readOnlyHint
+  const Value presets_res = run_command_post_tool(
+      "mcp_router", Value::object({{"action", Value{"presets"}}}));
+  require(field(presets_res, "count") == Value{Number{std::uint64_t{6}}} &&
+              field(presets_res, "presets").array().size() == 6U,
+          "mcp_router presets must return 6 official remote MCP presets");
+
+  const Value manifest_res = run_command_post_tool(
+      "mcp_router",
+      Value::object({{"action", Value{"manifest"}}, {"server", Value{"linear"}}}));
+  require(string_field(manifest_res, "endpoint_url") == "https://mcp.linear.app/mcp",
+          "mcp_router manifest linear mismatch");
+
+  const std::string custom_tools = R"([
+    {"server":"linear","name":"delete_everything","title":"Delete Workspace","description":"Permanently wipe workspace data","read_only_hint":true,"destructive_hint":true},
+    {"server":"linear","name":"search_issues","title":"Search Issues","description":"Query Linear issues","read_only_hint":true,"destructive_hint":false}
+  ])";
+  const Value search_res =
+      run_command_post_tool("mcp_router", Value::object({
+                                              {"action", Value{"search"}},
+                                              {"query", Value{"wipe workspace"}},
+                                              {"tools_json", Value{custom_tools}},
+                                              {"limit", Value{Number{2}}},
+                                          }));
+  const auto &hits = field(search_res, "hits").array();
+  require(!hits.empty(), "mcp_router search must return ranked hit");
+  require(string_field(hits[0], "tool") == "delete_everything",
+          "BM25 must rank delete_everything first");
+  require(std::get<bool>(field(hits[0], "tightened_by_destructive_hint").value()),
+          "destructiveHint=true must tighten authoritative effect");
+  require(string_field(hits[0], "authoritative_effect") != "read_only",
+          "untrusted readOnlyHint=true must NEVER downgrade authoritative effect");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2399,6 +2483,7 @@ int main(int argc, char **argv) {
 
   try {
     test_tool_definitions();
+    test_integrations_model_tools();
     test_superpower_tools_smoke(sandbox);
     test_readonly_no_dir_creation(sandbox);
     test_platoon_board_and_framing(sandbox);

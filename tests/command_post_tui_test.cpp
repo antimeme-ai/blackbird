@@ -2695,6 +2695,31 @@ void test_brakes_slash_status_and_probe() {
               sp_out->find("Native CPU-ARC:") != std::string::npos &&
               sp_out->find("Measure Harness:") != std::string::npos,
           "/superpowers status must report superpower readiness");
+
+  // /integrations passive zero-disk-write & metadata-only checks
+  TempDir int_tmp{"tui_integrations"};
+  const auto absent_vault = int_tmp.path / "never_created_vault";
+  ScopedEnvVar set_vault{"BLACKBIRD_INTEGRATIONS_VAULT_DIR", absent_vault.string()};
+  const auto int_status = handle_command_post_slash("/integrations", ctx);
+  require(int_status.has_value() && !std::filesystem::exists(absent_vault) &&
+              int_status->find("Blackbird Integrations:") != std::string::npos &&
+              int_status->find("Connected Vault Accounts: 0") != std::string::npos &&
+              int_status->find("Official MCP Presets (6):") != std::string::npos &&
+              int_status->find("Builtin Lua SaaS Packs (7):") != std::string::npos,
+          "/integrations must be passive zero-disk-write and list presets & packs");
+
+  const auto int_presets = handle_command_post_slash("/integrations presets", ctx);
+  require(int_presets.has_value() &&
+              int_presets->find("https://mcp.linear.app/mcp") != std::string::npos &&
+              int_presets->find("https://multiplayer.tech/mcp") != std::string::npos,
+          "/integrations presets must list official remote MCP endpoints");
+
+  const auto int_packs = handle_command_post_slash("/integrations packs", ctx);
+  require(int_packs.has_value() &&
+              int_packs->find("api.linear.app") != std::string::npos &&
+              int_packs->find("api.notion.com") != std::string::npos &&
+              int_packs->find("discord.com") != std::string::npos,
+          "/integrations packs must list builtin Lua 5.5.1 SaaS packs");
 }
 
 } // namespace

@@ -7,11 +7,14 @@
 #include "blackbird/cpu_arc.hpp"
 #include "blackbird/doctor.hpp"
 #include "blackbird/flight_deck_hero.hpp"
+#include "blackbird/integration_vault.hpp"
+#include "blackbird/integrations_runtime.hpp"
 #include "blackbird/issues.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/jupyter_notebook.hpp"
 #include "blackbird/lan_party_runtime.hpp"
 #include "blackbird/lsp_client.hpp"
+#include "blackbird/mcp_client.hpp"
 #include "blackbird/mcp_server.hpp"
 #include "blackbird/measure_harness.hpp"
 #include "blackbird/metrics_consumer.hpp"
@@ -25,6 +28,7 @@
 #include "blackbird/platoon_board.hpp"
 #include "blackbird/platoon_runner.hpp"
 #include "blackbird/project_memory.hpp"
+#include "blackbird/saas_packs.hpp"
 #include "blackbird/self_upgrade.hpp"
 #include "blackbird/sqlite_embedded.hpp"
 #include "blackbird/sqlite_workbench.hpp"
@@ -11376,6 +11380,469 @@ int run_superpowers_cli(std::span<char *> args, CliIo io) {
   return 0;
 }
 
+Value credential_metadata_to_json(const CredentialMetadata &meta) {
+  Value::Array hosts;
+  hosts.reserve(meta.allowed_hosts.size());
+  for (const auto &h : meta.allowed_hosts)
+    hosts.emplace_back(h);
+  Value::Array scopes;
+  scopes.reserve(meta.scopes.size());
+  for (const auto &s : meta.scopes)
+    scopes.emplace_back(s);
+  return Value::object({
+      {"id", Value{Number{meta.id.value}}},
+      {"service", Value{meta.service}},
+      {"account", Value{meta.account}},
+      {"scheme", Value{std::string{auth_scheme_name(meta.scheme)}}},
+      {"auth_header_name", Value{meta.auth_header_name}},
+      {"allowed_hosts", Value{std::move(hosts)}},
+      {"scopes", Value{std::move(scopes)}},
+      {"active", Value{meta.active}},
+      {"expired", Value{meta.expired}},
+      {"has_refresh_token", Value{meta.has_refresh_token}},
+      {"expires_at", Value{Number{meta.expires_at}}},
+      {"updated_at", Value{Number{meta.updated_at}}},
+      {"revision", Value{Number{meta.revision}}},
+  });
+}
+
+std::vector<std::string>
+default_hosts_for_integration_service(std::string_view service) {
+  std::vector<std::string> hosts;
+  auto push_unique = [&](std::string host) {
+    if (host.empty())
+      return;
+    for (const auto &existing : hosts) {
+      if (existing == host)
+        return;
+    }
+    hosts.push_back(std::move(host));
+  };
+  if (const auto manifest = find_builtin_saas_pack_manifest(service);
+      manifest.has_value()) {
+    for (const auto &h : manifest->allowed_hosts)
+      push_unique(h);
+  }
+  if (const auto preset = find_mcp_preset(service); preset.has_value()) {
+    if (const auto parsed = net::parse_url(preset->endpoint_url); parsed.has_value())
+      push_unique(parsed.value().host);
+  }
+  return hosts;
+}
+
+std::string_view strip_flag_value(std::string_view arg) noexcept {
+  const std::size_t eq = arg.find('=');
+  return eq == std::string_view::npos ? arg : arg.substr(0U, eq);
+}
+
+bool is_forbidden_secret_argv_flag(std::string_view arg) noexcept {
+  const std::string_view flag = strip_flag_value(arg);
+  return flag == "--token" || flag == "--secret" || flag == "--api-key" ||
+         flag == "--apikey" || flag == "--password" || flag == "--bearer" ||
+         flag == "--pat" || flag == "--access-token" || flag == "--refresh-token" ||
+         flag == "--client-secret" || flag == "--auth" || flag == "-t" ||
+         flag == "-p" || flag == "-k";
+}
+
+int run_integrations_connect(std::span<const std::string_view> sub_args, CliIo io) {
+  std::string service;
+  std::string account = "default";
+  std::string scheme_str;
+  fs::path vault_dir = default_integrations_vault_dir();
+  std::vector<std::string> explicit_hosts;
+  bool token_stdin = false;
+  bool json_out = false;
+
+  for (std::size_t i = 0; i < sub_args.size(); ++i) {
+    const std::string_view arg = sub_args[i];
+    if (is_forbidden_secret_argv_flag(arg)) {
+      return fail_usage(
+          io, "refusing secret on argv; supply credentials via --token-stdin");
+    }
+    if (arg == "--help" || arg == "-h") {
+      io.out << "Usage: blackbird integrations connect <service> --token-stdin "
+                "[--account NAME] [--scheme bearer_pat|discord_bot|bearer_oauth2|"
+                "header_key|basic_token] [--host HOST]... [--vault-dir DIR] [--json]\n"
+                "Alias: blackbird connect <service> --token-stdin ...\n"
+                "Security: secrets on argv (--token/--secret/--api-key) are refused.\n";
+      return 0;
+    }
+    if (arg == "--token-stdin") {
+      token_stdin = true;
+    } else if (arg == "--json") {
+      json_out = true;
+    } else if (arg == "--account") {
+      if (i + 1 >= sub_args.size())
+        return fail_usage(io, "--account requires a value");
+      account = std::string{sub_args[++i]};
+    } else if (arg == "--scheme") {
+      if (i + 1 >= sub_args.size())
+        return fail_usage(io, "--scheme requires a value");
+      scheme_str = std::string{sub_args[++i]};
+    } else if (arg == "--host") {
+      if (i + 1 >= sub_args.size())
+        return fail_usage(io, "--host requires a hostname");
+      explicit_hosts.emplace_back(sub_args[++i]);
+    } else if (arg == "--vault-dir") {
+      if (i + 1 >= sub_args.size())
+        return fail_usage(io, "--vault-dir requires a directory path");
+      vault_dir = fs::path{sub_args[++i]};
+    } else if (arg.starts_with('-')) {
+      return fail_usage(io, "unknown flag for integrations connect: " +
+                                std::string{strip_flag_value(arg)});
+    } else if (service.empty()) {
+      service = std::string{arg};
+    } else {
+      return fail_usage(io, "unexpected positional argument: " + std::string{arg});
+    }
+  }
+
+  if (service.empty())
+    return fail_usage(io, "integrations connect requires <service>");
+  if (!token_stdin) {
+    return fail_usage(
+        io, "integrations connect requires --token-stdin (never pass secrets on argv)");
+  }
+  if (vault_dir.empty())
+    return fail_message(io, "unable to resolve integrations vault directory");
+
+  std::string raw_line;
+  if (!std::getline(io.in, raw_line)) {
+    return fail_usage(io, "expected credential token on stdin");
+  }
+  while (!raw_line.empty() && (raw_line.back() == '\r' || raw_line.back() == '\n'))
+    raw_line.pop_back();
+  CleansedSecret secret{raw_line};
+  if (!raw_line.empty())
+    ::OPENSSL_cleanse(raw_line.data(), raw_line.size());
+  raw_line.clear();
+  if (secret.empty())
+    return fail_usage(io, "empty credential token on stdin");
+
+  AuthScheme scheme = AuthScheme::bearer_pat;
+  if (!scheme_str.empty()) {
+    auto parsed = parse_auth_scheme(scheme_str);
+    if (!parsed.has_value())
+      return fail_usage(io, "invalid --scheme value: " + scheme_str);
+    scheme = parsed.value();
+  } else if (service == "discord") {
+    scheme = AuthScheme::discord_bot;
+  }
+
+  std::vector<std::string> hosts = explicit_hosts.empty()
+                                       ? default_hosts_for_integration_service(service)
+                                       : std::move(explicit_hosts);
+  if (hosts.empty()) {
+    return fail_usage(io, "unknown service '" + service + "'; pass --host <hostname>");
+  }
+
+  IntegrationVaultConfig vcfg;
+  vcfg.directory = vault_dir;
+  IntegrationVault vault{std::move(vcfg)};
+
+  CredentialSaveInput input;
+  input.service = service;
+  input.account = account;
+  input.scheme = scheme;
+  input.access_token = std::move(secret);
+  input.allowed_hosts = std::move(hosts);
+  input.set_active = true;
+
+  auto saved = vault.save(input);
+  if (!saved.has_value())
+    return fail_error(io, "integrations connect", saved.error());
+
+  const CredentialMetadata &meta = saved.value();
+  if (json_out) {
+    return emit_json(io, Value::object({
+                             {"connected", Value{true}},
+                             {"credential", credential_metadata_to_json(meta)},
+                         }));
+  }
+  io.out << "Connected " << meta.service << " (account=" << meta.account
+         << ", id=" << meta.id.value << ", scheme=" << auth_scheme_name(meta.scheme)
+         << ", hosts=";
+  for (std::size_t i = 0; i < meta.allowed_hosts.size(); ++i) {
+    if (i > 0)
+      io.out << ',';
+    io.out << meta.allowed_hosts[i];
+  }
+  io.out << ")\n";
+  return 0;
+}
+
+int run_integrations_cli(std::span<char *> args, CliIo io) {
+  std::string_view sub = "status";
+  std::size_t start_idx = 1U;
+  if (args.size() > 1U) {
+    const std::string_view first{args[1]};
+    if (first == "--help" || first == "-h" || first == "help") {
+      io.out << "Usage:\n"
+                "  blackbird integrations [list|status] [--vault-dir DIR] [--json]\n"
+                "  blackbird integrations presets [--json]\n"
+                "  blackbird integrations packs [--json]\n"
+                "  blackbird integrations connect <service> --token-stdin [--account "
+                "NAME] [--scheme NAME] [--host HOST]... [--vault-dir DIR] [--json]\n"
+                "  blackbird integrations disconnect <service> [--account NAME] [--id "
+                "N] [--vault-dir DIR] [--json]\n"
+                "  blackbird connect <service> --token-stdin ...\n";
+      return 0;
+    }
+    if (!first.starts_with('-')) {
+      sub = first;
+      start_idx = 2U;
+    }
+  }
+
+  if (sub == "connect") {
+    std::vector<std::string_view> rest;
+    for (std::size_t i = start_idx; i < args.size(); ++i)
+      rest.emplace_back(args[i]);
+    return run_integrations_connect(rest, io);
+  }
+
+  if (sub == "presets") {
+    bool json_out = false;
+    for (std::size_t i = start_idx; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--json") {
+        json_out = true;
+      } else {
+        return fail_usage(io, "unknown flag for integrations presets: " +
+                                  std::string{strip_flag_value(arg)});
+      }
+    }
+    const auto &presets = builtin_mcp_presets();
+    if (json_out) {
+      Value::Array arr;
+      arr.reserve(presets.size());
+      for (const auto &p : presets) {
+        arr.push_back(Value::object({
+            {"preset_id", Value{Number{p.preset_id.value}}},
+            {"name", Value{p.name}},
+            {"display_name", Value{p.display_name}},
+            {"endpoint_url", Value{p.endpoint_url}},
+            {"readonly_endpoint_url", Value{p.readonly_endpoint_url}},
+            {"protocol_version", Value{p.protocol_version}},
+            {"is_open_world", Value{p.is_open_world}},
+            {"description", Value{p.description}},
+        }));
+      }
+      return emit_json(io, Value::object({
+                               {"count", Value{Number{presets.size()}}},
+                               {"presets", Value{std::move(arr)}},
+                           }));
+    }
+    io.out << "Official Remote MCP Presets (" << presets.size() << "):\n";
+    for (const auto &p : presets) {
+      io.out << "  " << p.name << " (" << p.display_name << ") -> " << p.endpoint_url
+             << " [" << p.protocol_version << "]\n";
+    }
+    return 0;
+  }
+
+  if (sub == "packs") {
+    bool json_out = false;
+    for (std::size_t i = start_idx; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--json") {
+        json_out = true;
+      } else {
+        return fail_usage(io, "unknown flag for integrations packs: " +
+                                  std::string{strip_flag_value(arg)});
+      }
+    }
+    const auto &manifests = builtin_saas_pack_manifests();
+    if (json_out) {
+      Value::Array arr;
+      arr.reserve(manifests.size());
+      for (const auto &m : manifests) {
+        Value::Array hosts;
+        for (const auto &h : m.allowed_hosts)
+          hosts.emplace_back(h);
+        Value::Array ops;
+        for (const auto &op : m.operations) {
+          ops.push_back(Value::object({
+              {"name", Value{op.name}},
+              {"effect", Value{std::string{saas_effect_class_name(op.effect)}}},
+          }));
+        }
+        arr.push_back(Value::object({
+            {"service", Value{m.service}},
+            {"display_name", Value{m.display_name}},
+            {"allowed_hosts", Value{std::move(hosts)}},
+            {"operations", Value{std::move(ops)}},
+            {"is_open_world", Value{m.is_open_world}},
+        }));
+      }
+      return emit_json(io, Value::object({
+                               {"count", Value{Number{manifests.size()}}},
+                               {"packs", Value{std::move(arr)}},
+                           }));
+    }
+    io.out << "Builtin Lua 5.5.1 SaaS Packs (" << manifests.size() << "):\n";
+    for (const auto &m : manifests) {
+      io.out << "  " << m.service << " (" << m.display_name << ") hosts=[";
+      for (std::size_t i = 0; i < m.allowed_hosts.size(); ++i) {
+        if (i > 0)
+          io.out << ',';
+        io.out << m.allowed_hosts[i];
+      }
+      io.out << "] ops=" << m.operations.size() << '\n';
+    }
+    return 0;
+  }
+
+  if (sub == "list" || sub == "status") {
+    fs::path vault_dir = default_integrations_vault_dir();
+    bool json_out = false;
+    for (std::size_t i = start_idx; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--json") {
+        json_out = true;
+      } else if (arg == "--vault-dir") {
+        if (i + 1 >= args.size())
+          return fail_usage(io, "--vault-dir requires a directory path");
+        vault_dir = fs::path{args[++i]};
+      } else {
+        return fail_usage(io, "unknown flag for integrations " + std::string{sub} +
+                                  ": " + std::string{strip_flag_value(arg)});
+      }
+    }
+
+    // Strictly passive zero-disk-write check when vault store does not exist yet.
+    std::vector<CredentialMetadata> creds;
+    bool store_present = false;
+    if (!vault_dir.empty()) {
+      IntegrationVaultConfig vcfg;
+      vcfg.directory = vault_dir;
+      IntegrationVault vault{std::move(vcfg)};
+      std::error_code ec;
+      store_present = fs::exists(vault.store_path(), ec) && !ec;
+      if (store_present) {
+        auto listed = vault.list();
+        if (!listed.has_value())
+          return fail_error(io, "integrations list", listed.error());
+        creds = std::move(listed.value());
+      }
+    }
+
+    const auto &presets = builtin_mcp_presets();
+    const auto &packs = builtin_saas_pack_manifests();
+    if (json_out) {
+      Value::Array connected;
+      connected.reserve(creds.size());
+      for (const auto &c : creds)
+        connected.push_back(credential_metadata_to_json(c));
+      return emit_json(io, Value::object({
+                               {"vault_dir", Value{vault_dir.string()}},
+                               {"vault_present", Value{store_present}},
+                               {"connected_count", Value{Number{creds.size()}}},
+                               {"connected", Value{std::move(connected)}},
+                               {"mcp_presets_count", Value{Number{presets.size()}}},
+                               {"saas_packs_count", Value{Number{packs.size()}}},
+                           }));
+    }
+
+    io.out << "Blackbird Integrations:\n"
+           << "  Connected accounts: " << creds.size() << '\n';
+    for (const auto &c : creds) {
+      io.out << "    [" << c.id.value << "] " << c.service << " (" << c.account
+             << ") scheme=" << auth_scheme_name(c.scheme)
+             << (c.active ? " [active]" : "") << (c.expired ? " [expired]" : "")
+             << '\n';
+    }
+    io.out << "  Official MCP presets: " << presets.size()
+           << " (use `blackbird integrations presets`)\n"
+           << "  Builtin SaaS packs:   " << packs.size()
+           << " (use `blackbird integrations packs`)\n";
+    return 0;
+  }
+
+  if (sub == "disconnect") {
+    std::string service;
+    std::string account;
+    std::optional<std::uint64_t> id_opt;
+    fs::path vault_dir = default_integrations_vault_dir();
+    bool json_out = false;
+    for (std::size_t i = start_idx; i < args.size(); ++i) {
+      const std::string_view arg{args[i]};
+      if (arg == "--json") {
+        json_out = true;
+      } else if (arg == "--account") {
+        if (i + 1 >= args.size())
+          return fail_usage(io, "--account requires a value");
+        account = std::string{args[++i]};
+      } else if (arg == "--id") {
+        if (i + 1 >= args.size())
+          return fail_usage(io, "--id requires an integer");
+        const auto parsed = parse_u64(args[++i]);
+        if (!parsed.has_value() || *parsed == 0U)
+          return fail_usage(io, "invalid --id value");
+        id_opt = *parsed;
+      } else if (arg == "--vault-dir") {
+        if (i + 1 >= args.size())
+          return fail_usage(io, "--vault-dir requires a directory path");
+        vault_dir = fs::path{args[++i]};
+      } else if (arg.starts_with('-')) {
+        return fail_usage(io, "unknown flag for integrations disconnect: " +
+                                  std::string{arg});
+      } else if (service.empty()) {
+        service = std::string{arg};
+      } else {
+        return fail_usage(io, "unexpected positional argument: " + std::string{arg});
+      }
+    }
+    if (!id_opt.has_value() && service.empty())
+      return fail_usage(io, "integrations disconnect requires <service> or --id N");
+    if (vault_dir.empty())
+      return fail_message(io, "unable to resolve integrations vault directory");
+
+    IntegrationVaultConfig vcfg;
+    vcfg.directory = vault_dir;
+    IntegrationVault vault{std::move(vcfg)};
+    std::error_code ec;
+    if (!fs::exists(vault.store_path(), ec) || ec)
+      return fail_message(io, "no connected integrations found");
+
+    CredentialId target_id{};
+    if (id_opt.has_value()) {
+      target_id = CredentialId{*id_opt};
+    } else {
+      auto found = vault.find(ServiceAccountKey{service, account});
+      if (!found.has_value())
+        return fail_error(io, "integrations disconnect", found.error());
+      target_id = found.value().id;
+    }
+
+    auto removed = vault.remove(target_id);
+    if (!removed.has_value())
+      return fail_error(io, "integrations disconnect", removed.error());
+
+    if (json_out) {
+      return emit_json(io, Value::object({
+                               {"disconnected", Value{true}},
+                               {"id", Value{Number{target_id.value}}},
+                               {"service", Value{service}},
+                           }));
+    }
+    io.out << "Disconnected integration credential id=" << target_id.value;
+    if (!service.empty())
+      io.out << " (" << service << ")";
+    io.out << '\n';
+    return 0;
+  }
+
+  return fail_usage(io, "unknown integrations subcommand: " + std::string{sub});
+}
+
+int run_connect_alias_cli(std::span<char *> args, CliIo io) {
+  std::vector<std::string_view> rest;
+  for (std::size_t i = 1U; i < args.size(); ++i)
+    rest.emplace_back(args[i]);
+  return run_integrations_connect(rest, io);
+}
+
 } // namespace
 
 bool is_command_post_subcommand(std::string_view arg) noexcept {
@@ -11383,7 +11850,8 @@ bool is_command_post_subcommand(std::string_view arg) noexcept {
          arg == "peer" || arg == "capabilities" || arg == "metrics" ||
          arg == "bridge" || arg == "join" || arg == "party" || arg == "flightdeck" ||
          arg == "online" || arg == "upgrade" || arg == "doctor" || arg == "lan" ||
-         arg == "brakes" || arg == "superpowers";
+         arg == "brakes" || arg == "superpowers" || arg == "integrations" ||
+         arg == "connect";
 }
 
 int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
@@ -11430,6 +11898,10 @@ int command_post_cli(int argc, char **argv, std::istream &in, std::ostream &out,
       return run_brakes_cli(args, io);
     if (subcommand == "superpowers")
       return run_superpowers_cli(args, io);
+    if (subcommand == "integrations")
+      return run_integrations_cli(args, io);
+    if (subcommand == "connect")
+      return run_connect_alias_cli(args, io);
     return fail_usage(io, "unknown subcommand: " + std::string{subcommand});
   } catch (const Error &e) {
     return fail_error(io, subcommand, e);

@@ -1,10 +1,12 @@
 #include "blackbird/terminal.hpp"
 #include "blackbird/brakes_policy.hpp"
 #include "blackbird/command_inspector.hpp"
+#include "blackbird/cpu_arc.hpp"
 #include "blackbird/display_text.hpp"
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
+#include "blackbird/os_sandbox.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/process_lifetime.hpp"
 #include "blackbird/raw_command.hpp"
@@ -13,6 +15,8 @@
 #include "blackbird/retained_state.hpp"
 #include "blackbird/right_rail.hpp"
 #include "blackbird/sprite.hpp"
+#include "blackbird/sqlite_embedded.hpp"
+#include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/task_view.hpp"
 #include "blackbird/terminal_custody.hpp"
 #include "blackbird/tools.hpp"
@@ -216,6 +220,9 @@ const std::array builtin_commands{
         "/superpowers", "[status|probe|help]",
         "Probe native model superpowers (SQLite, Neovim/Tree-sitter, LSP, Measure)",
         "Command Post"},
+    ChatCommand{"/integrations", "[status|presets|packs|help]",
+                "Inspect connected SaaS/MCP integrations, official presets, and packs",
+                "Command Post"},
     ChatCommand{"/rail",
                 "[toggle|show|hide|auto|escalations|tokenomics|tasks|anchors|"
                 "multiplayer|next|prev|refresh]",
@@ -2943,6 +2950,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
   RightRailPane right_rail_pane;
   std::vector<RightRailAnchor> right_rail_anchors;
   std::string right_rail_brakes_profile = "BLACK-FLAG";
+  RightRailSuperpowers right_rail_superpowers{};
   std::vector<double> right_rail_tps_history;
   auto refresh_right_rail_static = [&] {
     std::error_code ec;
@@ -2954,6 +2962,52 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
       right_rail_brakes_profile =
           std::string{brakes::brakes_profile_name(pol.value().effective_profile)};
     }
+    RightRailSuperpowers sp{};
+    const auto sql_caps = sqlite::probe_embedded_sqlite_capabilities();
+    const auto arc_caps = arc::probe_cpu_arc_capabilities();
+    const auto sbx_caps = sandbox::probe_os_sandbox_capabilities();
+    sp.cpu_arc.available = arc_caps.available;
+    if (const auto state_dir = sqlite::resolve_default_model_state_dir();
+        state_dir.has_value()) {
+      const std::string hash = sqlite::compute_project_db_hash(
+          cwd.empty() ? std::filesystem::path{"/"} : cwd);
+      const auto db_path =
+          state_dir.value().parent_path() / "cpu_arc" / (hash + ".sqlite");
+      std::error_code db_ec;
+      if (std::filesystem::is_regular_file(db_path, db_ec) && !db_ec) {
+        if (auto reg = arc::ArcRegistry::open(db_path); reg.has_value()) {
+          if (const auto st = reg.value().stats(); st.has_value()) {
+            const auto &s = st.value();
+            sp.cpu_arc.function_count = s.function_count;
+            sp.cpu_arc.compiled_count = s.compiled_function_count;
+            sp.cpu_arc.total_invocations = s.total_invocations;
+            sp.cpu_arc.cache_hits = s.total_successes;
+            sp.cpu_arc.fallbacks = s.total_fallbacks;
+            if (s.total_invocations > 0U) {
+              sp.cpu_arc.hit_rate = static_cast<double>(s.total_successes) /
+                                    static_cast<double>(s.total_invocations);
+            }
+            if (s.total_source_cost_usd > s.total_target_cost_usd) {
+              sp.cpu_arc.estimated_saved_usd =
+                  s.total_source_cost_usd - s.total_target_cost_usd;
+            }
+            if (s.total_target_cost_usd > 0.0 && s.total_source_cost_usd > 0.0) {
+              sp.cpu_arc.savings_multiplier =
+                  s.total_source_cost_usd / s.total_target_cost_usd;
+            }
+          }
+        }
+      }
+    }
+    sp.capabilities = {
+        {"SQLite", sql_caps.available, "embedded " + sql_caps.version + " FTS5"},
+        {"CPU-ARC", arc_caps.available, "Lua " + arc_caps.lua_version + " O(1)"},
+        {"SaaS Packs", true, "7 Lua packs"},
+        {"MCP Router", true, "BM25 lazy"},
+        {"Jupyter", true, "nbformat v4 + WS"},
+        {"Measure", true, "sandbox=" + sbx_caps.backend_name},
+    };
+    right_rail_superpowers = std::move(sp);
   };
   refresh_right_rail_static();
   const bool flightdeck_kitty_capable = kitty_graphics_capable();
@@ -4645,6 +4699,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             rsnap.tasks.push_back(std::move(t));
           }
           rsnap.anchors = right_rail_anchors;
+          rsnap.superpowers = right_rail_superpowers;
           const auto &ps = party_pane.snapshot();
           if (terminal_party_is_active(ps)) {
             rsnap.multiplayer.transport = RightRailPartyTransport::online;

@@ -399,6 +399,7 @@ struct LoopbackServerState {
   std::string friend_handle = "bob_friend";
   int relay_ping_status = 200;
   std::string last_relay_ping_path;
+  std::optional<std::string> get_party_override_json;
 };
 
 class LoopbackTlsServer {
@@ -1045,14 +1046,18 @@ private:
                     "relay.multiplayer.tech\"}");
     } else if (method_str == "GET" &&
                path == "/v1/parties/" + std::to_string(state_.party_id)) {
-      send_json(ssl, 200, "OK",
-                "{\"party_id\":" + std::to_string(state_.party_id) +
-                    ",\"party_epoch\":" + std::to_string(state_.party_epoch) +
-                    ",\"leader_account_id\":" + std::to_string(state_.account_id) +
-                    ",\"leader_device_id\":" + std::to_string(state_.device_id) +
-                    ",\"visibility\":1,\"join_mode\":0,\"relay_policy\":1,"
-                    "\"pinned_relay_url\":\"https://relay.multiplayer.tech\","
-                    "\"max_members\":4,\"member_count\":2}");
+      if (state_.get_party_override_json.has_value()) {
+        send_json(ssl, 200, "OK", *state_.get_party_override_json);
+      } else {
+        send_json(ssl, 200, "OK",
+                  "{\"party_id\":" + std::to_string(state_.party_id) +
+                      ",\"party_epoch\":" + std::to_string(state_.party_epoch) +
+                      ",\"leader_account_id\":" + std::to_string(state_.account_id) +
+                      ",\"leader_device_id\":" + std::to_string(state_.device_id) +
+                      ",\"visibility\":1,\"join_mode\":0,\"relay_policy\":1,"
+                      "\"pinned_relay_url\":\"https://relay.multiplayer.tech\","
+                      "\"max_members\":4,\"member_count\":2}");
+      }
     } else if (method_str == "POST" && path.ends_with("/invites")) {
       send_json(ssl, 201, "Created",
                 "{\"party_invite_id\":" + std::to_string(state_.party_invite_id) +
@@ -2079,6 +2084,71 @@ void test_loopback_tls_rest_and_ws() {
   require_ok(summary.value().party_id == created.value().party_id);
   require_ok(summary.value().relay_policy == RelayPolicy::force_relays);
   require_ok(summary.value().member_count == 2U);
+  require_ok(!summary.value().org_id.has_value());
+  require_ok(!summary.value().group_id.has_value());
+  require_ok(summary.value().external_guest_account_ids.empty());
+
+  // 9b. Live Org-Scoped GET /v1/parties/:id metadata & fail-closed validation.
+  {
+    const std::string base_prefix =
+        "{\"party_id\":5001,\"party_epoch\":1,\"leader_account_id\":1001,"
+        "\"leader_device_id\":2001,\"visibility\":1,\"join_mode\":0,"
+        "\"relay_policy\":1,\"pinned_relay_url\":\"https://relay.multiplayer.tech\","
+        "\"max_members\":4,\"member_count\":3";
+
+    auto set_party_json = [&](std::optional<std::string> body) {
+      std::lock_guard<std::mutex> lk{srv_state.mu};
+      srv_state.get_party_override_json = std::move(body);
+    };
+
+    // Org party with string org_id, group_id, and mixed integer + string guest IDs
+    // (including duplicate that must be deduplicated cleanly).
+    set_party_json(base_prefix +
+                   ",\"org_id\":\"org_9000\",\"group_id\":\"grp_eng\","
+                   "\"external_guest_account_ids\":[\"9001\",9002,\"9001\"]}");
+    const auto org_summary = client.get_party(created.value().party_id);
+    require_ok(org_summary.has_value());
+    require_ok(org_summary.value().org_id == std::optional<std::string>{"org_9000"});
+    require_ok(org_summary.value().group_id == std::optional<std::string>{"grp_eng"});
+    require_ok(org_summary.value().external_guest_account_ids.size() == 2U);
+    require_ok(org_summary.value().external_guest_account_ids[0] ==
+               AccountId::create(9001U).value());
+    require_ok(org_summary.value().external_guest_account_ids[1] ==
+               AccountId::create(9002U).value());
+
+    // Org party with uint64 org_id preserved as canonical decimal string + explicit
+    // nulls ignored cleanly.
+    set_party_json(base_prefix + ",\"org_id\":424242,\"group_id\":null,"
+                                 "\"external_guest_account_ids\":null}");
+    const auto org_u64 = client.get_party(created.value().party_id);
+    require_ok(org_u64.has_value());
+    require_ok(org_u64.value().org_id == std::optional<std::string>{"424242"});
+    require_ok(!org_u64.value().group_id.has_value());
+    require_ok(org_u64.value().external_guest_account_ids.empty());
+
+    // Malformed org / external_guest_account_ids MUST fail closed!
+    for (const std::string_view bad_suffix : std::array<std::string_view, 11>{
+             ",\"external_guest_account_ids\":\"9001\"}",
+             ",\"external_guest_account_ids\":9001}",
+             ",\"external_guest_account_ids\":[\"not_a_number\"]}",
+             ",\"external_guest_account_ids\":[\"0\"]}",
+             ",\"external_guest_account_ids\":[\"-5\"]}",
+             ",\"external_guest_account_ids\":[0]}",
+             ",\"external_guest_account_ids\":[9007199254740992]}",
+             ",\"external_guest_account_ids\":[true]}",
+             ",\"org_id\":\"\"}",
+             ",\"org_id\":0}",
+             ",\"group_id\":123}",
+         }) {
+      set_party_json(base_prefix + std::string{bad_suffix});
+      const auto bad = client.get_party(created.value().party_id);
+      require_ok(!bad.has_value());
+      require_ok(mp_client_error_of(bad.error()) ==
+                 MpClientError::http_response_schema);
+    }
+
+    set_party_json(std::nullopt);
+  }
 
   const auto inv = client.create_party_invite(
       CreatePartyInviteRequest{created.value().party_id, std::nullopt, 2U, 3600U});

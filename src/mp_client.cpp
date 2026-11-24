@@ -4925,6 +4925,143 @@ MpControlClient::create_party(const CreatePartyRequest &request) {
       CreatePartyResponse{pid.value(), epoch.value(), relay.value()});
 }
 
+namespace {
+
+Result<std::optional<std::string>> get_optional_id_string_or_u64(const Value &obj,
+                                                                 std::string_view key) {
+  const Value *field = obj.find(key);
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::optional<std::string>>::success(std::nullopt);
+  }
+  if (const auto *s = std::get_if<std::string>(&field->value())) {
+    if (s->empty()) {
+      return fail_c<std::optional<std::string>>(ErrorCode::corrupt,
+                                                MpClientError::http_response_schema);
+    }
+    return Result<std::optional<std::string>>::success(*s);
+  }
+  if (std::holds_alternative<Number>(field->value())) {
+    const auto u = value_as_u64(*field);
+    if (!u.has_value() || u.value() == 0U) {
+      return fail_c<std::optional<std::string>>(ErrorCode::corrupt,
+                                                MpClientError::http_response_schema);
+    }
+    return Result<std::optional<std::string>>::success(std::to_string(u.value()));
+  }
+  return fail_c<std::optional<std::string>>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+}
+
+Result<std::vector<AccountId>>
+parse_optional_external_guest_account_ids(const Value &obj) {
+  std::vector<AccountId> out;
+  const Value *field = obj.find("external_guest_account_ids");
+  if (field == nullptr || std::holds_alternative<std::nullptr_t>(field->value())) {
+    return Result<std::vector<AccountId>>::success(std::move(out));
+  }
+  const auto *arr = std::get_if<Value::Array>(&field->value());
+  if (arr == nullptr || arr->size() > 1024U) {
+    return fail_c<std::vector<AccountId>>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+  }
+  out.reserve(arr->size());
+  for (const auto &entry : *arr) {
+    std::optional<AccountId> parsed_id;
+    if (const auto *s = std::get_if<std::string>(&entry.value())) {
+      const auto id = AccountId::parse_decimal(*s);
+      if (!id.has_value()) {
+        return fail_c<std::vector<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+      }
+      parsed_id = id.value();
+    } else if (std::holds_alternative<Number>(entry.value())) {
+      const auto u = value_as_u64(entry);
+      if (!u.has_value()) {
+        return fail_c<std::vector<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+      }
+      const auto id = AccountId::create(u.value());
+      if (!id.has_value()) {
+        return fail_c<std::vector<AccountId>>(ErrorCode::corrupt,
+                                              MpClientError::http_response_schema);
+      }
+      parsed_id = id.value();
+    } else {
+      return fail_c<std::vector<AccountId>>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+    }
+    if (parsed_id.has_value() &&
+        std::find(out.begin(), out.end(), *parsed_id) == out.end()) {
+      out.push_back(*parsed_id);
+    }
+  }
+  return Result<std::vector<AccountId>>::success(std::move(out));
+}
+
+Result<PartySummary> parse_party_summary(const Value &obj) {
+  const auto pid_raw = get_required_u64(obj, "party_id");
+  const auto epoch = get_required_u64(obj, "party_epoch");
+  const auto leader_acct_raw = get_required_u64(obj, "leader_account_id");
+  const auto leader_dev_raw = get_required_u64(obj, "leader_device_id");
+  const auto vis_raw = get_required_u64(obj, "visibility");
+  const auto jm_raw = get_required_u64(obj, "join_mode");
+  const auto rp_raw = get_required_u64(obj, "relay_policy");
+  const auto pinned_relay = get_required_string(obj, "pinned_relay_url");
+  const auto max_mem = get_required_u64(obj, "max_members");
+  const auto mem_cnt = get_required_u64(obj, "member_count");
+  if (!pid_raw.has_value() || !epoch.has_value() || !leader_acct_raw.has_value() ||
+      !leader_dev_raw.has_value() || !vis_raw.has_value() || !jm_raw.has_value() ||
+      !rp_raw.has_value() || !pinned_relay.has_value() || !max_mem.has_value() ||
+      !mem_cnt.has_value()) {
+    return fail_c<PartySummary>(ErrorCode::corrupt,
+                                MpClientError::http_response_schema);
+  }
+  const auto pid = PartyId::create(pid_raw.value());
+  const auto leader_acct = AccountId::create(leader_acct_raw.value());
+  const auto leader_dev = DeviceId::create(leader_dev_raw.value());
+  if (!pid.has_value() || !leader_acct.has_value() || !leader_dev.has_value() ||
+      vis_raw.value() > 1U || jm_raw.value() > 1U || rp_raw.value() > 2U ||
+      max_mem.value() > 255U || mem_cnt.value() > 255U) {
+    return fail_c<PartySummary>(ErrorCode::corrupt,
+                                MpClientError::http_response_schema);
+  }
+
+  const auto org_id = get_optional_id_string_or_u64(obj, "org_id");
+  if (!org_id.has_value()) {
+    return Result<PartySummary>::failure(org_id.error());
+  }
+  const auto group_id = get_optional_string(obj, "group_id");
+  if (!group_id.has_value()) {
+    return Result<PartySummary>::failure(group_id.error());
+  }
+  if (group_id.value().has_value() && group_id.value()->empty()) {
+    return fail_c<PartySummary>(ErrorCode::corrupt,
+                                MpClientError::http_response_schema);
+  }
+  auto external_guests = parse_optional_external_guest_account_ids(obj);
+  if (!external_guests.has_value()) {
+    return Result<PartySummary>::failure(external_guests.error());
+  }
+
+  return Result<PartySummary>::success(PartySummary{
+      pid.value(),
+      epoch.value(),
+      leader_acct.value(),
+      leader_dev.value(),
+      static_cast<PartyVisibility>(vis_raw.value()),
+      static_cast<PartyJoinMode>(jm_raw.value()),
+      static_cast<RelayPolicy>(rp_raw.value()),
+      pinned_relay.value(),
+      static_cast<std::uint8_t>(max_mem.value()),
+      static_cast<std::uint8_t>(mem_cnt.value()),
+      org_id.value(),
+      group_id.value(),
+      std::move(external_guests).value(),
+  });
+}
+
+} // namespace
+
 Result<PartySummary> MpControlClient::get_party(PartyId party_id) {
   auto auth = require_device_auth(identity_);
   if (!auth.has_value()) {
@@ -4952,44 +5089,7 @@ Result<PartySummary> MpControlClient::get_party(PartyId party_id) {
   if (!obj.has_value()) {
     return Result<PartySummary>::failure(obj.error());
   }
-  const auto pid_raw = get_required_u64(obj.value(), "party_id");
-  const auto epoch = get_required_u64(obj.value(), "party_epoch");
-  const auto leader_acct_raw = get_required_u64(obj.value(), "leader_account_id");
-  const auto leader_dev_raw = get_required_u64(obj.value(), "leader_device_id");
-  const auto vis_raw = get_required_u64(obj.value(), "visibility");
-  const auto jm_raw = get_required_u64(obj.value(), "join_mode");
-  const auto rp_raw = get_required_u64(obj.value(), "relay_policy");
-  const auto pinned_relay = get_required_string(obj.value(), "pinned_relay_url");
-  const auto max_mem = get_required_u64(obj.value(), "max_members");
-  const auto mem_cnt = get_required_u64(obj.value(), "member_count");
-  if (!pid_raw.has_value() || !epoch.has_value() || !leader_acct_raw.has_value() ||
-      !leader_dev_raw.has_value() || !vis_raw.has_value() || !jm_raw.has_value() ||
-      !rp_raw.has_value() || !pinned_relay.has_value() || !max_mem.has_value() ||
-      !mem_cnt.has_value()) {
-    return fail_c<PartySummary>(ErrorCode::corrupt,
-                                MpClientError::http_response_schema);
-  }
-  const auto pid = PartyId::create(pid_raw.value());
-  const auto leader_acct = AccountId::create(leader_acct_raw.value());
-  const auto leader_dev = DeviceId::create(leader_dev_raw.value());
-  if (!pid.has_value() || !leader_acct.has_value() || !leader_dev.has_value() ||
-      vis_raw.value() > 1U || jm_raw.value() > 1U || rp_raw.value() > 2U ||
-      max_mem.value() > 255U || mem_cnt.value() > 255U) {
-    return fail_c<PartySummary>(ErrorCode::corrupt,
-                                MpClientError::http_response_schema);
-  }
-  return Result<PartySummary>::success(PartySummary{
-      pid.value(),
-      epoch.value(),
-      leader_acct.value(),
-      leader_dev.value(),
-      static_cast<PartyVisibility>(vis_raw.value()),
-      static_cast<PartyJoinMode>(jm_raw.value()),
-      static_cast<RelayPolicy>(rp_raw.value()),
-      pinned_relay.value(),
-      static_cast<std::uint8_t>(max_mem.value()),
-      static_cast<std::uint8_t>(mem_cnt.value()),
-  });
+  return parse_party_summary(obj.value());
 }
 
 Result<CreatePartyInviteResponse>

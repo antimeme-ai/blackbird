@@ -530,14 +530,160 @@ void test_all_four_cards_and_tab_cycling() {
           "lease conflict count");
   require(mp_txt.find("src/terminal.cpp") != std::string::npos, "lease conflict label");
 
-  // Tab cycling wraps forward and backward.
+  // Tab cycling wraps forward and backward across all 7 tabs.
+  require(right_rail_tab_name(RightRailTab::superpowers) == "superpowers",
+          "superpowers tab name");
   pane.pin_tab(RightRailTab::auto_context);
   pane.cycle_tab(1);
   require(pane.pinned_tab() == RightRailTab::escalations, "cycle +1 -> escalations");
   pane.cycle_tab(-2);
-  require(pane.pinned_tab() == RightRailTab::multiplayer, "cycle -2 wraps to mp");
+  require(pane.pinned_tab() == RightRailTab::superpowers,
+          "cycle -2 wraps to superpowers");
+  pane.cycle_tab(-1);
+  require(pane.pinned_tab() == RightRailTab::multiplayer, "cycle -1 -> multiplayer");
+  pane.cycle_tab(1);
+  require(pane.pinned_tab() == RightRailTab::superpowers, "cycle +1 -> superpowers");
   pane.cycle_tab(1);
   require(pane.pinned_tab() == RightRailTab::auto_context, "cycle +1 wraps to auto");
+}
+
+void test_superpowers_and_cpu_arc_telemetry() {
+  RightRailSnapshot empty_snap{};
+  require(!empty_snap.superpowers.is_populated(),
+          "default superpowers is not populated");
+  RightRailPane empty_pane(empty_snap);
+  empty_pane.pin_tab(RightRailTab::superpowers);
+  const auto empty_frame = empty_pane.render(44, 16);
+  verify_frame_bounds(empty_frame, 44, 16);
+  require(empty_frame.header.find("ARC/TOOLS") != std::string::npos,
+          "superpowers header shows ARC/TOOLS");
+  const std::string empty_txt = empty_frame.text();
+  require(empty_txt.find("CPU-ARC: unavailable") != std::string::npos,
+          "unavailable CPU-ARC message");
+  require(empty_txt.find("(no superpowers reported)") != std::string::npos,
+          "empty superpowers message");
+
+  // Default auto_context must NOT emit CPU-ARC compact summary when idle.
+  empty_pane.pin_tab(RightRailTab::auto_context);
+  const auto idle_auto = empty_pane.render(44, 24);
+  verify_frame_bounds(idle_auto, 44, 24);
+  require(idle_auto.text().find("CPU-ARC ") == std::string::npos,
+          "idle CPU-ARC omitted from auto_context");
+
+  // Populated superpowers & CPU-ARC telemetry.
+  RightRailSnapshot snap{};
+  snap.tokenomics.provider = "anthropic";
+  snap.tokenomics.model = "claude-opus-4";
+  snap.tokenomics.tok_per_sec = 88.5;
+  snap.tokenomics.cache_hit_ratio = 0.70;
+  snap.tokenomics.context_fill_ratio = 0.35;
+  snap.tasks.push_back(RightRailTaskItem{
+      .id = "t-arc",
+      .source = RightRailTaskSource::builtin,
+      .status = RightRailTaskStatus::active,
+      .title = "Verify CPU-ARC panel",
+      .owner = "pat",
+  });
+  snap.superpowers.cpu_arc = RightRailCpuArcTelemetry{
+      .available = true,
+      .function_count = 16,
+      .compiled_count = 12,
+      .total_invocations = 4200,
+      .cache_hits = 3276,
+      .fallbacks = 924,
+      .hit_rate = 0.78,
+      .estimated_saved_usd = 14.25,
+      .savings_multiplier = 42.0,
+      .queued_distill_candidates = 3,
+  };
+  snap.superpowers.capabilities = {
+      {.name = "SQLite 3.54.1 FTS5", .ready = true, .detail = "indexed"},
+      {.name = "Lua 5.5.1 CPU-ARC", .ready = true, .detail = "12 compiled"},
+      {.name = "LSP (clangd)", .ready = true, .detail = "active"},
+      {.name = "Neovim TS", .ready = false, .detail = "idle"},
+      {.name = "Jupyter v4", .ready = false, .detail = "no kernel"},
+      {.name = "Measure (seatbelt)", .ready = true, .detail = "sandbox ok"},
+  };
+  require(snap.superpowers.is_populated(), "populated superpowers detected");
+
+  RightRailPane pane(snap);
+  pane.pin_tab(RightRailTab::superpowers);
+  const auto sp_frame = pane.render(46, 22);
+  verify_frame_bounds(sp_frame, 46, 22);
+  require(sp_frame.active_tab == RightRailTab::superpowers, "superpowers tab active");
+  require(sp_frame.header.find("ARC/TOOLS") != std::string::npos, "ARC/TOOLS header");
+  const std::string sp_txt = sp_frame.text();
+  require(sp_txt.find("78%") != std::string::npos, "CPU-ARC hit-rate percentage");
+  require(sp_txt.find("[██████░░] 78%") != std::string::npos, "CPU-ARC hit-rate bar");
+  require(sp_txt.find("12/16 compiled") != std::string::npos, "compiled/total fns");
+  require(sp_txt.find("4.2k calls") != std::string::npos, "invocation count");
+  require(sp_txt.find("Saved $14.25 (42.0x)") != std::string::npos,
+          "USD saved and multiplier");
+  require(sp_txt.find("Distill queue: 3 candidates") != std::string::npos,
+          "queued distill candidates");
+  require(sp_txt.find("SUPERPOWERS (4/6)") != std::string::npos,
+          "ready/total capability count");
+  require(sp_txt.find("● SQLite 3.54.1 FTS5") != std::string::npos, "ready capability");
+  require(sp_txt.find("○ Neovim TS") != std::string::npos, "non-ready capability");
+  require(sp_txt.find("● Measure (seatbelt)") != std::string::npos,
+          "seatbelt capability");
+
+  // Compact 2-line CPU-ARC summary in auto_context, preserving Priority Escalation
+  // precedence!
+  snap.escalations.push_back(RightRailEscalation{
+      .kind = RightRailEscalationKind::brakes_escalation,
+      .id = "brk-arc-1",
+      .title = "Confirm outbound push",
+      .source_label = "brakes:guarded",
+      .detail_lines = {"cmd: git push"},
+      .actions = {"[a] Allow once", "[d] Deny"},
+      .policy_locked = false,
+  });
+  pane.update(snap);
+  pane.pin_tab(RightRailTab::auto_context);
+  const auto auto_frame = pane.render(46, 36);
+  verify_frame_bounds(auto_frame, 46, 36);
+  require(auto_frame.has_priority_escalation, "priority escalation active");
+  const std::string auto_txt = auto_frame.text();
+  const auto pos_esc = auto_txt.find("BRAKES");
+  const auto pos_tok = auto_txt.find("TOKENOMICS");
+  const auto pos_arc = auto_txt.find("CPU-ARC [██████░░] 78%");
+  const auto pos_arc2 = auto_txt.find("12/16 fns · saved $14.25 (42.0x)");
+  const auto pos_tsk = auto_txt.find("TASKS");
+  require(pos_esc != std::string::npos, "escalation rendered");
+  require(pos_tok != std::string::npos, "tokenomics rendered");
+  require(pos_arc != std::string::npos, "compact CPU-ARC line 1 rendered");
+  require(pos_arc2 != std::string::npos, "compact CPU-ARC line 2 rendered");
+  require(pos_tsk != std::string::npos, "tasks rendered");
+  require(pos_esc < pos_tok && pos_tok < pos_arc && pos_arc < pos_arc2 &&
+              pos_arc2 < pos_tsk,
+          "priority escalation stays strictly above tokenomics, compact CPU-ARC, and "
+          "tasks");
+
+  // Non-finite / NaN / negative double safety in CPU-ARC rendering.
+  RightRailSnapshot nan_snap{};
+  nan_snap.superpowers.cpu_arc = RightRailCpuArcTelemetry{
+      .available = true,
+      .function_count = 4,
+      .compiled_count = 2,
+      .total_invocations = 10,
+      .cache_hits = 5,
+      .fallbacks = 5,
+      .hit_rate = std::numeric_limits<double>::quiet_NaN(),
+      .estimated_saved_usd = std::numeric_limits<double>::infinity(),
+      .savings_multiplier = -std::numeric_limits<double>::infinity(),
+      .queued_distill_candidates = 1,
+  };
+  RightRailPane nan_pane(nan_snap);
+  nan_pane.pin_tab(RightRailTab::superpowers);
+  const auto nan_frame = nan_pane.render(44, 18);
+  verify_frame_bounds(nan_frame, 44, 18);
+  const std::string nan_txt = nan_frame.text();
+  require(nan_txt.find("--%") != std::string::npos, "NaN hit_rate shows --%");
+  require(nan_txt.find("Saved $-- (--x)") != std::string::npos,
+          "non-finite USD and multiplier show safe placeholders");
+  require(nan_txt.find("Distill queue: 1 candidate") != std::string::npos,
+          "singular candidate grammar");
 }
 
 void test_discover_repo_anchors_passive_and_symlink_safe() {
@@ -693,11 +839,32 @@ void test_hostile_sanitization_and_sweep_bounds() {
       .lease_conflicts = 2,
       .lease_conflict_labels = {hostile},
   };
+  snap.superpowers = RightRailSuperpowers{
+      .cpu_arc =
+          RightRailCpuArcTelemetry{
+              .available = true,
+              .function_count = 9,
+              .compiled_count = 7,
+              .total_invocations = 120,
+              .cache_hits = 90,
+              .fallbacks = 30,
+              .hit_rate = std::numeric_limits<double>::quiet_NaN(),
+              .estimated_saved_usd = 1e300,
+              .savings_multiplier = 1e20,
+              .queued_distill_candidates = 4,
+          },
+      .capabilities =
+          {
+              {.name = hostile, .ready = true, .detail = hostile},
+              {.name = "", .ready = false, .detail = hostile},
+          },
+  };
 
   RightRailPane pane(snap);
   static constexpr RightRailTab kAllTabs[] = {
       RightRailTab::auto_context, RightRailTab::escalations, RightRailTab::tokenomics,
       RightRailTab::tasks,        RightRailTab::anchors,     RightRailTab::multiplayer,
+      RightRailTab::superpowers,
   };
 
   for (const RightRailTab tab : kAllTabs) {
@@ -743,6 +910,7 @@ int main() {
   test_layout_auto_dock_and_overlay();
   test_priority_takeover_and_policy_locked();
   test_all_four_cards_and_tab_cycling();
+  test_superpowers_and_cpu_arc_telemetry();
   test_discover_repo_anchors_passive_and_symlink_safe();
   test_hostile_sanitization_and_sweep_bounds();
   std::cout << "right_rail_test: all checks passed\n";

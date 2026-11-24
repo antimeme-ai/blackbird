@@ -18,7 +18,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::size_t kTabCount = 6;
+constexpr std::size_t kTabCount = 7;
 constexpr std::size_t kMaxDocsDirEntries = 512;
 constexpr std::size_t kSanitizeLimit = 512;
 
@@ -225,6 +225,35 @@ std::string format_tok_per_sec(double rate) {
   } else {
     std::snprintf(buf, sizeof(buf), "%.1f", rate);
   }
+  return std::string{buf};
+}
+
+std::string format_usd_saved(double usd) {
+  if (!std::isfinite(usd) || usd < 0.0)
+    return "$--";
+  char buf[32]{};
+  if (usd >= 1'000'000'000'000.0) {
+    return "$>1T";
+  }
+  if (usd >= 1'000'000'000.0) {
+    std::snprintf(buf, sizeof(buf), "$%.1fB", usd / 1'000'000'000.0);
+    return std::string{buf};
+  }
+  if (usd >= 1'000'000.0) {
+    std::snprintf(buf, sizeof(buf), "$%.1fM", usd / 1'000'000.0);
+    return std::string{buf};
+  }
+  std::snprintf(buf, sizeof(buf), "$%.2f", usd);
+  return std::string{buf};
+}
+
+std::string format_multiplier(double mult) {
+  if (!std::isfinite(mult) || mult < 0.0)
+    return "--x";
+  if (mult >= 1'000'000.0)
+    return ">999kx";
+  char buf[32]{};
+  std::snprintf(buf, sizeof(buf), "%.1fx", mult);
   return std::string{buf};
 }
 
@@ -746,6 +775,76 @@ void append_multiplayer_card(std::vector<std::string> &body,
   }
 }
 
+void append_cpu_arc_compact_summary(std::vector<std::string> &body,
+                                    const RightRailCpuArcTelemetry &arc,
+                                    std::size_t width) {
+  const std::size_t bar_cells = width >= 26 ? 8U : 6U;
+  body.push_back(clip_to_cells(
+      "CPU-ARC " + format_right_rail_bar(arc.hit_rate, bar_cells), width));
+  const std::string detail = "  " + std::to_string(arc.compiled_count) + "/" +
+                             std::to_string(arc.function_count) + " fns · saved " +
+                             format_usd_saved(arc.estimated_saved_usd) + " (" +
+                             format_multiplier(arc.savings_multiplier) + ")";
+  body.push_back(clip_to_cells(detail, width));
+}
+
+void append_superpowers_card(std::vector<std::string> &body,
+                             const RightRailSuperpowers &sp, std::size_t width) {
+  body.push_back(section_rule("CPU-ARC", width));
+  const auto &arc = sp.cpu_arc;
+  const bool has_arc_data = arc.available || arc.function_count > 0 ||
+                            arc.compiled_count > 0 || arc.total_invocations > 0 ||
+                            arc.cache_hits > 0 || arc.fallbacks > 0 ||
+                            arc.queued_distill_candidates > 0;
+  if (!has_arc_data) {
+    body.push_back(clip_to_cells("CPU-ARC: unavailable", width));
+  } else {
+    const std::size_t bar_cells = width >= 26 ? 8U : 6U;
+    body.push_back(
+        clip_to_cells("Hit: " + format_right_rail_bar(arc.hit_rate, bar_cells), width));
+    const std::string fns_line = "Fns: " + std::to_string(arc.compiled_count) + "/" +
+                                 std::to_string(arc.function_count) + " compiled · " +
+                                 format_compact_count(arc.total_invocations) + " calls";
+    body.push_back(clip_to_cells(fns_line, width));
+    const std::string hits_line = "Hits " + format_compact_count(arc.cache_hits) +
+                                  " · Fallbacks " + format_compact_count(arc.fallbacks);
+    body.push_back(clip_to_cells(hits_line, width));
+    const std::string saved_line = "Saved " +
+                                   format_usd_saved(arc.estimated_saved_usd) + " (" +
+                                   format_multiplier(arc.savings_multiplier) + ")";
+    body.push_back(clip_to_cells(saved_line, width));
+    const std::string queue_line =
+        "Distill queue: " + std::to_string(arc.queued_distill_candidates) +
+        (arc.queued_distill_candidates == 1 ? " candidate" : " candidates");
+    body.push_back(clip_to_cells(queue_line, width));
+  }
+
+  std::size_t ready_n = 0;
+  for (const auto &cap : sp.capabilities) {
+    if (cap.ready)
+      ++ready_n;
+  }
+  const std::string cap_title = sp.capabilities.empty()
+                                    ? std::string{"SUPERPOWERS"}
+                                    : ("SUPERPOWERS (" + std::to_string(ready_n) + "/" +
+                                       std::to_string(sp.capabilities.size()) + ")");
+  body.push_back(section_rule(cap_title, width));
+  if (sp.capabilities.empty()) {
+    body.push_back(clip_to_cells("  (no superpowers reported)", width));
+    return;
+  }
+  for (const auto &cap : sp.capabilities) {
+    const std::string glyph = cap.ready ? "●" : "○";
+    const std::string name = sanitize_field(cap.name);
+    const std::string detail = sanitize_field(cap.detail);
+    std::string row = glyph + " " + (name.empty() ? "(capability)" : name);
+    if (!detail.empty()) {
+      row += " · " + detail;
+    }
+    body.push_back(clip_to_cells(row, width));
+  }
+}
+
 struct ChromeContext {
   RightRailTab active_tab = RightRailTab::auto_context;
   std::size_t esc_count = 0;
@@ -764,6 +863,7 @@ std::string build_tab_strip(ChromeContext ctx) {
       {RightRailTab::tasks, "Tsk"},
       {RightRailTab::anchors, "Doc"},
       {RightRailTab::multiplayer, "MP"},
+      {RightRailTab::superpowers, "Arc"},
   }};
 
   std::string strip;
@@ -804,8 +904,12 @@ std::string build_header(ChromeContext ctx) {
     out += "ANCHORS";
     if (ctx.esc_count > 0)
       out += " [!" + std::to_string(ctx.esc_count) + "]";
-  } else {
+  } else if (ctx.active_tab == RightRailTab::multiplayer) {
     out += "PARTY/SWARM";
+    if (ctx.esc_count > 0)
+      out += " [!" + std::to_string(ctx.esc_count) + "]";
+  } else {
+    out += "ARC/TOOLS";
     if (ctx.esc_count > 0)
       out += " [!" + std::to_string(ctx.esc_count) + "]";
   }
@@ -832,6 +936,8 @@ std::string_view right_rail_tab_name(RightRailTab tab) noexcept {
     return "anchors";
   case RightRailTab::multiplayer:
     return "multiplayer";
+  case RightRailTab::superpowers:
+    return "superpowers";
   }
   return "auto_context";
 }
@@ -1259,6 +1365,13 @@ bool RightRailMultiplayer::is_active() const noexcept {
          !lease_conflict_labels.empty();
 }
 
+bool RightRailSuperpowers::is_populated() const noexcept {
+  return cpu_arc.available || cpu_arc.function_count > 0 ||
+         cpu_arc.compiled_count > 0 || cpu_arc.total_invocations > 0 ||
+         cpu_arc.cache_hits > 0 || cpu_arc.fallbacks > 0 ||
+         cpu_arc.queued_distill_candidates > 0 || !capabilities.empty();
+}
+
 std::string RightRailRenderFrame::text() const {
   std::string out;
   for (const auto &line : lines) {
@@ -1363,6 +1476,10 @@ RightRailRenderFrame RightRailPane::render(RightRailWidth width_arg,
       append_escalation_cards(body, snapshot_.escalations, width);
     }
     append_tokenomics_card(body, snapshot_.tokenomics, width);
+    if (snapshot_.superpowers.cpu_arc.total_invocations > 0 ||
+        snapshot_.superpowers.cpu_arc.function_count > 0) {
+      append_cpu_arc_compact_summary(body, snapshot_.superpowers.cpu_arc, width);
+    }
     append_tasks_card(body, snapshot_.tasks, width);
     if (snapshot_.multiplayer.is_active()) {
       append_multiplayer_card(body, snapshot_.multiplayer, width);
@@ -1385,6 +1502,9 @@ RightRailRenderFrame RightRailPane::render(RightRailWidth width_arg,
     break;
   case RightRailTab::multiplayer:
     append_multiplayer_card(body, snapshot_.multiplayer, width);
+    break;
+  case RightRailTab::superpowers:
+    append_superpowers_card(body, snapshot_.superpowers, width);
     break;
   }
 

@@ -23,6 +23,7 @@ enum class RightRailTab : std::uint8_t {
   tasks,
   anchors,
   multiplayer,
+  superpowers,
 };
 
 enum class RightRailMode : std::uint8_t {
@@ -232,12 +233,44 @@ struct RightRailMultiplayer {
   bool operator==(const RightRailMultiplayer &) const = default;
 };
 
+struct RightRailCpuArcTelemetry {
+  bool available = false;
+  std::size_t function_count = 0;
+  std::size_t compiled_count = 0;
+  std::uint64_t total_invocations = 0;
+  std::uint64_t cache_hits = 0;
+  std::uint64_t fallbacks = 0;
+  double hit_rate = 0.0;
+  double estimated_saved_usd = 0.0;
+  double savings_multiplier = 0.0;
+  std::size_t queued_distill_candidates = 0;
+
+  bool operator==(const RightRailCpuArcTelemetry &) const = default;
+};
+
+struct RightRailSuperpowerStatus {
+  std::string name;
+  bool ready = false;
+  std::string detail;
+
+  bool operator==(const RightRailSuperpowerStatus &) const = default;
+};
+
+struct RightRailSuperpowers {
+  RightRailCpuArcTelemetry cpu_arc;
+  std::vector<RightRailSuperpowerStatus> capabilities;
+
+  bool is_populated() const noexcept;
+  bool operator==(const RightRailSuperpowers &) const = default;
+};
+
 struct RightRailSnapshot {
   std::vector<RightRailEscalation> escalations;
   RightRailTokenomics tokenomics;
   std::vector<RightRailTaskItem> tasks;
   std::vector<RightRailAnchor> anchors;
   RightRailMultiplayer multiplayer;
+  RightRailSuperpowers superpowers;
 
   const std::vector<RightRailEscalation> &active_escalations() const noexcept {
     return escalations;
