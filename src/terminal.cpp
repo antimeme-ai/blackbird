@@ -19,6 +19,7 @@
 #include "blackbird/sqlite_workbench.hpp"
 #include "blackbird/task_view.hpp"
 #include "blackbird/terminal_custody.hpp"
+#include "blackbird/terminal_notify.hpp"
 #include "blackbird/tools.hpp"
 #include "blackbird/workflows.hpp"
 #include <algorithm>
@@ -663,10 +664,9 @@ std::string terminal_key_help() {
          "  PTY input    Keys and Ctrl-C reach selected command; Ctrl-B returns\n"
          "  Ctrl-Q       Stop and exit; preserve unsent draft\n"
          "  PgUp / PgDn  Scroll transcript\n"
-         "  Mouse / Copy Trackpad/wheel scrolls chat; drag in chat selects & copies\n"
-         "               via OSC 52 (bounded to chat). /mouse off or "
-         "BLACKBIRD_MOUSE=0\n"
-         "               disables reporting; Shift-drag uses terminal selection.\n"
+         "  Mouse / Copy Native terminal drag-select active by default; wheel scrolls\n"
+         "               via alternate scroll. /mouse on or BLACKBIRD_MOUSE=1 opts\n"
+         "               into SGR mouse reporting (Shift/Option-drag selects).\n"
          "  Paste        Multiline text stays literal; Enter sends explicitly\n";
 }
 std::vector<std::string> terminal_builtin_names() {
@@ -1012,6 +1012,316 @@ std::string terminal_party_status_pill(const PartyChatPane &pane, bool docked) {
   if (docked)
     return "Alt+P party";
   return {};
+}
+namespace {
+std::string strip_ansi_sequences(std::string_view raw) {
+  std::string out;
+  out.reserve(raw.size());
+  std::size_t i = 0;
+  auto skip_csi = [&](std::size_t pos) noexcept -> std::size_t {
+    while (pos < raw.size()) {
+      const auto ch = static_cast<unsigned char>(raw[pos++]);
+      if (ch >= 0x40U && ch <= 0x7EU)
+        break;
+    }
+    return pos;
+  };
+  auto skip_string_terminated = [&](std::size_t pos) noexcept -> std::size_t {
+    while (pos < raw.size()) {
+      const auto ch = static_cast<unsigned char>(raw[pos]);
+      if (ch == 0x07U)
+        return pos + 1U;
+      if (ch == 0x9CU)
+        return pos + 1U;
+      if (ch == 0xC2U && pos + 1U < raw.size() &&
+          static_cast<unsigned char>(raw[pos + 1U]) == 0x9CU)
+        return pos + 2U;
+      if (ch == 0x1BU && pos + 1U < raw.size() && raw[pos + 1U] == '\\')
+        return pos + 2U;
+      ++pos;
+    }
+    return pos;
+  };
+  while (i < raw.size()) {
+    const auto b = static_cast<unsigned char>(raw[i]);
+    if (b == 0x1BU) {
+      if (i + 1U >= raw.size()) {
+        ++i;
+        break;
+      }
+      const auto next = static_cast<unsigned char>(raw[i + 1U]);
+      if (next == '[') {
+        i = skip_csi(i + 2U);
+        continue;
+      }
+      if (next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X') {
+        i = skip_string_terminated(i + 2U);
+        continue;
+      }
+      if (next >= 0x20U && next <= 0x7EU) {
+        i += 2U;
+        continue;
+      }
+      ++i;
+      continue;
+    }
+    if (b == 0x9BU) {
+      i = skip_csi(i + 1U);
+      continue;
+    }
+    if (b == 0x9DU || b == 0x90U || b == 0x9FU || b == 0x9EU || b == 0x98U) {
+      i = skip_string_terminated(i + 1U);
+      continue;
+    }
+    if (b == 0xC2U && i + 1U < raw.size()) {
+      const auto next = static_cast<unsigned char>(raw[i + 1U]);
+      if (next == 0x9BU) {
+        i = skip_csi(i + 2U);
+        continue;
+      }
+      if (next == 0x9DU || next == 0x90U || next == 0x9FU || next == 0x9EU ||
+          next == 0x98U) {
+        i = skip_string_terminated(i + 2U);
+        continue;
+      }
+    }
+    out.push_back(raw[i++]);
+  }
+  return out;
+}
+std::string sanitize_strip_text(std::string_view raw, std::size_t max_bytes) {
+  return sanitize_terminal_notify_text(strip_ansi_sequences(raw), max_bytes);
+}
+bool ascii_contains_ci(std::string_view haystack, std::string_view needle) noexcept {
+  if (needle.empty() || needle.size() > haystack.size())
+    return false;
+  auto lower = [](char ch) noexcept {
+    return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+  };
+  for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+    bool match = true;
+    for (std::size_t j = 0; j < needle.size(); ++j) {
+      if (lower(haystack[i + j]) != lower(needle[j])) {
+        match = false;
+        break;
+      }
+    }
+    if (match)
+      return true;
+  }
+  return false;
+}
+std::size_t chat_row_cells(const ChatRow &row) {
+  std::size_t total = 0;
+  for (const auto &seg : row)
+    total += display_width(seg.text);
+  return total;
+}
+} // namespace
+bool terminal_default_mouse_wanted(const char *env_value) noexcept {
+  return env_value != nullptr && std::string_view{env_value} == "1";
+}
+ChatRow terminal_party_strip(const PartyChatPane &pane, std::size_t max_cells) {
+  const auto &snap = pane.snapshot();
+  if (!terminal_party_is_active(snap) || max_cells == 0)
+    return {};
+  struct StripPeer {
+    bool local_self = false;
+    PartyParticipantState state = PartyParticipantState::offline;
+    std::string dot;
+    Ink dot_ink = Ink::muted;
+    std::string handle;
+    std::string client;
+  };
+  auto state_rank = [](PartyParticipantState st) noexcept -> int {
+    switch (st) {
+    case PartyParticipantState::online:
+    case PartyParticipantState::working:
+      return 0;
+    case PartyParticipantState::idle:
+      return 1;
+    case PartyParticipantState::offline:
+      return 2;
+    }
+    return 2;
+  };
+  std::size_t live_count = 0;
+  std::size_t reconnecting_count = 0;
+  std::size_t away_count = 0;
+  std::vector<StripPeer> peers;
+  peers.reserve(snap.participants.size());
+  for (const auto &p : snap.participants) {
+    StripPeer sp{};
+    sp.local_self = p.local_self;
+    sp.state = p.state;
+    switch (p.state) {
+    case PartyParticipantState::online:
+    case PartyParticipantState::working:
+      sp.dot = "●";
+      sp.dot_ink = Ink::success;
+      ++live_count;
+      break;
+    case PartyParticipantState::idle:
+      sp.dot = "◐";
+      sp.dot_ink = Ink::selected;
+      ++reconnecting_count;
+      break;
+    case PartyParticipantState::offline:
+      sp.dot = "○";
+      sp.dot_ink = Ink::muted;
+      ++away_count;
+      break;
+    }
+    if (p.local_self) {
+      sp.handle = "you";
+      if (p.provider && !p.provider->empty())
+        sp.client = sanitize_strip_text(*p.provider, 20U);
+      else if (ascii_contains_ci(p.model, "outpost") ||
+               ascii_contains_ci(p.host, "outpost"))
+        sp.client = "Outpost";
+      else
+        sp.client = "Blackbird";
+    } else {
+      const std::string_view raw_name = !p.display_name.empty() ? p.display_name : p.id;
+      std::string clean_name = sanitize_strip_text(raw_name, 24U);
+      if (clean_name.empty())
+        clean_name = "peer";
+      sp.handle = clean_name.front() == '@' ? clean_name : ("@" + clean_name);
+      if (p.provider && !p.provider->empty())
+        sp.client = sanitize_strip_text(*p.provider, 20U);
+      else if (ascii_contains_ci(p.model, "outpost") ||
+               ascii_contains_ci(p.host, "outpost"))
+        sp.client = "Outpost";
+      else if (ascii_contains_ci(p.model, "blackbird") ||
+               ascii_contains_ci(p.host, "blackbird"))
+        sp.client = "Blackbird";
+      else if (p.role == PartyMemberRole::bridge_peer)
+        sp.client = "Outpost";
+      else if (p.role == PartyMemberRole::platoon_leader)
+        sp.client = "Leader";
+      else if (p.remote_model && !p.remote_model->empty())
+        sp.client = sanitize_strip_text(*p.remote_model, 20U);
+    }
+    peers.push_back(std::move(sp));
+  }
+  std::stable_sort(peers.begin(), peers.end(),
+                   [&](const StripPeer &a, const StripPeer &b) noexcept {
+                     if (a.local_self != b.local_self)
+                       return a.local_self;
+                     return state_rank(a.state) < state_rank(b.state);
+                   });
+  std::string lead_dot = "○";
+  Ink lead_ink = Ink::muted;
+  std::string primary_status;
+  if (live_count > 0) {
+    lead_dot = "●";
+    lead_ink = Ink::success;
+    primary_status = std::to_string(live_count) + " live";
+  } else if (reconnecting_count > 0) {
+    lead_dot = "◐";
+    lead_ink = Ink::selected;
+    primary_status = std::to_string(reconnecting_count) + " reconnecting";
+  } else {
+    lead_dot = "○";
+    lead_ink = Ink::muted;
+    primary_status = away_count > 0 ? (std::to_string(away_count) + " away") : "away";
+  }
+  const std::size_t unread = pane.unread_count();
+  const std::string full_hint =
+      unread > 0 ? ("  [Alt+P chat · " + std::to_string(unread) + " unread]")
+                 : "  [Alt+P chat]";
+  const std::string short_hint =
+      unread > 0 ? (" [Alt+P · " + std::to_string(unread) + "]") : " [Alt+P]";
+
+  struct StripTier {
+    std::size_t max_peers = 0;
+    bool include_self = true;
+    bool include_client = true;
+    bool include_secondary_status = true;
+    bool long_hint = true;
+  };
+  auto build = [&](const StripTier &tier) -> ChatRow {
+    ChatRow row;
+    row.push_back({lead_dot, lead_ink});
+    row.push_back({" Party: ", Ink::heading});
+    std::size_t shown = 0;
+    for (const auto &sp : peers) {
+      if (!tier.include_self && sp.local_self)
+        continue;
+      if (shown >= tier.max_peers)
+        break;
+      if (shown > 0)
+        row.push_back({" · ", Ink::border});
+      if (!(shown == 0 && sp.local_self)) {
+        row.push_back({sp.dot, sp.dot_ink});
+        row.push_back({" ", Ink::normal});
+      }
+      row.push_back({sp.handle, sp.state == PartyParticipantState::offline
+                                    ? Ink::muted
+                                    : Ink::normal});
+      if (tier.include_client && !sp.client.empty())
+        row.push_back({" (" + sp.client + ")", Ink::muted});
+      ++shown;
+    }
+    if (shown > 0)
+      row.push_back({" · ", Ink::border});
+    row.push_back({primary_status, lead_ink});
+    if (tier.include_secondary_status && live_count > 0) {
+      if (reconnecting_count > 0) {
+        row.push_back({" · ", Ink::border});
+        row.push_back({"◐ " + std::to_string(reconnecting_count) + " reconnecting",
+                       Ink::selected});
+      }
+      if (away_count > 0) {
+        row.push_back({" · ", Ink::border});
+        row.push_back({"○ " + std::to_string(away_count) + " away", Ink::muted});
+      }
+    }
+    row.push_back({tier.long_hint ? full_hint : short_hint,
+                   unread > 0 ? Ink::selected : Ink::muted});
+    return row;
+  };
+  constexpr std::array<StripTier, 7> tiers{{
+      {3U, true, true, true, true},
+      {2U, true, true, true, true},
+      {2U, true, false, true, true},
+      {1U, false, false, true, true},
+      {0U, false, false, true, true},
+      {0U, false, false, false, true},
+      {0U, false, false, false, false},
+  }};
+  for (const auto &tier : tiers) {
+    auto candidate = build(tier);
+    if (!candidate.empty() && chat_row_cells(candidate) <= max_cells)
+      return candidate;
+  }
+  auto minimal = build({0U, false, false, false, false});
+  const auto clipped = terminal_lines(chat_plain(minimal), max_cells)[0];
+  return {{clipped, lead_ink}};
+}
+std::string
+TerminalNotifyLimiter::format_if_allowed(TerminalNotifyTarget target,
+                                         const TerminalNotification &note,
+                                         std::chrono::steady_clock::time_point now) {
+  if (target.protocol == TerminalNotifyProtocol::none)
+    return {};
+  TerminalNotification clean{};
+  clean.title = sanitize_strip_text(note.title, kTerminalDesktopNotifyMaxBytes);
+  clean.body = sanitize_strip_text(note.body, kTerminalDesktopNotifyMaxBytes);
+  if (clean.title.empty() && clean.body.empty())
+    return {};
+  if (last_emitted_.has_value() && now >= *last_emitted_ &&
+      (now - *last_emitted_) < min_interval_) {
+    return {};
+  }
+  clean.id = note.id > 0U ? note.id : next_id_;
+  std::string seq = format_terminal_notification(target, clean);
+  if (seq.empty())
+    return {};
+  last_emitted_ = now;
+  if (note.id == 0U)
+    ++next_id_;
+  return seq;
 }
 std::string terminal_command_hint(std::string_view draft) {
   const auto catalog = command_catalog();
@@ -2483,6 +2793,29 @@ void TerminalUI::party_chat(PartySnapshot snapshot) {
     (void)::write(notification_, &byte, 1);
   }
 }
+void TerminalUI::desktop_notify(TerminalNotifyTitle title, TerminalNotifyBody body) {
+  TerminalNotification clean{};
+  clean.title = sanitize_strip_text(title.value, kTerminalDesktopNotifyMaxBytes);
+  clean.body = sanitize_strip_text(body.value, kTerminalDesktopNotifyMaxBytes);
+  if (clean.title.empty() && clean.body.empty())
+    return;
+  auto payload = std::make_shared<const TerminalNotification>(std::move(clean));
+  const std::lock_guard lock{mutex_};
+  std::size_t queued_notifications = 0;
+  for (const auto &existing : messages_) {
+    if (existing.kind == Kind::desktop_notify)
+      ++queued_notifications;
+  }
+  if (queued_notifications >= 4U)
+    return;
+  Message message{Kind::desktop_notify, "", Ink::muted, {}, {}, {}, {}};
+  message.notification = std::move(payload);
+  messages_.push_back(std::move(message));
+  if (notification_ >= 0) {
+    const char byte = 1;
+    (void)::write(notification_, &byte, 1);
+  }
+}
 void TerminalUI::operation_started(bool provider) {
   post(provider ? Kind::provider_start : Kind::tool_start, {});
 }
@@ -3261,12 +3594,32 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
            at - *context_changed_at < context_blink + std::chrono::milliseconds{250};
   };
   // SGR wheel + button-drag reporting rides frame packets; emitted state commits
-  // on completion. On by default so trackpad scroll and chat-bounded drag-select
-  // with OSC 52 clipboard copy work out of the box (BLACKBIRD_MOUSE=0 disables).
+  // on completion. Off by default so native terminal drag-select works out of
+  // the box; alternate-scroll (\x1b[?1007h) keeps wheel scrolling active
+  // (BLACKBIRD_MOUSE=1 or /mouse on opts into SGR mouse reporting).
   const auto *mouse_setting = std::getenv("BLACKBIRD_MOUSE");
-  bool mouse_wanted = !(mouse_setting && std::string_view{mouse_setting} == "0");
+  bool mouse_wanted = terminal_default_mouse_wanted(mouse_setting);
   bool mouse_emitted = false, pending_mouse = false;
+  bool alt_scroll_emitted = false, pending_alt_scroll = false;
+  struct AltScrollCleanup {
+    ChatPresenter &output;
+    bool &emitted;
+    bool &pending;
+    ~AltScrollCleanup() {
+      if (emitted || pending) {
+        output.detach();
+        (void)::write(STDOUT_FILENO, kTerminalAltScrollOff.data(),
+                      kTerminalAltScrollOff.size());
+        emitted = false;
+        pending = false;
+      }
+    }
+  } alt_scroll_cleanup{output, alt_scroll_emitted, pending_alt_scroll};
   std::string pending_osc52;
+  const TerminalNotifyTarget notify_target =
+      detect_terminal_notify_target(process_env_lookup);
+  TerminalNotifyLimiter notify_limiter;
+  std::string pending_notify;
   constexpr std::string_view mouse_on = "\x1b[?1000h\x1b[?1002h\x1b[?1006h",
                              mouse_off = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
   struct ChatSelectionState {
@@ -3274,7 +3627,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     std::size_t anchor_line = 0, anchor_col = 0;
     std::size_t focus_line = 0, focus_col = 0;
   } chat_selection;
-  std::size_t chat_begin_line = 0, chat_end_line = 0, chat_height = 0, chat_width = 0;
+  std::size_t chat_top_row = 2, chat_begin_line = 0, chat_end_line = 0, chat_height = 0,
+              chat_width = 0;
   auto service_output = [&] {
     try {
       if (!output.flush())
@@ -3287,6 +3641,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     image_loaded = pending_image_loaded;
     image_placement = pending_image_placement;
     mouse_emitted = pending_mouse;
+    alt_scroll_emitted = pending_alt_scroll;
     first_frame.outcome(RawRegionOutcome::flushed);
     first_frame.finish();
     return true;
@@ -3533,12 +3888,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (!persist())
       return false;
     output.detach();
+    if (alt_scroll_emitted || pending_alt_scroll) {
+      (void)::write(STDOUT_FILENO, kTerminalAltScrollOff.data(),
+                    kTerminalAltScrollOff.size());
+      alt_scroll_emitted = pending_alt_scroll = false;
+    }
     mode.suspend();
     const auto edited = edit_terminal_draft(composer.text(), &terminal_context);
     mode.resume();
     image_loaded = false;
     image_placement = {};
     mouse_emitted = pending_mouse = false; // The suspend packet ended reporting.
+    alt_scroll_emitted = pending_alt_scroll = false;
     output.attach(STDOUT_FILENO);
     terminal_native_flush(&terminal_context); // Editor typeahead cannot send a draft.
     if (edited.accepted && edited.text != composer.text())
@@ -3568,12 +3929,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
     if (!persist())
       return false;
     output.detach();
+    if (alt_scroll_emitted || pending_alt_scroll) {
+      (void)::write(STDOUT_FILENO, kTerminalAltScrollOff.data(),
+                    kTerminalAltScrollOff.size());
+      alt_scroll_emitted = pending_alt_scroll = false;
+    }
     mode.suspend();
     const int exit_code = run_interactive_bang_shell(command);
     mode.resume();
     image_loaded = false;
     image_placement = {};
     mouse_emitted = pending_mouse = false; // The suspend packet ended reporting.
+    alt_scroll_emitted = pending_alt_scroll = false;
     output.attach(STDOUT_FILENO);
     terminal_native_flush(&terminal_context);
     viewport_invalidated = true;
@@ -3746,6 +4113,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (message.kind == Kind::party_chat && message.party_snapshot) {
             party_snapshot_external = true;
             party_pane.update(*message.party_snapshot);
+          }
+          if (message.kind == Kind::desktop_notify && message.notification) {
+            const std::string seq = notify_limiter.format_if_allowed(
+                notify_target, *message.notification, std::chrono::steady_clock::now());
+            if (!seq.empty())
+              pending_notify = seq;
           }
           if (message.kind == Kind::provider_start ||
               message.kind == Kind::tool_start) {
@@ -4001,11 +4374,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         // Foreground PTY input reaches the child verbatim, so reporting stays off.
         const bool mouse_target = mouse_wanted && !foreground_pty && !flightdeck_open;
         const bool mouse_change = mouse_target != mouse_emitted;
-        // A recovering frame is never empty, so a mode or clipboard update always
-        // has a packet.
+        const bool alt_scroll_target = !foreground_pty && !flightdeck_open;
+        const bool alt_scroll_change = alt_scroll_target != alt_scroll_emitted;
+        // A recovering frame is never empty, so a mode, clipboard, or notify update
+        // always has a packet.
         const bool recover = viewport_invalidated || committed.tiny ||
                              committed.rows != rows || committed.columns != width ||
-                             mouse_change || !pending_osc52.empty() ||
+                             mouse_change || alt_scroll_change ||
+                             !pending_osc52.empty() || !pending_notify.empty() ||
                              flightdeck_pending_erase || flightdeck_restore_cursor;
         // A later resize wake must survive completion of this packet.
         viewport_invalidated = false;
@@ -4151,6 +4527,14 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             payload += mouse_target ? mouse_on : mouse_off;
             pending_mouse = mouse_target;
           }
+          if (alt_scroll_change) {
+            payload += alt_scroll_target ? kTerminalAltScrollOn : kTerminalAltScrollOff;
+            pending_alt_scroll = alt_scroll_target;
+          }
+          if (!pending_notify.empty()) {
+            payload += pending_notify;
+            pending_notify.clear();
+          }
           if (graphics_enabled && image_placement[2]) {
             payload += blackbird_graphics_erase();
             pending_image_placement = {};
@@ -4205,7 +4589,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           const auto bound =
               raw_capture_ && raw_enabled()
                   ? raw_ui_add(raw_ui_multiply(composer.text().size() + 2, 4),
-                               320 + pending_osc52.size())
+                               320 + kTerminalAltScrollOn.size() +
+                                   pending_osc52.size() + pending_notify.size())
                   : 0;
           RawUiFrame captured{raw_capture_, bound};
           captured.run([&] {
@@ -4222,9 +4607,18 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
               small_frame += mouse_target ? mouse_on : mouse_off;
               pending_mouse = mouse_target;
             }
+            if (alt_scroll_change) {
+              small_frame +=
+                  alt_scroll_target ? kTerminalAltScrollOn : kTerminalAltScrollOff;
+              pending_alt_scroll = alt_scroll_target;
+            }
             if (!pending_osc52.empty()) {
               small_frame += pending_osc52;
               pending_osc52.clear();
+            }
+            if (!pending_notify.empty()) {
+              small_frame += pending_notify;
+              pending_notify.clear();
             }
             if (graphics_enabled && image_placement[2]) {
               small_frame += blackbird_graphics_erase();
@@ -4286,12 +4680,22 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             terminal_powerword_lines("> " + composer.text(), inner_width);
         const auto caret = terminal_caret("> " + composer.text(),
                                           {composer.cursor() + 2}, {inner_width});
+        const bool show_party_strip = terminal_party_is_active(party_pane.snapshot());
+        const std::size_t party_strip_rows = show_party_strip ? 1U : 0U;
+        const std::size_t content_top = 2U + party_strip_rows;
         const auto draft_height = std::min<std::size_t>(
             {6, composed.size(), static_cast<std::size_t>(rows - 7)});
+        const std::size_t chrome_fixed = 5U + party_strip_rows + draft_height;
+        const std::size_t max_palette =
+            static_cast<std::size_t>(rows) > chrome_fixed
+                ? static_cast<std::size_t>(rows) - chrome_fixed
+                : 0U;
         const auto palette =
-            composer.palette_lines(std::min<std::size_t>(8, rows - 5 - draft_height));
+            composer.palette_lines(std::min<std::size_t>(8, max_palette));
         const auto height =
-            static_cast<std::size_t>(rows - 5) - draft_height - palette.size();
+            static_cast<std::size_t>(rows) > chrome_fixed + palette.size()
+                ? static_cast<std::size_t>(rows) - chrome_fixed - palette.size()
+                : 0U;
         const bool show_sprite = !inspecting && !welcoming && mascot_enabled &&
                                  !show_party_docked && !show_right_rail_docked &&
                                  (!tasks_expanded || show_task_pane) &&
@@ -4368,7 +4772,9 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                : context_badge + " ";
         const auto badge_width = std::min(display_width(badge), header_width / 2);
         const auto raw_party_pill =
-            terminal_party_status_pill(party_pane, show_party_docked);
+            show_party_strip
+                ? std::string{}
+                : terminal_party_status_pill(party_pane, show_party_docked);
         const auto party_pill = raw_party_pill.empty() || header_width < 28
                                     ? std::string{}
                                     : "· " + raw_party_pill + " ";
@@ -4406,6 +4812,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                       {shown_badge, lit ? Ink::selected : Ink::muted},
                       {shown_party_pill, party_pill_ink},
                       {rule, Ink::border}});
+        if (show_party_strip && header_width > 1U) {
+          ChatRow strip_row{{" ", Ink::normal}};
+          auto strip = terminal_party_strip(party_pane, header_width - 1U);
+          strip_row.insert(strip_row.end(), std::make_move_iterator(strip.begin()),
+                           std::make_move_iterator(strip.end()));
+          grid.line(2, std::move(strip_row));
+        }
         if (show_sprite) {
           const auto &sprite = blackbird_sprite(busy, phase / 2);
           const auto ink = turn_failed   ? Ink::failure
@@ -4420,7 +4833,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         }
         std::array<std::size_t, 4> placement{};
         if (welcoming) {
-          std::size_t lettering_row = 2, lettering_column = 2;
+          std::size_t lettering_row = content_top, lettering_column = 2;
           if (graphics_enabled) {
             std::size_t lettering_width = 0;
             for (const auto &line : welcome_lines)
@@ -4430,7 +4843,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             if (width >= reserved + 24 &&
                 height >= std::max<std::size_t>(12, lettering_height)) {
               const auto side = std::min(height, (width - reserved) / 2);
-              placement = {2, 2, side * 2, side};
+              placement = {content_top, 2, side * 2, side};
               lettering_column = side * 2 + 6;
               lettering_row += (side - lettering_height) / 2;
             } else if (height > lettering_height + 1) {
@@ -4443,10 +4856,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
             grid.line(row + lettering_row, {{welcome_lines[row], Ink::assistant}},
                       lettering_column);
           if (!graphics_enabled && welcome_lines.size() + 1 < height)
-            grid.line(welcome_lines.size() + 3,
+            grid.line(welcome_lines.size() + content_top + 1U,
                       {{"  Enter continues · / commands · Workflow reloads each turn.",
                         Ink::muted}});
         } else if (!inspecting && (!tasks_expanded || show_task_pane)) {
+          chat_top_row = content_top;
           chat_begin_line = begin;
           chat_end_line = end;
           chat_height = height;
@@ -4464,7 +4878,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           }
           for (std::size_t row = 0; row < height; ++row) {
             if (begin + row < end) {
-              grid.line(row + 2, lines[begin + row]);
+              grid.line(row + content_top, lines[begin + row]);
               const auto line_idx = begin + row;
               if (chat_selection.active && line_idx >= sel_norm.start_line &&
                   line_idx <= sel_norm.end_line && main_width > 4) {
@@ -4476,7 +4890,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                                       : content_max;
                 if (c_lo <= c_hi) {
                   for (std::size_t c = 4 + c_lo; c <= 4 + c_hi && c < grid.width; ++c)
-                    grid.cells[(row + 2) * grid.width + c].ink = Ink::highlight;
+                    grid.cells[(row + content_top) * grid.width + c].ink =
+                        Ink::highlight;
                 }
               }
             }
@@ -4504,7 +4919,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                     main_width + 2);
         } else if (!inspecting && tasks_expanded && !welcoming) {
           for (std::size_t row = 0; row < height && row < task_rows.size(); ++row)
-            grid.line(row + 2, task_rows[row]);
+            grid.line(row + content_top, task_rows[row]);
         } else if (!inspecting && !welcoming && !busy && !tasks_hidden &&
                    !field(task_page, "items").array().empty()) {
           grid.line(1, {{terminal_lines("Tasks: " + task_summary(task_page) +
@@ -4526,7 +4941,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (!route_notice.empty())
             caption = std::string{route_notice} + " · " + caption;
           visit_inspection([&](auto &view) {
-            inspection_layout = unwrap(view.render(grid, {0, 2, main_width, height}));
+            inspection_layout =
+                unwrap(view.render(grid, {0, content_top, main_width, height}));
             if (!context_wb && !hooks_open && !view.notice().empty())
               caption += " · " + std::string{view.notice()};
           });
@@ -4559,7 +4975,7 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                              .front(),
                          Ink::failure}});
         }
-        std::size_t menu_row = height + 2;
+        std::size_t menu_row = content_top + height;
         for (const auto &line : palette) {
           const auto text = terminal_lines(line, main_width)[0];
           const bool selected = text.starts_with("> ");
@@ -4712,12 +5128,13 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           if (show_right_rail_overlay)
             chat_height = 0;
         }
-        const auto cursor_line = height + palette.size() + 4 + cursor_row - draft_begin;
+        const auto cursor_line =
+            content_top + height + palette.size() + 2U + cursor_row - draft_begin;
         const auto cells = caret.column.value;
         std::size_t display_cursor_line =
             inspecting && inspection_focused() && inspection_layout
                 ? inspection_layout->bounds.y + 1
-            : composer.palette_open() ? height + 3
+            : composer.palette_open() ? content_top + height + 1U
                                       : cursor_line;
         std::size_t display_cursor_cells =
             inspecting && inspection_focused() ? 1
@@ -4770,29 +5187,41 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           const bool graphics_update =
               graphics_enabled && (recover || placement != image_placement);
           const bool osc52_update = !pending_osc52.empty();
+          const bool notify_update = !pending_notify.empty();
           const bool flightdeck_cleanup =
               flightdeck_pending_erase || flightdeck_restore_cursor;
-          if (graphics_update || mouse_change || osc52_update || flightdeck_cleanup) {
+          if (graphics_update || mouse_change || alt_scroll_change || osc52_update ||
+              notify_update || flightdeck_cleanup) {
             layout.stage(4);
             constexpr auto digits = std::numeric_limits<std::size_t>::digits10 + 1;
             const auto image_bound =
                 raw_capture_ && raw_enabled()
-                    ? raw_ui_add(packet.size(), 4096 + 320 + 4 * digits +
-                                                    mouse_on.size() +
-                                                    pending_osc52.size())
+                    ? raw_ui_add(packet.size(),
+                                 4096 + 320 + 4 * digits + mouse_on.size() +
+                                     kTerminalAltScrollOn.size() +
+                                     pending_osc52.size() + pending_notify.size())
                     : 0;
             RawUiFrame image{raw_capture_, image_bound};
             image.run([&] {
-              // Insert image, mouse-mode, and OSC 52 commands before the existing
-              // synchronized-update close.
+              // Insert image, mouse-mode, alt-scroll, OSC 52, and desktop-notify
+              // commands before the existing synchronized-update close.
               packet.resize(packet.size() - std::string_view{"\x1b[?2026l"}.size());
               if (mouse_change) {
                 packet += mouse_target ? mouse_on : mouse_off;
                 pending_mouse = mouse_target;
               }
+              if (alt_scroll_change) {
+                packet +=
+                    alt_scroll_target ? kTerminalAltScrollOn : kTerminalAltScrollOff;
+                pending_alt_scroll = alt_scroll_target;
+              }
               if (osc52_update) {
                 packet += pending_osc52;
                 pending_osc52.clear();
+              }
+              if (notify_update) {
+                packet += pending_notify;
+                pending_notify.clear();
               }
               if (flightdeck_pending_erase) {
                 packet += encode_kitty_erase(hero_default_kitty_image_id);
@@ -5599,10 +6028,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
           scroll -= std::min(scroll, std::size_t{3});
         if (result.action == InputAction::mouse_press) {
           if (!inspection_open() && !welcoming && chat_height > 0 && chat_width > 4 &&
-              chat_end_line > chat_begin_line && result.mouse_row >= 2 &&
-              result.mouse_row < 2 + chat_height && result.mouse_col < chat_width) {
-            const auto line =
-                std::min(chat_begin_line + (result.mouse_row - 2), chat_end_line - 1);
+              chat_end_line > chat_begin_line && result.mouse_row >= chat_top_row &&
+              result.mouse_row < chat_top_row + chat_height &&
+              result.mouse_col < chat_width) {
+            const auto line = std::min(
+                chat_begin_line + (result.mouse_row - chat_top_row), chat_end_line - 1);
             const auto col =
                 result.mouse_col >= 4 ? result.mouse_col - 4 : std::size_t{0};
             chat_selection = {true, true, line, col, line, col};
@@ -5612,12 +6042,12 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         } else if (result.action == InputAction::mouse_drag) {
           if (chat_selection.dragging && chat_height > 0 && chat_width > 4 &&
               chat_end_line > chat_begin_line) {
-            const auto clamped_row =
-                std::clamp<std::size_t>(result.mouse_row, 2, 2 + chat_height - 1);
+            const auto clamped_row = std::clamp<std::size_t>(
+                result.mouse_row, chat_top_row, chat_top_row + chat_height - 1);
             const auto clamped_col =
                 std::clamp<std::size_t>(result.mouse_col, 4, chat_width - 1);
-            chat_selection.focus_line =
-                std::min(chat_begin_line + (clamped_row - 2), chat_end_line - 1);
+            chat_selection.focus_line = std::min(
+                chat_begin_line + (clamped_row - chat_top_row), chat_end_line - 1);
             chat_selection.focus_col = clamped_col - 4;
           }
         } else if (result.action == InputAction::mouse_release) {
@@ -5868,14 +6298,15 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                        result.text == "/mouse off") {
               if (result.text != "/mouse")
                 mouse_wanted = result.text == "/mouse on";
+              if (!mouse_wanted)
+                chat_selection = {};
               transcript +=
                   mouse_wanted
-                      ? "\nMouse on: trackpad/wheel scrolls chat; drag in chat "
-                        "selects and copies (OSC 52). Shift-drag uses terminal "
-                        "selection. /mouse off disables reporting.\n"
-                      : "\nMouse off: native terminal drag-select active. "
-                        "/mouse on restores trackpad scroll and chat-bounded "
-                        "selection.\n";
+                      ? "\nMouse mode on (hold Shift/Option to drag-select; /mouse "
+                        "off restores native selection)\n"
+                      : "\nMouse mode off: native terminal drag-select active; wheel "
+                        "scrolling uses alternate scroll. /mouse on enables SGR mouse "
+                        "reporting.\n";
               scroll = 0;
             } else if (result.text == "/drafts") {
               transcript +=

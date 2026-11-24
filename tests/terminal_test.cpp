@@ -1,19 +1,28 @@
 #include "blackbird/json.hpp"
 #include "blackbird/terminal.hpp"
 #include "blackbird/tools.hpp"
+#include <chrono>
 #include <clocale>
 #include <cstdlib>
+#include <fcntl.h>
 #include <iostream>
 #include <poll.h>
 #include <source_location>
 #include <stdexcept>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 using namespace blackbird;
 void check(bool good, std::source_location where = std::source_location::current()) {
   if (!good)
     throw std::runtime_error("terminal contract at line " +
                              std::to_string(where.line()));
+}
+void require(bool condition, std::string_view message) {
+  if (!condition)
+    throw std::runtime_error(std::string{message});
 }
 InputResult feed(Composer &c, std::string_view bytes) {
   InputResult result;
@@ -871,6 +880,322 @@ int main() {
       check(run_interactive_bang_shell("exit 7") == 7);
       check(run_interactive_bang_shell("") == 2);
       check(run_interactive_bang_shell(std::string_view{"exit 0\0; exit 9", 15}) == 2);
+    }
+
+    // Neon TUI polish: sacred native text selection, compact 1-line Party Strip,
+    // and OSC 9/777/99 desktop notifications.
+    {
+      // 1. Default mouse reporting is OFF unless BLACKBIRD_MOUSE=1; alt-scroll
+      //    constants are exact DECSET/DECRST 1007 sequences.
+      require(!terminal_default_mouse_wanted(nullptr),
+              "mouse reporting must default OFF when BLACKBIRD_MOUSE is unset");
+      require(!terminal_default_mouse_wanted(""),
+              "mouse reporting must default OFF when BLACKBIRD_MOUSE is empty");
+      require(!terminal_default_mouse_wanted("0"),
+              "mouse reporting must be OFF when BLACKBIRD_MOUSE=0");
+      require(!terminal_default_mouse_wanted("true"),
+              "mouse reporting must stay OFF unless BLACKBIRD_MOUSE is literally 1");
+      require(terminal_default_mouse_wanted("1"),
+              "mouse reporting opts ON when BLACKBIRD_MOUSE=1");
+      require(kTerminalAltScrollOn == "\x1b[?1007h",
+              "alternate-scroll enter sequence must be DECSET 1007");
+      require(kTerminalAltScrollOff == "\x1b[?1007l",
+              "alternate-scroll exit sequence must be DECRST 1007");
+      require(terminal_key_help().find("Native terminal drag-select") !=
+                  std::string::npos,
+              "key help must document native drag-select default");
+      require(terminal_key_help().find("alternate scroll") != std::string::npos,
+              "key help must document alternate-scroll wheel support");
+
+      // 2. Always-visible compact 1-line Party Strip at any width + strict
+      // sanitization.
+      auto assert_no_control_or_bidi = [](std::string_view text, const char *label) {
+        for (std::size_t i = 0; i < text.size(); ++i) {
+          const auto b = static_cast<unsigned char>(text[i]);
+          require(b >= 0x20U && b != 0x7FU,
+                  std::string{label} + ": contains C0 or DEL byte");
+          if (b == 0xC2U && i + 1U < text.size()) {
+            const auto b1 = static_cast<unsigned char>(text[i + 1U]);
+            require(b1 < 0x80U || b1 > 0x9FU,
+                    std::string{label} + ": contains UTF-8 C1 control");
+          }
+          if (b == 0xE2U && i + 2U < text.size()) {
+            const auto b1 = static_cast<unsigned char>(text[i + 1U]);
+            const auto b2 = static_cast<unsigned char>(text[i + 2U]);
+            const bool is_bidi_202x = (b1 == 0x80U && b2 >= 0xAAU && b2 <= 0xAEU);
+            const bool is_bidi_206x = (b1 == 0x81U && b2 >= 0xA6U && b2 <= 0xA9U);
+            const bool is_lrm_rlm = (b1 == 0x80U && (b2 == 0x8EU || b2 == 0x8FU));
+            require(!is_bidi_202x && !is_bidi_206x && !is_lrm_rlm,
+                    std::string{label} + ": contains BiDi control");
+          }
+        }
+        require(text.find('\x1b') == std::string_view::npos,
+                std::string{label} + ": contains ESC");
+        require(text.find('\x07') == std::string_view::npos,
+                std::string{label} + ": contains BEL");
+      };
+
+      PartyChatPane inactive_pane;
+      require(terminal_party_strip(inactive_pane, 80U).empty(),
+              "inactive party must render no party strip");
+
+      PartySnapshot live_snap;
+      live_snap.room_scope = "ops/neon";
+      live_snap.party_config_present = true;
+      PartyParticipant self_p;
+      self_p.id = "antimeme";
+      self_p.display_name = "antimeme";
+      self_p.role = PartyMemberRole::operator_human;
+      self_p.provider = "Blackbird";
+      self_p.state = PartyParticipantState::online;
+      self_p.local_self = true;
+
+      PartyParticipant phall_p;
+      phall_p.id = "phall";
+      phall_p.display_name = "@phall";
+      phall_p.role = PartyMemberRole::operator_human;
+      phall_p.provider = "Outpost";
+      phall_p.state = PartyParticipantState::online;
+      phall_p.local_self = false;
+      live_snap.participants = {self_p, phall_p};
+
+      PartyChatPane live_pane{live_snap};
+      const ChatRow strip_80 = terminal_party_strip(live_pane, 80U);
+      const std::string plain_80 = chat_plain(strip_80);
+      require(
+          plain_80 ==
+              "● Party: you (Blackbird) · ● @phall (Outpost) · 2 live  [Alt+P chat]",
+          "80-col party strip must match expected crisp format, got: " + plain_80);
+      require(display_cells(plain_80).value <= 80U,
+              "80-col party strip must fit within 80 cells");
+      assert_no_control_or_bidi(plain_80, "live 80-col strip");
+
+      for (const std::size_t narrow_w : {60U, 44U, 30U, 18U}) {
+        const ChatRow narrow_strip = terminal_party_strip(live_pane, narrow_w);
+        const std::string narrow_plain = chat_plain(narrow_strip);
+        require(!narrow_plain.empty(), "narrow party strip must remain visible");
+        require(display_cells(narrow_plain).value <= narrow_w,
+                "narrow party strip must never overflow width " +
+                    std::to_string(narrow_w));
+        require(narrow_plain.find("●") != std::string::npos,
+                "narrow party strip must retain shape glyph");
+        assert_no_control_or_bidi(narrow_plain, "narrow strip");
+      }
+
+      // Unread messages appear in the strip hint.
+      PartyMessage incoming;
+      incoming.id = "party-msg-1";
+      incoming.sender_id = "phall";
+      incoming.body = "ready to pair";
+      live_pane.push_message(incoming);
+      const std::string unread_strip =
+          chat_plain(terminal_party_strip(live_pane, 100U));
+      require(unread_strip.find("1 unread") != std::string::npos,
+              "party strip must surface unread count");
+
+      // Reconnecting (◐) and away (○) states always carry shape + word.
+      PartySnapshot reconn_snap = live_snap;
+      reconn_snap.participants[0].state = PartyParticipantState::idle;
+      reconn_snap.participants[1].state = PartyParticipantState::idle;
+      const std::string reconn_plain =
+          chat_plain(terminal_party_strip(PartyChatPane{reconn_snap}, 90U));
+      require(reconn_plain.find("◐") != std::string::npos &&
+                  reconn_plain.find("reconnecting") != std::string::npos,
+              "reconnecting strip must show shape ◐ and word reconnecting");
+
+      PartySnapshot away_snap = live_snap;
+      away_snap.participants[0].state = PartyParticipantState::offline;
+      away_snap.participants[1].state = PartyParticipantState::offline;
+      const std::string away_plain =
+          chat_plain(terminal_party_strip(PartyChatPane{away_snap}, 90U));
+      require(away_plain.find("○") != std::string::npos &&
+                  away_plain.find("away") != std::string::npos,
+              "away strip must show shape ○ and word away");
+
+      PartySnapshot mixed_snap = live_snap;
+      mixed_snap.participants[1].state = PartyParticipantState::idle;
+      const std::string mixed_plain =
+          chat_plain(terminal_party_strip(PartyChatPane{mixed_snap}, 110U));
+      require(mixed_plain.find("●") != std::string::npos &&
+                  mixed_plain.find("live") != std::string::npos &&
+                  mixed_plain.find("◐") != std::string::npos &&
+                  mixed_plain.find("reconnecting") != std::string::npos,
+              "mixed strip must show both live and reconnecting shapes+words");
+
+      // Hostile remote handle and client injection must be completely stripped.
+      PartySnapshot hostile_snap = live_snap;
+      hostile_snap.participants[1].display_name =
+          std::string{"\x1b[31m\x1b]0;pwn\x07\xC2\x9B"
+                      "2J\xE2\x80\xAE@evil\x00\x07\x7F\n\r",
+                      34U};
+      hostile_snap.participants[1].provider =
+          std::string{"\x1b]52;c;AAAA\x1b\\Out\xE2\x81\xA6post\x1b[0m", 32U};
+      const std::string hostile_plain =
+          chat_plain(terminal_party_strip(PartyChatPane{hostile_snap}, 120U));
+      assert_no_control_or_bidi(hostile_plain, "hostile party strip");
+      require(hostile_plain.find("@evil") != std::string::npos &&
+                  hostile_plain.find("Outpost") != std::string::npos,
+              "hostile sanitizer must preserve safe handle/client text: " +
+                  hostile_plain);
+      require(hostile_plain.find("pwn") == std::string::npos &&
+                  hostile_plain.find("AAAA") == std::string::npos,
+              "hostile OSC payloads must be stripped, not leaked: " + hostile_plain);
+
+      // 3. TerminalNotifyLimiter: sanitization, bounding, OSC framing, rate limit.
+      TerminalNotifyLimiter limiter{std::chrono::milliseconds{1000}};
+      const auto t0 = std::chrono::steady_clock::now();
+      const TerminalNotifyTarget ghostty_target{TerminalNotifyProtocol::osc777, false};
+      const TerminalNotifyTarget iterm_target{TerminalNotifyProtocol::osc9, false};
+      const TerminalNotifyTarget none_target{TerminalNotifyProtocol::none, false};
+
+      // Unsupported target and empty/control-only inputs never consume rate budget.
+      require(limiter.format_if_allowed(none_target, {"Title", "Body", 0U}, t0).empty(),
+              "none protocol must emit nothing");
+      require(limiter
+                  .format_if_allowed(
+                      ghostty_target,
+                      {"\x1b[31m\x07\x00", "\x1b]0;x\x07\xE2\x80\xAE", 0U}, t0)
+                  .empty(),
+              "control-only notification must emit nothing");
+
+      const std::string osc777 = limiter.format_if_allowed(
+          ghostty_target,
+          {"\x1b[31mParty;Invite\x07",
+           "\x1b]9;spoof\x1b\\\xE2\x80\xAE@phall joined\nnow\x07", 0U},
+          t0);
+      require(osc777 == "\x1b]777;notify;Party:Invite;@phall joined now\x1b\\",
+              "OSC 777 notification must sanitize and frame safely, got: " + osc777);
+      require(osc777.find('\x07') == std::string::npos,
+              "OSC 777 packet must contain no BEL");
+
+      // Immediate second notification is rate-limited.
+      require(limiter
+                  .format_if_allowed(ghostty_target, {"Second", "Spam", 0U},
+                                     t0 + std::chrono::milliseconds{500})
+                  .empty(),
+              "notification inside min_interval must be rate-limited");
+
+      // After min_interval elapses, oversized body is bounded and emitted cleanly.
+      const std::string long_body(1024U, 'A');
+      const std::string osc9 = limiter.format_if_allowed(
+          iterm_target, {"Alert", long_body, 0U}, t0 + std::chrono::milliseconds{1000});
+      require(osc9.starts_with("\x1b]9;Alert: ") && osc9.ends_with("\x1b\\"),
+              "OSC 9 notification must emit after rate limit window");
+      require(osc9.size() <= 16U + kTerminalDesktopNotifyMaxBytes,
+              "notification body must be strictly bounded");
+
+      // TerminalUI::desktop_notify safely queues without throwing (accepts
+      // string literals, std::string_view, and std::string cleanly).
+      task_ui.desktop_notify("Party", "@phall joined");
+      task_ui.desktop_notify(std::string_view{"Party"}, std::string_view{"sv body"});
+      task_ui.desktop_notify("\x1b[31m\x07", "");
+
+      // 4. End-to-end 80x24 PTY check: default mouse OFF, alt-scroll ON/OFF,
+      //    80-col Party Strip visible, /mouse on/off toggle, OSC 777 delivery.
+      int master = ::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+      require(master >= 0 && ::grantpt(master) == 0 && ::unlockpt(master) == 0,
+              "PTY master setup");
+      const char *slave_name = ::ptsname(master);
+      require(slave_name != nullptr, "PTY slave name");
+      const int slave = ::open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+      require(slave >= 0, "PTY slave open");
+      winsize ws{};
+      ws.ws_row = 24;
+      ws.ws_col = 80;
+      require(::ioctl(slave, TIOCSWINSZ, &ws) == 0, "PTY 80x24 winsize");
+      const pid_t child = ::fork();
+      require(child >= 0, "PTY fork");
+      if (child == 0) {
+        ::close(master);
+        if (::dup2(slave, STDIN_FILENO) < 0 || ::dup2(slave, STDOUT_FILENO) < 0)
+          ::_exit(90);
+        ::close(slave);
+        ::unsetenv("BLACKBIRD_MOUSE");
+        ::setenv("BLACKBIRD_MASCOT", "0", 1);
+        ::setenv("TERM_PROGRAM", "ghostty", 1);
+        ::setenv("TERM", "xterm-ghostty", 1);
+        try {
+          TerminalUI pty_ui{"neon-pty"};
+          pty_ui.party_chat(live_snap);
+          pty_ui.desktop_notify("Party invite", "@phall invited you");
+          pty_ui.desktop_notify("Burst", "should be rate-limited");
+          std::atomic_bool cancelled{false};
+          pty_ui.run([](std::string_view) {}, cancelled);
+          ::_exit(0);
+        } catch (...) {
+          ::_exit(91);
+        }
+      }
+      ::close(slave);
+      auto drain_pty = [&](std::string &buf, std::string_view needle, int timeout_ms) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
+        char chunk[4096];
+        while (std::chrono::steady_clock::now() < deadline) {
+          if (!needle.empty() && buf.find(needle) != std::string::npos)
+            return true;
+          pollfd pfd{master, POLLIN, 0};
+          const int rc = ::poll(&pfd, 1, 25);
+          if (rc > 0 && (pfd.revents & POLLIN)) {
+            const ssize_t n = ::read(master, chunk, sizeof(chunk));
+            if (n > 0)
+              buf.append(chunk, static_cast<std::size_t>(n));
+            else if (n == 0)
+              break;
+          } else if (rc > 0 && (pfd.revents & POLLHUP)) {
+            break;
+          }
+        }
+        return !needle.empty() && buf.find(needle) != std::string::npos;
+      };
+      auto send_pty = [&](std::string_view bytes) {
+        require(::write(master, bytes.data(), bytes.size()) ==
+                    static_cast<ssize_t>(bytes.size()),
+                "write to PTY master");
+      };
+
+      std::string initial_out;
+      require(drain_pty(initial_out,
+                        "\x1b]777;notify;Party invite;@phall invited you\x1b\\", 3000),
+              "PTY initial frame must emit OSC 777 notification");
+      require(initial_out.find("\x1b[?1007h") != std::string::npos,
+              "PTY enter must enable alternate-scroll (?1007h)");
+      require(initial_out.find("\x1b[?1000h") == std::string::npos,
+              "PTY default must NOT enable SGR mouse reporting (?1000h)");
+      require(initial_out.find("Party: ") != std::string::npos &&
+                  initial_out.find("@phall") != std::string::npos &&
+                  initial_out.find("2 live") != std::string::npos &&
+                  initial_out.find("[Alt+P chat]") != std::string::npos,
+              "80-col PTY must render always-visible 1-line Party Strip");
+      require(initial_out.find("should be rate-limited") == std::string::npos,
+              "immediate duplicate desktop_notify must be coalesced/rate-limited");
+
+      // Toggle /mouse on -> enables SGR reporting + prints hint.
+      std::string mouse_on_out;
+      send_pty("/mouse on\r");
+      require(drain_pty(mouse_on_out, "\x1b[?1000h\x1b[?1002h\x1b[?1006h", 3000),
+              "/mouse on must enable SGR mouse reporting");
+      require(mouse_on_out.find("hold Shift/Option to drag-select") !=
+                  std::string::npos,
+              "/mouse on must display Shift/Option drag-select hint");
+
+      // Toggle /mouse off -> disables SGR reporting.
+      std::string mouse_off_out;
+      send_pty("/mouse off\r");
+      require(drain_pty(mouse_off_out, "\x1b[?1006l\x1b[?1002l\x1b[?1000l", 3000),
+              "/mouse off must disable SGR mouse reporting");
+
+      // Exit via /quit -> disables alternate-scroll (?1007l).
+      std::string exit_out;
+      send_pty("/quit\r");
+      (void)drain_pty(exit_out, "\x1b[?1007l", 3000);
+      require(exit_out.find("\x1b[?1007l") != std::string::npos,
+              "PTY exit must disable alternate-scroll (?1007l)");
+      int wstatus = 0;
+      require(::waitpid(child, &wstatus, 0) == child && WIFEXITED(wstatus) &&
+                  WEXITSTATUS(wstatus) == 0,
+              "PTY child must exit cleanly with code 0");
+      ::close(master);
     }
 
     std::filesystem::remove_all(dir);

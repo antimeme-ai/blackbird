@@ -8,6 +8,7 @@
 #include "blackbird/party_chat.hpp"
 #include "blackbird/raw_ui.hpp"
 #include "blackbird/tasks.hpp"
+#include "blackbird/terminal_notify.hpp"
 #include "blackbird/tui_instrument.hpp"
 #include "blackbird/tui_navigation.hpp"
 #include <atomic>
@@ -117,6 +118,47 @@ void terminal_render_party_pane(ChatGrid &grid, const PartyChatPane &pane,
                                 const TerminalPartyLayout &layout);
 bool terminal_party_is_active(const PartySnapshot &snapshot) noexcept;
 std::string terminal_party_status_pill(const PartyChatPane &pane, bool docked);
+// Crisp 1-line Party Strip for TUI chrome at any terminal width.
+// Returns an empty row when no party is active.
+ChatRow terminal_party_strip(const PartyChatPane &pane, std::size_t max_cells);
+// Default mouse reporting policy: OFF unless BLACKBIRD_MOUSE == "1".
+bool terminal_default_mouse_wanted(const char *env_value) noexcept;
+inline constexpr std::string_view kTerminalAltScrollOn = "\x1b[?1007h";
+inline constexpr std::string_view kTerminalAltScrollOff = "\x1b[?1007l";
+inline constexpr std::chrono::milliseconds kTerminalDesktopNotifyMinInterval{1500};
+inline constexpr std::size_t kTerminalDesktopNotifyMaxBytes = 256U;
+// Distinct non-mutually-convertible title/body wrappers so callers can pass
+// string literals, std::string_view, or std::string directly without
+// swappable-parameter hazards.
+struct TerminalNotifyTitle {
+  std::string_view value;
+  constexpr TerminalNotifyTitle(std::string_view text) noexcept : value(text) {}
+  constexpr TerminalNotifyTitle(const char *text) noexcept
+      : value(text ? std::string_view{text} : std::string_view{}) {}
+  TerminalNotifyTitle(const std::string &text) noexcept : value(text) {}
+};
+struct TerminalNotifyBody {
+  std::string_view value;
+  constexpr TerminalNotifyBody(std::string_view text) noexcept : value(text) {}
+  constexpr TerminalNotifyBody(const char *text) noexcept
+      : value(text ? std::string_view{text} : std::string_view{}) {}
+  TerminalNotifyBody(const std::string &text) noexcept : value(text) {}
+};
+class TerminalNotifyLimiter {
+public:
+  explicit TerminalNotifyLimiter(std::chrono::milliseconds min_interval =
+                                     kTerminalDesktopNotifyMinInterval) noexcept
+      : min_interval_(min_interval) {}
+  std::string format_if_allowed(TerminalNotifyTarget target,
+                                const TerminalNotification &note,
+                                std::chrono::steady_clock::time_point now);
+  std::chrono::milliseconds min_interval() const noexcept { return min_interval_; }
+
+private:
+  std::chrono::milliseconds min_interval_;
+  std::optional<std::chrono::steady_clock::time_point> last_emitted_;
+  std::uint64_t next_id_ = 1U;
+};
 // Shared command discovery; local-only commands are labelled in help.
 std::string terminal_help();
 // "◆ CONTEXT compacted −48 KiB": badge text for one published context change.
@@ -258,6 +300,7 @@ public:
   void context_workbench(ContextWorkbenchSnapshot snapshot);
   void hooks_view(HooksViewSnapshot snapshot);
   void party_chat(PartySnapshot snapshot);
+  void desktop_notify(TerminalNotifyTitle title, TerminalNotifyBody body);
   void operation_started(bool provider);
   void status(std::string_view text);
   // A published context revision (a1v): kind label, e.g. "compacted", and the
@@ -308,7 +351,8 @@ private:
     telemetry,
     context_workbench,
     hooks_view,
-    party_chat
+    party_chat,
+    desktop_notify
   };
   struct Message {
     Kind kind;
@@ -323,6 +367,7 @@ private:
     std::shared_ptr<const ContextWorkbenchSnapshot> workbench_snapshot{};
     std::shared_ptr<const HooksViewSnapshot> hooks_snapshot{};
     std::shared_ptr<const PartySnapshot> party_snapshot{};
+    std::shared_ptr<const TerminalNotification> notification{};
   };
   bool raw_capture_ = false;
   RawUiSource initial_source_{};
