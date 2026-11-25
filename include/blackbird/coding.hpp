@@ -2,6 +2,7 @@
 #include "blackbird/beads.hpp"
 #include "blackbird/colleague.hpp"
 #include "blackbird/command_jobs.hpp"
+#include "blackbird/command_post_tools.hpp"
 #include "blackbird/decision_models.hpp"
 #include "blackbird/hooks.hpp"
 #include "blackbird/host_tools.hpp"
@@ -199,6 +200,8 @@ public:
   // Optional native effect restriction for a scoped workflow (e.g. recovery
   // evidence protection). Throwing refuses admission; it is not Lua authority.
   std::function<void(std::string_view, const Value &)> effect_policy;
+  // Optional bridge to the operator's live online party room (party_chat tool).
+  std::optional<LivePartyBridge> live_party;
   // Install once, outside a turn. A resumed session never restores callbacks.
   void host_tools(HostToolCatalog catalog, HostToolCallback callback);
   void detach_host_tools();

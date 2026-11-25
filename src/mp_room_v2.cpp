@@ -358,24 +358,6 @@ std::string render_agent_card_body(std::string_view body) {
   return out;
 }
 
-std::string format_member_display_name(const MpRoomV2Member &m) {
-  const std::string handle = party_chat_sanitize(strip_at(m.handle), 64U);
-  std::string out =
-      m.is_guest ? ((handle.empty() ? std::string{"guest"} : handle) + " [guest]")
-                 : ("@" + (handle.empty() ? std::string{"member"} : handle));
-  const std::string client = party_chat_sanitize(m.client, 32U);
-  const std::string agent = party_chat_sanitize(m.agent_name, 48U);
-  if (!client.empty() && !agent.empty() && agent != client &&
-      !(client == "blackbird" && agent == "Blackbird")) {
-    out += " (" + client + " · " + agent + ")";
-  } else if (!client.empty()) {
-    out += " (" + client + ")";
-  } else if (!agent.empty()) {
-    out += " (" + agent + ")";
-  }
-  return out;
-}
-
 PartyParticipantState map_member_state(const MpRoomV2Member &m) noexcept {
   if (m.status == "offline" || m.status == "away") {
     return PartyParticipantState::offline;
@@ -383,9 +365,6 @@ PartyParticipantState map_member_state(const MpRoomV2Member &m) noexcept {
   if (m.agent_state == "working" || m.agent_state == "busy" ||
       m.agent_state == "running") {
     return PartyParticipantState::working;
-  }
-  if (m.agent_state == "idle") {
-    return PartyParticipantState::idle;
   }
   return PartyParticipantState::online;
 }
@@ -1270,20 +1249,113 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
   PartySnapshot snap{};
   snap.room_scope =
       !room_code_.empty() ? ("room/" + room_code_) : std::string{"party/live"};
-  snap.mode =
-      members_.size() > 1U ? PartyMode::multi_operator : PartyMode::single_operator;
   snap.mode_override = PartyModeOverride::auto_detect;
+  snap.compact_room_presentation = true;
 
-  snap.participants.reserve(members_.size());
+  auto state_priority = [](PartyParticipantState st) noexcept -> int {
+    switch (st) {
+    case PartyParticipantState::working:
+      return 3;
+    case PartyParticipantState::online:
+      return 2;
+    case PartyParticipantState::idle:
+      return 1;
+    case PartyParticipantState::offline:
+      return 0;
+    }
+    return 0;
+  };
+  auto lower_ascii = [](std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+      out.push_back((ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch);
+    }
+    return out;
+  };
+
+  struct MergedMember {
+    std::string key;
+    std::string handle;
+    bool is_guest = false;
+    bool is_self = false;
+    PartyParticipantState state = PartyParticipantState::offline;
+    std::vector<std::string> clients;
+    std::string agent_name;
+  };
+  std::vector<MergedMember> merged;
+  merged.reserve(members_.size());
   for (const auto &m : members_) {
+    const std::string key = (!m.is_guest && m.account_id.has_value())
+                                ? ("acct:" + std::to_string(m.account_id->value()))
+                                : ("guest:" + lower_ascii(strip_at(m.handle)));
+    auto it = std::find_if(merged.begin(), merged.end(),
+                           [&](const MergedMember &e) { return e.key == key; });
+    const PartyParticipantState st = map_member_state(m);
+    const std::string clean_client = party_chat_sanitize(m.client, 24U);
+    const std::string clean_agent = party_chat_sanitize(m.agent_name, 32U);
+    auto add_client = [&](MergedMember &entry) {
+      if (!clean_client.empty() && std::find(entry.clients.begin(), entry.clients.end(),
+                                             clean_client) == entry.clients.end()) {
+        if (clean_client != "web" && !entry.clients.empty() &&
+            entry.clients.front() == "web") {
+          entry.clients.insert(entry.clients.begin(), clean_client);
+        } else {
+          entry.clients.push_back(clean_client);
+        }
+      }
+      if (!clean_agent.empty() && lower_ascii(clean_agent) != "blackbird" &&
+          lower_ascii(clean_agent) != lower_ascii(clean_client) &&
+          entry.agent_name.empty()) {
+        entry.agent_name = clean_agent;
+      }
+    };
+    if (it == merged.end()) {
+      MergedMember entry{};
+      entry.key = key;
+      entry.handle = party_chat_sanitize(strip_at(m.handle), 64U);
+      entry.is_guest = m.is_guest;
+      entry.is_self = m.is_self;
+      entry.state = st;
+      add_client(entry);
+      merged.push_back(std::move(entry));
+    } else {
+      it->is_self = it->is_self || m.is_self;
+      it->is_guest = it->is_guest && m.is_guest;
+      if (state_priority(st) > state_priority(it->state)) {
+        it->state = st;
+      }
+      add_client(*it);
+    }
+  }
+
+  snap.mode =
+      merged.size() > 1U ? PartyMode::multi_operator : PartyMode::single_operator;
+  snap.participants.reserve(merged.size());
+  for (const auto &entry : merged) {
     PartyParticipant p{};
-    p.id = m.handle;
-    p.display_name = format_member_display_name(m);
+    p.id = entry.handle;
+    std::string clients_joined;
+    for (std::size_t i = 0; i < entry.clients.size(); ++i) {
+      if (i > 0)
+        clients_joined += " + ";
+      clients_joined += entry.clients[i];
+    }
+    std::string disp =
+        entry.is_guest ? (entry.handle + " [guest]") : ("@" + entry.handle);
+    if (!clients_joined.empty() && !entry.agent_name.empty()) {
+      disp += " (" + clients_joined + " · " + entry.agent_name + ")";
+    } else if (!clients_joined.empty()) {
+      disp += " (" + clients_joined + ")";
+    } else if (!entry.agent_name.empty()) {
+      disp += " (" + entry.agent_name + ")";
+    }
+    p.display_name = std::move(disp);
     p.role = PartyMemberRole::operator_human;
-    p.host = m.client;
-    p.model = m.agent_name;
-    p.state = map_member_state(m);
-    p.local_self = m.is_self;
+    p.host = std::move(clients_joined);
+    p.model = entry.agent_name;
+    p.state = entry.state;
+    p.local_self = entry.is_self;
     snap.participants.push_back(std::move(p));
   }
 
@@ -1298,8 +1370,8 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
     pm.sender_role = m.kind == "agent_card" ? PartyMemberRole::platoon_leader
                                             : PartyMemberRole::operator_human;
     pm.sender_host = m.sender_client;
-    pm.sender_model = m.sender_agent_name;
-    pm.verified_peer = true;
+    pm.sender_model = m.kind == "agent_card" ? m.sender_agent_name : std::string{};
+    pm.verified_peer = !m.sender_is_guest;
     pm.target = m.target.empty() ? std::string{"@all"} : m.target;
     pm.kind = map_message_kind(m.kind);
     std::string body_out = m.rendered_body;
@@ -1307,7 +1379,7 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
       body_out += m.delivered ? " ✓" : " …";
     }
     pm.body = std::move(body_out);
-    pm.untrusted_remote = !m.local_self;
+    pm.untrusted_remote = m.sender_is_guest && !m.local_self;
     if (m.parsed_agent_card.has_value()) {
       PartyAgentCard pc{};
       pc.title = m.parsed_agent_card->title;
@@ -1629,6 +1701,8 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
         party_chat_sanitize(json_opt_string(*sender_field, "client").value_or(""), 32U);
     msg.sender_agent_name = party_chat_sanitize(
         json_opt_string(*sender_field, "agent_name").value_or(""), 48U);
+    msg.sender_is_guest =
+        !msg.sender_account_id.has_value() || json_opt_bool(*sender_field, "is_guest");
   }
   const bool matched_outbox =
       !cmsg_id.empty() &&

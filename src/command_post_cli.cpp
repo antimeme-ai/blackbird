@@ -11997,7 +11997,7 @@ int run_login_cli(std::span<char *> args, CliIo io) {
                 "[--connect-host HOST] [--port N] [--ca-bundle FILE] [--json]\n";
       return 0;
     }
-    if (arg == "--no-browser") {
+    if (arg == "--no-browser" || arg == "--no-open") {
       no_browser = true;
     } else if (arg == "--json") {
       json_out = true;

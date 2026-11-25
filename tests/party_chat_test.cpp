@@ -1002,6 +1002,89 @@ void test_structured_agent_card_rendering_and_hostile_sanitization() {
           "color card render includes status badge");
 }
 
+void test_compact_room_presentation_rendering() {
+  PartySnapshot snap{};
+  snap.room_scope = "room/335K";
+  snap.mode = PartyMode::multi_operator;
+  snap.compact_room_presentation = true;
+
+  PartyParticipant me{};
+  me.id = "antimeme";
+  me.display_name = "@antimeme";
+  me.role = PartyMemberRole::operator_human;
+  me.host = "blackbird + web";
+  me.state = PartyParticipantState::online;
+  me.local_self = true;
+
+  PartyParticipant peer{};
+  peer.id = "spongebob";
+  peer.display_name = "@spongebob";
+  peer.role = PartyMemberRole::operator_human;
+  peer.host = "blackbird";
+  peer.state = PartyParticipantState::online;
+  snap.participants = {me, peer};
+
+  PartyMessage peer_chat{};
+  peer_chat.id = "m1";
+  peer_chat.timestamp_ns = 1795587256000000000LL;
+  peer_chat.sender_id = "@spongebob";
+  peer_chat.sender_role = PartyMemberRole::operator_human;
+  peer_chat.target = "@all";
+  peer_chat.kind = PartyMessageKind::chat;
+  peer_chat.body = "hello from spongebob";
+  peer_chat.untrusted_remote = false;
+
+  PartyMessage direct_msg{};
+  direct_msg.id = "m2";
+  direct_msg.timestamp_ns = 1795587262000000000LL;
+  direct_msg.sender_id = "@antimeme";
+  direct_msg.sender_role = PartyMemberRole::operator_human;
+  direct_msg.target = "@spongebob";
+  direct_msg.kind = PartyMessageKind::chat;
+  direct_msg.body = "pinging you directly ✓";
+
+  PartyMessage guest_msg{};
+  guest_msg.id = "m3";
+  guest_msg.timestamp_ns = 1795587270000000000LL;
+  guest_msg.sender_id = "@visitor";
+  guest_msg.sender_role = PartyMemberRole::operator_human;
+  guest_msg.target = "@all";
+  guest_msg.kind = PartyMessageKind::chat;
+  guest_msg.body = "hi";
+  guest_msg.untrusted_remote = true;
+
+  snap.messages = {peer_chat, direct_msg, guest_msg};
+
+  PartyChatPane pane{snap};
+  const PartyChatFrame frame = pane.render_frame(110, 20, false);
+  const std::string plain = frame.text();
+
+  require(plain.find("PARTY · room/335K · 2 online") != std::string::npos,
+          "compact room header must show clean room code and online count");
+  require(plain.find("0 leaders") == std::string::npos,
+          "compact room header must omit 0 leaders noise");
+  require(plain.find("[MULTI-OP]") == std::string::npos,
+          "compact room header must omit [MULTI-OP] noise");
+  require(plain.find("ROSTER (2)") != std::string::npos,
+          "compact roster must show deduplicated participant count");
+  require(plain.find("@antimeme (you)") != std::string::npos,
+          "compact roster must render handle cleanly without [OP]");
+  require(plain.find("blackbird + web") != std::string::npos,
+          "compact roster must render merged client list");
+  require(plain.find("[OP]") == std::string::npos,
+          "compact room presentation must omit [OP] tags");
+  require(plain.find("[PEER:UNTRUSTED]") == std::string::npos,
+          "compact room presentation must not stamp [PEER:UNTRUSTED] on authenticated "
+          "friends");
+  require(plain.find("@spongebob: hello from spongebob") != std::string::npos,
+          "compact broadcast chat must omit -> @all noise");
+  require(plain.find("@antimeme → @spongebob: pinging you directly") !=
+              std::string::npos,
+          "compact direct chat must preserve target mention");
+  require(plain.find("[GUEST] @visitor: hi") != std::string::npos,
+          "compact chat must label unauthenticated guests with [GUEST]");
+}
+
 } // namespace
 
 int main() {
@@ -1014,6 +1097,7 @@ int main() {
     test_hostile_escape_sanitization_and_responsive_rendering();
     test_unverified_and_revoked_bridge_peer_cannot_impersonate_or_escalate();
     test_structured_agent_card_rendering_and_hostile_sanitization();
+    test_compact_room_presentation_rendering();
     std::cout << "party_chat_test: all checks passed\n";
     return 0;
   } catch (const std::exception &ex) {

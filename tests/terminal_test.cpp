@@ -814,6 +814,11 @@ int main() {
         check(terminal_help().find("/resume") != std::string::npos);
         check(terminal_help().find("Alt+F cockpit") != std::string::npos);
         check(terminal_key_help().find("Alt+F") != std::string::npos);
+        check(terminal_help().find("/about") != std::string::npos);
+        check(terminal_help().find("/version") != std::string::npos);
+        check(terminal_about().find("blackbird v") != std::string::npos);
+        check(terminal_about().find("https://multiplayer.tech") != std::string::npos);
+        check(terminal_command_hint("/about").starts_with("/about"));
         check(terminal_command_hint("/cwd").starts_with("/cwd"));
         check(terminal_command_hint("/resume").starts_with("/resume"));
 
@@ -1184,6 +1189,22 @@ int main() {
       send_pty("/mouse off\r");
       require(drain_pty(mouse_off_out, "\x1b[?1006l\x1b[?1002l\x1b[?1000l", 3000),
               "/mouse off must disable SGR mouse reporting");
+
+      // Alternate-scroll (?1007h) translates trackpad/wheel into Up/Down cursor
+      // bursts; when SGR mouse reporting is off on an empty composer, they must
+      // scroll the transcript (showing "Up " in the status bar) without capturing
+      // native drag-selection.
+      for (int ln = 0; ln < 30; ++ln) {
+        send_pty("/about\r");
+      }
+      std::string filled_out;
+      require(drain_pty(filled_out, "Version:", 3000),
+              "PTY must accumulate scrollable transcript lines");
+      std::string scrolled_out;
+      send_pty("\x1b[A\x1b[A\x1b[A");
+      require(
+          drain_pty(scrolled_out, "Up ", 3000),
+          "alternate-scroll Up arrows must scroll chat transcript while mouse is off");
 
       // Exit via /quit -> disables alternate-scroll (?1007l).
       std::string exit_out;

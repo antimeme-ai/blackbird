@@ -114,8 +114,13 @@ std::vector<std::string> default_observation_budget(std::string_view name,
                         arguments.find("line_end");
   const auto *op = arguments.find("op");
   const bool foreground = name == "process" && op && *op == Value{"foreground"};
+  const auto has_nonempty_ref = [&](std::string_view key) noexcept {
+    const auto *val = arguments.find(key);
+    return val != nullptr && std::holds_alternative<std::string>(val->value()) &&
+           !val->string().empty();
+  };
   constexpr std::uint64_t budget = 8192, head = 2048, tail = budget - head;
-  if (name == "read_process_output" && arguments.find("result_ref")) {
+  if (name == "read_process_output" && has_nonempty_ref("result_ref")) {
     // Fetch-back is a bounded page (design §5.7): 8192 bytes from the range's start,
     // ranged or not; only an explicit output_max_bytes asks for more (T1). A head
     // alone keeps the default 6144-byte tail after it, as an output_ref read does.
@@ -1343,7 +1348,12 @@ Value CodingEngine::retained_process_output(const Value &arguments) {
 // shaping measured, with read_process_output's ranges and budgets.
 Value CodingEngine::retained_result_output(const Value &arguments) {
   const auto *reference = arguments.find("result_ref");
-  if (arguments.find("output_ref") || !reference ||
+  const auto *out_ref = arguments.find("output_ref");
+  const bool has_output_ref =
+      out_ref != nullptr && !std::holds_alternative<std::nullptr_t>(out_ref->value()) &&
+      !(std::holds_alternative<std::string>(out_ref->value()) &&
+        out_ref->string().empty());
+  if (has_output_ref || !reference ||
       !std::holds_alternative<std::string>(reference->value()))
     throw Error{ErrorCode::invalid_range};
   if (arguments.find("output_max_bytes")) // At most 16777216 per page.
@@ -1862,9 +1872,23 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
           });
         }
         if (name == "read_process_output") {
-          if (arguments.find("result_ref"))
+          const auto *rref = arguments.find("result_ref");
+          const auto *oref = arguments.find("output_ref");
+          const bool has_result_ref =
+              rref != nullptr &&
+              !std::holds_alternative<std::nullptr_t>(rref->value()) &&
+              !(std::holds_alternative<std::string>(rref->value()) &&
+                rref->string().empty());
+          const bool has_output_ref =
+              oref != nullptr &&
+              !std::holds_alternative<std::nullptr_t>(oref->value()) &&
+              !(std::holds_alternative<std::string>(oref->value()) &&
+                oref->string().empty());
+          if (has_result_ref && has_output_ref)
+            throw Error{ErrorCode::invalid_range};
+          if (has_result_ref)
             return retained_result_output(arguments);
-          if (!arguments.find("output_ref"))
+          if (!has_output_ref)
             throw Error{ErrorCode::invalid_range};
           return retained_process_output(arguments);
         }
@@ -1887,7 +1911,9 @@ Value CodingEngine::dispatch(std::string name, Value arguments, const Value &opt
         if (auto cp = try_dispatch_command_post_tool(
                 name, arguments,
                 CommandPostToolContext{.decision_models = &decision_models_,
-                                       .cancelled = cancelled})) {
+                                       .cancelled = cancelled,
+                                       .live_party =
+                                           live_party ? &*live_party : nullptr})) {
           return std::move(*cp);
         }
         if (name == "rageshake") {

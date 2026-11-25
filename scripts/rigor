@@ -200,13 +200,26 @@ def expect_fault(args, marker, *, env=None):
         raise RuntimeError(f"expected nonzero diagnostic containing {marker!r}")
 
 
+def ctest_env():
+    env = dict(os.environ)
+    # Isolate local test runs from any live developer Blackbird party or online
+    # session running on the same workstation.
+    env.setdefault("BLACKBIRD_ONLINE_AUTO_CONNECT", "0")
+    iso_dir = ROOT / "context/rigor/isolated-ctest"
+    iso_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("BLACKBIRD_HOME", str(iso_dir / "home"))
+    env.setdefault("BLACKBIRD_PARTY_SOCKET", str(iso_dir / "no-party.sock"))
+    env.setdefault("BLACKBIRD_ONLINE_DIR", str(iso_dir / "no-online"))
+    return env
+
+
 def qualify():
     versions = verify_tools()
     for profile in PROFILES:
         build(profile)
         if profile != "fuzz":
             run([PROFILE["ctest"]["path"], "--preset", profile, "--timeout", "120"],
-                timeout=None)
+                timeout=None, env=ctest_env())
     expect_fault([ROOT / "build/asan/instrumentation_fault", "memory"], "AddressSanitizer")
     expect_fault([ROOT / "build/asan/instrumentation_fault", "undefined"], "signed integer overflow")
     env = dict(os.environ, TSAN_OPTIONS="halt_on_error=1:exitcode=66")
@@ -267,7 +280,7 @@ def main():
                 # CTest owns each test's watchdog. A suite is many commands,
                 # not one command that must finish within the same 120 seconds.
                 run([PROFILE["ctest"]["path"], "--preset", args.profile, "--parallel", "6",
-                     "--timeout", "120"], timeout=None)
+                     "--timeout", "120"], timeout=None, env=ctest_env())
             if args.profile != "debug":
                 build("debug")
             lint()

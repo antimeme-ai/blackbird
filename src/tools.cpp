@@ -469,7 +469,11 @@ Value process_output_presentation(const std::string &raw, const Value &args) {
                                         {"end", Value{Number{first + tail_start}}}}));
   }
   // A shaped result's original pages exactly like a process output (T1).
-  const auto *reference_key = args.find("result_ref") ? "result_ref" : "output_ref";
+  const auto *rref = args.find("result_ref");
+  const bool has_result_ref = rref != nullptr &&
+                              std::holds_alternative<std::string>(rref->value()) &&
+                              !rref->string().empty();
+  const auto *reference_key = has_result_ref ? "result_ref" : "output_ref";
   if (const auto *reference = args.find(reference_key)) {
     result.object().emplace_back(reference_key, *reference);
     // A result_ref read pages only its selection: the marker's range ends where the
@@ -1365,11 +1369,7 @@ Value tool_definitions() {
                         Value::object({{"type", Value{"integer"}},
                                        {"minimum", Value{Number{0}}}})},
                        {"output_ref", Value::object({{"type", Value{"string"}}})},
-                       {"result_ref", Value::object({{"type", Value{"string"}}})},
-                       {"byte_start", Value::object({{"type", Value{"integer"}},
-                                                     {"minimum", Value{Number{0}}}})},
-                       {"byte_end", Value::object({{"type", Value{"integer"}},
-                                                   {"minimum", Value{Number{0}}}})}})},
+                       {"result_ref", Value::object({{"type", Value{"string"}}})}})},
                  {"required", Value{Value::Array{}}}})}}),
       Value::object(
           {{"type", Value{"function"}},

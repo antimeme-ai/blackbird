@@ -527,8 +527,12 @@ void MpSocialRuntime::handle_transient_ws_disconnect(
   reconnect_attempts_ = 0U;
   last_ping_sent_override_s_.reset();
   if (config_.max_reconnect_attempts > 0U) {
-    next_reconnect_at_ =
-        steady_now + std::chrono::milliseconds{compute_reconnect_backoff_ms(0U)};
+    // On 4001 (session_replaced by another local window), back off to reconnect_max_ms
+    // instead of tight-looping reconnects and flooding the transcript.
+    const std::uint32_t delay_ms = (close_code == 4001U)
+                                       ? config_.reconnect_max_ms
+                                       : compute_reconnect_backoff_ms(0U);
+    next_reconnect_at_ = steady_now + std::chrono::milliseconds{delay_ms};
   }
   MpSocialEvent ev{};
   ev.kind = MpSocialEventKind::control_disconnected;

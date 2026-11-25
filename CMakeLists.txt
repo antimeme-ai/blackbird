@@ -268,12 +268,13 @@ if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git/HEAD")
     endif()
   endif()
 endif()
+set(BLACKBIRD_RELEASE_VERSION "v0.8.1" CACHE STRING "Semantic release version tag (e.g. v0.8.1)")
 set(BLACKBIRD_BUILD_LABEL "${CMAKE_BUILD_TYPE}")
 if(NOT BLACKBIRD_BUILD_LABEL)
   set(BLACKBIRD_BUILD_LABEL "default")
 endif()
 set(BLACKBIRD_VERSION_STRING
-  "blackbird ${BLACKBIRD_GIT_COMMIT} (lua ${LUA_VERSION_STRING}, ${BLACKBIRD_BUILD_LABEL}, ${BLACKBIRD_COMPILER_PROFILE})")
+  "blackbird ${BLACKBIRD_RELEASE_VERSION} (${BLACKBIRD_GIT_COMMIT}, lua ${LUA_VERSION_STRING}, ${BLACKBIRD_BUILD_LABEL}, ${BLACKBIRD_COMPILER_PROFILE})")
 add_library(blackbird_coding src/coding.cpp src/coding_lua.cpp src/coding_provider.cpp src/coding_dispatch.cpp src/context_workbench.cpp src/hooks.cpp src/hooks_view.cpp src/workflows.cpp src/chat_view.cpp src/task_view.cpp src/sprite.cpp src/terminal.cpp src/terminal_custody.cpp src/session.cpp src/backstop.cpp src/station.cpp)
 target_sources(blackbird_coding PRIVATE src/openrouter.cpp src/responses_provider.cpp src/anthropic_provider.cpp src/chat_provider.cpp src/application.cpp src/host_tools.cpp)
 add_executable(anthropic_provider_test tests/anthropic_provider_test.cpp)
@@ -322,7 +323,10 @@ set(BLACKBIRD_RESOURCE_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "Owned runtime prog
 target_compile_definitions(blackbird PRIVATE BLACKBIRD_WORKFLOW="${BLACKBIRD_RESOURCE_ROOT}/programs/turn.lua")
 target_compile_definitions(blackbird PRIVATE BLACKBIRD_PROFILE_DIRECTORY="${BLACKBIRD_RESOURCE_ROOT}/profiles/providers")
 target_compile_definitions(blackbird PRIVATE BLACKBIRD_VERSION_STRING="${BLACKBIRD_VERSION_STRING}")
-target_compile_definitions(blackbird_coding PRIVATE BLACKBIRD_SPRITE_ASSET="${BLACKBIRD_RESOURCE_ROOT}/assets/sr71.png")
+target_compile_definitions(blackbird_coding PRIVATE
+  BLACKBIRD_SPRITE_ASSET="${BLACKBIRD_RESOURCE_ROOT}/assets/sr71.png"
+  BLACKBIRD_VERSION_STRING="${BLACKBIRD_VERSION_STRING}"
+  BLACKBIRD_RELEASE_VERSION="${BLACKBIRD_RELEASE_VERSION}")
 add_executable(terminal_edge_fixture tests/terminal_edge_fixture.cpp)
 target_link_libraries(terminal_edge_fixture PRIVATE blackbird_coding)
 add_test(NAME terminal_edge_physical COMMAND ${Python3_EXECUTABLE}

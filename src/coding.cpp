@@ -1037,6 +1037,34 @@ Value CodingEngine::operation(
             Value{"This result_ref names a result with no text form within the "
                   "provider limits; it has no pages. Its original stays retained for "
                   "audit_inspect."});
+      if (name == "read_process_output" && effect_error &&
+          effect_error->code == ErrorCode::invalid_range) {
+        result.object().emplace_back(
+            "message",
+            Value{
+                "Provide exactly one of output_ref or result_ref (omit unused "
+                "optional keys). Use optional range {mode: lines|bytes, start, end} "
+                "(lines are 1-based inclusive; bytes 0-based half-open; end >= start) "
+                "and do not mix range with legacy byte_start/byte_end. "
+                "output_head_bytes must be <= output_max_bytes."});
+        const auto *oref = input.find("output_ref");
+        const auto *rref = input.find("result_ref");
+        const bool use_result = rref &&
+                                std::holds_alternative<std::string>(rref->value()) &&
+                                !rref->string().empty();
+        result.object().emplace_back(
+            "example",
+            Value::object(
+                {{use_result ? "result_ref" : "output_ref",
+                  use_result ? *rref
+                  : (oref && std::holds_alternative<std::string>(oref->value()) &&
+                     !oref->string().empty())
+                      ? *oref
+                      : Value{"<ref>"}},
+                 {"range", Value::object({{"mode", Value{"lines"}},
+                                          {"start", Value{Number{"1"}}},
+                                          {"end", Value{Number{"80"}}}})}}));
+      }
       if (name == "read_file" && effect_error &&
           effect_error->code == ErrorCode::invalid_range) {
         result.object().emplace_back(

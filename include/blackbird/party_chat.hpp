@@ -200,6 +200,7 @@ struct PartySnapshot {
   bool platoon_present = false;
   bool bridge_present = false;
   bool known_peers_present = false;
+  bool compact_room_presentation = false;
   std::optional<PartyPendingMention> pending_mention;
 
   std::size_t operator_count() const noexcept;

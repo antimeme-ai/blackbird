@@ -75,6 +75,10 @@ const std::array builtin_commands{
                 "Load a recovered draft; explicit Enter sends (TUI only)", "Chat"},
     ChatCommand{"/quit", "", "Stop work and exit; preserve draft", "Chat"},
     ChatCommand{"/exit", "", "Alias for /quit", "Chat"},
+    ChatCommand{"/about", "",
+                "Blackbird version, build, and runtime info (immediate in TUI)",
+                "Chat"},
+    ChatCommand{"/version", "", "Alias for /about (immediate in TUI)", "Chat"},
     ChatCommand{"/provider", "[ID [MODEL]]",
                 "Switch provider (and optional model) or pick interactively",
                 "Session"},
@@ -148,8 +152,8 @@ const std::array builtin_commands{
         "/send", "JSON",
         "Address direction by run_id, message_id, from, text; next request boundary",
         "Participants"},
-    ChatCommand{"/join", "JSON",
-                "Seal run_ids, drain accepted directions, return in declared order",
+    ChatCommand{"/join", "[@handle|CODE|url] | JSON",
+                "Join a live party room (or seal participant run_ids with JSON)",
                 "Participants"},
     ChatCommand{
         "/await", "JSON",
@@ -215,6 +219,19 @@ const std::array builtin_commands{
                 "[status|health|whoami|resolve HANDLE|friends|friend add/accept/deny|"
                 "party create/info/invite/join/attach/detach/leave|watch]",
                 "Manage multiplayer.tech account, friends, presence & live P2P parties",
+                "Command Post"},
+    ChatCommand{"/login", "[--no-browser]",
+                "Sign in to multiplayer.tech for live parties and friends",
+                "Command Post"},
+    ChatCommand{"/invite", "[@handle]",
+                "Create a live party room and optionally invite a friend",
+                "Command Post"},
+    ChatCommand{"/friends", "",
+                "List friends and who is online or in a party (alias: /who)",
+                "Command Post"},
+    ChatCommand{"/add", "@handle",
+                "Send or accept a friend request on multiplayer.tech", "Command Post"},
+    ChatCommand{"/leave", "", "Leave the currently attached live party room",
                 "Command Post"},
     ChatCommand{"/doctor", "[--offline] [--no-update-check]",
                 "Run zero-secret local & online diagnostics (binary, auth, API, relay)",
@@ -648,7 +665,7 @@ std::string terminal_key_help() {
          "  Ctrl-G       Edit current draft in $VISUAL/$EDITOR (idle only)\n"
          "  Ctrl-Space/T Search commands; arrows select, Enter loads, Esc backs out\n"
          "  Up / Down    Move between draft lines; history at first/last line\n"
-         "  Ctrl-P / N   Explicit history; restores your draft and cursor\n"
+         "  Ctrl-P / N   Prompt history (also Alt-Up / Down); restores draft\n"
          "  Left / Right Move within the draft\n"
          "  Ctrl-A / E   Start / end of line (also Home / End)\n"
          "  Ctrl-Home/End Start / end of draft\n"
@@ -671,7 +688,7 @@ std::string terminal_key_help() {
          "               Ctrl-Left/Right: list pages or output pages by focus\n"
          "  PTY input    Keys and Ctrl-C reach selected command; Ctrl-B returns\n"
          "  Ctrl-Q       Stop and exit; preserve unsent draft\n"
-         "  PgUp / PgDn  Scroll transcript\n"
+         "  PgUp / PgDn  Scroll transcript (also Shift-Up / Down or trackpad wheel)\n"
          "  Mouse / Copy Native terminal drag-select active by default; wheel scrolls\n"
          "               via alternate scroll. /mouse on or BLACKBIRD_MOUSE=1 opts\n"
          "               into SGR mouse reporting (Shift/Option-drag selects).\n"
@@ -682,6 +699,21 @@ std::vector<std::string> terminal_builtin_names() {
   for (const auto &c : builtin_commands)
     names.push_back(c.name);
   return names;
+}
+std::string terminal_about() {
+#ifdef BLACKBIRD_VERSION_STRING
+  constexpr std::string_view version_str = BLACKBIRD_VERSION_STRING;
+#else
+  constexpr std::string_view version_str = "blackbird (unknown version)";
+#endif
+  std::string out = "Blackbird\n";
+  out += "  Version:  " + std::string{version_str} + "\n";
+  out += "  Engine:   C++23 · Lua 5.5.1 · SQLite 3.54.1 · OpenSSL 3\n";
+  out += "  Web:      https://multiplayer.tech · https://clank.party\n";
+  out += "  Source:   https://github.com/antimemeai/blackbird (MIT)\n";
+  out +=
+      "  Tools:    /doctor (health) · /upgrade --check (updates) · /help (commands)\n";
+  return out;
 }
 std::string terminal_help() {
   const auto catalog = command_catalog();
@@ -2302,6 +2334,15 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
         kill(cursor_, word_right(text_, cursor_));
       if (escape_ == "\x1b\x7f" || escape_ == "\x1b\x08")
         kill(word_left(text_, cursor_), cursor_);
+      if (escape_ == "\x1b[1;3A" || escape_ == "\x1b[1;3B") {
+        history(escape_ == "\x1b[1;3A");
+      }
+      if (escape_ == "\x1b[1;2A" || escape_ == "\x1b[1;2B") {
+        const auto scroll_act =
+            escape_ == "\x1b[1;2A" ? InputAction::scroll_up : InputAction::scroll_down;
+        escape_.clear();
+        return {scroll_act, {}};
+      }
       if (escape_ == "\x1b[3~" && cursor_ < text_.size())
         text_.erase(cursor_, next(text_, cursor_) - cursor_);
     }
@@ -5823,6 +5864,37 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         keyboard_process.progress(static_cast<std::size_t>(i) + 1);
         continue;
       }
+      // Alternate-scroll (?1007h) translates trackpad/mouse-wheel scrolling into
+      // Up/Down cursor sequences when SGR mouse reporting is off so native terminal
+      // drag-selection stays intact. Route those cursor sequences to chat scroll
+      // when we are in the main chat view (and either already scrolled up, idle on
+      // an empty prompt outside history, or receiving a multi-tick scroll burst).
+      if (!mouse_emitted && alt_scroll_emitted && !inspection_focused() &&
+          !composer.palette_open() && !composer.slash_open() &&
+          !composer.choices_open() && !composer.escape_pending() &&
+          !composer.pasted() && composer.text().find('\n') == std::string::npos &&
+          i + 2 < count && bytes[i] == '\x1b' &&
+          (bytes[i + 1] == '[' || bytes[i + 1] == 'O') &&
+          (bytes[i + 2] == 'A' || bytes[i + 2] == 'B')) {
+        const bool is_burst = i + 5 < count && bytes[i + 3] == '\x1b' &&
+                              (bytes[i + 4] == '[' || bytes[i + 4] == 'O') &&
+                              (bytes[i + 5] == 'A' || bytes[i + 5] == 'B');
+        const bool should_scroll =
+            is_burst || scroll > 0 ||
+            (composer.text().empty() && !composer.browsing_history());
+        if (should_scroll) {
+          const bool up = bytes[i + 2] == 'A';
+          if (up)
+            scroll += 1;
+          else
+            scroll -= std::min(scroll, std::size_t{1});
+          welcoming = false;
+          redraw = true;
+          keyboard_process.progress(static_cast<std::size_t>(i) + 3);
+          i += 2;
+          continue;
+        }
+      }
       const bool was_escape = composer.escape_pending();
       auto result = keyboard_process.run([&] {
         auto session_data = raw_ui_data(raw_capture_, composer.capture_bound(1));
@@ -6350,9 +6422,11 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                 finish_action();
                 break;
               }
-            } else if (result.text == "/help" || result.text == "/keys") {
-              transcript += "\n" + (result.text == "/help" ? terminal_help()
-                                                           : terminal_key_help());
+            } else if (result.text == "/help" || result.text == "/keys" ||
+                       result.text == "/about" || result.text == "/version") {
+              transcript += "\n" + (result.text == "/help"   ? terminal_help()
+                                    : result.text == "/keys" ? terminal_key_help()
+                                                             : terminal_about());
               scroll = 0;
             } else if (result.text == "/queue") {
               transcript +=

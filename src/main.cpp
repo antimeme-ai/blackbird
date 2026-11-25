@@ -1128,6 +1128,119 @@ public:
 
   MpRoomV2Session *mp2_session() const noexcept { return room_v2_session_.get(); }
 
+  LivePartyBridge build_live_party_bridge(const std::string *active_model) {
+    LivePartyBridge bridge{};
+    bridge.read_state = [this]() -> LivePartyRoomState {
+      LivePartyRoomState out{};
+      if (!mp2_active()) {
+        out.connected = false;
+        out.state_name = "disconnected";
+        return out;
+      }
+      const auto snap = room_v2_session_->snapshot();
+      const auto party_snap = room_v2_session_->to_party_snapshot();
+      out.connected = snap.active;
+      out.state_name = std::string{mp_room_v2_state_name(snap.state)};
+      out.room_code = snap.room_code;
+      out.room_name = snap.room_name;
+      out.share_url = snap.share_url;
+      out.latest_seq = snap.latest_seq;
+      out.members.reserve(party_snap.participants.size());
+      for (const auto &p : party_snap.participants) {
+        LivePartyMemberInfo info{};
+        info.handle = p.id;
+        info.is_self = p.local_self;
+        info.is_guest = p.display_name.find("[guest]") != std::string::npos;
+        info.clients = p.host;
+        switch (p.state) {
+        case PartyParticipantState::working:
+          info.state = "working";
+          break;
+        case PartyParticipantState::online:
+          info.state = "online";
+          break;
+        case PartyParticipantState::idle:
+          info.state = "idle";
+          break;
+        case PartyParticipantState::offline:
+          info.state = "offline";
+          break;
+        }
+        for (const auto &raw_m : snap.members) {
+          if (raw_m.handle == p.id) {
+            if (!info.account_id.has_value() && raw_m.account_id.has_value())
+              info.account_id = raw_m.account_id->value();
+            if (info.agent_summary.empty() && !raw_m.agent_summary.empty())
+              info.agent_summary = raw_m.agent_summary;
+          }
+        }
+        out.members.push_back(std::move(info));
+      }
+      out.messages.reserve(snap.messages.size());
+      for (const auto &m : snap.messages) {
+        LivePartyMessageInfo mi{};
+        mi.seq = m.seq;
+        mi.ts_ms = m.ts_ms;
+        mi.sender_handle = m.sender_handle;
+        if (m.sender_account_id.has_value())
+          mi.sender_account_id = m.sender_account_id->value();
+        mi.sender_is_guest = m.sender_is_guest;
+        mi.sender_client = m.sender_client;
+        mi.sender_agent_name = m.sender_agent_name;
+        mi.target = m.target;
+        mi.kind = m.kind;
+        mi.body = m.rendered_body;
+        mi.local_self = m.local_self;
+        if (m.parsed_agent_card.has_value()) {
+          LivePartyCardInfo ci{};
+          ci.title = m.parsed_agent_card->title;
+          ci.summary = m.parsed_agent_card->summary;
+          ci.status = m.parsed_agent_card->status;
+          ci.agent_name = m.parsed_agent_card->agent_name;
+          ci.files = m.parsed_agent_card->files;
+          ci.diff_stat = m.parsed_agent_card->diff_stat;
+          mi.agent_card = std::move(ci);
+        }
+        out.messages.push_back(std::move(mi));
+      }
+      return out;
+    };
+    bridge.send_chat = [this](std::string_view text,
+                              std::string_view target) -> Result<void> {
+      if (!mp2_active())
+        return Result<void>::failure({ErrorCode::unsupported});
+      auto res = room_v2_session_->send_chat(std::string{text}, MpRoomV2Target{target});
+      if (!res.has_value())
+        return Result<void>::failure(res.error());
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      return Result<void>::success();
+    };
+    bridge.send_card = [this,
+                        active_model](const LivePartyCardInfo &card) -> Result<void> {
+      if (!mp2_active())
+        return Result<void>::failure({ErrorCode::unsupported});
+      MpRoomV2AgentCard out_card{};
+      out_card.title = card.title;
+      out_card.summary = card.summary;
+      out_card.status = card.status;
+      out_card.agent_name = !card.agent_name.empty()
+                                ? card.agent_name
+                                : (active_model != nullptr && !active_model->empty()
+                                       ? *active_model
+                                       : std::string{"Blackbird"});
+      out_card.files = card.files;
+      out_card.diff_stat = card.diff_stat;
+      auto res = room_v2_session_->send_agent_card(out_card);
+      if (!res.has_value())
+        return Result<void>::failure(res.error());
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      return Result<void>::success();
+    };
+    return bridge;
+  }
+
   bool *party_cards_enabled_ptr() noexcept { return &party_cards_enabled_; }
   bool party_cards_enabled() const noexcept { return party_cards_enabled_; }
 
@@ -1255,8 +1368,11 @@ public:
       return handle_v2_add_friend(args);
     if (cmd == "/invite")
       return handle_v2_invite(args);
-    if (cmd == "/join")
+    if (cmd == "/join") {
+      if (trim_ascii_ws(args).starts_with('{'))
+        return std::nullopt;
       return handle_v2_join(args);
+    }
     if (cmd == "/leave")
       return handle_v2_leave(args);
     if (cmd == "/friends" || cmd == "/who")
@@ -3161,10 +3277,13 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     struct TurnCallbackDetachGuard {
       CodingEngine &target;
       ~TurnCallbackDetachGuard() {
+        target.live_party.reset();
         target.effect_policy = {};
         target.display = {};
       }
     } detach_turn_callbacks{engine};
+
+    engine.live_party = online_hub.build_live_party_bridge(&model);
 
     engine.display = [&](std::string_view chunk) {
       emit(chunk);
@@ -3410,7 +3529,8 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                 !prompt.starts_with("/provider ") && prompt != "/session" &&
                 prompt != "/sessions" && prompt != "/resume" && prompt != "/cwd" &&
                 !prompt.starts_with("/cwd ") && prompt != "/help" &&
-                prompt != "/context" && prompt != "/profile") {
+                prompt != "/about" && prompt != "/version" && prompt != "/context" &&
+                prompt != "/profile") {
               ask_effort(session_store.settings(),
                          route_efforts(session_store.settings(), command_context));
               return;
@@ -3430,6 +3550,9 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             } else if (prompt == "/help") {
               raw_main_branch(dispatch, 1);
               emit(terminal_help());
+            } else if (prompt == "/about" || prompt == "/version") {
+              raw_main_branch(dispatch, 1);
+              emit(terminal_about());
             } else if (prompt.starts_with("/exec ") ||
                        prompt.starts_with("/process ")) {
               raw_main_branch(dispatch, 2);

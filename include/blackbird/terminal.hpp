@@ -161,6 +161,8 @@ private:
 };
 // Shared command discovery; local-only commands are labelled in help.
 std::string terminal_help();
+// Version, build profile, and runtime summary shown by /about and /version.
+std::string terminal_about();
 // "◆ CONTEXT compacted −48 KiB": badge text for one published context change.
 std::string terminal_context_badge(std::string_view kind,
                                    std::optional<std::size_t> bytes_before,
@@ -220,6 +222,8 @@ public:
   void views(tui::ViewRoute current = tui::ViewRoute::conversation);
   bool palette_open() const noexcept { return palette_open_; }
   bool slash_open() const noexcept { return slash_open_; }
+  bool choices_open() const noexcept { return choices_ != nullptr; }
+  bool browsing_history() const noexcept { return history_index_ < history_.size(); }
   bool escape_pending() const noexcept { return !escape_.empty(); }
   bool bare_escape_pending() const noexcept { return escape_ == "\x1b"; }
   bool pasted() const noexcept { return pasted_; }

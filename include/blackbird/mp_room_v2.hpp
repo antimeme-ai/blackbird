@@ -170,6 +170,7 @@ struct MpRoomV2Message {
   std::uint64_t ts_ms = 0U;
   std::string client_msg_id;
   std::optional<mp::AccountId> sender_account_id;
+  bool sender_is_guest = false;
   std::string sender_handle;
   std::string sender_client;
   std::string sender_agent_name;

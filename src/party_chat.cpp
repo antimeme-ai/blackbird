@@ -2750,6 +2750,7 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
   frame.split_layout = split;
   frame.lines.reserve(H);
 
+  const bool compact = snapshot_.compact_room_presentation;
   const PartyMode cur_mode = frame.mode;
   const std::string mode_badge = cur_mode == PartyMode::multi_operator
                                      ? std::string{"[MULTI-OP]"}
@@ -2762,18 +2763,25 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
 
   const std::size_t op_cnt = snapshot_.operator_count();
   const std::size_t leader_cnt = snapshot_.leader_count();
-  const std::string counts = std::to_string(op_cnt) + (op_cnt == 1 ? " op" : " ops") +
-                             " · " + std::to_string(leader_cnt) +
-                             (leader_cnt == 1 ? " leader" : " leaders");
+  const std::size_t online_cnt = snapshot_.online_operator_count();
+  const std::string counts =
+      compact
+          ? (std::to_string(online_cnt > 0 ? online_cnt
+                                           : snapshot_.participants.size()) +
+             " online")
+          : (std::to_string(op_cnt) + (op_cnt == 1 ? " op" : " ops") + " · " +
+             std::to_string(leader_cnt) + (leader_cnt == 1 ? " leader" : " leaders"));
 
   const std::string unread_str =
       unread_count_ > 0 ? (" [+" + std::to_string(unread_count_) + " unread]")
                         : std::string{};
-  const std::string_view key_hints = "Tab target · ↑↓ scroll · /party";
+  const std::string_view key_hints =
+      compact ? "Tab target · ↑↓ scroll · Esc back" : "Tab target · ↑↓ scroll · /party";
 
   // --- Row 0: Primary Header ---
   {
-    std::string plain = "PARTY CHAT " + mode_badge + " " + safe_scope;
+    std::string plain = compact ? ("PARTY · " + safe_scope)
+                                : ("PARTY CHAT " + mode_badge + " " + safe_scope);
     if (split) {
       plain += " · " + counts + " | To: " + safe_target + unread_str;
     } else if (!unread_str.empty()) {
@@ -2842,7 +2850,11 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
   } else {
     for (std::size_t idx = 0; idx < msgs.size(); ++idx) {
       const auto &m = msgs[idx];
-      const std::string ts = format_timestamp_tag({m.timestamp_ns, idx});
+      const std::string ts_full = format_timestamp_tag({m.timestamp_ns, idx});
+      const std::string ts =
+          (compact && ts_full.size() == 8U && ts_full[2] == ':' && ts_full[5] == ':')
+              ? ts_full.substr(0U, 5U)
+              : ts_full;
       const std::string rbadge{role_badge(m.sender_role)};
       const std::string sender =
           party_chat_sanitize(m.sender_id.empty() ? std::string_view{"unknown"}
@@ -2851,10 +2863,10 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
       const std::string target =
           party_chat_sanitize(normalize_target_tag(m.target), 32);
 
-      std::string prefix = ts + " " + rbadge;
+      std::string prefix = compact ? ts : (ts + " " + rbadge);
       PartyInk line_ink = ink_for_role(m.sender_role);
       if (m.untrusted_remote) {
-        prefix += " [PEER:UNTRUSTED]";
+        prefix += compact ? " [GUEST]" : " [PEER:UNTRUSTED]";
         line_ink = PartyInk::untrusted_badge;
       }
       if (m.kind == PartyMessageKind::conflict) {
@@ -2873,7 +2885,13 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
       prefix += " " + sender;
       if (!m.sender_model.empty() && feed_col_w >= 64)
         prefix += "(" + party_chat_sanitize(m.sender_model, 20) + ")";
-      prefix += " -> " + target + ": ";
+      if (compact) {
+        if (target != "@all")
+          prefix += " → " + target;
+        prefix += ": ";
+      } else {
+        prefix += " -> " + target + ": ";
+      }
 
       if (m.agent_card.has_value()) {
         const auto &card = *m.agent_card;
@@ -2997,14 +3015,22 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
         const auto &p = snapshot_.participants[i];
         if (i > 0)
           strip += " · ";
-        strip += std::string{state_dot(p.state)} + " " +
-                 std::string{role_badge(p.role)} + " " + party_chat_sanitize(p.id, 20);
-        if (!p.model.empty())
-          strip += "(" + party_chat_sanitize(p.model, 14) + ")";
-        else if (!p.host.empty())
-          strip += "@" + party_chat_sanitize(p.host, 14);
-        if (!p.fingerprint.empty())
-          strip += "[" + party_chat_sanitize(short_fp(p.fingerprint), 12) + "]";
+        strip += std::string{state_dot(p.state)} + " ";
+        if (compact) {
+          const bool is_guest = p.display_name.find("[guest]") != std::string::npos;
+          const std::string clean_id = party_chat_sanitize(p.id, 20);
+          strip += is_guest ? (clean_id + " [guest]")
+                            : (clean_id.starts_with('@') ? clean_id : ("@" + clean_id));
+        } else {
+          strip +=
+              std::string{role_badge(p.role)} + " " + party_chat_sanitize(p.id, 20);
+          if (!p.model.empty())
+            strip += "(" + party_chat_sanitize(p.model, 14) + ")";
+          else if (!p.host.empty())
+            strip += "@" + party_chat_sanitize(p.host, 14);
+          if (!p.fingerprint.empty())
+            strip += "[" + party_chat_sanitize(short_fp(p.fingerprint), 12) + "]";
+        }
       }
     }
     const std::size_t strip_budget = H >= 14 ? 2U : 1U;
@@ -3070,16 +3096,22 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
         const auto &p = snapshot_.participants[i];
         const bool is_sel =
             selected_target_index_.has_value() && *selected_target_index_ == i;
-        std::string l1 = (is_sel ? "> " : "  ") + std::string{state_dot(p.state)} +
-                         " " + std::string{role_badge(p.role)} + " " +
-                         party_chat_sanitize(p.id, 18);
+        std::string l1 = (is_sel ? "> " : "  ") + std::string{state_dot(p.state)} + " ";
+        if (compact) {
+          const bool is_guest = p.display_name.find("[guest]") != std::string::npos;
+          const std::string clean_id = party_chat_sanitize(p.id, 18);
+          l1 += is_guest ? (clean_id + " [guest]")
+                         : (clean_id.starts_with('@') ? clean_id : ("@" + clean_id));
+        } else {
+          l1 += std::string{role_badge(p.role)} + " " + party_chat_sanitize(p.id, 18);
+        }
         if (p.local_self)
           l1 += " (you)";
         roster_lines.push_back({std::move(l1), ink_for_state(p.state)});
 
         std::string meta;
         if (!p.host.empty())
-          meta += party_chat_sanitize(p.host, 14);
+          meta += party_chat_sanitize(p.host, compact ? 22U : 14U);
         if (!p.model.empty()) {
           if (!meta.empty())
             meta += " · ";

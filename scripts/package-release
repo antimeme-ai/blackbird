@@ -667,6 +667,7 @@ def main(argv: list[str] | None = None) -> int:
             "-B",
             str(build_dir),
             f"-DBLACKBIRD_CARGO_TARGET_DIR={cargo_target_dir}",
+            f"-DBLACKBIRD_RELEASE_VERSION={version}",
             "-DBLACKBIRD_RESOURCE_ROOT=/nonexistent/blackbird-packaged",
         ]
 

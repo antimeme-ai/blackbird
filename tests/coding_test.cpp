@@ -516,6 +516,17 @@ void retained_output_test(const std::string &path) {
     if (string_field(result, "output") != "cdef" || read_file(marker) != "X" ||
         field(result, "output_bytes").number().text() != "6" || provider.calls != 0)
       throw Error{ErrorCode::corrupt};
+    // Models that populate unused optional schema strings (result_ref: "") alongside
+    // output_ref must still read output_ref cleanly.
+    auto with_empty_result_ref = invoke(
+        engine, "read_process_output",
+        Value::object({{"output_ref", Value{reference}},
+                       {"result_ref", Value{""}},
+                       {"range", Value::object({{"mode", Value{"bytes"}},
+                                                {"start", Value{Number{"2"}}},
+                                                {"end", Value{Number{"6"}}}})}}));
+    if (string_field(with_empty_result_ref, "output") != "cdef")
+      throw Error{ErrorCode::corrupt};
     auto partial = invoke(engine, "read_process_output",
                           Value::object({{"output_ref", Value{timed_reference}}}));
     if (string_field(partial, "output") != "PARTIAL")
