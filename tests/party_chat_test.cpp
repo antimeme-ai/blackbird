@@ -916,6 +916,92 @@ void test_unverified_and_revoked_bridge_peer_cannot_impersonate_or_escalate() {
           "pane renders [PEER:UNTRUSTED] badge for spoofed messages");
 }
 
+void test_structured_agent_card_rendering_and_hostile_sanitization() {
+  PartySnapshot snap{};
+  snap.room_scope = "room/KAIH";
+  snap.mode = PartyMode::multi_operator;
+
+  PartyParticipant self_p{};
+  self_p.id = "antimeme";
+  self_p.display_name = "@antimeme (blackbird)";
+  self_p.role = PartyMemberRole::operator_human;
+  self_p.state = PartyParticipantState::online;
+  self_p.local_self = true;
+
+  PartyParticipant phall_p{};
+  phall_p.id = "phall";
+  phall_p.display_name = "@phall (outpost · Claude Code)";
+  phall_p.role = PartyMemberRole::operator_human;
+  phall_p.state = PartyParticipantState::working;
+  snap.participants = {self_p, phall_p};
+
+  PartyMessage card_msg{};
+  card_msg.id = "card-1";
+  card_msg.timestamp_ns = 1'700'000'500'000'000'000LL;
+  card_msg.sender_id = "@phall";
+  card_msg.sender_role = PartyMemberRole::platoon_leader;
+  card_msg.sender_model = "Claude Code";
+  card_msg.verified_peer = true;
+  card_msg.untrusted_remote = true;
+  card_msg.target = "@all";
+  card_msg.kind = PartyMessageKind::leader_update;
+  card_msg.body = "[agent] Fixed auth test — 2 files changed";
+  PartyAgentCard card{};
+  card.title = "Fixed auth test";
+  card.summary = "Updated token validation and added regression coverage";
+  card.status = "done";
+  card.agent_name = "Claude Code";
+  card.diff_stat = "+42 -7";
+  card.files = {"src/auth.cpp", "tests/auth_test.cpp", "src/a.cpp", "src/b.cpp",
+                "src/c.cpp",    "src/d.cpp",           "src/e.cpp"};
+  card_msg.agent_card = card;
+
+  // Also test hostile ANSI/OSC/BiDi inside a blocked card.
+  PartyMessage hostile_card_msg{};
+  hostile_card_msg.id = "card-2";
+  hostile_card_msg.timestamp_ns = 1'700'000'510'000'000'000LL;
+  hostile_card_msg.sender_id = "@phall";
+  hostile_card_msg.sender_role = PartyMemberRole::platoon_leader;
+  hostile_card_msg.untrusted_remote = true;
+  hostile_card_msg.kind = PartyMessageKind::leader_update;
+  PartyAgentCard hostile_card{};
+  hostile_card.title = "\x1b[31mBlocked\x1b]0;pwn\x07\xE2\x80\xAE task";
+  hostile_card.summary = "Waiting on \xC2\x9B"
+                         "2J review";
+  hostile_card.status = "blocked";
+  hostile_card.agent_name = "Bot\x07";
+  hostile_card.files = {"src/secret\x1b[0m.cpp"};
+  hostile_card_msg.agent_card = hostile_card;
+
+  snap.messages = {card_msg, hostile_card_msg};
+
+  PartyChatPane pane{snap};
+  const PartyChatFrame frame = pane.render_frame(120, 28, false);
+  const std::string plain = frame.text();
+  require(plain.find("┌─ [DONE] Claude Code · Fixed auth test (+42 -7)") !=
+              std::string::npos,
+          "Party Chat pane must render structured DONE agent card header");
+  require(plain.find("Updated token validation") != std::string::npos,
+          "Party Chat pane must render agent card summary");
+  require(plain.find("└─ files: src/auth.cpp, tests/auth_test.cpp") !=
+              std::string::npos,
+          "Party Chat pane must render agent card file list footer");
+  require(plain.find("+1") != std::string::npos,
+          "Party Chat pane must summarize overflow file count beyond 6");
+  require(plain.find("[BLOCKED]") != std::string::npos,
+          "Party Chat pane must render BLOCKED status badge");
+
+  for (const auto &line : frame.lines) {
+    assert_zero_raw_controls(line);
+  }
+
+  // Color mode must also render cleanly without throwing or emptying.
+  const PartyChatFrame color_frame = pane.render_frame(100, 24, true);
+  require(color_frame.lines.size() == 24U, "color card render preserves height");
+  require(color_frame.text().find("[DONE]") != std::string::npos,
+          "color card render includes status badge");
+}
+
 } // namespace
 
 int main() {
@@ -927,6 +1013,7 @@ int main() {
     test_party_json_roundtrip_and_security_rejections();
     test_hostile_escape_sanitization_and_responsive_rendering();
     test_unverified_and_revoked_bridge_peer_cannot_impersonate_or_escalate();
+    test_structured_agent_card_rendering_and_hostile_sanitization();
     std::cout << "party_chat_test: all checks passed\n";
     return 0;
   } catch (const std::exception &ex) {

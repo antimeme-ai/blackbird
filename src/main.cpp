@@ -1122,6 +1122,86 @@ public:
            (party_session_ != nullptr && party_session_->is_active());
   }
 
+  bool mp2_active() const noexcept {
+    return room_v2_session_ != nullptr && room_v2_session_->is_active();
+  }
+
+  MpRoomV2Session *mp2_session() const noexcept { return room_v2_session_.get(); }
+
+  bool *party_cards_enabled_ptr() noexcept { return &party_cards_enabled_; }
+  bool party_cards_enabled() const noexcept { return party_cards_enabled_; }
+
+  struct RespondExecution {
+    std::string prompt;
+    MpRoomV2PendingMention mention;
+  };
+
+  std::optional<std::string> try_handle_respond(std::string_view prompt,
+                                                std::optional<RespondExecution> &exec) {
+    const auto trimmed = trim_ascii_ws(prompt);
+    const auto [cmd, args] = split_ws_token(trimmed);
+    std::string_view guidance;
+    if (cmd == "/respond") {
+      guidance = args;
+    } else if (cmd == "/party") {
+      const auto [sub, rest] = split_ws_token(args);
+      if (sub != "respond")
+        return std::nullopt;
+      guidance = rest;
+    } else {
+      return std::nullopt;
+    }
+
+    if (!mp2_active())
+      return "Not in an active live party — no pending @agent mention.\n";
+    const auto pending = room_v2_session_->consume_pending_agent_mention();
+    if (!pending.has_value())
+      return "No pending @agent mention to respond to.\n";
+    if (tui_)
+      ui_.party_chat(room_v2_session_->to_party_snapshot());
+
+    const std::string who = "@" + party_chat_sanitize(pending->sender_handle, 48);
+    const std::string trust{brakes::party_trust_profile_name(pending->effective_trust)};
+    exec =
+        RespondExecution{build_mp_room_v2_respond_prompt(*pending, guidance), *pending};
+    return "Responding to " + who +
+           "'s mention under Brakes isolation (trust=" + trust + ")...\n";
+  }
+
+  void notify_turn_working(std::string_view summary) noexcept {
+    if (!mp2_active())
+      return;
+    try {
+      MpRoomV2StatusUpdate st{};
+      st.client = "blackbird";
+      st.agent_name = "Blackbird";
+      st.agent_state = "working";
+      st.agent_summary = party_chat_sanitize(summary, 96);
+      (void)room_v2_session_->update_status(std::move(st));
+    } catch (...) {
+    }
+  }
+
+  void notify_turn_finished(const MpRoomV2AgentCard &card) noexcept {
+    if (!mp2_active())
+      return;
+    try {
+      MpRoomV2StatusUpdate st{};
+      st.client = "blackbird";
+      st.agent_name = "Blackbird";
+      st.agent_state = "idle";
+      st.agent_summary = party_chat_sanitize(card.title, 96);
+      (void)room_v2_session_->update_status(std::move(st));
+
+      if (party_cards_enabled_) {
+        const auto sent = room_v2_session_->send_agent_card(card);
+        if (sent.has_value() && tui_)
+          ui_.party_chat(room_v2_session_->to_party_snapshot());
+      }
+    } catch (...) {
+    }
+  }
+
   std::optional<std::string> try_handle_party_say(std::string_view say_body) {
     if (!party_attached())
       return std::nullopt;
@@ -1181,12 +1261,16 @@ public:
       return handle_v2_leave(args);
     if (cmd == "/friends" || cmd == "/who")
       return handle_v2_friends(args);
+    if (cmd == "/card")
+      return handle_v2_card(args);
 
     std::string_view online_args;
     if (cmd == "/online") {
       online_args = args;
     } else if (cmd == "/party") {
       const auto [sub, rest] = split_ws_token(args);
+      if (sub == "cards")
+        return handle_party_cards(rest);
       if (sub != "online")
         return std::nullopt;
       online_args = rest;
@@ -1313,6 +1397,13 @@ private:
         raw_session->drain_wake();
         const auto snap = raw_session->snapshot();
         if (tui_) {
+          for (const auto &alert : snap.mention_alerts) {
+            const std::string who = "@" + party_chat_sanitize(alert.sender_handle, 48);
+            ui_.notice("\n[party] ● " + who + " pinged your agent — /respond\n");
+            ui_.desktop_notify(
+                TerminalNotifyTitle{who + " pinged your agent"},
+                TerminalNotifyBody{alert.sanitized_preview + " — /respond"});
+          }
           for (const auto &notice : snap.notices) {
             ui_.notice("\n[party] " + notice + "\n");
             ui_.desktop_notify(TerminalNotifyTitle{"Blackbird Party"},
@@ -1617,6 +1708,55 @@ private:
     return "Left party.\n";
   }
 
+  std::string handle_party_cards(std::string_view rest) {
+    const auto [mode_tok, extra] = split_ws_token(rest);
+    if (!extra.empty())
+      return "Usage: /party cards [on|off|status]\n";
+    if (mode_tok.empty() || mode_tok == "status") {
+      return std::string{"Party agent cards: "} +
+             (party_cards_enabled_ ? "ON" : "OFF") +
+             " (toggle with `/party cards on|off`)\n";
+    }
+    if (mode_tok == "on") {
+      party_cards_enabled_ = true;
+      return "Party agent cards: ON (auto-emitting turn summaries to active party).\n";
+    }
+    if (mode_tok == "off") {
+      party_cards_enabled_ = false;
+      return "Party agent cards: OFF (use `/card <title> | <summary>` to post "
+             "manually).\n";
+    }
+    return "Usage: /party cards [on|off|status]\n";
+  }
+
+  std::string handle_v2_card(std::string_view args) {
+    const auto trimmed = trim_ascii_ws(args);
+    if (trimmed.empty())
+      return "Usage: /card <title> | <summary>\n";
+    if (!mp2_active())
+      return "Not in an active live party — run `/invite` or `/join` first.\n";
+    MpRoomV2AgentCard card{};
+    const std::size_t bar = trimmed.find('|');
+    if (bar == std::string_view::npos) {
+      card.title = std::string{trimmed};
+    } else {
+      card.title = std::string{trim_ascii_ws(trimmed.substr(0, bar))};
+      card.summary = std::string{trim_ascii_ws(trimmed.substr(bar + 1))};
+    }
+    card.status = "done";
+    const auto sent = room_v2_session_->send_agent_card(card);
+    if (!sent.has_value()) {
+      if (mp_room_v2_error_of(sent.error()) == MpRoomV2Error::secret_rejected)
+        return "Agent card refused: recognizable secret token detected.\n";
+      return "Agent card failed: " +
+             std::string{mp_room_v2_error_name(mp_room_v2_error_of(sent.error()))} +
+             "\n";
+    }
+    if (tui_)
+      ui_.party_chat(room_v2_session_->to_party_snapshot());
+    return "Posted agent card: " + party_chat_sanitize(card.title, 120) + "\n";
+  }
+
   std::string handle_v2_friends(std::string_view rest) {
     if (!trim_ascii_ws(rest).empty())
       return "Usage: /friends\n";
@@ -1839,6 +1979,7 @@ private:
   std::atomic<bool> social_running_{false};
   std::atomic<std::size_t> social_online_count_{0U};
   std::atomic<std::size_t> social_tracked_count_{0U};
+  bool party_cards_enabled_ = true;
 };
 } // namespace
 int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
@@ -2654,6 +2795,25 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
         config.auth.curl_executable = curl;
       return std::make_unique<RegisteredResponsesCodingProvider>(std::move(config));
     };
+    // Declared BEFORE `engine` so callback captures stay valid through `engine`
+    // teardown; `TurnCallbackDetachGuard` also clears callbacks explicitly.
+    struct TurnCardCapture {
+      bool active = false;
+      std::string title;
+      std::string output_excerpt;
+      std::vector<std::string> touched_files;
+      std::optional<brakes::BrakesGate> respond_brakes_gate;
+      std::filesystem::path workspace_root;
+
+      void reset() noexcept {
+        active = false;
+        title.clear();
+        output_excerpt.clear();
+        touched_files.clear();
+        respond_brakes_gate.reset();
+        workspace_root.clear();
+      }
+    } turn_capture;
     std::unique_ptr<CodingProvider> provider =
         make_coding_provider(provider_name, session_capture);
     CodingEngine engine{log, context, *provider, model};
@@ -2998,7 +3158,50 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
     };
     ask_effort(settings, initial_efforts);
     refresh_info(session_capture);
-    engine.display = emit;
+    struct TurnCallbackDetachGuard {
+      CodingEngine &target;
+      ~TurnCallbackDetachGuard() {
+        target.effect_policy = {};
+        target.display = {};
+      }
+    } detach_turn_callbacks{engine};
+
+    engine.display = [&](std::string_view chunk) {
+      emit(chunk);
+      if (turn_capture.active && turn_capture.output_excerpt.size() < 360U) {
+        const std::size_t rem = 360U - turn_capture.output_excerpt.size();
+        turn_capture.output_excerpt.append(chunk.substr(0, rem));
+      }
+    };
+    engine.effect_policy = [&](std::string_view op_name, const Value &op_input) {
+      if (turn_capture.respond_brakes_gate.has_value()) {
+        const auto decision = evaluate_mp_room_v2_respond_effect(
+            *turn_capture.respond_brakes_gate, op_name, op_input,
+            turn_capture.workspace_root);
+        // Fail closed on BOTH `deny` and `escalate` (no silent approval bypass).
+        if (!decision.allow)
+          throw Error{ErrorCode::unsupported};
+      }
+      if (turn_capture.active && (op_name == "write_file" || op_name == "edit_file") &&
+          turn_capture.touched_files.size() < kMpRoomV2MaxAgentCardFiles) {
+        if (const auto *p = op_input.find("path");
+            p != nullptr && std::holds_alternative<std::string>(p->value())) {
+          std::string rel = p->string();
+          std::error_code rel_ec;
+          if (!turn_capture.workspace_root.empty()) {
+            const auto r = std::filesystem::relative(
+                std::filesystem::path{rel}, turn_capture.workspace_root, rel_ec);
+            if (!rel_ec && !r.empty() && !r.string().starts_with(".."))
+              rel = r.string();
+          }
+          if (!rel.empty() && std::find(turn_capture.touched_files.begin(),
+                                        turn_capture.touched_files.end(),
+                                        rel) == turn_capture.touched_files.end()) {
+            turn_capture.touched_files.push_back(std::move(rel));
+          }
+        }
+      }
+    };
     if (tui) {
       RawEventRef source;
       const auto snapshot = engine.tasks().snapshot(&source);
@@ -3192,6 +3395,12 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           const RawAdapterContext *previous;
           ~OutputSelection() { selected = previous; }
         } output_selection{output_context, output_context};
+        // Unconditionally disarms `turn_capture` (and `respond_brakes_gate`) on
+        // any exit path, including non-`Error` exceptions or early returns.
+        struct TurnCaptureResetGuard {
+          TurnCardCapture &cap;
+          ~TurnCaptureResetGuard() { cap.reset(); }
+        } turn_capture_guard{turn_capture};
         output_context = &command_context;
         try {
           dispatch.run([&] {
@@ -4149,102 +4358,177 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
               engine.turn({"", prompt.substr(5)});
             } else {
               raw_main_branch(dispatch, 40);
-              if (engine.operator_turn(
-                      prompt, prompt.starts_with("/")
-                                  ? ""
-                                  : read_workflow_source(workflow, &command_context))) {
-                publish_workflows(engine.workflows());
-              } else if (prompt.starts_with("/")) {
-                bool handled_remote_party = false;
-                if (const auto live_out = online_hub.try_handle_slash(prompt);
-                    live_out.has_value()) {
-                  handled_remote_party = true;
-                  if (tui)
-                    ui.notice("\n" + *live_out);
-                  else
-                    emit(*live_out);
+              auto begin_turn_card = [&](std::string_view title_src,
+                                         const MpRoomV2PendingMention *mention) {
+                turn_capture.reset();
+                turn_capture.active = true;
+                const std::string clean_title =
+                    mp_room_v2_contains_secret_token(title_src)
+                        ? std::string{"Completed turn"}
+                        : party_chat_sanitize(title_src, 80);
+                turn_capture.title =
+                    clean_title.empty() ? std::string{"Completed turn"} : clean_title;
+                std::error_code ws_ec;
+                turn_capture.workspace_root = std::filesystem::current_path(ws_ec);
+                if (mention != nullptr) {
+                  brakes::EffectivePolicy eff_policy{};
+                  if (auto loaded = brakes::load_effective_policy(); loaded.has_value())
+                    eff_policy = std::move(loaded).value();
+                  brakes::BrakesGate gate{std::move(eff_policy)};
+                  (void)gate.ingest_peer(mention->provenance);
+                  turn_capture.respond_brakes_gate.emplace(std::move(gate));
                 }
-                if (!handled_remote_party) {
-                  if (const auto say_body = extract_party_say_body(prompt);
-                      say_body.has_value()) {
-                    if (const auto online_sent =
-                            online_hub.try_handle_party_say(*say_body);
-                        online_sent.has_value()) {
-                      handled_remote_party = true;
-                      if (tui)
-                        ui.notice("\n" + *online_sent);
-                      else
-                        emit(*online_sent);
+                online_hub.notify_turn_working(turn_capture.title);
+              };
+              auto finish_turn_card_ok = [&]() {
+                if (!turn_capture.active)
+                  return;
+                MpRoomV2AgentCard card{};
+                card.title = turn_capture.title;
+                card.status = "done";
+                card.agent_name = model;
+                card.files = turn_capture.touched_files;
+                if (!turn_capture.output_excerpt.empty() &&
+                    !mp_room_v2_contains_secret_token(turn_capture.output_excerpt)) {
+                  card.summary = party_chat_sanitize(turn_capture.output_excerpt, 240);
+                } else if (!card.files.empty()) {
+                  card.summary =
+                      std::to_string(card.files.size()) +
+                      (card.files.size() == 1U ? " file updated" : " files updated");
+                } else {
+                  card.summary = "Turn completed";
+                }
+                online_hub.notify_turn_finished(card);
+                turn_capture.reset();
+              };
+
+              std::optional<LiveOnlineSessionHub::RespondExecution> respond_exec;
+              if (const auto respond_msg =
+                      online_hub.try_handle_respond(prompt, respond_exec);
+                  respond_msg.has_value()) {
+                if (tui)
+                  ui.notice("\n" + *respond_msg);
+                else
+                  emit(*respond_msg);
+                if (respond_exec.has_value()) {
+                  begin_turn_card("Reply to @" + respond_exec->mention.sender_handle,
+                                  &respond_exec->mention);
+                  if (engine.operator_turn(
+                          respond_exec->prompt,
+                          read_workflow_source(workflow, &command_context))) {
+                    publish_workflows(engine.workflows());
+                  }
+                  finish_turn_card_ok();
+                }
+              } else {
+                const bool is_model_turn = !prompt.starts_with("/");
+                if (is_model_turn)
+                  begin_turn_card(prompt, nullptr);
+                if (engine.operator_turn(
+                        prompt,
+                        prompt.starts_with("/")
+                            ? ""
+                            : read_workflow_source(workflow, &command_context))) {
+                  publish_workflows(engine.workflows());
+                  finish_turn_card_ok();
+                } else if (prompt.starts_with("/")) {
+                  turn_capture.reset();
+                  bool handled_remote_party = false;
+                  if (const auto live_out = online_hub.try_handle_slash(prompt);
+                      live_out.has_value()) {
+                    handled_remote_party = true;
+                    if (tui)
+                      ui.notice("\n" + *live_out);
+                    else
+                      emit(*live_out);
+                  }
+                  if (!handled_remote_party) {
+                    if (const auto say_body = extract_party_say_body(prompt);
+                        say_body.has_value()) {
+                      if (const auto online_sent =
+                              online_hub.try_handle_party_say(*say_body);
+                          online_sent.has_value()) {
+                        handled_remote_party = true;
+                        if (tui)
+                          ui.notice("\n" + *online_sent);
+                        else
+                          emit(*online_sent);
+                      }
                     }
                   }
-                }
-                if (!handled_remote_party) {
-                  if (const auto say_body = extract_party_say_body(prompt);
-                      say_body.has_value()) {
-                    std::error_code cwd_ec;
-                    const auto cwd = std::filesystem::current_path(cwd_ec);
-                    if (const auto remote_party_file = find_remote_party_config(
-                            cwd_ec ? std::filesystem::path{} : cwd, home);
-                        remote_party_file.has_value()) {
-                      handled_remote_party = true;
-                      const auto party_root =
-                          remote_party_file->parent_path().parent_path();
-                      PartyDispatchConfig dcfg =
-                          PartyDispatchConfig::for_project(party_root);
-                      dcfg.party_config_path = *remote_party_file;
-                      dcfg.local_actor = "operator";
-                      if (!cwd_ec && !cwd.empty())
-                        dcfg.working_dir = cwd;
-                      dcfg.cancelled = engine.cancelled;
-                      if (tui)
-                        ui.status("Dispatching party message to remote peers...");
-                      auto dispatched = dispatch_party_message(*say_body, dcfg);
-                      if (!dispatched.has_value()) {
-                        const std::string err_msg =
-                            "Party dispatch failed: " +
-                            std::string{error_name(dispatched.error().code)} + "\n";
+                  if (!handled_remote_party) {
+                    if (const auto say_body = extract_party_say_body(prompt);
+                        say_body.has_value()) {
+                      std::error_code cwd_ec;
+                      const auto cwd = std::filesystem::current_path(cwd_ec);
+                      if (const auto remote_party_file = find_remote_party_config(
+                              cwd_ec ? std::filesystem::path{} : cwd, home);
+                          remote_party_file.has_value()) {
+                        handled_remote_party = true;
+                        const auto party_root =
+                            remote_party_file->parent_path().parent_path();
+                        PartyDispatchConfig dcfg =
+                            PartyDispatchConfig::for_project(party_root);
+                        dcfg.party_config_path = *remote_party_file;
+                        dcfg.local_actor = "operator";
+                        if (!cwd_ec && !cwd.empty())
+                          dcfg.working_dir = cwd;
+                        dcfg.cancelled = engine.cancelled;
                         if (tui)
-                          ui.notice("\n" + err_msg);
-                        else
-                          emit(err_msg);
-                      } else {
-                        const std::string formatted = format_party_dispatch_report(
-                            dispatched.value(), dcfg.local_actor);
-                        if (tui) {
-                          ui.notice("\n" + formatted);
-                          refresh_tui_party_pane(ui,
-                                                 {.party_root = party_root,
-                                                  .party_file = *remote_party_file});
+                          ui.status("Dispatching party message to remote peers...");
+                        auto dispatched = dispatch_party_message(*say_body, dcfg);
+                        if (!dispatched.has_value()) {
+                          const std::string err_msg =
+                              "Party dispatch failed: " +
+                              std::string{error_name(dispatched.error().code)} + "\n";
+                          if (tui)
+                            ui.notice("\n" + err_msg);
+                          else
+                            emit(err_msg);
                         } else {
-                          emit(formatted);
+                          const std::string formatted = format_party_dispatch_report(
+                              dispatched.value(), dcfg.local_actor);
+                          if (tui) {
+                            ui.notice("\n" + formatted);
+                            refresh_tui_party_pane(ui,
+                                                   {.party_root = party_root,
+                                                    .party_file = *remote_party_file});
+                          } else {
+                            emit(formatted);
+                          }
                         }
                       }
                     }
                   }
-                }
-                if (!handled_remote_party) {
-                  CommandPostTuiContext cp_ctx;
-                  cp_ctx.session_dir = session;
-                  cp_ctx.audit_log = &log;
-                  cp_ctx.session_id = session.filename().string();
-                  cp_ctx.tui = tui;
-                  if (const auto out = handle_command_post_slash(prompt, cp_ctx)) {
-                    if (tui) {
-                      ui.notice("\n" + *out);
-                      if (prompt == "/party" || prompt.starts_with("/party ")) {
-                        std::error_code cwd_ec;
-                        const auto cwd = std::filesystem::current_path(cwd_ec);
-                        if (!cwd_ec && !cwd.empty())
-                          refresh_tui_party_pane(ui,
-                                                 {.party_root = cwd, .party_file = {}});
+                  if (!handled_remote_party) {
+                    CommandPostTuiContext cp_ctx;
+                    cp_ctx.session_dir = session;
+                    cp_ctx.audit_log = &log;
+                    cp_ctx.session_id = session.filename().string();
+                    cp_ctx.tui = tui;
+                    cp_ctx.party_cards_enabled = online_hub.party_cards_enabled_ptr();
+                    cp_ctx.mp_room_v2 = online_hub.mp2_session();
+                    if (const auto out = handle_command_post_slash(prompt, cp_ctx)) {
+                      if (tui) {
+                        ui.notice("\n" + *out);
+                        if (prompt == "/party" || prompt.starts_with("/party ")) {
+                          std::error_code cwd_ec;
+                          const auto cwd = std::filesystem::current_path(cwd_ec);
+                          if (!cwd_ec && !cwd.empty())
+                            refresh_tui_party_pane(
+                                ui, {.party_root = cwd, .party_file = {}});
+                        }
+                      } else {
+                        emit(*out);
                       }
                     } else {
-                      emit(*out);
+                      emit(
+                          "Unknown command: " + std::string{prompt} +
+                          ". /help lists commands; /quit or /exit closes Blackbird.\n");
                     }
-                  } else {
-                    emit("Unknown command: " + std::string{prompt} +
-                         ". /help lists commands; /quit or /exit closes Blackbird.\n");
                   }
+                } else {
+                  turn_capture.reset();
                 }
               }
             }
@@ -4283,6 +4567,16 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
             }
           });
         } catch (const Error &e) {
+          if (turn_capture.active) {
+            MpRoomV2AgentCard err_card{};
+            err_card.title = turn_capture.title;
+            err_card.summary = std::string{"Turn failed: "} + error_name(e.code);
+            err_card.status = "error";
+            err_card.agent_name = model;
+            err_card.files = turn_capture.touched_files;
+            online_hub.notify_turn_finished(err_card);
+            turn_capture.reset();
+          }
           dispatch.require_capture();
           input.require_capture();
           if (tui)

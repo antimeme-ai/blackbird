@@ -198,10 +198,18 @@ const std::array builtin_commands{
     ChatCommand{"/flightdeck", "[tick N|detach]",
                 "SR-71 flight deck telemetry, Kitty cockpit (Alt+F) and detach",
                 "Command Post"},
-    ChatCommand{"/party",
-                "[status|peers|add ALIAS|all|operators|leaders|conflicts|say TEXT|"
-                "create [ROOM]|join URI|invite [URL]|close|leave|remove ALIAS]",
-                "Open/inspect Party Chat, manage peers, or message @all / @leader",
+    ChatCommand{
+        "/party",
+        "[status|peers|add ALIAS|all|operators|leaders|conflicts|say TEXT|"
+        "cards on|off|respond [GUIDANCE]|create [ROOM]|join URI|invite [URL]|"
+        "close|leave|remove ALIAS]",
+        "Open/inspect Party Chat, manage peers, cards, or message @all / @leader",
+        "Command Post"},
+    ChatCommand{"/card", "<title> | <summary>",
+                "Post a structured agent update card to the live party",
+                "Command Post"},
+    ChatCommand{"/respond", "[guidance]",
+                "Respond to the latest peer @agent mention under Brakes isolation",
                 "Command Post"},
     ChatCommand{"/online",
                 "[status|health|whoami|resolve HANDLE|friends|friend add/accept/deny|"
@@ -1233,11 +1241,77 @@ ChatRow terminal_party_strip(const PartyChatPane &pane, std::size_t max_cells) {
   const std::string short_hint =
       unread > 0 ? (" [Alt+P · " + std::to_string(unread) + "]") : " [Alt+P]";
 
+  // Urgent cross-operator `@agent` mention cue takes top priority in the strip.
+  if (snap.pending_mention.has_value()) {
+    std::string who = sanitize_strip_text(snap.pending_mention->sender_handle, 32U);
+    while (!who.empty() && who.front() == '@') {
+      who.erase(who.begin());
+    }
+    if (who.empty()) {
+      who = "peer";
+    }
+    const std::string full_cue = " @" + who + " pinged your agent — /respond";
+    const std::string short_cue = " @" + who + " — /respond";
+    const std::array<ChatRow, 4> mention_tiers{{
+        {{"●", Ink::selected},
+         {full_cue, Ink::selected},
+         {full_hint, unread > 0 ? Ink::selected : Ink::muted}},
+        {{"●", Ink::selected},
+         {full_cue, Ink::selected},
+         {short_hint, unread > 0 ? Ink::selected : Ink::muted}},
+        {{"●", Ink::selected}, {full_cue, Ink::selected}},
+        {{"●", Ink::selected}, {short_cue, Ink::selected}},
+    }};
+    for (const auto &candidate : mention_tiers) {
+      if (chat_row_cells(candidate) <= max_cells) {
+        return candidate;
+      }
+    }
+    const auto clipped = terminal_lines(chat_plain(mention_tiers.back()), max_cells)[0];
+    return {{clipped, Ink::selected}};
+  }
+
+  // Optional compact 1-line summary of the latest structured `agent_card`.
+  std::string card_badge;
+  std::string card_text;
+  Ink card_ink = Ink::success;
+  for (auto it = snap.messages.rbegin(); it != snap.messages.rend(); ++it) {
+    if (!it->agent_card.has_value()) {
+      continue;
+    }
+    const auto &c = *it->agent_card;
+    if (c.status == "error") {
+      card_badge = "[ERROR]";
+      card_ink = Ink::failure;
+    } else if (c.status == "blocked") {
+      card_badge = "[BLOCKED]";
+      card_ink = Ink::selected;
+    } else if (c.status == "working") {
+      card_badge = "[WORKING]";
+      card_ink = Ink::selected;
+    } else if (c.status == "testing") {
+      card_badge = "[TESTING]";
+      card_ink = Ink::selected;
+    } else {
+      card_badge = "[DONE]";
+      card_ink = Ink::success;
+    }
+    card_text = sanitize_strip_text(c.title.empty() ? c.summary : c.title, 40U);
+    if (c.diff_stat.has_value() && !c.diff_stat->empty()) {
+      const std::string ds = sanitize_strip_text(*c.diff_stat, 24U);
+      if (!ds.empty()) {
+        card_text += " (" + ds + ")";
+      }
+    }
+    break;
+  }
+
   struct StripTier {
     std::size_t max_peers = 0;
     bool include_self = true;
     bool include_client = true;
     bool include_secondary_status = true;
+    bool include_card = false;
     bool long_hint = true;
   };
   auto build = [&](const StripTier &tier) -> ChatRow {
@@ -1277,25 +1351,43 @@ ChatRow terminal_party_strip(const PartyChatPane &pane, std::size_t max_cells) {
         row.push_back({"○ " + std::to_string(away_count) + " away", Ink::muted});
       }
     }
+    if (tier.include_card && !card_text.empty()) {
+      row.push_back({" · ", Ink::border});
+      row.push_back({card_badge, card_ink});
+      row.push_back({" " + card_text, Ink::normal});
+    }
     row.push_back({tier.long_hint ? full_hint : short_hint,
                    unread > 0 ? Ink::selected : Ink::muted});
     return row;
   };
+  if (!card_text.empty()) {
+    constexpr std::array<StripTier, 4> card_tiers{{
+        {2U, true, false, false, true, true},
+        {1U, false, false, false, true, true},
+        {0U, false, false, false, true, true},
+        {0U, false, false, false, true, false},
+    }};
+    for (const auto &tier : card_tiers) {
+      auto candidate = build(tier);
+      if (!candidate.empty() && chat_row_cells(candidate) <= max_cells)
+        return candidate;
+    }
+  }
   constexpr std::array<StripTier, 7> tiers{{
-      {3U, true, true, true, true},
-      {2U, true, true, true, true},
-      {2U, true, false, true, true},
-      {1U, false, false, true, true},
-      {0U, false, false, true, true},
-      {0U, false, false, false, true},
-      {0U, false, false, false, false},
+      {3U, true, true, true, false, true},
+      {2U, true, true, true, false, true},
+      {2U, true, false, true, false, true},
+      {1U, false, false, true, false, true},
+      {0U, false, false, true, false, true},
+      {0U, false, false, false, false, true},
+      {0U, false, false, false, false, false},
   }};
   for (const auto &tier : tiers) {
     auto candidate = build(tier);
     if (!candidate.empty() && chat_row_cells(candidate) <= max_cells)
       return candidate;
   }
-  auto minimal = build({0U, false, false, false, false});
+  auto minimal = build({0U, false, false, false, false, false});
   const auto clipped = terminal_lines(chat_plain(minimal), max_cells)[0];
   return {{clipped, lead_ink}};
 }

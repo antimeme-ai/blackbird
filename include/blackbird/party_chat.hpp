@@ -105,6 +105,24 @@ struct PartyParticipant {
   bool operator==(const PartyParticipant &) const = default;
 };
 
+struct PartyAgentCard {
+  std::string title;
+  std::string summary;
+  std::vector<std::string> files;
+  std::string status = "done";
+  std::string agent_name;
+  std::optional<std::string> diff_stat;
+
+  bool operator==(const PartyAgentCard &) const = default;
+};
+
+struct PartyPendingMention {
+  std::string sender_handle;
+  std::string preview;
+
+  bool operator==(const PartyPendingMention &) const = default;
+};
+
 struct PartyMessage {
   std::string id;
   std::int64_t timestamp_ns = 0;
@@ -118,6 +136,7 @@ struct PartyMessage {
   PartyMessageKind kind = PartyMessageKind::chat;
   std::string body;
   bool untrusted_remote = false;
+  std::optional<PartyAgentCard> agent_card;
 
   bool operator==(const PartyMessage &) const = default;
 };
@@ -181,6 +200,7 @@ struct PartySnapshot {
   bool platoon_present = false;
   bool bridge_present = false;
   bool known_peers_present = false;
+  std::optional<PartyPendingMention> pending_mention;
 
   std::size_t operator_count() const noexcept;
   std::size_t online_operator_count() const noexcept;

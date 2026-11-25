@@ -1,5 +1,6 @@
 #pragma once
 
+#include "blackbird/brakes_policy.hpp"
 #include "blackbird/foundation.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
@@ -33,6 +34,8 @@ inline constexpr std::size_t kMpRoomV2DefaultMaxRetainedMessages = 512U;
 inline constexpr std::size_t kMpRoomV2MaxRetainedMessagesCap = 4096U;
 inline constexpr std::size_t kMpRoomV2MaxRetainedNotices = 256U;
 inline constexpr std::size_t kMpRoomV2MaxPendingOutbox = 256U;
+inline constexpr std::size_t kMpRoomV2MaxAgentCardBytes = 2048U;
+inline constexpr std::size_t kMpRoomV2MaxAgentCardFiles = 16U;
 
 enum class MpRoomV2Error : std::int64_t {
   none = 0,
@@ -44,6 +47,7 @@ enum class MpRoomV2Error : std::int64_t {
   invalid_utf8 = 2305,
   wake_pipe_failed = 2306,
   protocol_error = 2307,
+  secret_rejected = 2308,
 };
 
 constexpr MpRoomV2Error mp_room_v2_error_of(const Error &error) noexcept {
@@ -76,9 +80,67 @@ struct MpRoomV2AgentCard {
   std::string title;
   std::string summary;
   std::vector<std::string> files;
+  std::string status = "done";
+  std::string agent_name;
+  std::optional<std::string> diff_stat;
 
   bool operator==(const MpRoomV2AgentCard &) const = default;
 };
+
+// Returns true when `text` contains recognizable multiplayer/provider secret
+// tokens (`mprk1_`, `mpinv1_`, `mppi1_`, `mpcs1_`, `mpguest1_`, PEM keys, etc.).
+bool mp_room_v2_contains_secret_token(std::string_view text) noexcept;
+
+// Returns true when `status` is one of "done"|"working"|"testing"|"blocked"|"error".
+bool mp_room_v2_valid_agent_card_status(std::string_view status) noexcept;
+
+// Validates, scrubs control/BiDi characters, rejects secret tokens, caps files
+// to <= kMpRoomV2MaxAgentCardFiles, and serializes bounded JSON (<= 2048 bytes).
+Result<std::string>
+serialize_mp_room_v2_agent_card(const MpRoomV2AgentCard &card,
+                                std::string_view default_agent_name = {});
+
+// Parses and sanitizes an incoming `kind == "agent_card"` UTF-8 JSON body.
+std::optional<MpRoomV2AgentCard> parse_mp_room_v2_agent_card(std::string_view body);
+
+// Matches `@<handle>`, `@<handle>:agent`, or `@<handle>'s agent` with ASCII
+// word boundaries (case-insensitive). Rejects emails like `foo@handle.com` and
+// prefix collisions like `@handle2`.
+bool detect_self_agent_mention(std::string_view body,
+                               std::string_view self_handle) noexcept;
+
+struct MpRoomV2PendingMention {
+  std::uint64_t seq = 0U;
+  std::uint64_t ts_ms = 0U;
+  std::optional<mp::AccountId> sender_account_id;
+  bool sender_is_guest = false;
+  std::string sender_handle;
+  std::string sender_client;
+  std::string sender_agent_name;
+  std::string room_scope;
+  std::string raw_body;
+  std::string sanitized_preview;
+  std::string fenced_envelope;
+  brakes::PeerProvenance provenance{};
+  brakes::PartyTrustProfile effective_trust = brakes::PartyTrustProfile::advisory;
+
+  bool operator==(const MpRoomV2PendingMention &) const = default;
+};
+
+// Builds an operator-triggered `/respond` prompt that wraps the remote mention
+// inside its nonce-fenced `[UNTRUSTED_PEER_DATA]` block and appends any local
+// operator guidance strictly outside the untrusted fence.
+std::string build_mp_room_v2_respond_prompt(const MpRoomV2PendingMention &mention,
+                                            std::string_view extra_guidance = {});
+
+// Evaluates a CodingEngine `effect_policy` operation during a `/respond` turn
+// under `gate`. Allows the turn's own `"provider"` model invocation and routes
+// all other tools through `gate.evaluate_tool_call(...)`. Callers MUST fail
+// closed whenever `!decision.allow` (blocking both `deny` and `escalate`).
+brakes::BrakesDecision
+evaluate_mp_room_v2_respond_effect(const brakes::BrakesGate &gate,
+                                   std::string_view op_name, const Value &op_input,
+                                   const std::filesystem::path &workspace_root);
 
 struct MpRoomV2StatusUpdate {
   std::string client = "blackbird";
@@ -116,6 +178,7 @@ struct MpRoomV2Message {
   std::string body_encoding = "utf8";
   std::string body;
   std::string rendered_body;
+  std::optional<MpRoomV2AgentCard> parsed_agent_card;
   bool delivered = false;
   bool local_self = false;
 
@@ -152,6 +215,8 @@ struct MpRoomV2Snapshot {
   std::vector<MpRoomV2Member> members;
   std::vector<MpRoomV2Message> messages;
   std::vector<std::string> notices;
+  std::vector<MpRoomV2PendingMention> mention_alerts;
+  std::optional<MpRoomV2PendingMention> pending_agent_mention;
   std::string status_summary;
 
   bool operator==(const MpRoomV2Snapshot &) const = default;
@@ -209,15 +274,22 @@ public:
                                       MpRoomV2Target target = MpRoomV2Target{});
   Result<void> update_status(MpRoomV2StatusUpdate status);
 
-  // Thread-safe snapshots (snapshot() drains accumulated plain-English notices;
-  // to_party_snapshot() renders PartyChatPane-compatible state with real @handles).
+  // Thread-safe snapshots (snapshot() drains accumulated plain-English notices
+  // and urgent mention_alerts; to_party_snapshot() renders PartyChatPane state).
   MpRoomV2Snapshot snapshot();
   PartySnapshot to_party_snapshot() const;
+
+  // Latest pending remote `@agent` mention (Brakes Stage 1 nonce-fenced) and
+  // explicit operator consumption for `/respond`.
+  std::optional<MpRoomV2PendingMention> pending_agent_mention() const;
+  std::optional<MpRoomV2PendingMention> consume_pending_agent_mention();
+  brakes::TurnTaintState turn_taint_snapshot() const;
 
   // Thread-safe accessors.
   bool is_active() const noexcept;
   MpRoomV2State state() const noexcept;
   mp::PartyId party_id() const noexcept { return party_id_; }
+  std::string local_handle() const;
   std::string room_code() const;
   std::string share_url() const;
   std::uint64_t latest_seq() const noexcept;
@@ -239,7 +311,7 @@ private:
   void worker_loop(const std::stop_token &stop_token);
   void handle_text_frame_locked(std::string_view json_text, FrameAction &action);
   void handle_hello_locked(const Value &obj, FrameAction &action);
-  void handle_event_locked(const Value &obj);
+  void handle_event_locked(const Value &obj, bool is_history = false);
   void handle_ack_locked(const Value &obj);
   void handle_presence_locked(const Value &obj);
   void handle_error_locked(const Value &obj, FrameAction &action);
@@ -296,6 +368,9 @@ private:
   std::deque<OutboundMessage> outbox_;
   std::optional<MpRoomV2StatusUpdate> pending_status_;
   std::deque<std::string> notices_;
+  std::deque<MpRoomV2PendingMention> mention_alerts_;
+  std::optional<MpRoomV2PendingMention> pending_agent_mention_;
+  brakes::BrakesGate brakes_gate_;
   std::string status_summary_;
   bool connected_once_ = false;
   std::uint64_t local_msg_counter_ = 0U;

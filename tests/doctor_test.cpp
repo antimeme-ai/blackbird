@@ -498,7 +498,7 @@ void test_offline_zero_disk_and_zero_secret_leak() {
   const auto &online = find_check(report, "online_identity");
   require(online.status == DoctorStatus::info, "absent online identity must be info");
   require(online.hint.has_value() &&
-              online.hint->find("blackbird online register") != std::string::npos,
+              online.hint->find("blackbird login") != std::string::npos,
           "online identity hint missing");
 
   const auto &cp = find_check(report, "control_plane");

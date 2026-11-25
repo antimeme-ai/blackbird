@@ -2875,6 +2875,99 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
         prefix += "(" + party_chat_sanitize(m.sender_model, 20) + ")";
       prefix += " -> " + target + ": ";
 
+      if (m.agent_card.has_value()) {
+        const auto &card = *m.agent_card;
+        std::string status_tag = "[AGENT]";
+        PartyInk card_ink = PartyInk::leader_badge;
+        if (card.status == "done") {
+          status_tag = "[DONE]";
+          card_ink = PartyInk::dot_online;
+        } else if (card.status == "working") {
+          status_tag = "[WORKING]";
+          card_ink = PartyInk::target_pill;
+        } else if (card.status == "testing") {
+          status_tag = "[TESTING]";
+          card_ink = PartyInk::target_pill;
+        } else if (card.status == "blocked") {
+          status_tag = "[BLOCKED]";
+          card_ink = PartyInk::untrusted_badge;
+        } else if (card.status == "error") {
+          status_tag = "[ERROR]";
+          card_ink = PartyInk::conflict_badge;
+        }
+
+        // Sender attribution line above the card box.
+        std::string hdr = prefix;
+        if (hdr.size() >= 2U && hdr.ends_with(": ")) {
+          hdr.pop_back();
+        }
+        for (auto &wline : wrap_words_sanitized(hdr, {feed_col_w, feed_col_w})) {
+          feed_lines.push_back({std::move(wline), line_ink});
+        }
+
+        const std::string pad = feed_col_w >= 20U ? "  " : "";
+        const std::size_t pad_w = pad.size();
+        const std::string safe_agent = party_chat_sanitize(card.agent_name, 40U);
+        const std::string safe_title =
+            party_chat_sanitize(card.title.empty() ? std::string_view{"Agent update"}
+                                                   : std::string_view{card.title},
+                                160U);
+        std::string card_top = pad + "┌─ " + status_tag + " ";
+        if (!safe_agent.empty()) {
+          card_top += safe_agent + " · ";
+        }
+        card_top += safe_title;
+        if (card.diff_stat.has_value() && !card.diff_stat->empty()) {
+          card_top += " (" + party_chat_sanitize(*card.diff_stat, 48U) + ")";
+        }
+        const std::string cont_prefix = pad + "│ ";
+        const std::size_t cont_w =
+            feed_col_w > pad_w + 2U ? (feed_col_w - pad_w - 2U) : feed_col_w;
+        auto top_wrapped = wrap_words_sanitized(card_top, {feed_col_w, cont_w});
+        for (std::size_t wi = 0; wi < top_wrapped.size(); ++wi) {
+          if (wi == 0) {
+            feed_lines.push_back({std::move(top_wrapped[wi]), card_ink});
+          } else {
+            feed_lines.push_back(
+                {cont_prefix + std::move(top_wrapped[wi]), PartyInk::normal});
+          }
+        }
+
+        if (!card.summary.empty()) {
+          const std::string safe_summary = party_chat_sanitize(card.summary, 512U);
+          auto sum_wrapped = wrap_words_sanitized(safe_summary, {cont_w, cont_w});
+          for (auto &sline : sum_wrapped) {
+            feed_lines.push_back({cont_prefix + std::move(sline), PartyInk::normal});
+          }
+        }
+
+        if (!card.files.empty()) {
+          std::string files_line = "files: ";
+          const std::size_t shown = std::min<std::size_t>(card.files.size(), 6U);
+          for (std::size_t fi = 0; fi < shown; ++fi) {
+            if (fi > 0) {
+              files_line += ", ";
+            }
+            files_line += party_chat_sanitize(card.files[fi], 96U);
+          }
+          if (card.files.size() > shown) {
+            files_line += ", +" + std::to_string(card.files.size() - shown);
+          }
+          const std::string foot_prefix = pad + "└─ ";
+          const std::size_t foot_w =
+              feed_col_w > pad_w + 3U ? (feed_col_w - pad_w - 3U) : feed_col_w;
+          auto files_wrapped = wrap_words_sanitized(files_line, {foot_w, foot_w});
+          for (std::size_t wi = 0; wi < files_wrapped.size(); ++wi) {
+            feed_lines.push_back(
+                {(wi == 0 ? foot_prefix : (pad + "   ")) + std::move(files_wrapped[wi]),
+                 PartyInk::muted});
+          }
+        } else if (feed_col_w >= pad_w + 4U) {
+          feed_lines.push_back({pad + "└─", PartyInk::border});
+        }
+        continue;
+      }
+
       const std::string safe_body = party_chat_sanitize(m.body, 2048);
       const std::string full = prefix + safe_body;
       const std::size_t indent_cols = feed_col_w >= 24 ? 4U : 0U;

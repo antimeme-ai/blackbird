@@ -13,6 +13,8 @@
 
 namespace blackbird {
 
+class MpRoomV2Session;
+
 struct CommandPostTuiContext {
   std::filesystem::path project_root;
   std::filesystem::path session_dir;
@@ -27,6 +29,9 @@ struct CommandPostTuiContext {
   std::optional<ProviderAuthConfig> provider_auth_config;
   std::function<Value(const Value &arguments)> decision_evaluator;
   bool tui = false;
+  bool *party_cards_enabled = nullptr;
+  MpRoomV2Session *mp_room_v2 = nullptr;
+  std::function<void(std::string_view)> respond_turn_runner;
 };
 
 // Bounded, operator-controlled slash-command dispatcher for Command Post TUI

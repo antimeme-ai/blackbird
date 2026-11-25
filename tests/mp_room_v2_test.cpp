@@ -356,6 +356,12 @@ public:
   void request_rate_limit_next_send_once() {
     rate_limit_next_send_once_.store(true, std::memory_order_release);
   }
+  void request_push_mention_events() {
+    push_mention_events_.store(true, std::memory_order_release);
+  }
+  void request_push_card_mention_event() {
+    push_card_mention_event_.store(true, std::memory_order_release);
+  }
   int rate_limited_rejections() const noexcept {
     return rate_limit_reject_count_.load(std::memory_order_acquire);
   }
@@ -576,6 +582,23 @@ private:
         // Simulate abrupt network drop without close frame!
         return;
       }
+      if (push_mention_events_.exchange(false, std::memory_order_acq_rel)) {
+        // 1) Self-sent echo containing @antimeme MUST NOT trigger a pending mention.
+        send_server_text_ws_frame(
+            ssl,
+            R"({"v":2,"t":"event","seq":20,"ts_ms":1795495460000,"client_msg_id":"self-echo-20","sender":{"account_id":"3541107795115782","handle":"antimeme","client":"blackbird","agent_name":"Blackbird"},"target":"@all","kind":"chat","body_encoding":"utf8","body":"@antimeme self echo should never trigger"})");
+        // 2) Remote @antimeme:agent mention from @phall MUST trigger Brakes isolation.
+        send_server_text_ws_frame(
+            ssl,
+            R"({"v":2,"t":"event","seq":21,"ts_ms":1795495461000,"client_msg_id":"phall-mention-21","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"chat","body_encoding":"utf8","body":"hey @antimeme:agent please review src/auth.cpp"})");
+      }
+      if (push_card_mention_event_.exchange(false, std::memory_order_acq_rel)) {
+        // Remote agent_card whose summary mentions @antimeme:agent MUST also trigger
+        // Brakes Stage 1 mention isolation (parity with Outpost & clank.party).
+        send_server_text_ws_frame(
+            ssl,
+            R"({"v":2,"t":"event","seq":22,"ts_ms":1795495462000,"client_msg_id":"phall-card-mention-22","sender":{"account_id":"285954035275878","handle":"phall","client":"outpost","agent_name":"Claude Code"},"target":"@all","kind":"agent_card","body_encoding":"utf8","body":"{\"title\":\"Auth PR ready\",\"summary\":\"@antimeme:agent please verify token refresh\",\"status\":\"done\",\"files\":[\"src/auth.cpp\"]}"})");
+      }
       auto frame = read_client_ws_frame(ssl, cfd, std::chrono::milliseconds{40});
       if (!frame.has_value())
         continue;
@@ -658,6 +681,8 @@ private:
   std::atomic<bool> stop_{false};
   std::atomic<bool> drop_ws_once_{false};
   std::atomic<bool> rate_limit_next_send_once_{false};
+  std::atomic<bool> push_mention_events_{false};
+  std::atomic<bool> push_card_mention_event_{false};
   std::atomic<int> rate_limit_reject_count_{0};
   std::atomic<int> ws_conn_count_{0};
   std::atomic<int> resume_count_{0};
@@ -911,15 +936,20 @@ int main() {
 
   // 6. Local send_agent_card target bound enforcement + valid ack
   {
+    MpRoomV2AgentCard card{};
+    card.title = "Title";
+    card.summary = "Summary";
     const auto bad_card =
-        session->send_agent_card(MpRoomV2AgentCard{"Title", "Summary", {}},
-                                 MpRoomV2Target{std::string(200U, 'x')});
+        session->send_agent_card(card, MpRoomV2Target{std::string(200U, 'x')});
     require_ok(!bad_card.has_value());
     require_ok(bad_card.error().code == ErrorCode::capacity);
     require_ok(mp_room_v2_error_of(bad_card.error()) == MpRoomV2Error::field_too_large);
   }
-  const std::string card_cid = require_val(session->send_agent_card(
-      MpRoomV2AgentCard{"Shipped mp2", "Zero iroh required", {"src/mp_room_v2.cpp"}}));
+  MpRoomV2AgentCard shipped_card{};
+  shipped_card.title = "Shipped mp2";
+  shipped_card.summary = "Zero iroh required";
+  shipped_card.files = {"src/mp_room_v2.cpp"};
+  const std::string card_cid = require_val(session->send_agent_card(shipped_card));
   require_ok(wait_until([&]() {
     const auto snap = session->snapshot();
     for (const auto &m : snap.messages) {
@@ -986,6 +1016,226 @@ int main() {
     require_ok(phall_1_count == 1); // deduped across resume replay!
     require_ok(idx_10 < snap.messages.size() && idx_11 < snap.messages.size() &&
                idx_10 < idx_11); // backfilled gap ordered before history tail!
+  }
+
+  // 8b. Live remote `@agent` mention detection, self-echo rejection, Brakes
+  //     Stage 1 [UNTRUSTED_PEER_DATA] wrapping, PartySnapshot cue, and /respond
+  //     prompt construction.
+  require_ok(!session->pending_agent_mention().has_value());
+  srv.request_push_mention_events();
+  require_ok(wait_until([&]() { return session->latest_seq() >= 21U; }, 5000));
+  {
+    const auto snap = session->snapshot();
+    require_ok(snap.mention_alerts.size() == 1U);
+    require_ok(snap.mention_alerts[0].sender_handle == "phall");
+    require_ok(snap.mention_alerts[0].seq == 21U);
+    require_ok(snap.pending_agent_mention.has_value());
+    require_ok(snap.pending_agent_mention->sender_handle == "phall");
+    require_ok(snap.pending_agent_mention->fenced_envelope.find(
+                   "[UNTRUSTED_PEER_DATA nonce=") != std::string::npos);
+    require_ok(snap.pending_agent_mention->fenced_envelope.find(
+                   "[/UNTRUSTED_PEER_DATA nonce=") != std::string::npos);
+    require_ok(session->turn_taint_snapshot().is_tainted());
+
+    const PartySnapshot ps = session->to_party_snapshot();
+    require_ok(ps.pending_mention.has_value());
+    require_ok(ps.pending_mention->sender_handle == "phall");
+
+    const auto consumed = session->consume_pending_agent_mention();
+    require_ok(consumed.has_value() && consumed->seq == 21U);
+    require_ok(!session->pending_agent_mention().has_value());
+    require_ok(!session->to_party_snapshot().pending_mention.has_value());
+
+    const std::string prompt =
+        build_mp_room_v2_respond_prompt(*consumed, "Check auth.cpp read-only first");
+    const auto fence_open = prompt.find("[UNTRUSTED_PEER_DATA nonce=");
+    const auto fence_close = prompt.find("[/UNTRUSTED_PEER_DATA nonce=");
+    const auto guidance_pos = prompt.find("Check auth.cpp read-only first");
+    require_ok(fence_open != std::string::npos && fence_close != std::string::npos &&
+               guidance_pos != std::string::npos && fence_open < fence_close &&
+               fence_close < guidance_pos);
+  }
+
+  // 8c. Structured `agent_card` serialization bounds, control-char scrubbing,
+  //     secret refusal, file cap (<= 16), and `detect_self_agent_mention` matrix.
+  {
+    // Valid card with all fields + >16 files capped to 16 + control chars scrubbed.
+    MpRoomV2AgentCard card{};
+    card.title = "Fixed\x1b[31m auth\nbug\x07";
+    card.summary = "All\tchecks\xE2\x80\xAE passed";
+    card.status = "testing";
+    card.agent_name = "Blackbird";
+    card.diff_stat = "+42 -7";
+    for (int i = 0; i < 22; ++i) {
+      card.files.push_back("src/file_" + std::to_string(i) + ".cpp");
+    }
+    const std::string encoded = require_val(serialize_mp_room_v2_agent_card(card));
+    require_ok(encoded.size() <= kMpRoomV2MaxAgentCardBytes);
+    require_ok(encoded.find('\x1b') == std::string::npos);
+    require_ok(encoded.find('\x07') == std::string::npos);
+    const auto reparsed = parse_mp_room_v2_agent_card(encoded);
+    require_ok(reparsed.has_value());
+    require_ok(reparsed->status == "testing");
+    require_ok(reparsed->agent_name == "Blackbird");
+    require_ok(reparsed->diff_stat.has_value() && *reparsed->diff_stat == "+42 -7");
+    require_ok(reparsed->files.size() == kMpRoomV2MaxAgentCardFiles);
+    require_ok(reparsed->title.find("Fixed auth bug") != std::string::npos);
+
+    // Invalid status rejected.
+    MpRoomV2AgentCard bad_status{};
+    bad_status.title = "Bad";
+    bad_status.status = "exploded";
+    const auto bs_res = serialize_mp_room_v2_agent_card(bad_status);
+    require_ok(!bs_res.has_value() &&
+               mp_room_v2_error_of(bs_res.error()) == MpRoomV2Error::invalid_field);
+
+    // Oversized card (> 2048 bytes) rejected.
+    MpRoomV2AgentCard huge{};
+    huge.title = "Huge card";
+    huge.summary = std::string(1024U, 'a');
+    for (int i = 0; i < 16; ++i) {
+      huge.files.push_back("very/long/directory/path/segment/" + std::string(90U, 'x') +
+                           "_" + std::to_string(i) + ".cpp");
+    }
+    const auto huge_res = serialize_mp_room_v2_agent_card(huge);
+    require_ok(!huge_res.has_value() &&
+               mp_room_v2_error_of(huge_res.error()) == MpRoomV2Error::field_too_large);
+
+    // Secret tokens strictly refused (including control-char smuggling).
+    const std::array<std::string, 7> secrets{{
+        "mprk1_supersecretrecoverykey",
+        "mpinv1_secretinvitecode",
+        "mppi1_5001_partysecret",
+        "mpcs1_sessiontoken",
+        "mpguest1_guesttoken",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg",
+        std::string{"mprk1_\x00smuggled", 15U},
+    }};
+    for (const auto &tok : secrets) {
+      MpRoomV2AgentCard sc{};
+      sc.title = "Update";
+      sc.summary = "leaked " + tok;
+      const auto res = serialize_mp_room_v2_agent_card(sc);
+      require_ok(!res.has_value() &&
+                 mp_room_v2_error_of(res.error()) == MpRoomV2Error::secret_rejected);
+      const auto send_res = session->send_agent_card(sc);
+      require_ok(!send_res.has_value() && mp_room_v2_error_of(send_res.error()) ==
+                                              MpRoomV2Error::secret_rejected);
+    }
+
+    // `detect_self_agent_mention` positive and negative cases.
+    require_ok(detect_self_agent_mention("@antimeme check this", "antimeme"));
+    require_ok(detect_self_agent_mention("hey @ANTIMEME, thoughts?", "@antimeme"));
+    require_ok(detect_self_agent_mention("@antimeme:agent run tests", "antimeme"));
+    require_ok(detect_self_agent_mention("ask @Antimeme:AGENT please", "antimeme"));
+    require_ok(
+        detect_self_agent_mention("@antimeme's agent can you look?", "antimeme"));
+    require_ok(
+        detect_self_agent_mention("@antimeme\xe2\x80\x99s agent check PR", "antimeme"));
+    require_ok(detect_self_agent_mention("(@antimeme)", "antimeme"));
+    require_ok(detect_self_agent_mention("@antimeme: hello", "antimeme"));
+
+    require_ok(!detect_self_agent_mention("foo@antimeme.com", "antimeme"));
+    require_ok(!detect_self_agent_mention("mailto:@antimeme.com", "antimeme"));
+    require_ok(!detect_self_agent_mention("@antimeme2 check this", "antimeme"));
+    require_ok(!detect_self_agent_mention("@antimeme_bot hi", "antimeme"));
+    require_ok(!detect_self_agent_mention("@antimeme-2 hi", "antimeme"));
+    require_ok(!detect_self_agent_mention("@antimeme:other hi", "antimeme"));
+    require_ok(!detect_self_agent_mention("hello @phall", "antimeme"));
+    require_ok(!detect_self_agent_mention("@antimeme", ""));
+  }
+
+  // 8d. Regression checks for dentist-2 findings:
+  //     (a) Remote `agent_card` mentioning `@antimeme:agent` triggers mention cue +
+  //         Brakes Stage 1 wrapping.
+  //     (b) `scrub_agent_card_text` strips DCS/SOS/PM/APC, bare/UTF-8 C1 CSI/OSC
+  //         payloads, zero-width chars, U+2028/U+2029, and Unicode Tag U+E0000..E007F.
+  //     (c) `evaluate_mp_room_v2_respond_effect` allows `"provider"` & workspace
+  //         `"read_file"`, denies secret-store reads and `"write_file"`/`"exec"`
+  //         under advisory, and returns `!allow` on `BrakesVerdict::escalate`.
+  {
+    srv.request_push_card_mention_event();
+    require_ok(wait_until([&]() { return session->latest_seq() >= 22U; }, 5000));
+    const auto card_snap = session->snapshot();
+    require_ok(card_snap.mention_alerts.size() == 1U &&
+               card_snap.mention_alerts[0].seq == 22U &&
+               card_snap.mention_alerts[0].sender_handle == "phall");
+    require_ok(card_snap.pending_agent_mention.has_value() &&
+               card_snap.pending_agent_mention->fenced_envelope.find(
+                   "[UNTRUSTED_PEER_DATA nonce=") != std::string::npos &&
+               card_snap.pending_agent_mention->fenced_envelope.find("Auth PR ready") !=
+                   std::string::npos);
+    require_ok(session->consume_pending_agent_mention().has_value());
+
+    MpRoomV2AgentCard hostile{};
+    hostile.title = std::string{"Clean"} + "\x1bP" + "dcs-payload" + "\x1b\\" +
+                    "\x1bX" + "sos-payload" + "\x1b\\" + "\x1b^" + "pm-payload" +
+                    "\x1b\\" + "\x1b_" + "apc-payload" + "\x1b\\" + "\x9b" + "31m" +
+                    "\xc2\x9b" + "2J" + "\xc2\x9d" + "0;osc-pwn\x07" + "Title";
+    hostile.summary = std::string{"Line1"} + "\xe2\x80\x8b\xe2\x80\x8c\xe2\x80\x8d" +
+                      "\xe2\x80\xa8" + "Line2" + "\xe2\x80\xa9" + "Line3" +
+                      "\xf3\xa0\x80\x81\xf3\xa0\x81\xbf";
+    hostile.status = "done";
+    const std::string encoded = require_val(serialize_mp_room_v2_agent_card(hostile));
+    require_ok(encoded.find("dcs-payload") == std::string::npos);
+    require_ok(encoded.find("sos-payload") == std::string::npos);
+    require_ok(encoded.find("pm-payload") == std::string::npos);
+    require_ok(encoded.find("apc-payload") == std::string::npos);
+    require_ok(encoded.find("31m") == std::string::npos);
+    require_ok(encoded.find("2J") == std::string::npos);
+    require_ok(encoded.find("osc-pwn") == std::string::npos);
+    require_ok(encoded.find("\xe2\x80\x8b") == std::string::npos);
+    require_ok(encoded.find("\xe2\x80\xa8") == std::string::npos);
+    require_ok(encoded.find("\xe2\x80\xa9") == std::string::npos);
+    require_ok(encoded.find("\xf3\xa0\x80\x81") == std::string::npos);
+    const auto parsed_h = parse_mp_room_v2_agent_card(encoded);
+    require_ok(parsed_h.has_value());
+    require_ok(parsed_h->title == "CleanTitle");
+    require_ok(parsed_h->summary == "Line1 Line2 Line3");
+
+    const std::filesystem::path ws_root = tmp.path / "ws";
+    std::filesystem::create_directories(ws_root);
+    brakes::EffectivePolicy eff{};
+    brakes::BrakesGate adv_gate{eff};
+    brakes::PeerProvenance adv_prov{};
+    adv_prov.origin = brakes::PeerOriginKind::online_peer;
+    adv_prov.account_id = 285954035275878ULL;
+    adv_prov.safety_number = "mp2-acct-285954035275878";
+    adv_prov.effective_trust = brakes::PartyTrustProfile::advisory;
+    (void)adv_gate.ingest_peer(adv_prov);
+
+    const auto d_provider = evaluate_mp_room_v2_respond_effect(
+        adv_gate, "provider", Value::object({}), ws_root);
+    require_ok(d_provider.allow);
+
+    const auto d_read_ws = evaluate_mp_room_v2_respond_effect(
+        adv_gate, "read_file",
+        Value::object({{"path", Value{(ws_root / "a.cpp").string()}}}), ws_root);
+    require_ok(d_read_ws.allow);
+
+    const auto d_read_secret = evaluate_mp_room_v2_respond_effect(
+        adv_gate, "read_file",
+        Value::object({{"path", Value{"/Users/test/.ssh/id_ed25519"}}}), ws_root);
+    require_ok(!d_read_secret.allow && d_read_secret.deny);
+
+    const auto d_write = evaluate_mp_room_v2_respond_effect(
+        adv_gate, "write_file",
+        Value::object({{"path", Value{(ws_root / "a.cpp").string()}}}), ws_root);
+    require_ok(!d_write.allow && d_write.deny);
+
+    const auto d_exec = evaluate_mp_room_v2_respond_effect(
+        adv_gate, "exec", Value::object({{"command", Value{"echo hi"}}}), ws_root);
+    require_ok(!d_exec.allow && d_exec.deny);
+
+    // Escalate verdict under `human_gated` trust MUST fail closed (`!decision.allow`).
+    brakes::BrakesGate hg_gate{eff};
+    brakes::PeerProvenance hg_prov = adv_prov;
+    hg_prov.effective_trust = brakes::PartyTrustProfile::human_gated;
+    (void)hg_gate.ingest_peer(hg_prov);
+    const auto d_escalate = evaluate_mp_room_v2_respond_effect(
+        hg_gate, "write_file",
+        Value::object({{"path", Value{(ws_root / "a.cpp").string()}}}), ws_root);
+    require_ok(d_escalate.escalate && !d_escalate.allow);
   }
 
   // 9. Clean stop & room_leave

@@ -25,6 +25,7 @@ namespace {
 constexpr std::uint64_t kWakeClosingBit = std::uint64_t{1U} << 63U;
 constexpr std::uint64_t kWakeCountMask = kWakeClosingBit - 1U;
 constexpr std::size_t kMaxRoomTargetBytes = 128U;
+constexpr std::size_t kMaxMentionAlerts = 64U;
 
 template <typename T> Result<T> fail(ErrorCode code, MpRoomV2Error detail) {
   return Result<T>::failure({code, static_cast<std::int64_t>(detail)});
@@ -32,6 +33,244 @@ template <typename T> Result<T> fail(ErrorCode code, MpRoomV2Error detail) {
 
 Result<void> fail_void(ErrorCode code, MpRoomV2Error detail) {
   return Result<void>::failure({code, static_cast<std::int64_t>(detail)});
+}
+
+char ascii_lower(char ch) noexcept {
+  return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+}
+
+bool ascii_is_alnum(char ch) noexcept {
+  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+         (ch >= '0' && ch <= '9');
+}
+
+bool is_handle_word_char(char ch) noexcept {
+  return ascii_is_alnum(ch) || ch == '_' || ch == '-';
+}
+
+bool is_mention_prefix_blocker(char ch) noexcept {
+  return ascii_is_alnum(ch) || ch == '_' || ch == '-' || ch == '.';
+}
+
+bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (std::size_t i = 0U; i < a.size(); ++i) {
+    if (ascii_lower(a[i]) != ascii_lower(b[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ascii_istarts_with(std::string_view text, std::string_view prefix) noexcept {
+  if (text.size() < prefix.size()) {
+    return false;
+  }
+  return ascii_iequals(text.substr(0U, prefix.size()), prefix);
+}
+
+std::string_view trim_ascii_ws(std::string_view text) noexcept {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' ||
+                           text.front() == '\r' || text.front() == '\n')) {
+    text.remove_prefix(1U);
+  }
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
+                           text.back() == '\r' || text.back() == '\n')) {
+    text.remove_suffix(1U);
+  }
+  return text;
+}
+
+// Consumes a CSI parameter/intermediate sequence through its final byte (0x40..0x7E).
+void consume_csi_tail(std::string_view raw, std::size_t &i) noexcept {
+  while (i < raw.size()) {
+    const auto c = static_cast<unsigned char>(raw[i++]);
+    if (c >= 0x40U && c <= 0x7eU) {
+      break;
+    }
+  }
+}
+
+// Consumes an OSC/DCS/SOS/PM/APC string payload through BEL (0x07), ESC \,
+// bare C1 ST (0x9C), or UTF-8 C1 ST (0xC2 0x9C).
+void consume_st_tail(std::string_view raw, std::size_t &i) noexcept {
+  while (i < raw.size()) {
+    const auto c = static_cast<unsigned char>(raw[i++]);
+    if (c == 0x07U || c == 0x9cU) {
+      break;
+    }
+    if (c == 0x1bU && i < raw.size() && raw[i] == '\\') {
+      ++i;
+      break;
+    }
+    if (c == 0xc2U && i < raw.size() && static_cast<unsigned char>(raw[i]) == 0x9cU) {
+      ++i;
+      break;
+    }
+  }
+}
+
+// Strips ANSI CSI/OSC/DCS/SOS/PM/APC (both 7-bit ESC and 8-bit/UTF-8 C1),
+// C0/DEL/C1/BiDi/zero-width/line-separator/Unicode-Tag controls, and invalid
+// UTF-8 bytes so outbound agent_card JSON stays strictly printable UTF-8.
+std::string scrub_agent_card_text(std::string_view raw, std::size_t max_bytes) {
+  std::string out;
+  out.reserve(std::min(raw.size(), max_bytes));
+  std::size_t i = 0U;
+  auto push_space_collapsed = [&]() {
+    if (!out.empty() && out.back() != ' ' && out.size() < max_bytes) {
+      out.push_back(' ');
+    }
+  };
+  while (i < raw.size() && out.size() < max_bytes) {
+    const auto b0 = static_cast<unsigned char>(raw[i]);
+    if (b0 == 0x1bU) {
+      ++i;
+      if (i < raw.size()) {
+        const char next = raw[i++];
+        if (next == '[') {
+          consume_csi_tail(raw, i);
+        } else if (next == ']' || next == 'P' || next == 'X' || next == '^' ||
+                   next == '_') {
+          consume_st_tail(raw, i);
+        }
+      }
+      continue;
+    }
+    if (b0 == '\r' || b0 == '\n' || b0 == '\t') {
+      push_space_collapsed();
+      ++i;
+      continue;
+    }
+    if (b0 < 0x20U || b0 == 0x7fU) {
+      ++i;
+      continue;
+    }
+    if (b0 < 0x80U) {
+      out.push_back(static_cast<char>(b0));
+      ++i;
+      continue;
+    }
+    // Bare single-byte C1 controls (0x80..0x9F), including CSI/OSC/DCS/SOS/PM/APC.
+    if (b0 <= 0x9fU) {
+      ++i;
+      if (b0 == 0x9bU) {
+        consume_csi_tail(raw, i);
+      } else if (b0 == 0x9dU || b0 == 0x90U || b0 == 0x98U || b0 == 0x9eU ||
+                 b0 == 0x9fU) {
+        consume_st_tail(raw, i);
+      }
+      continue;
+    }
+    // Validate UTF-8 multibyte sequence and reject C1/BiDi/zero-width/Tag controls.
+    if ((b0 & 0xe0U) == 0xc0U) {
+      if (b0 < 0xc2U || i + 1U >= raw.size()) {
+        ++i;
+        continue;
+      }
+      const auto b1 = static_cast<unsigned char>(raw[i + 1U]);
+      if ((b1 & 0xc0U) != 0x80U) {
+        ++i;
+        continue;
+      }
+      const char32_t cp =
+          (static_cast<char32_t>(b0 & 0x1fU) << 6U) | static_cast<char32_t>(b1 & 0x3fU);
+      if (cp <= 0x9fU) {
+        i += 2U;
+        if (cp == 0x9bU) {
+          consume_csi_tail(raw, i);
+        } else if (cp == 0x9dU || cp == 0x90U || cp == 0x98U || cp == 0x9eU ||
+                   cp == 0x9fU) {
+          consume_st_tail(raw, i);
+        }
+        continue;
+      }
+      if (cp == 0x061cU) {
+        i += 2U;
+        continue;
+      }
+      if (out.size() + 2U > max_bytes) {
+        break;
+      }
+      out.append(raw.data() + i, 2U);
+      i += 2U;
+      continue;
+    }
+    if ((b0 & 0xf0U) == 0xe0U) {
+      if (i + 2U >= raw.size()) {
+        ++i;
+        continue;
+      }
+      const auto b1 = static_cast<unsigned char>(raw[i + 1U]);
+      const auto b2 = static_cast<unsigned char>(raw[i + 2U]);
+      if ((b1 & 0xc0U) != 0x80U || (b2 & 0xc0U) != 0x80U ||
+          (b0 == 0xe0U && b1 < 0xa0U) || (b0 == 0xedU && b1 >= 0xa0U)) {
+        ++i;
+        continue;
+      }
+      const char32_t cp = (static_cast<char32_t>(b0 & 0x0fU) << 12U) |
+                          (static_cast<char32_t>(b1 & 0x3fU) << 6U) |
+                          static_cast<char32_t>(b2 & 0x3fU);
+      if (cp == 0x2028U || cp == 0x2029U) {
+        push_space_collapsed();
+        i += 3U;
+        continue;
+      }
+      if ((cp >= 0x200bU && cp <= 0x200fU) || (cp >= 0x202aU && cp <= 0x202eU) ||
+          (cp >= 0x2066U && cp <= 0x2069U) || cp == 0xfeffU) {
+        i += 3U;
+        continue;
+      }
+      if (out.size() + 3U > max_bytes) {
+        break;
+      }
+      out.append(raw.data() + i, 3U);
+      i += 3U;
+      continue;
+    }
+    if ((b0 & 0xf8U) == 0xf0U) {
+      if (b0 > 0xf4U || i + 3U >= raw.size()) {
+        ++i;
+        continue;
+      }
+      const auto b1 = static_cast<unsigned char>(raw[i + 1U]);
+      const auto b2 = static_cast<unsigned char>(raw[i + 2U]);
+      const auto b3 = static_cast<unsigned char>(raw[i + 3U]);
+      if ((b1 & 0xc0U) != 0x80U || (b2 & 0xc0U) != 0x80U || (b3 & 0xc0U) != 0x80U ||
+          (b0 == 0xf0U && b1 < 0x90U) || (b0 == 0xf4U && b1 >= 0x90U)) {
+        ++i;
+        continue;
+      }
+      const char32_t cp = (static_cast<char32_t>(b0 & 0x07U) << 18U) |
+                          (static_cast<char32_t>(b1 & 0x3fU) << 12U) |
+                          (static_cast<char32_t>(b2 & 0x3fU) << 6U) |
+                          static_cast<char32_t>(b3 & 0x3fU);
+      if (cp >= 0xe0000U && cp <= 0xe007fU) {
+        i += 4U;
+        continue;
+      }
+      if (out.size() + 4U > max_bytes) {
+        break;
+      }
+      out.append(raw.data() + i, 4U);
+      i += 4U;
+      continue;
+    }
+    ++i;
+  }
+  while (!out.empty() && out.back() == ' ') {
+    out.pop_back();
+  }
+  std::size_t lead = 0U;
+  while (lead < out.size() && out[lead] == ' ') {
+    ++lead;
+  }
+  if (lead > 0U) {
+    out.erase(0U, lead);
+  }
+  return out;
 }
 
 std::uint64_t wall_now_ms() noexcept {
@@ -85,42 +324,36 @@ std::optional<std::string> json_opt_string(const Value &obj, std::string_view ke
 }
 
 std::string render_agent_card_body(std::string_view body) {
-  ValueLimits limits{};
-  limits.bytes = mp::kMaxMp2BodyBytes;
-  limits.nodes = 2048U;
-  limits.depth = 16U;
-  const auto parsed = parse_json(body, limits);
-  if (!parsed.has_value() ||
-      !std::holds_alternative<Value::Object>(parsed.value().value())) {
+  const auto parsed_card = parse_mp_room_v2_agent_card(body);
+  if (!parsed_card.has_value()) {
     return party_chat_sanitize(body, 2048U);
   }
-  const Value &obj = parsed.value();
-  const std::string title =
-      party_chat_sanitize(json_opt_string(obj, "title").value_or("Agent update"), 160U);
-  const std::string summary =
-      party_chat_sanitize(json_opt_string(obj, "summary").value_or(""), 512U);
+  const auto &c = *parsed_card;
+  const std::string title = c.title.empty() ? std::string{"Agent update"}
+                                            : party_chat_sanitize(c.title, 160U);
   std::string out = "[agent] " + title;
-  if (!summary.empty()) {
-    out += " — " + summary;
+  if (!c.status.empty() && c.status != "done") {
+    out += " [" + party_chat_sanitize(c.status, 24U) + "]";
   }
-  if (const Value *files_field = obj.find("files"); files_field != nullptr) {
-    if (const auto *arr = std::get_if<Value::Array>(&files_field->value());
-        arr != nullptr && !arr->empty()) {
-      out += " [";
-      const std::size_t shown = std::min<std::size_t>(arr->size(), 6U);
-      for (std::size_t i = 0U; i < shown; ++i) {
-        if (i > 0U) {
-          out += ", ";
-        }
-        if (const auto *s = std::get_if<std::string>(&(*arr)[i].value())) {
-          out += party_chat_sanitize(*s, 96U);
-        }
+  if (!c.summary.empty()) {
+    out += " — " + party_chat_sanitize(c.summary, 512U);
+  }
+  if (c.diff_stat.has_value() && !c.diff_stat->empty()) {
+    out += " (" + party_chat_sanitize(*c.diff_stat, 48U) + ")";
+  }
+  if (!c.files.empty()) {
+    out += " [";
+    const std::size_t shown = std::min<std::size_t>(c.files.size(), 6U);
+    for (std::size_t i = 0U; i < shown; ++i) {
+      if (i > 0U) {
+        out += ", ";
       }
-      if (arr->size() > shown) {
-        out += ", +" + std::to_string(arr->size() - shown);
-      }
-      out += "]";
+      out += party_chat_sanitize(c.files[i], 96U);
     }
+    if (c.files.size() > shown) {
+      out += ", +" + std::to_string(c.files.size() - shown);
+    }
+    out += "]";
   }
   return out;
 }
@@ -267,6 +500,13 @@ bool is_permanent_connect_error(const Error &err) noexcept {
          ce == mp::MpClientError::http_not_found || ce == mp::MpClientError::http_gone;
 }
 
+brakes::EffectivePolicy load_effective_brakes_policy_or_default() {
+  if (auto loaded = brakes::load_effective_policy(); loaded.has_value()) {
+    return std::move(loaded).value();
+  }
+  return brakes::EffectivePolicy{};
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -293,8 +533,298 @@ std::string_view mp_room_v2_error_name(MpRoomV2Error detail) noexcept {
     return "wake_pipe_failed";
   case MpRoomV2Error::protocol_error:
     return "protocol_error";
+  case MpRoomV2Error::secret_rejected:
+    return "secret_rejected";
   }
   return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Agent Card validation, scrubbing, serialization & `@agent` mention detection
+// ---------------------------------------------------------------------------
+
+bool mp_room_v2_contains_secret_token(std::string_view text) noexcept {
+  if (text.empty()) {
+    return false;
+  }
+  static constexpr std::array<std::string_view, 14> kMarkers{
+      "mprk1_",      "mpinv1_", "mppi1_", "mpcs1_",      "mpguest1_",
+      "mpdl1_",      "sk-ant-", "sk-or-", "sk-proj-",    "ghp_",
+      "github_pat_", "xoxb-",   "xoxp-",  "-----begin ",
+  };
+  for (std::size_t i = 0U; i < text.size(); ++i) {
+    const std::string_view tail = text.substr(i);
+    for (const std::string_view marker : kMarkers) {
+      if (ascii_istarts_with(tail, marker)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool mp_room_v2_valid_agent_card_status(std::string_view status) noexcept {
+  return status == "done" || status == "working" || status == "testing" ||
+         status == "blocked" || status == "error";
+}
+
+Result<std::string>
+serialize_mp_room_v2_agent_card(const MpRoomV2AgentCard &card,
+                                std::string_view default_agent_name) {
+  const std::string status_raw = card.status.empty()
+                                     ? std::string{"done"}
+                                     : std::string{trim_ascii_ws(card.status)};
+  if (!mp_room_v2_valid_agent_card_status(status_raw)) {
+    return fail<std::string>(ErrorCode::invalid_range, MpRoomV2Error::invalid_field);
+  }
+
+  auto check_secret = [](std::string_view raw, std::string_view scrubbed) noexcept {
+    return mp_room_v2_contains_secret_token(raw) ||
+           mp_room_v2_contains_secret_token(scrubbed);
+  };
+
+  const std::string title = scrub_agent_card_text(card.title, 256U);
+  const std::string summary = scrub_agent_card_text(card.summary, 1024U);
+  const std::string_view raw_agent =
+      card.agent_name.empty() ? default_agent_name : std::string_view{card.agent_name};
+  const std::string agent_name = scrub_agent_card_text(raw_agent, 64U);
+  std::string diff_stat;
+  if (card.diff_stat.has_value()) {
+    diff_stat = scrub_agent_card_text(*card.diff_stat, 64U);
+    if (check_secret(*card.diff_stat, diff_stat)) {
+      return fail<std::string>(ErrorCode::invalid_range,
+                               MpRoomV2Error::secret_rejected);
+    }
+  }
+
+  if (check_secret(card.title, title) || check_secret(card.summary, summary) ||
+      check_secret(raw_agent, agent_name)) {
+    return fail<std::string>(ErrorCode::invalid_range, MpRoomV2Error::secret_rejected);
+  }
+  if (title.empty() && summary.empty()) {
+    return fail<std::string>(ErrorCode::invalid_range, MpRoomV2Error::invalid_field);
+  }
+
+  std::vector<std::string> clean_files;
+  clean_files.reserve(std::min(card.files.size(), kMpRoomV2MaxAgentCardFiles));
+  for (const auto &raw_path : card.files) {
+    const std::string scrubbed = scrub_agent_card_text(raw_path, 160U);
+    if (check_secret(raw_path, scrubbed)) {
+      return fail<std::string>(ErrorCode::invalid_range,
+                               MpRoomV2Error::secret_rejected);
+    }
+    if (scrubbed.empty()) {
+      continue;
+    }
+    if (std::find(clean_files.begin(), clean_files.end(), scrubbed) !=
+        clean_files.end()) {
+      continue;
+    }
+    if (clean_files.size() >= kMpRoomV2MaxAgentCardFiles) {
+      break;
+    }
+    clean_files.push_back(scrubbed);
+  }
+
+  Value::Object card_obj;
+  card_obj.emplace_back("title", Value{title});
+  card_obj.emplace_back("summary", Value{summary});
+  card_obj.emplace_back("status", Value{status_raw});
+  if (!agent_name.empty()) {
+    card_obj.emplace_back("agent_name", Value{agent_name});
+  }
+  if (!diff_stat.empty()) {
+    card_obj.emplace_back("diff_stat", Value{diff_stat});
+  }
+  if (!clean_files.empty()) {
+    Value::Array files_arr;
+    files_arr.reserve(clean_files.size());
+    for (auto &f : clean_files) {
+      files_arr.emplace_back(std::move(f));
+    }
+    card_obj.emplace_back("files", Value{std::move(files_arr)});
+  }
+
+  auto json_res = dump_json(Value::object(std::move(card_obj)));
+  if (!json_res.has_value()) {
+    return fail<std::string>(ErrorCode::corrupt, MpRoomV2Error::invalid_field);
+  }
+  std::string body = std::move(json_res).value();
+  if (body.size() > kMpRoomV2MaxAgentCardBytes) {
+    return fail<std::string>(ErrorCode::capacity, MpRoomV2Error::field_too_large);
+  }
+  return Result<std::string>::success(std::move(body));
+}
+
+std::optional<MpRoomV2AgentCard> parse_mp_room_v2_agent_card(std::string_view body) {
+  ValueLimits limits{};
+  limits.bytes = mp::kMaxMp2BodyBytes;
+  limits.nodes = 2048U;
+  limits.depth = 16U;
+  const auto parsed = parse_json(body, limits);
+  if (!parsed.has_value() ||
+      !std::holds_alternative<Value::Object>(parsed.value().value())) {
+    return std::nullopt;
+  }
+  const Value &obj = parsed.value();
+  MpRoomV2AgentCard card{};
+  card.title = party_chat_sanitize(json_opt_string(obj, "title").value_or(""), 160U);
+  card.summary =
+      party_chat_sanitize(json_opt_string(obj, "summary").value_or(""), 512U);
+  if (card.title.empty() && card.summary.empty()) {
+    return std::nullopt;
+  }
+  const std::string raw_status = json_opt_string(obj, "status").value_or("done");
+  card.status = mp_room_v2_valid_agent_card_status(raw_status) ? raw_status : "done";
+  card.agent_name =
+      party_chat_sanitize(json_opt_string(obj, "agent_name").value_or(""), 48U);
+  if (const auto ds = json_opt_string(obj, "diff_stat"); ds.has_value()) {
+    const std::string clean_ds = party_chat_sanitize(*ds, 64U);
+    if (!clean_ds.empty()) {
+      card.diff_stat = clean_ds;
+    }
+  }
+  if (const Value *files_field = obj.find("files"); files_field != nullptr) {
+    if (const auto *arr = std::get_if<Value::Array>(&files_field->value());
+        arr != nullptr) {
+      const std::size_t cap =
+          std::min<std::size_t>(arr->size(), kMpRoomV2MaxAgentCardFiles);
+      card.files.reserve(cap);
+      for (std::size_t i = 0U; i < cap; ++i) {
+        if (const auto *s = std::get_if<std::string>(&(*arr)[i].value())) {
+          const std::string clean_path = party_chat_sanitize(*s, 160U);
+          if (!clean_path.empty()) {
+            card.files.push_back(clean_path);
+          }
+        }
+      }
+    }
+  }
+  return card;
+}
+
+bool detect_self_agent_mention(std::string_view body,
+                               std::string_view self_handle) noexcept {
+  while (!self_handle.empty() && self_handle.front() == '@') {
+    self_handle.remove_prefix(1U);
+  }
+  if (self_handle.empty() || body.size() < self_handle.size() + 1U) {
+    return false;
+  }
+
+  for (std::size_t pos = 0U; pos < body.size(); ++pos) {
+    if (body[pos] != '@') {
+      continue;
+    }
+    if (pos > 0U && is_mention_prefix_blocker(body[pos - 1U])) {
+      continue;
+    }
+    const std::size_t hstart = pos + 1U;
+    if (hstart + self_handle.size() > body.size()) {
+      break;
+    }
+    if (!ascii_iequals(body.substr(hstart, self_handle.size()), self_handle)) {
+      continue;
+    }
+
+    const std::size_t after = hstart + self_handle.size();
+    if (after == body.size()) {
+      return true;
+    }
+
+    const std::string_view rest = body.substr(after);
+    // Explicit `@handle:agent` form.
+    if (ascii_istarts_with(rest, ":agent")) {
+      const std::size_t end = after + 6U;
+      if (end == body.size() || !is_handle_word_char(body[end])) {
+        return true;
+      }
+      continue;
+    }
+
+    // Explicit `@handle's agent` (ASCII apostrophe or UTF-8 U+2019 right single quote).
+    std::size_t apos_len = 0U;
+    if (rest.front() == '\'') {
+      apos_len = 1U;
+    } else if (rest.size() >= 3U && static_cast<unsigned char>(rest[0]) == 0xe2U &&
+               static_cast<unsigned char>(rest[1]) == 0x80U &&
+               static_cast<unsigned char>(rest[2]) == 0x99U) {
+      apos_len = 3U;
+    }
+    if (apos_len > 0U && rest.size() > apos_len && ascii_lower(rest[apos_len]) == 's') {
+      std::size_t sp = apos_len + 1U;
+      std::size_t spaces = 0U;
+      while (sp < rest.size() && (rest[sp] == ' ' || rest[sp] == '\t')) {
+        ++sp;
+        ++spaces;
+      }
+      if (spaces > 0U && ascii_istarts_with(rest.substr(sp), "agent")) {
+        const std::size_t end = after + sp + 5U;
+        if (end == body.size() || !is_handle_word_char(body[end])) {
+          return true;
+        }
+      }
+      continue;
+    }
+
+    // Reject email/domain like `@handle.com` (dot immediately followed by alnum).
+    if (rest.front() == '.' && rest.size() > 1U && ascii_is_alnum(rest[1])) {
+      continue;
+    }
+
+    // Reject unknown colon-tag like `@handle:other`, while allowing `@handle: hi`.
+    if (rest.front() == ':' && rest.size() > 1U && is_handle_word_char(rest[1])) {
+      continue;
+    }
+
+    // Reject prefix collisions like `@handle2`, `@handle_bot`, `@handle-x`.
+    if (is_handle_word_char(rest.front())) {
+      continue;
+    }
+
+    return true;
+  }
+  return false;
+}
+
+std::string build_mp_room_v2_respond_prompt(const MpRoomV2PendingMention &mention,
+                                            std::string_view extra_guidance) {
+  const std::string sender =
+      mention.sender_handle.empty()
+          ? std::string{"@peer"}
+          : ("@" + party_chat_sanitize(strip_at(mention.sender_handle), 64U));
+  const std::string scope = mention.room_scope.empty()
+                                ? std::string{"party/live"}
+                                : party_chat_sanitize(mention.room_scope, 64U);
+  std::string out = "The local operator explicitly asked you to review and respond to "
+                    "a peer mention from " +
+                    sender + " in " + scope + ".\n" + mention.fenced_envelope;
+  const std::string_view trimmed_guidance = trim_ascii_ws(extra_guidance);
+  if (!trimmed_guidance.empty()) {
+    out += "\n\nOperator guidance: ";
+    out.append(trimmed_guidance);
+  }
+  return out;
+}
+
+brakes::BrakesDecision
+evaluate_mp_room_v2_respond_effect(const brakes::BrakesGate &gate,
+                                   std::string_view op_name, const Value &op_input,
+                                   const std::filesystem::path &workspace_root) {
+  // The operator explicitly triggered `/respond`: allow the turn's own primary
+  // LLM provider invocation so the model can actually read & answer the mention,
+  // while routing every tool call strictly through BrakesGate.
+  if (op_name == "provider") {
+    return brakes::BrakesDecision::make_allow("respond turn model invocation");
+  }
+  brakes::ToolCallRequest req{};
+  req.tool_name = std::string{op_name};
+  if (const auto *p = op_input.find("path");
+      p != nullptr && std::holds_alternative<std::string>(p->value())) {
+    req.target_path = std::filesystem::path{p->string()};
+  }
+  req.workspace_root = workspace_root;
+  return gate.evaluate_tool_call(req);
 }
 
 std::string_view mp_room_v2_state_name(MpRoomV2State state) noexcept {
@@ -392,6 +922,7 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
       room_code_(party_chat_sanitize(params.config.room_code, 32U)),
       room_name_(party_chat_sanitize(params.config.room_name, 128U)),
       share_url_(party_chat_sanitize(params.config.share_url, 256U)),
+      brakes_gate_(load_effective_brakes_policy_or_default()),
       wake_read_fd_(params.wake_read_fd), wake_write_fd_(params.wake_write_fd) {
   std::vector<MpRoomV2Member> initial;
   initial.reserve(params.config.initial_members.size() + 1U);
@@ -577,9 +1108,6 @@ Result<std::string> MpRoomV2Session::send_agent_card(const MpRoomV2AgentCard &ca
       stopped_.load(std::memory_order_acquire)) {
     return fail<std::string>(ErrorCode::stale_handle, MpRoomV2Error::session_stopped);
   }
-  if (card.title.empty() && card.summary.empty()) {
-    return fail<std::string>(ErrorCode::invalid_range, MpRoomV2Error::invalid_field);
-  }
   if (target.value.empty()) {
     target.value = "@all";
   }
@@ -587,25 +1115,12 @@ Result<std::string> MpRoomV2Session::send_agent_card(const MpRoomV2AgentCard &ca
     return fail<std::string>(ErrorCode::capacity, MpRoomV2Error::field_too_large);
   }
 
-  Value::Object card_obj;
-  card_obj.emplace_back("title", Value{card.title});
-  card_obj.emplace_back("summary", Value{card.summary});
-  if (!card.files.empty()) {
-    Value::Array files_arr;
-    files_arr.reserve(card.files.size());
-    for (const auto &f : card.files) {
-      files_arr.emplace_back(f);
-    }
-    card_obj.emplace_back("files", Value{std::move(files_arr)});
-  }
-  auto json_res = dump_json(Value::object(std::move(card_obj)));
+  auto json_res = serialize_mp_room_v2_agent_card(card, agent_name_);
   if (!json_res.has_value()) {
-    return fail<std::string>(ErrorCode::corrupt, MpRoomV2Error::invalid_field);
+    return Result<std::string>::failure(json_res.error());
   }
   std::string body = std::move(json_res).value();
-  if (body.size() > mp::kMaxMp2BodyBytes) {
-    return fail<std::string>(ErrorCode::capacity, MpRoomV2Error::field_too_large);
-  }
+  auto parsed_card = parse_mp_room_v2_agent_card(body);
 
   std::string msg_id;
   {
@@ -629,6 +1144,7 @@ Result<std::string> MpRoomV2Session::send_agent_card(const MpRoomV2AgentCard &ca
     optimistic.body_encoding = "utf8";
     optimistic.body = body;
     optimistic.rendered_body = render_agent_card_body(body);
+    optimistic.parsed_agent_card = std::move(parsed_card);
     optimistic.delivered = false;
     optimistic.local_self = true;
     upsert_message_locked(std::move(optimistic));
@@ -684,6 +1200,11 @@ MpRoomV2State MpRoomV2Session::state() const noexcept {
   return state_;
 }
 
+std::string MpRoomV2Session::local_handle() const {
+  std::lock_guard<std::mutex> lock(state_mu_);
+  return local_handle_;
+}
+
 std::string MpRoomV2Session::room_code() const {
   std::lock_guard<std::mutex> lock(state_mu_);
   return room_code_;
@@ -696,6 +1217,29 @@ std::string MpRoomV2Session::share_url() const {
 
 std::uint64_t MpRoomV2Session::latest_seq() const noexcept {
   return latest_seq_atomic_.load(std::memory_order_acquire);
+}
+
+std::optional<MpRoomV2PendingMention> MpRoomV2Session::pending_agent_mention() const {
+  std::lock_guard<std::mutex> lock(state_mu_);
+  return pending_agent_mention_;
+}
+
+std::optional<MpRoomV2PendingMention> MpRoomV2Session::consume_pending_agent_mention() {
+  std::optional<MpRoomV2PendingMention> out;
+  {
+    std::lock_guard<std::mutex> lock(state_mu_);
+    out = std::move(pending_agent_mention_);
+    pending_agent_mention_.reset();
+  }
+  if (out.has_value()) {
+    signal_wake();
+  }
+  return out;
+}
+
+brakes::TurnTaintState MpRoomV2Session::turn_taint_snapshot() const {
+  std::lock_guard<std::mutex> lock(state_mu_);
+  return brakes_gate_.taint();
 }
 
 MpRoomV2Snapshot MpRoomV2Session::snapshot() {
@@ -714,6 +1258,9 @@ MpRoomV2Snapshot MpRoomV2Session::snapshot() {
   snap.messages.assign(messages_.begin(), messages_.end());
   snap.notices.assign(notices_.begin(), notices_.end());
   notices_.clear();
+  snap.mention_alerts.assign(mention_alerts_.begin(), mention_alerts_.end());
+  mention_alerts_.clear();
+  snap.pending_agent_mention = pending_agent_mention_;
   snap.status_summary = status_summary_;
   return snap;
 }
@@ -761,7 +1308,25 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
     }
     pm.body = std::move(body_out);
     pm.untrusted_remote = !m.local_self;
+    if (m.parsed_agent_card.has_value()) {
+      PartyAgentCard pc{};
+      pc.title = m.parsed_agent_card->title;
+      pc.summary = m.parsed_agent_card->summary;
+      pc.files = m.parsed_agent_card->files;
+      pc.status = m.parsed_agent_card->status;
+      pc.agent_name = !m.parsed_agent_card->agent_name.empty()
+                          ? m.parsed_agent_card->agent_name
+                          : m.sender_agent_name;
+      pc.diff_stat = m.parsed_agent_card->diff_stat;
+      pm.agent_card = std::move(pc);
+    }
     snap.messages.push_back(std::move(pm));
+  }
+  if (pending_agent_mention_.has_value()) {
+    snap.pending_mention = PartyPendingMention{
+        pending_agent_mention_->sender_handle,
+        pending_agent_mention_->sanitized_preview,
+    };
   }
   return snap;
 }
@@ -991,7 +1556,7 @@ void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action)
     if (const auto *arr = std::get_if<Value::Array>(&hist_field->value())) {
       for (const auto &ev : *arr) {
         if (std::holds_alternative<Value::Object>(ev.value())) {
-          handle_event_locked(ev);
+          handle_event_locked(ev, true);
         }
       }
     }
@@ -1022,7 +1587,7 @@ void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action)
   rebuild_status_summary_locked();
 }
 
-void MpRoomV2Session::handle_event_locked(const Value &obj) {
+void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
   const std::uint64_t seq = json_u64_or_decimal(obj, "seq").value_or(0U);
   const std::uint64_t ts_ms = json_u64_or_decimal(obj, "ts_ms").value_or(wall_now_ms());
   const std::string cmsg_id =
@@ -1034,6 +1599,10 @@ void MpRoomV2Session::handle_event_locked(const Value &obj) {
   const std::string encoding =
       party_chat_sanitize(json_opt_string(obj, "body_encoding").value_or("utf8"), 32U);
   const std::string body = json_opt_string(obj, "body").value_or("");
+
+  const bool already_seen =
+      (seq > 0U && seen_seqs_.contains(seq)) ||
+      (!cmsg_id.empty() && seen_client_msg_ids_.contains(cmsg_id));
 
   MpRoomV2Message msg{};
   msg.seq = seq;
@@ -1049,7 +1618,7 @@ void MpRoomV2Session::handle_event_locked(const Value &obj) {
       sender_field != nullptr &&
       std::holds_alternative<Value::Object>(sender_field->value())) {
     if (const auto acct_raw = json_u64_or_decimal(*sender_field, "account_id");
-        acct_raw.has_value()) {
+        acct_raw.has_value() && *acct_raw != 0U) {
       if (const auto aid = mp::AccountId::create(*acct_raw); aid.has_value()) {
         msg.sender_account_id = aid.value();
       }
@@ -1061,10 +1630,17 @@ void MpRoomV2Session::handle_event_locked(const Value &obj) {
     msg.sender_agent_name = party_chat_sanitize(
         json_opt_string(*sender_field, "agent_name").value_or(""), 48U);
   }
-  msg.local_self = local_account_id_.has_value() && msg.sender_account_id.has_value() &&
-                   *msg.sender_account_id == *local_account_id_;
+  const bool matched_outbox =
+      !cmsg_id.empty() &&
+      std::any_of(outbox_.begin(), outbox_.end(), [&](const OutboundMessage &pending) {
+        return pending.client_msg_id == cmsg_id;
+      });
+  msg.local_self = matched_outbox || (local_account_id_.has_value() &&
+                                      msg.sender_account_id.has_value() &&
+                                      *msg.sender_account_id == *local_account_id_);
 
   if (msg.kind == "agent_card" && msg.body_encoding == "utf8") {
+    msg.parsed_agent_card = parse_mp_room_v2_agent_card(msg.body);
     msg.rendered_body = render_agent_card_body(msg.body);
   } else if (msg.body_encoding == "opaque_b64") {
     msg.rendered_body = "[encrypted message]";
@@ -1077,6 +1653,75 @@ void MpRoomV2Session::handle_event_locked(const Value &obj) {
     std::erase_if(outbox_, [&](const OutboundMessage &pending) {
       return pending.client_msg_id == cmsg_id;
     });
+  }
+
+  // Detect incoming remote `@<self_handle>` / `@<self_handle>:agent` /
+  // `@<self_handle>'s agent` mentions in both chat messages and `agent_card`
+  // events, and isolate through Brakes Stage 1. Never triggers on self-sent
+  // echoes, encrypted opaque frames, or duplicates.
+  bool mentions_self = false;
+  std::string_view mention_payload;
+  if (!is_history && !already_seen && !msg.local_self && msg.body_encoding == "utf8") {
+    if (msg.kind == "chat") {
+      mentions_self = detect_self_agent_mention(msg.body, local_handle_) ||
+                      detect_self_agent_mention(msg.target, local_handle_);
+      mention_payload = msg.body;
+    } else if (msg.kind == "agent_card") {
+      mentions_self =
+          detect_self_agent_mention(msg.target, local_handle_) ||
+          (msg.parsed_agent_card.has_value() &&
+           (detect_self_agent_mention(msg.parsed_agent_card->title, local_handle_) ||
+            detect_self_agent_mention(msg.parsed_agent_card->summary, local_handle_)));
+      mention_payload = msg.rendered_body;
+    }
+  }
+  if (mentions_self) {
+    const bool sender_is_guest = !msg.sender_account_id.has_value();
+    const std::string room_scope =
+        !room_code_.empty() ? ("room/" + room_code_) : std::string{"party/live"};
+    const std::string sender_handle =
+        msg.sender_handle.empty() ? std::string{"peer"} : msg.sender_handle;
+
+    brakes::PeerProvenance prov{};
+    prov.origin = brakes::PeerOriginKind::online_peer;
+    prov.account_id =
+        msg.sender_account_id.has_value() ? msg.sender_account_id->value() : 0U;
+    prov.is_external_guest = sender_is_guest;
+    prov.safety_number = msg.sender_account_id.has_value()
+                             ? ("mp2-acct-" + msg.sender_account_id->to_decimal())
+                             : std::string{"mp2-guest"};
+    prov.effective_trust =
+        std::min(brakes::PartyTrustProfile::advisory,
+                 brakes_gate_.policy().party_trust.max_default_profile);
+
+    const brakes::PartyTrustProfile clamped_trust = brakes_gate_.ingest_peer(prov);
+    prov.effective_trust = clamped_trust;
+
+    const auto wrapped = brakes::format_untrusted_peer_envelope(
+        prov, brakes::RoomScopeRef{room_scope}, brakes::SenderRef{"@" + sender_handle},
+        brakes::MessageBodyRef{mention_payload});
+    if (wrapped.has_value()) {
+      MpRoomV2PendingMention pending{};
+      pending.seq = msg.seq;
+      pending.ts_ms = msg.ts_ms;
+      pending.sender_account_id = msg.sender_account_id;
+      pending.sender_is_guest = sender_is_guest;
+      pending.sender_handle = sender_handle;
+      pending.sender_client = msg.sender_client;
+      pending.sender_agent_name = msg.sender_agent_name;
+      pending.room_scope = room_scope;
+      pending.raw_body = std::string{mention_payload};
+      pending.sanitized_preview = party_chat_sanitize(mention_payload, 140U);
+      pending.fenced_envelope = wrapped.value();
+      pending.provenance = std::move(prov);
+      pending.effective_trust = clamped_trust;
+
+      pending_agent_mention_ = pending;
+      mention_alerts_.push_back(std::move(pending));
+      while (mention_alerts_.size() > kMaxMentionAlerts) {
+        mention_alerts_.pop_front();
+      }
+    }
   }
 
   upsert_message_locked(std::move(msg));

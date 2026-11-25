@@ -938,6 +938,7 @@ Result<PartyMessage> message_from_value(const Value &value) {
       kind.value(),
       std::move(body).value(),
       untrusted.value(),
+      std::nullopt,
   });
 }
 

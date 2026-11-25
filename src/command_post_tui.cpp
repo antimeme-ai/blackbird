@@ -14,6 +14,7 @@
 #include "blackbird/metrics_consumer.hpp"
 #include "blackbird/mp_client.hpp"
 #include "blackbird/mp_protocol.hpp"
+#include "blackbird/mp_room_v2.hpp"
 #include "blackbird/nvim_rpc.hpp"
 #include "blackbird/os_sandbox.hpp"
 #include "blackbird/party_chat.hpp"
@@ -3290,6 +3291,54 @@ std::string handle_online(std::string_view args) {
          "'. Run `/online help` for usage.\n";
 }
 
+std::string handle_respond(std::string_view args, const CommandPostTuiContext &ctx) {
+  if (ctx.mp_room_v2 == nullptr || !ctx.mp_room_v2->is_active()) {
+    return "Not in an active live party — no pending @agent mention.\n";
+  }
+  const auto pending = ctx.mp_room_v2->consume_pending_agent_mention();
+  if (!pending.has_value()) {
+    return "No pending @agent mention to respond to.\n";
+  }
+  const std::string prompt = build_mp_room_v2_respond_prompt(*pending, args);
+  const std::string who = "@" + sanitize_inline(pending->sender_handle, 48);
+  const std::string trust{brakes::party_trust_profile_name(pending->effective_trust)};
+  if (ctx.respond_turn_runner) {
+    ctx.respond_turn_runner(prompt);
+    return "Responded to " + who + "'s mention under Brakes isolation (trust=" + trust +
+           ").\n";
+  }
+  return "Brakes-isolated mention prompt from " + who + " (trust=" + trust + "):\n" +
+         prompt + "\n";
+}
+
+std::string handle_card(std::string_view args, const CommandPostTuiContext &ctx) {
+  const std::string_view trimmed = trim_view(args);
+  if (trimmed.empty()) {
+    return "Usage: /card <title> | <summary>\n";
+  }
+  if (ctx.mp_room_v2 == nullptr || !ctx.mp_room_v2->is_active()) {
+    return "Not in an active live party — run `/invite` or `/join` first.\n";
+  }
+  MpRoomV2AgentCard card{};
+  const std::size_t bar = trimmed.find('|');
+  if (bar == std::string_view::npos) {
+    card.title = std::string{trimmed};
+  } else {
+    card.title = std::string{trim_view(trimmed.substr(0, bar))};
+    card.summary = std::string{trim_view(trimmed.substr(bar + 1))};
+  }
+  card.status = "done";
+  const auto res = ctx.mp_room_v2->send_agent_card(card);
+  if (!res.has_value()) {
+    if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::secret_rejected) {
+      return "Agent card refused: recognizable secret token detected.\n";
+    }
+    return "Agent card failed: " +
+           std::string{mp_room_v2_error_name(mp_room_v2_error_of(res.error()))} + "\n";
+  }
+  return "Posted agent card: " + sanitize_inline(card.title, 120) + "\n";
+}
+
 std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx) {
   const auto root = resolve_project_root(ctx);
   const auto party_config_path = resolve_party_config_path(ctx);
@@ -3299,6 +3348,37 @@ std::string handle_party(std::string_view args, const CommandPostTuiContext &ctx
   // /party online <args...> -> route cleanly to /online handler!
   if (sub == "online")
     return handle_online(rest);
+
+  // /party cards [on|off|status]
+  if (sub == "cards") {
+    const auto [mode_tok, extra] = split_first_token(rest);
+    if (!extra.empty()) {
+      return "Usage: /party cards [on|off|status]\n";
+    }
+    if (mode_tok.empty() || mode_tok == "status") {
+      const bool on = ctx.party_cards_enabled ? *ctx.party_cards_enabled : true;
+      return std::string{"Party agent cards: "} + (on ? "ON" : "OFF") +
+             " (toggle with `/party cards on|off`)\n";
+    }
+    if (mode_tok == "on") {
+      if (ctx.party_cards_enabled != nullptr) {
+        *ctx.party_cards_enabled = true;
+      }
+      return "Party agent cards: ON (auto-emitting turn summaries to active party).\n";
+    }
+    if (mode_tok == "off") {
+      if (ctx.party_cards_enabled != nullptr) {
+        *ctx.party_cards_enabled = false;
+      }
+      return "Party agent cards: OFF (use `/card <title> | <summary>` to post "
+             "manually).\n";
+    }
+    return "Usage: /party cards [on|off|status]\n";
+  }
+
+  // /party respond [extra guidance]
+  if (sub == "respond")
+    return handle_respond(rest, ctx);
 
   // /party close | /party hide
   if (sub == "close" || sub == "hide") {
@@ -4477,6 +4557,10 @@ std::optional<std::string> handle_command_post_slash(std::string_view line,
       return bound_output(handle_flightdeck(args, ctx));
     if (cmd == "/party")
       return bound_output(handle_party(args, ctx));
+    if (cmd == "/card")
+      return bound_output(handle_card(args, ctx));
+    if (cmd == "/respond")
+      return bound_output(handle_respond(args, ctx));
     if (cmd == "/online")
       return bound_output(handle_online(args));
     if (cmd == "/doctor")

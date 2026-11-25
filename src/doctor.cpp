@@ -1109,8 +1109,7 @@ DoctorCheck check_online_identity(const DoctorConfig &cfg) {
   if (!dir_opt.has_value()) {
     chk.status = DoctorStatus::info;
     chk.summary = "not configured (no online state directory resolved)";
-    chk.hint = "Run: blackbird online register --invite <mpinv1_...> --handle <name> "
-               "(or devices link join <CODE>)";
+    chk.hint = "Run: blackbird login";
     return chk;
   }
 
@@ -1120,8 +1119,7 @@ DoctorCheck check_online_identity(const DoctorConfig &cfg) {
     if (errno == ENOENT) {
       chk.status = DoctorStatus::info;
       chk.summary = "not configured";
-      chk.hint = "Run: blackbird online register --invite <mpinv1_...> --handle <name> "
-                 "(or devices link join <CODE>)";
+      chk.hint = "Run: blackbird login";
       return chk;
     }
     chk.status = DoctorStatus::fail;
@@ -1136,8 +1134,7 @@ DoctorCheck check_online_identity(const DoctorConfig &cfg) {
     if (err_kind == mp::MpClientError::keystore_not_found) {
       chk.status = DoctorStatus::info;
       chk.summary = "not configured";
-      chk.hint = "Run: blackbird online register --invite <mpinv1_...> --handle <name> "
-                 "(or devices link join <CODE>)";
+      chk.hint = "Run: blackbird login";
       return chk;
     }
     chk.status = DoctorStatus::fail;
@@ -1187,8 +1184,7 @@ DoctorCheck check_online_identity(const DoctorConfig &cfg) {
     if (!st.account_id.has_value() && !st.device_id.has_value()) {
       cwt_status = DoctorStatus::info;
       cwt_summary = "unlinked device";
-      cwt_hint = "Run: blackbird online register --invite <mpinv1_...> --handle <name> "
-                 "(or devices link join <CODE>)";
+      cwt_hint = "Run: blackbird login";
     } else {
       cwt_status = DoctorStatus::fail;
       cwt_summary = "missing";
