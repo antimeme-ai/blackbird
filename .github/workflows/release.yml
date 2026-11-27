@@ -102,7 +102,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl gnupg lsb-release ninja-build cmake \
-            libssl-dev pkg-config build-essential
+            pkg-config build-essential
           # Install LLVM/Clang 23 + libc++ 23 from the official LLVM APT repository.
           curl -fsSL --proto '=https' --tlsv1.2 https://apt.llvm.org/llvm-snapshot.gpg.key | \
             sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
@@ -128,6 +128,28 @@ jobs:
             rm -rf "$cmake_tmp"
           fi
           cmake --version
+          # Build pinned OpenSSL 3.5.0 LTS static libraries (Argon2id KDF requires OpenSSL >= 3.2;
+          # Ubuntu 24.04 ships 3.0.13) with mandatory SHA-256 verification.
+          sudo apt-get remove -y libssl-dev || true
+          if [ ! -f /opt/openssl-3.5/lib/libcrypto.a ]; then
+            ossl_tmp="$(mktemp -d)"
+            curl -fsSL --proto '=https' --tlsv1.2 \
+              https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz \
+              -o "$ossl_tmp/openssl-3.5.0.tar.gz"
+            printf '%s  %s\n' \
+              '344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0' \
+              "$ossl_tmp/openssl-3.5.0.tar.gz" | sha256sum -c -
+            tar -xzf "$ossl_tmp/openssl-3.5.0.tar.gz" -C "$ossl_tmp"
+            (
+              cd "$ossl_tmp/openssl-3.5.0"
+              CC=gcc ./Configure linux-x86_64 no-shared no-tests --prefix=/opt/openssl-3.5 --libdir=lib
+              make -j4
+              sudo make install_sw
+            )
+            rm -rf "$ossl_tmp"
+          fi
+          ls -la /opt/openssl-3.5/lib/libcrypto.a /opt/openssl-3.5/lib/libssl.a
+          echo "OPENSSL_ROOT_DIR=/opt/openssl-3.5" >> "$GITHUB_ENV"
           # Build pinned Lua 5.5.1 with mandatory SHA-256 verification.
           if ! lua -v 2>/dev/null | grep -q '5\.5\.1'; then
             tmpdir="$(mktemp -d)"
