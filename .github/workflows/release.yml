@@ -115,6 +115,19 @@ jobs:
           echo "CC=/usr/bin/clang-23" >> "$GITHUB_ENV"
           echo "CXX=/usr/bin/clang++-23" >> "$GITHUB_ENV"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Install pinned CMake 4.3.0 (FindLua 5.5 support) with mandatory SHA-256 verification.
+          if ! cmake --version 2>/dev/null | grep -q '4\.3\.0'; then
+            cmake_tmp="$(mktemp -d)"
+            curl -fsSL --proto '=https' --tlsv1.2 \
+              https://github.com/Kitware/CMake/releases/download/v4.3.0/cmake-4.3.0-linux-x86_64.tar.gz \
+              -o "$cmake_tmp/cmake-4.3.0-linux-x86_64.tar.gz"
+            printf '%s  %s\n' \
+              '201bdabe17a54e017f119cffa247648e9c44327e52473c2cc60a88fded94652a' \
+              "$cmake_tmp/cmake-4.3.0-linux-x86_64.tar.gz" | sha256sum -c -
+            sudo tar -xzf "$cmake_tmp/cmake-4.3.0-linux-x86_64.tar.gz" --strip-components=1 -C /usr/local
+            rm -rf "$cmake_tmp"
+          fi
+          cmake --version
           # Build pinned Lua 5.5.1 with mandatory SHA-256 verification.
           if ! lua -v 2>/dev/null | grep -q '5\.5\.1'; then
             tmpdir="$(mktemp -d)"
