@@ -3,19 +3,19 @@
   "name": "Blackbird",
   "version": "0.3.0",
   "description": "Native C++23 + Lua 5.5.1 coding harness and sovereign multi-agent colleague",
-  "repository": "https://github.com/antimemeai/blackbird",
+  "repository": "https://github.com/antimeme-ai/blackbird",
   "authors": ["Antimeme AI LLC <ops@antimeme.ai>"],
   "license": "MIT",
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/antimemeai/blackbird/releases/download/v0.3.0/blackbird-v0.3.0-darwin-arm64.tar.gz",
+        "archive": "https://github.com/antimeme-ai/blackbird/releases/download/v0.3.0/blackbird-v0.3.0-darwin-arm64.tar.gz",
         "sha256": "246f52dd2edc825f31464672af7481d23b27506ae5ba34316f187ca33aa00e9a",
         "cmd": "./blackbird-v0.3.0-darwin-arm64/bin/blackbird",
         "args": ["--acp"]
       },
       "linux-x86_64": {
-        "archive": "https://github.com/antimemeai/blackbird/releases/download/v0.3.0/blackbird-v0.3.0-linux-x86_64.tar.gz",
+        "archive": "https://github.com/antimeme-ai/blackbird/releases/download/v0.3.0/blackbird-v0.3.0-linux-x86_64.tar.gz",
         "sha256": "c3678e1b5beada0f67e1db2fd39af1de79fd6026c7142882312144d8ee0c09e4",
         "cmd": "./blackbird-v0.3.0-linux-x86_64/bin/blackbird",
         "args": ["--acp"]

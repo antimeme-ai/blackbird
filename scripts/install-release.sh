@@ -1,6 +1,6 @@
 #!/bin/sh
 # Download, SHA-256 verify, smoke-check, and atomically install a prebuilt Blackbird release.
-# Usage: curl -fsSL https://github.com/antimemeai/blackbird/releases/latest/download/install-release.sh | sh
+# Usage: curl -fsSL https://github.com/antimeme-ai/blackbird/releases/latest/download/install-release.sh | sh
 set -eu
 
 blackbird_version=${BLACKBIRD_VERSION:-latest}
@@ -80,9 +80,9 @@ fi
 
 if [ -z "$blackbird_base_url" ]; then
   if [ "$blackbird_version" = latest ]; then
-    blackbird_base_url='https://github.com/antimemeai/blackbird/releases/latest/download'
+    blackbird_base_url='https://github.com/antimeme-ai/blackbird/releases/latest/download'
   else
-    blackbird_base_url="https://github.com/antimemeai/blackbird/releases/download/$blackbird_version"
+    blackbird_base_url="https://github.com/antimeme-ai/blackbird/releases/download/$blackbird_version"
   fi
 fi
 

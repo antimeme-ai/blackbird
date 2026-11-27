@@ -12,12 +12,12 @@
       sources = {
         "aarch64-darwin" = {
           target = "darwin-arm64";
-          url = "https://github.com/antimemeai/blackbird/releases/download/v${version}/blackbird-v${version}-darwin-arm64.tar.gz";
+          url = "https://github.com/antimeme-ai/blackbird/releases/download/v${version}/blackbird-v${version}-darwin-arm64.tar.gz";
           hash = "sha256-JG9S3S7cgl8xRkZyr3SB0jsnUGrlujQxbxh8ozqgDpo=";
         };
         "x86_64-linux" = {
           target = "linux-x86_64";
-          url = "https://github.com/antimemeai/blackbird/releases/download/v${version}/blackbird-v${version}-linux-x86_64.tar.gz";
+          url = "https://github.com/antimeme-ai/blackbird/releases/download/v${version}/blackbird-v${version}-linux-x86_64.tar.gz";
           hash = "sha256-w2eOG1vq2g9n4dsv05rx3nn9YCbHFCiCMSFE2O4MCeQ=";
         };
       };
@@ -94,8 +94,8 @@
 
             meta = with lib; {
               description = "Native C++23 + Lua 5.5.1 coding harness and sovereign multi-agent Command Post";
-              homepage = "https://github.com/antimemeai/blackbird";
-              changelog = "https://github.com/antimemeai/blackbird/releases/tag/v${version}";
+              homepage = "https://github.com/antimeme-ai/blackbird";
+              changelog = "https://github.com/antimeme-ai/blackbird/releases/tag/v${version}";
               license = licenses.mit;
               mainProgram = "blackbird";
               platforms = supportedSystems;

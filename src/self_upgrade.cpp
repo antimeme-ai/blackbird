@@ -47,9 +47,9 @@ constexpr int kSmokeTimeoutSeconds = 20;
 constexpr int kPollIntervalMs = 80;
 
 constexpr std::string_view kDefaultReleaseLatestBase =
-    "https://github.com/antimemeai/blackbird/releases/latest/download";
+    "https://github.com/antimeme-ai/blackbird/releases/latest/download";
 constexpr std::string_view kDefaultReleaseTagPrefix =
-    "https://github.com/antimemeai/blackbird/releases/download/";
+    "https://github.com/antimeme-ai/blackbird/releases/download/";
 
 struct UniqueFd {
   int fd = -1;

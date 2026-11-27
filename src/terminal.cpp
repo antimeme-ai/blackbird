@@ -710,7 +710,7 @@ std::string terminal_about() {
   out += "  Version:  " + std::string{version_str} + "\n";
   out += "  Engine:   C++23 · Lua 5.5.1 · SQLite 3.54.1 · OpenSSL 3\n";
   out += "  Web:      https://multiplayer.tech · https://clank.party\n";
-  out += "  Source:   https://github.com/antimemeai/blackbird (MIT)\n";
+  out += "  Source:   https://github.com/antimeme-ai/blackbird (MIT)\n";
   out +=
       "  Tools:    /doctor (health) · /upgrade --check (updates) · /help (commands)\n";
   return out;

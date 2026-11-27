@@ -264,38 +264,38 @@ void test_all_seven_builtin_packs() {
       const auto accept = find_req_header(req, "Accept");
       require(accept.has_value() && *accept == "application/vnd.github+json",
               "GitHub must send Accept: application/vnd.github+json");
-      if (req.path == "/repos/antimemeai/blackbird/pulls") {
+      if (req.path == "/repos/antimeme-ai/blackbird/pulls") {
         return Result<PinnedHttpResponse>::success(PinnedHttpResponse{
             200,
             {{"Content-Type", "application/json"}},
             R"([{"number":99,"state":"open","title":"Add SaaS Packs","user":{"login":"pat"}}])"});
       }
-      if (req.path == "/repos/antimemeai/blackbird/pulls/99") {
+      if (req.path == "/repos/antimeme-ai/blackbird/pulls/99") {
         return Result<PinnedHttpResponse>::success(PinnedHttpResponse{
             200,
             {{"Content-Type", "application/json"}},
             R"({"number":99,"state":"open","title":"Add SaaS Packs","body":"Adds 7 Lua packs","user":{"login":"pat"}})"});
       }
-      if (req.path == "/repos/antimemeai/blackbird/pulls/99/files") {
+      if (req.path == "/repos/antimeme-ai/blackbird/pulls/99/files") {
         return Result<PinnedHttpResponse>::success(PinnedHttpResponse{
             200,
             {{"Content-Type", "application/json"}},
             R"([{"filename":"src/saas_packs.cpp","additions":200,"deletions":0,"patch":"@@ -0,0 +1 @@\n+// ok"}])"});
       }
-      if (req.path == "/repos/antimemeai/blackbird/issues/99/comments" &&
+      if (req.path == "/repos/antimeme-ai/blackbird/issues/99/comments" &&
           req.method == "GET") {
         return Result<PinnedHttpResponse>::success(PinnedHttpResponse{
             200,
             {{"Content-Type", "application/json"}},
             R"([{"id":501,"user":{"login":"dentist"},"body":"Clean diff!"}])"});
       }
-      if (req.path == "/repos/antimemeai/blackbird/issues" && req.method == "POST") {
+      if (req.path == "/repos/antimeme-ai/blackbird/issues" && req.method == "POST") {
         return Result<PinnedHttpResponse>::success(
             PinnedHttpResponse{201,
                                {{"Content-Type", "application/json"}},
                                R"({"number":100,"title":"Track OAuth"})"});
       }
-      if (req.path == "/repos/antimemeai/blackbird/issues/99/comments" &&
+      if (req.path == "/repos/antimeme-ai/blackbird/issues/99/comments" &&
           req.method == "POST") {
         return Result<PinnedHttpResponse>::success(PinnedHttpResponse{
             201, {{"Content-Type", "application/json"}}, R"({"id":502})"});
@@ -513,7 +513,7 @@ void test_all_seven_builtin_packs() {
   {
     const auto r1 = invoke_turn({"github",
                                  "list_items",
-                                 Value::object({{"owner", Value{"antimemeai"}},
+                                 Value::object({{"owner", Value{"antimeme-ai"}},
                                                 {"repo", Value{"blackbird"}},
                                                 {"kind", Value{"pulls"}}}),
                                  "",
@@ -522,7 +522,7 @@ void test_all_seven_builtin_packs() {
             "github.list_items mismatch");
     const auto r2 = invoke_turn({"github",
                                  "view_item",
-                                 Value::object({{"owner", Value{"antimemeai"}},
+                                 Value::object({{"owner", Value{"antimeme-ai"}},
                                                 {"repo", Value{"blackbird"}},
                                                 {"number", Value{Number{99}}},
                                                 {"is_pr", Value{true}}}),
@@ -533,7 +533,7 @@ void test_all_seven_builtin_packs() {
             "github.view_item must include PR diff and comments");
     const auto r3 = invoke_turn({"github",
                                  "create_issue",
-                                 Value::object({{"owner", Value{"antimemeai"}},
+                                 Value::object({{"owner", Value{"antimeme-ai"}},
                                                 {"repo", Value{"blackbird"}},
                                                 {"title", Value{"Track OAuth"}}}),
                                  "",
@@ -542,7 +542,7 @@ void test_all_seven_builtin_packs() {
             "github.create_issue mismatch");
     const auto r4 = invoke_turn({"github",
                                  "comment_item",
-                                 Value::object({{"owner", Value{"antimemeai"}},
+                                 Value::object({{"owner", Value{"antimeme-ai"}},
                                                 {"repo", Value{"blackbird"}},
                                                 {"number", Value{Number{99}}},
                                                 {"body", Value{"LGTM"}}}),

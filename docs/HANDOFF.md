@@ -43,7 +43,7 @@ reference study does not adopt a library.
 
 Repo: <repo>. Current work branch:
 **work/nls2-qualification-state**, pushed to origin. Remote is
-https://github.com/antimemeai/blackbird.git. This handoff is a documentation-only
+https://github.com/antimeme-ai/blackbird.git. This handoff is a documentation-only
 checkpoint after f250552; use git log/status for its final commit ID.
 
 | Checkpoint | Meaning |
