@@ -112,6 +112,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang-23 lld-23 libc++-23-dev libc++abi-23-dev libunwind-23-dev
+          echo "CC=/usr/bin/clang-23" >> "$GITHUB_ENV"
           echo "CXX=/usr/bin/clang++-23" >> "$GITHUB_ENV"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           # Build pinned Lua 5.5.1 with mandatory SHA-256 verification.
