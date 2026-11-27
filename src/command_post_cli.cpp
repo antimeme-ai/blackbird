@@ -7286,6 +7286,9 @@ struct ParsedPartyJoinTarget {
 };
 
 std::optional<ParsedPartyJoinTarget> parse_party_join_target(std::string_view raw) {
+  if (auto frag = mp::parse_fragment_invite_url(raw); frag.has_value()) {
+    return ParsedPartyJoinTarget{frag->party_id, std::move(frag->canonical_url)};
+  }
   constexpr std::string_view kPrefix = "mppi1_";
   if (raw.starts_with(kPrefix)) {
     const std::string_view rest = raw.substr(kPrefix.size());
@@ -12160,9 +12163,12 @@ int run_invite_cli(std::span<char *> args, CliIo io) {
 
   const auto &r = res.value();
   const std::string code = party_chat_sanitize(r.room_code, 32);
-  const std::string share = party_chat_sanitize(r.share_url, 256);
+  const std::string share = mp::is_usable_room_share_url(r.share_url)
+                                ? party_chat_sanitize(r.share_url, 256)
+                                : std::string{};
   if (json_out) {
     Value::Object obj{
+        {"party_id", Value{Number{r.party_id.value()}}},
         {"room_code", Value{code}},
         {"share_url", Value{share}},
         {"ws_path", Value{party_chat_sanitize(r.ws_path, 128)}},
@@ -12173,27 +12179,32 @@ int run_invite_cli(std::span<char *> args, CliIo io) {
     }
     return emit_json(io, Value::object(std::move(obj)));
   }
+  const std::string room_label = mp::format_room_display_label(r.party_id, code);
   if (target_handle.has_value()) {
     const std::string who =
         "@" + party_chat_sanitize(r.invited_handle.value_or(*target_handle), 64);
-    io.out << "Invited " << who << " · Room code: " << code << " · Share: " << share
-           << "\n";
+    io.out << "Invited " << who << " · " << room_label;
   } else {
-    io.out << "Party live · Room code: " << code << " · Share: " << share << "\n";
+    io.out << "Party live · " << room_label;
   }
+  if (!share.empty()) {
+    io.out << " · Share: " << share;
+  }
+  io.out << "\n";
   return 0;
 }
 
 int run_join_v2_cli(std::span<char *> args, CliIo io) {
   OnlineCommonOpts opts{};
   std::string target;
+  const CleanseCliStringGuard target_guard{target};
   bool has_target = false;
   bool json_out = false;
 
   for (std::size_t i = 1U; i < args.size(); ++i) {
     const std::string_view arg{args[i]};
     if (arg == "--help" || arg == "-h") {
-      io.err << "usage: blackbird join [@handle|CODE|url] [--state-dir DIR] "
+      io.err << "usage: blackbird join [invite-url|@handle|party_id] [--state-dir DIR] "
                 "[--authority HOST] [--connect-host HOST] [--port N] "
                 "[--ca-bundle FILE] [--json]\n"
                 "       blackbird join <bbjoin1:...> --alias NAME [--peers DIR] "
@@ -12213,7 +12224,8 @@ int run_join_v2_cli(std::span<char *> args, CliIo io) {
         target = std::string{arg};
         has_target = true;
       } else {
-        return fail_usage(io, "join: unknown option: " + std::string{arg});
+        return fail_usage(io,
+                          "join: unknown option: " + mp::redact_invite_secrets(arg));
       }
     }
   }
@@ -12224,6 +12236,7 @@ int run_join_v2_cli(std::span<char *> args, CliIo io) {
 
   mp::RoomEnterRequest req{};
   req.target = target;
+  const CleanseCliStringGuard req_target_guard{req.target};
   req.client = "blackbird";
   req.agent_name = "Blackbird";
   const auto res = opened.ctx->client.room_enter(req);
@@ -12232,7 +12245,10 @@ int run_join_v2_cli(std::span<char *> args, CliIo io) {
 
   const auto &r = res.value();
   const std::string code = party_chat_sanitize(r.room_code, 32);
-  const std::string share = party_chat_sanitize(r.share_url, 256);
+  const std::string share =
+      mp::is_usable_room_share_url(r.share_url)
+          ? mp::redact_invite_secrets(party_chat_sanitize(r.share_url, 256))
+          : std::string{};
   if (json_out) {
     Value::Array members_json;
     members_json.reserve(r.members.size());
@@ -12246,6 +12262,7 @@ int run_join_v2_cli(std::span<char *> args, CliIo io) {
     }
     return emit_json(io, Value::object({
                              {"connected", Value{true}},
+                             {"party_id", Value{Number{r.party_id.value()}}},
                              {"room_code", Value{code}},
                              {"name", Value{party_chat_sanitize(r.name, 128)}},
                              {"share_url", Value{share}},
@@ -12264,10 +12281,11 @@ int run_join_v2_cli(std::span<char *> args, CliIo io) {
     peers += "@" + h;
     ++peer_n;
   }
+  const std::string room_label = mp::format_room_display_label(r.party_id, code);
   if (peer_n > 0U) {
-    io.out << "● Connected — live with " << peers << " · Room code: " << code << "\n";
+    io.out << "● Connected — live with " << peers << " · " << room_label << "\n";
   } else {
-    io.out << "● Connected — party live · Room code: " << code << "\n";
+    io.out << "● Connected — party live · " << room_label << "\n";
   }
   return 0;
 }

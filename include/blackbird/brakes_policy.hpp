@@ -245,6 +245,13 @@ public:
   PartyTrustProfile ingest(const PeerProvenance &provenance,
                            const EffectivePolicy &policy);
 
+  // Monotonically latches taint from another TurnTaintState (never clears or
+  // weakens existing taint).
+  PartyTrustProfile latch_from(const TurnTaintState &other,
+                               const PartyTrustSectionPolicy &policy) noexcept;
+  PartyTrustProfile latch_from(const TurnTaintState &other,
+                               const EffectivePolicy &policy) noexcept;
+
   void reset_by_operator() noexcept;
 
   bool is_tainted() const noexcept {
@@ -324,6 +331,9 @@ public:
 
   PartyTrustProfile ingest_peer(const PeerProvenance &provenance) {
     return taint_.ingest(provenance, policy_.party_trust);
+  }
+  PartyTrustProfile latch_taint_from(const TurnTaintState &other) noexcept {
+    return taint_.latch_from(other, policy_.party_trust);
   }
   void reset_taint_by_operator() noexcept { taint_.reset_by_operator(); }
 

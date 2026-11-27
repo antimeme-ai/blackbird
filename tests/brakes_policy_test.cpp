@@ -1065,6 +1065,42 @@ void test_scrubbed_child_env() {
   }
 }
 
+void test_monotonic_taint_latch_from() {
+  g_stage = "monotonic_taint_latch_from";
+
+  EffectivePolicy eff{};
+  BrakesGate session_gate{eff};
+  PeerProvenance browser_prov{};
+  browser_prov.origin = PeerOriginKind::online_peer;
+  browser_prov.account_id = 3541107795115782ULL;
+  browser_prov.is_external_guest = true;
+  browser_prov.safety_number = "mp2-browser-acct-3541107795115782";
+  browser_prov.effective_trust = PartyTrustProfile::advisory;
+  (void)session_gate.ingest_peer(browser_prov);
+
+  BrakesGate turn_gate{eff};
+  require(!turn_gate.taint().is_tainted(), "fresh turn_gate starts untainted");
+  (void)turn_gate.latch_taint_from(session_gate.taint());
+  require(turn_gate.taint().is_tainted(), "turn_gate becomes tainted after latch_from");
+  require(turn_gate.taint().external_guest_seen(),
+          "external_guest_seen propagates via latch_from");
+  require(turn_gate.taint().effective_trust() == PartyTrustProfile::advisory,
+          "effective_trust clamped to advisory");
+
+  // Latching an untainted state MUST NEVER clear or weaken existing turn taint!
+  TurnTaintState clean_state{};
+  (void)turn_gate.latch_taint_from(clean_state);
+  require(turn_gate.taint().is_tainted(),
+          "latch_from(clean) must NOT weaken or clear existing turn taint");
+  require(turn_gate.taint().external_guest_seen(),
+          "latch_from(clean) must preserve external_guest_seen");
+
+  ToolCallRequest write_req{};
+  write_req.tool_name = "write_file";
+  const auto dec = turn_gate.evaluate_tool_call(write_req);
+  require(!dec.allow && dec.deny, "latched turn_gate denies write_file");
+}
+
 } // namespace
 
 int main() {
@@ -1074,6 +1110,7 @@ int main() {
     test_peer_envelope_and_taint_gate();
     test_path_containment_guard();
     test_scrubbed_child_env();
+    test_monotonic_taint_latch_from();
     std::cout << "brakes_policy_test: PASS\n";
     return 0;
   } catch (const std::exception &ex) {

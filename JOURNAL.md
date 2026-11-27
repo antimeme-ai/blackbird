@@ -14333,3 +14333,14 @@ Blackbird must not present itself as another product.
 - **Cross-Repo Regiment Companions (isolated worktrees on branch `work/xbox-live-mp2`, coordinated on `xplat-board` `#62`):**
   - `neon-cloud-server` (`mp-site-v2`, `@dentist-2` CLEAN): `PartyDO` `mp2` ordered opaque-envelope WSS log + persistent rooms + 4-char codes, `/v1/rooms/{invite,enter,leave}`, `/v1/friends/live`, `AccountDO` `custody_mode=0` cloud accounts + `/v1/auth/session/{start,poll}` + `/v1/devices/me/renew`, and `/@:handle` + `/p/:code` live browser party client (`clank.party` + `multiplayer.rsvp` short-link support).
   - `neon-outpost-v2` (`mp-outpost-v2`): killed 60-digit safety-number send gate by default (opt-in `--strict-pins`), wired `mp2` WSS primary transport, added `login` + 1-verb CLI + 4 new MCP party lifecycle tools (`party_invite`, `party_join`, `party_leave`, `friend_add`).
+
+## 2026-11-27 — Release `v0.9.0`: MLS (RFC 9420) End-to-End Encryption, Unified Rust Staticlib, and `BrakesGate` Hardening
+
+- **Wave 2 Security & Party UX Hardening (`include/blackbird/{brakes_policy,command_post_tools,mp_client,party_chat}.hpp`, `src/{brakes_policy,command_post_cli,command_post_tools,command_post_tui,main,mp_client,terminal}.cpp`, `tests/{brakes_policy,command_post_tools,terminal}_test.cpp`):**
+  - Hardened `BrakesGate` with persistent multi-account taint tracking and strict `is_browser` taint latching even under the operator's own `@handle` so untrusted browser-origin frames cannot bypass Brakes isolation.
+  - Added `#fragment` invite URL parsing with automatic secret redaction across CLI/TUI logs and errors, and cleaned up empty `room_code` UI rendering in the Party Strip and Party Pane.
+- **MLS (RFC 9420) E2EE (`crates/mp-mls/`, `crates/blackbird-p2p/`, `include/blackbird/{mp_mls,mp_protocol,mp_room_v2}.hpp`, `src/{mp_mls,mp_protocol,mp_room_v2}.cpp`, `tests/{mp_mls,mp_room_v2}_test.cpp`):**
+  - Vendored self-contained `crates/mp-mls` (`openmls = "=0.9.2"`) and unified `iroh v1.5.0` P2P + `mp-mls` into the single panic-safe C-ABI staticlib `libblackbird_p2p.a` (`crates/blackbird-p2p/src/mls_ffi.rs`, `crates/blackbird-p2p/include/blackbird_mls_abi.h`).
+  - Implemented C++23 RAII `MpMlsEngine` with persistent MLS state, macOS (`com.apple.metadata:com_apple_backup_excludeItem`) / Linux backup exclusion, exact `512 / 2048 / 8192 / 24000 B` message padding buckets, Tier 0–3 verification states with `epoch_authenticator` export, authenticated `BrakesGate` provenance binding, and historical catch-up non-triggering so replayed encrypted room history never fires live agent mentions.
+- **Self-Contained Release Packaging (`CMakeLists.txt`, `.github/workflows/release.yml`):**
+  - Bumped `BLACKBIRD_RELEASE_VERSION` to `v0.9.0`, added `crates/mp-mls` dependency tracking in CMake, and pinned `dtolnay/rust-toolchain@stable` (`rustc >= 1.91`, Rust 2024 edition) across both `macos-15` and `ubuntu-24.04` release runners.

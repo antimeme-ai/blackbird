@@ -266,6 +266,10 @@ inline constexpr std::size_t kMaxDeviceLabelLength = 64U;
 Result<std::string> compute_safety_number(AccountId account_id,
                                           const Ed25519PubKey &root_pubkey);
 
+Result<std::string> compute_safety_number_v2(AccountId account_id,
+                                             const Ed25519PubKey &root_pubkey,
+                                             std::uint8_t custody_mode);
+
 Result<std::string> encode_recovery_key(const Ed25519Seed &root_seed);
 Result<Ed25519Seed> decode_recovery_key(std::string_view raw);
 

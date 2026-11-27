@@ -268,7 +268,7 @@ if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git/HEAD")
     endif()
   endif()
 endif()
-set(BLACKBIRD_RELEASE_VERSION "v0.8.1" CACHE STRING "Semantic release version tag (e.g. v0.8.1)")
+set(BLACKBIRD_RELEASE_VERSION "v0.9.0" CACHE STRING "Semantic release version tag (e.g. v0.9.0)")
 set(BLACKBIRD_BUILD_LABEL "${CMAKE_BUILD_TYPE}")
 if(NOT BLACKBIRD_BUILD_LABEL)
   set(BLACKBIRD_BUILD_LABEL "default")
@@ -860,6 +860,12 @@ set_tests_properties(coding_file_raw PROPERTIES TIMEOUT 60)
 add_executable(raw_file_test tests/raw_file_test.cpp)
 target_link_libraries(raw_file_test PRIVATE blackbird_coding Threads::Threads ${CMAKE_DL_LIBS})
 set_target_properties(raw_file_test PROPERTIES ENABLE_EXPORTS ON)
+if(APPLE)
+  target_link_options(raw_file_test PRIVATE
+    "LINKER:-u,_bb_file_before_stdio"
+    "LINKER:-u,_bb_file_after_stdio"
+    "LINKER:-u,_bb_file_observed_stdio")
+endif()
 add_test(NAME raw_file COMMAND raw_file_test)
 set_tests_properties(raw_file PROPERTIES TIMEOUT 120)
 add_library(raw_file_stdio SHARED tests/raw_file_stdio.cpp)
@@ -1414,7 +1420,7 @@ elseif(NOT BLACKBIRD_ENABLE_IROH STREQUAL "off")
   message(FATAL_ERROR "BLACKBIRD_ENABLE_IROH must be auto, on, or off")
 endif()
 
-target_sources(blackbird_foundation PRIVATE src/p2p_transport.cpp)
+target_sources(blackbird_foundation PRIVATE src/p2p_transport.cpp src/mp_mls.cpp)
 if(BLACKBIRD_USE_IROH)
   set(BLACKBIRD_P2P_STATICLIB "${BLACKBIRD_CARGO_TARGET_DIR}/release/libblackbird_p2p.a")
   add_custom_command(
@@ -1426,12 +1432,24 @@ if(BLACKBIRD_USE_IROH)
       "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.toml"
       "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/Cargo.lock"
       "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/src/lib.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/src/mls_ffi.rs"
       "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/include/blackbird_p2p_abi.h"
-    COMMENT "Building blackbird-p2p (iroh v1.5.0) Rust C-ABI staticlib"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/include/blackbird_mls_abi.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/Cargo.toml"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/lib.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/client.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/crypto.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/ds.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/error.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/framing.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/identity.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/invite.rs"
+      "${CMAKE_CURRENT_SOURCE_DIR}/crates/mp-mls/src/policy.rs"
+    COMMENT "Building unified blackbird-p2p (iroh v1.5.0 + mp-mls OpenMLS 0.9.2) Rust C-ABI staticlib"
     VERBATIM)
   add_custom_target(blackbird_p2p_rust DEPENDS "${BLACKBIRD_P2P_STATICLIB}")
   add_dependencies(blackbird_foundation blackbird_p2p_rust)
-  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=1)
+  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=1 BLACKBIRD_HAS_MLS=1)
   target_include_directories(blackbird_foundation PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/crates/blackbird-p2p/include")
   target_link_libraries(blackbird_foundation PRIVATE "${BLACKBIRD_P2P_STATICLIB}")
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -1440,12 +1458,23 @@ if(BLACKBIRD_USE_IROH)
       "-framework CoreFoundation"
       "-framework SystemConfiguration"
       resolv)
+    target_link_options(blackbird_foundation INTERFACE "LINKER:-dead_strip")
   else()
     target_link_libraries(blackbird_foundation PRIVATE ${CMAKE_DL_LIBS} m)
   endif()
 else()
-  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=0)
+  target_compile_definitions(blackbird_foundation PRIVATE BLACKBIRD_HAS_IROH=0 BLACKBIRD_HAS_MLS=0)
 endif()
+
+add_executable(mp_mls_test tests/mp_mls_test.cpp)
+target_link_libraries(mp_mls_test PRIVATE blackbird_foundation OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(BLACKBIRD_USE_IROH)
+  target_compile_definitions(mp_mls_test PRIVATE BLACKBIRD_HAS_MLS=1)
+else()
+  target_compile_definitions(mp_mls_test PRIVATE BLACKBIRD_HAS_MLS=0)
+endif()
+add_test(NAME mp_mls COMMAND mp_mls_test)
+set_tests_properties(mp_mls PROPERTIES TIMEOUT 60)
 
 add_executable(p2p_transport_test tests/p2p_transport_test.cpp)
 target_link_libraries(p2p_transport_test PRIVATE blackbird_foundation Threads::Threads)

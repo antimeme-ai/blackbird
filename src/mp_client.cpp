@@ -27,6 +27,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#if defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
 #include <unistd.h>
 #ifndef SO_NOSIGPIPE
 #include <pthread.h>
@@ -638,6 +641,48 @@ Result<void> fsync_fd(int fd) noexcept {
   return Result<void>::success();
 }
 
+Result<void> write_file_atomic_0600(int dir_fd, const char *name,
+                                    std::span<const std::uint8_t> data);
+
+// Marks sensitive keystore / live MLS directories excluded from OS cloud/local backups
+// (Spec v3 §7.2): macOS `fsetxattr` `com.apple.metadata:com_apple_backup_excludeItem`,
+// Linux `0o600` `.nobackup` + `CACHEDIR.TAG`.
+void exclude_from_os_backup(int dir_fd) noexcept {
+#if defined(__APPLE__)
+  // Standard Apple binary plist encoding NSString "com.apple.backupd".
+  static constexpr std::array<std::uint8_t, 61> kBackupExcludePlist = {
+      0x62U, 0x70U, 0x6cU, 0x69U, 0x73U, 0x74U, 0x30U, 0x30U, // "bplist00"
+      0x5fU, 0x10U, 0x11U,                                    // ASCII string, len 17
+      'c',   'o',   'm',   '.',   'a',   'p',   'p',   'l',   'e',
+      '.',   'b',   'a',   'c',   'k',   'u',   'p',   'd',
+      0x08U,                                                  // offset table
+      0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, 0x01U, // trailer
+      0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, // num objects = 1
+      0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, // top object = 0
+      0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x1cU, // offset table = 28
+  };
+  (void)::fsetxattr(dir_fd, "com.apple.metadata:com_apple_backup_excludeItem",
+                    kBackupExcludePlist.data(), kBackupExcludePlist.size(), 0U, 0);
+#else
+  struct stat st{};
+  if (::fstatat(dir_fd, ".nobackup", &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+      errno == ENOENT) {
+    (void)write_file_atomic_0600(dir_fd, ".nobackup", {});
+  }
+  if (::fstatat(dir_fd, "CACHEDIR.TAG", &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+      errno == ENOENT) {
+    static constexpr std::string_view kCacheDirTag =
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# Blackbird keystore & live MLS state - do not back up.\n";
+    (void)write_file_atomic_0600(
+        dir_fd, "CACHEDIR.TAG",
+        std::span<const std::uint8_t>{
+            reinterpret_cast<const std::uint8_t *>(kCacheDirTag.data()),
+            kCacheDirTag.size()});
+  }
+#endif
+}
+
 Result<ScopedFd> open_keystore_dir(const std::filesystem::path &dir, bool create,
                                    std::filesystem::path &normalized_dir) {
   if (const auto ok = validate_keystore_path(dir); !ok.has_value()) {
@@ -701,6 +746,9 @@ Result<ScopedFd> open_keystore_dir(const std::filesystem::path &dir, bool create
   }
   if (const auto ok = check_dir_mode(owned.get()); !ok.has_value()) {
     return Result<ScopedFd>::failure(ok.error());
+  }
+  if (create) {
+    exclude_from_os_backup(owned.get());
   }
   normalized_dir = std::filesystem::path{std::move(path_str)};
   return Result<ScopedFd>::success(std::move(owned));
@@ -5906,6 +5954,16 @@ Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
       }
       is_guest = is_guest || gb.value();
     }
+    bool is_browser = false;
+    if (const Value *bf = entry.find("is_browser");
+        bf != nullptr && !std::holds_alternative<std::nullptr_t>(bf->value())) {
+      const auto bb = value_as_bool_or_flag(*bf);
+      if (!bb.has_value()) {
+        return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
+                                                   MpClientError::http_response_schema);
+      }
+      is_browser = bb.value();
+    }
     const auto client = get_optional_string(entry, "client");
     const auto agent_name = get_optional_string(entry, "agent_name");
     const auto agent_state = get_optional_string(entry, "agent_state");
@@ -5916,11 +5974,19 @@ Result<std::vector<RoomMemberInfo>> parse_room_member_list(const Value &obj) {
       return fail_c<std::vector<RoomMemberInfo>>(ErrorCode::corrupt,
                                                  MpClientError::http_response_schema);
     }
+    const std::string client_str = client.value().value_or("");
+    if (!is_browser) {
+      const std::string lower_client = ascii_lower(client_str);
+      if (lower_client == "web" || lower_client == "browser") {
+        is_browser = true;
+      }
+    }
     out.push_back(RoomMemberInfo{
         acct_id.value(),
         is_guest,
+        is_browser,
         handle.value(),
-        client.value().value_or(""),
+        client_str,
         agent_name.value().value_or(""),
         agent_state.value().value_or(""),
         agent_summary.value().value_or(""),
@@ -5937,7 +6003,176 @@ std::string strip_leading_at(std::string_view raw) {
   return std::string{raw};
 }
 
+bool is_base64url_char(char ch) noexcept {
+  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+         (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+}
+
+bool is_ascii_ws(char ch) noexcept {
+  return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+std::string_view trim_ascii_ws_client(std::string_view text) noexcept {
+  while (!text.empty() && is_ascii_ws(text.front())) {
+    text.remove_prefix(1U);
+  }
+  while (!text.empty() && is_ascii_ws(text.back())) {
+    text.remove_suffix(1U);
+  }
+  return text;
+}
+
+bool ascii_istarts_with_client(std::string_view text,
+                               std::string_view prefix) noexcept {
+  if (text.size() < prefix.size()) {
+    return false;
+  }
+  for (std::size_t i = 0U; i < prefix.size(); ++i) {
+    const char a = (text[i] >= 'A' && text[i] <= 'Z')
+                       ? static_cast<char>(text[i] - 'A' + 'a')
+                       : text[i];
+    const char b = (prefix[i] >= 'A' && prefix[i] <= 'Z')
+                       ? static_cast<char>(prefix[i] - 'A' + 'a')
+                       : prefix[i];
+    if (a != b) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
+
+std::optional<ParsedFragmentInviteUrl> parse_fragment_invite_url(std::string_view raw) {
+  const std::string_view trimmed = trim_ascii_ws_client(raw);
+  constexpr std::string_view kMpPrefix = "https://multiplayer.tech/p/i/";
+  constexpr std::string_view kClankPrefix = "https://clank.party/i/";
+
+  std::string_view rest;
+  if (ascii_istarts_with_client(trimmed, kMpPrefix)) {
+    rest = trimmed.substr(kMpPrefix.size());
+  } else if (ascii_istarts_with_client(trimmed, kClankPrefix)) {
+    rest = trimmed.substr(kClankPrefix.size());
+  } else {
+    return std::nullopt;
+  }
+
+  const std::size_t hash = rest.find('#');
+  if (hash == std::string_view::npos || hash == 0U || hash + 1U >= rest.size()) {
+    return std::nullopt;
+  }
+  const std::string_view pid_text = rest.substr(0U, hash);
+  const std::string_view secret = rest.substr(hash + 1U);
+  if (pid_text.find('/') != std::string_view::npos ||
+      pid_text.find('?') != std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto pid = PartyId::parse_decimal(pid_text);
+  if (!pid.has_value()) {
+    return std::nullopt;
+  }
+  if (secret.size() < 16U || secret.size() > 128U) {
+    return std::nullopt;
+  }
+  for (const char ch : secret) {
+    if (!is_base64url_char(ch)) {
+      return std::nullopt;
+    }
+  }
+  ParsedFragmentInviteUrl out{};
+  out.party_id = pid.value();
+  out.secret = std::string{secret};
+  out.canonical_url =
+      "https://multiplayer.tech/p/i/" + pid.value().to_decimal() + "#" + out.secret;
+  return out;
+}
+
+std::string redact_invite_secrets(std::string_view text) {
+  if (text.empty()) {
+    return {};
+  }
+  static constexpr std::array<std::string_view, 2> kMarkers{
+      "multiplayer.tech/p/i/",
+      "clank.party/i/",
+  };
+  std::string out;
+  out.reserve(text.size());
+  std::size_t pos = 0U;
+  while (pos < text.size()) {
+    std::size_t match_pos = std::string_view::npos;
+    std::size_t match_len = 0U;
+    for (const std::string_view marker : kMarkers) {
+      for (std::size_t i = pos; i + marker.size() <= text.size(); ++i) {
+        if (ascii_istarts_with_client(text.substr(i), marker)) {
+          if (match_pos == std::string_view::npos || i < match_pos) {
+            match_pos = i;
+            match_len = marker.size();
+          }
+          break;
+        }
+      }
+    }
+    if (match_pos == std::string_view::npos) {
+      out.append(text.substr(pos));
+      break;
+    }
+    const std::size_t after_marker = match_pos + match_len;
+    std::size_t hash = after_marker;
+    while (hash < text.size() && text[hash] != '#' && !is_ascii_ws(text[hash]) &&
+           text[hash] != '"' && text[hash] != '\'' && text[hash] != ')' &&
+           text[hash] != ']') {
+      ++hash;
+    }
+    if (hash >= text.size() || text[hash] != '#') {
+      out.append(text.substr(pos, after_marker - pos));
+      pos = after_marker;
+      continue;
+    }
+    std::size_t secret_end = hash + 1U;
+    while (secret_end < text.size() && !is_ascii_ws(text[secret_end]) &&
+           text[secret_end] != '"' && text[secret_end] != '\'' &&
+           text[secret_end] != ')' && text[secret_end] != ']' &&
+           text[secret_end] != ',' && text[secret_end] != ';') {
+      ++secret_end;
+    }
+    if (secret_end == hash + 1U) {
+      out.append(text.substr(pos, secret_end - pos));
+      pos = secret_end;
+      continue;
+    }
+    out.append(text.substr(pos, (hash + 1U) - pos));
+    out.append("[REDACTED]");
+    pos = secret_end;
+  }
+  return out;
+}
+
+bool is_usable_room_share_url(std::string_view url) noexcept {
+  const std::string_view trimmed = trim_ascii_ws_client(url);
+  if (trimmed.empty()) {
+    return false;
+  }
+  static constexpr std::array<std::string_view, 8> kBroken{
+      "https://clank.party",        "https://clank.party/",
+      "https://clank.party/i",      "https://clank.party/i/",
+      "https://multiplayer.tech",   "https://multiplayer.tech/",
+      "https://multiplayer.tech/p", "https://multiplayer.tech/p/",
+  };
+  for (const std::string_view b : kBroken) {
+    if (trimmed.size() == b.size() && ascii_istarts_with_client(trimmed, b)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string format_room_display_label(PartyId party_id, std::string_view room_code) {
+  const std::string_view trimmed = trim_ascii_ws_client(room_code);
+  if (!trimmed.empty()) {
+    return "Room code: " + std::string{trimmed};
+  }
+  return "party #" + party_id.to_decimal();
+}
 
 Result<RoomInviteResponse>
 MpControlClient::room_invite(const RoomInviteRequest &request) {
@@ -5990,8 +6225,8 @@ MpControlClient::room_invite(const RoomInviteRequest &request) {
     return Result<RoomInviteResponse>::failure(obj.error());
   }
   const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
-  const auto room_code = get_required_string(obj.value(), "room_code");
-  const auto share_url = get_required_string(obj.value(), "share_url");
+  const auto room_code = get_optional_string(obj.value(), "room_code");
+  const auto share_url = get_optional_string(obj.value(), "share_url");
   const auto ws_path = get_required_string(obj.value(), "ws_path");
   const auto handle_url = get_optional_string(obj.value(), "handle_url");
   const auto invited_handle = get_optional_string(obj.value(), "invited_handle");
@@ -6007,8 +6242,8 @@ MpControlClient::room_invite(const RoomInviteRequest &request) {
   }
   return Result<RoomInviteResponse>::success(RoomInviteResponse{
       pid.value(),
-      room_code.value(),
-      share_url.value(),
+      room_code.value().value_or(""),
+      share_url.value().value_or(""),
       handle_url.value().value_or(""),
       ws_path.value(),
       invited_handle.value(),
@@ -6059,7 +6294,7 @@ Result<RoomEnterResponse> MpControlClient::room_enter(const RoomEnterRequest &re
     return Result<RoomEnterResponse>::failure(obj.error());
   }
   const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
-  const auto room_code = get_required_string(obj.value(), "room_code");
+  const auto room_code = get_optional_string(obj.value(), "room_code");
   const auto ws_path = get_required_string(obj.value(), "ws_path");
   const auto name = get_optional_string(obj.value(), "name");
   const auto share_url = get_optional_string(obj.value(), "share_url");
@@ -6076,7 +6311,7 @@ Result<RoomEnterResponse> MpControlClient::room_enter(const RoomEnterRequest &re
   }
   return Result<RoomEnterResponse>::success(RoomEnterResponse{
       pid.value(),
-      room_code.value(),
+      room_code.value().value_or(""),
       name.value().value_or(""),
       share_url.value().value_or(""),
       ws_path.value(),
@@ -6522,6 +6757,633 @@ Result<MpControlSocket> MpControlClient::connect_ws_v2(std::string_view ws_path)
 
 Result<MpControlSocket> MpControlClient::connect_party_socket_v2(PartyId party_id) {
   return connect_ws_v2("/v1/parties/" + party_id.to_decimal() + "/ws");
+}
+
+// ---------------------------------------------------------------------------
+// MLS E2EE Control-Plane HTTPS endpoints (`mp2-mls-v1`)
+// ---------------------------------------------------------------------------
+
+Result<MlsReserveDeviceResponse>
+MpControlClient::mls_reserve_device(const MlsReserveDeviceRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsReserveDeviceResponse>::failure(auth.error());
+  }
+  if (const auto pk_ok = validate_ed25519_pubkey_strict(request.mls_sig_pubkey);
+      !pk_ok.has_value()) {
+    return Result<MlsReserveDeviceResponse>::failure(pk_ok.error());
+  }
+
+  Value::Object body_obj;
+  body_obj.emplace_back("mls_sig_pubkey_b64",
+                        Value{base64_encode(request.mls_sig_pubkey)});
+  body_obj.emplace_back(
+      "client_class", Value{Number{static_cast<std::uint64_t>(request.client_class)}});
+  body_obj.emplace_back("agent_capable", Value{request.agent_capable});
+  if (!request.device_label.empty()) {
+    body_obj.emplace_back("device_label", Value{request.device_label});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<MlsReserveDeviceResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/devices/reserve";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsReserveDeviceResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<MlsReserveDeviceResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsReserveDeviceResponse>::failure(obj.error());
+  }
+  const auto dev_raw = get_required_u64_or_decimal(obj.value(), "device_id");
+  const auto root_gen = get_required_u64(obj.value(), "root_gen");
+  const auto dev_gen = get_required_u64(obj.value(), "device_gen");
+  if (!dev_raw.has_value() || !root_gen.has_value() || !dev_gen.has_value() ||
+      root_gen.value() == 0U ||
+      root_gen.value() > std::numeric_limits<std::uint32_t>::max() ||
+      dev_gen.value() == 0U ||
+      dev_gen.value() > std::numeric_limits<std::uint32_t>::max()) {
+    return fail_c<MlsReserveDeviceResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  const auto dev_id = DeviceId::create(dev_raw.value());
+  if (!dev_id.has_value()) {
+    return fail_c<MlsReserveDeviceResponse>(ErrorCode::corrupt,
+                                            MpClientError::http_response_schema);
+  }
+  return Result<MlsReserveDeviceResponse>::success(MlsReserveDeviceResponse{
+      dev_id.value(),
+      static_cast<std::uint32_t>(root_gen.value()),
+      static_cast<std::uint32_t>(dev_gen.value()),
+  });
+}
+
+Result<void> MpControlClient::mls_upload_device_binding(
+    const MlsUploadDeviceBindingRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<void>::failure(auth.error());
+  }
+  if (request.device_binding.size() != 236U) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("device_binding_b64",
+                        Value{base64_encode(request.device_binding)});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<void>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/devices/binding";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<void>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201 &&
+      resp.value().status != 204) {
+    return Result<void>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  return Result<void>::success();
+}
+
+Result<void>
+MpControlClient::mls_publish_device_list(const MlsPublishDeviceListRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<void>::failure(auth.error());
+  }
+  if (request.device_list.empty() || request.device_list.size() > 1024U) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("device_list_b64", Value{base64_encode(request.device_list)});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<void>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/devices/list";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<void>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201 &&
+      resp.value().status != 204) {
+    return Result<void>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  return Result<void>::success();
+}
+
+Result<MlsInitPartyResponse>
+MpControlClient::mls_init_party(const MlsInitPartyRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsInitPartyResponse>::failure(auth.error());
+  }
+  if (request.group_info_bytes.empty() ||
+      request.group_info_bytes.size() > kMaxHttpBodyBytes) {
+    return fail_c<MlsInitPartyResponse>(ErrorCode::invalid_range,
+                                        MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("group_id_b64", Value{base64_encode(request.group_id)});
+  body_obj.emplace_back("group_info_b64",
+                        Value{base64_encode(request.group_info_bytes)});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<MlsInitPartyResponse>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/init";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsInitPartyResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<MlsInitPartyResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsInitPartyResponse>::failure(obj.error());
+  }
+  const auto epoch = get_required_u64(obj.value(), "mls_epoch");
+  const auto ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  if (!epoch.has_value() || !ds_pk.has_value()) {
+    return fail_c<MlsInitPartyResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+  }
+  return Result<MlsInitPartyResponse>::success(
+      MlsInitPartyResponse{epoch.value(), ds_pk.value()});
+}
+
+Result<MlsRegisterInviteResponse>
+MpControlClient::mls_register_invite(const MlsRegisterInviteRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsRegisterInviteResponse>::failure(auth.error());
+  }
+  Value::Object body_obj;
+  if (request.invite_id > 0U) {
+    body_obj.emplace_back("invite_id", Value{Number{request.invite_id}});
+  }
+  body_obj.emplace_back("server_token_hash_b64",
+                        Value{base64_encode(request.server_token_hash)});
+  body_obj.emplace_back("max_uses",
+                        Value{Number{static_cast<std::uint64_t>(request.max_uses)}});
+  body_obj.emplace_back("expires_at_ms", Value{Number{request.expires_at_ms}});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<MlsRegisterInviteResponse>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/invites";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsRegisterInviteResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<MlsRegisterInviteResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsRegisterInviteResponse>::failure(obj.error());
+  }
+  const auto iid = get_required_u64_or_decimal(obj.value(), "invite_id");
+  const auto iepoch = get_required_u64(obj.value(), "invite_epoch");
+  if (!iid.has_value() || !iepoch.has_value()) {
+    return fail_c<MlsRegisterInviteResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+  }
+  return Result<MlsRegisterInviteResponse>::success(
+      MlsRegisterInviteResponse{iid.value(), iepoch.value()});
+}
+
+Result<void> MpControlClient::mls_join_party(const MlsJoinPartyRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<void>::failure(auth.error());
+  }
+  if (request.kp_bytes.empty() || request.kp_bytes.size() > kMaxHttpBodyBytes) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("invite_id", Value{Number{request.invite_id}});
+  body_obj.emplace_back("server_invite_token_b64",
+                        Value{base64_encode(request.server_invite_token)});
+  body_obj.emplace_back("kp_ref_b64", Value{base64_encode(request.kp_ref)});
+  body_obj.emplace_back("kp_b64", Value{base64_encode(request.kp_bytes)});
+  body_obj.emplace_back("join_proof_b64", Value{base64_encode(request.join_proof)});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<void>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/join";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+  CleanseVectorGuard body_cleanse{req.body};
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<void>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201 &&
+      resp.value().status != 202) {
+    return Result<void>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  return Result<void>::success();
+}
+
+Result<MlsSubmitCommitResponse>
+MpControlClient::mls_submit_commit(const MlsSubmitCommitRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsSubmitCommitResponse>::failure(auth.error());
+  }
+  if (request.commit_bytes.empty() || request.commit_bytes.size() > kMaxHttpBodyBytes) {
+    return fail_c<MlsSubmitCommitResponse>(ErrorCode::invalid_range,
+                                           MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("parent_epoch", Value{Number{request.parent_epoch}});
+  body_obj.emplace_back("commit_b64", Value{base64_encode(request.commit_bytes)});
+  if (request.welcome_bytes.has_value() && !request.welcome_bytes->empty()) {
+    body_obj.emplace_back("welcome_b64", Value{base64_encode(*request.welcome_bytes)});
+  }
+  if (request.welcome_auth_bytes.has_value() && !request.welcome_auth_bytes->empty()) {
+    body_obj.emplace_back("welcome_auth_b64",
+                          Value{base64_encode(*request.welcome_auth_bytes)});
+  }
+  if (request.welcome_target_device_id.has_value()) {
+    body_obj.emplace_back("welcome_target_device_id",
+                          Value{Number{request.welcome_target_device_id->value()}});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<MlsSubmitCommitResponse>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/commit";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsSubmitCommitResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201 &&
+      resp.value().status != 202) {
+    return Result<MlsSubmitCommitResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsSubmitCommitResponse>::failure(obj.error());
+  }
+  const auto target_epoch = get_required_u64(obj.value(), "target_epoch");
+  const auto sha = get_optional_string(obj.value(), "commit_sha256");
+  bool finalized = false;
+  if (const Value *ff = obj.value().find("finalized"); ff != nullptr) {
+    const auto fb = value_as_bool_or_flag(*ff);
+    if (!fb.has_value()) {
+      return fail_c<MlsSubmitCommitResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    finalized = fb.value();
+  }
+  if (!target_epoch.has_value() || !sha.has_value()) {
+    return fail_c<MlsSubmitCommitResponse>(ErrorCode::corrupt,
+                                           MpClientError::http_response_schema);
+  }
+  return Result<MlsSubmitCommitResponse>::success(MlsSubmitCommitResponse{
+      target_epoch.value(),
+      finalized,
+      sha.value().value_or(""),
+  });
+}
+
+Result<void>
+MpControlClient::mls_submit_commit_ack(const MlsSubmitCommitAckRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<void>::failure(auth.error());
+  }
+  if (request.ack_bytes.empty() || request.ack_bytes.size() > 4096U) {
+    return fail_cv(ErrorCode::invalid_range, MpClientError::invalid_config);
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("parent_epoch", Value{Number{request.parent_epoch}});
+  body_obj.emplace_back("target_epoch", Value{Number{request.target_epoch}});
+  body_obj.emplace_back("status",
+                        Value{Number{static_cast<std::uint64_t>(request.status)}});
+  body_obj.emplace_back("ack_b64", Value{base64_encode(request.ack_bytes)});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<void>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/ack";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<void>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201 &&
+      resp.value().status != 204) {
+    return Result<void>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  return Result<void>::success();
+}
+
+Result<MlsFetchCommitsResponse>
+MpControlClient::mls_fetch_commits(const MlsFetchCommitsRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsFetchCommitsResponse>::failure(auth.error());
+  }
+  const std::uint32_t clamped_limit = std::clamp<std::uint32_t>(request.limit, 1U, 32U);
+  RawHttpRequest req{};
+  req.method = HttpMethod::get;
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/commits";
+  req.query = "?from_epoch=" + std::to_string(request.from_epoch) +
+              "&limit=" + std::to_string(clamped_limit);
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsFetchCommitsResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<MlsFetchCommitsResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsFetchCommitsResponse>::failure(obj.error());
+  }
+  MlsFetchCommitsResponse out{};
+  if (const auto head = get_required_u64(obj.value(), "head_epoch"); head.has_value()) {
+    out.head_epoch = head.value();
+  }
+  if (const Value *cf = obj.value().find("commits"); cf != nullptr) {
+    const auto *arr = std::get_if<Value::Array>(&cf->value());
+    if (arr == nullptr) {
+      return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
+                                             MpClientError::http_response_schema);
+    }
+    out.commits.reserve(arr->size());
+    for (const auto &item : *arr) {
+      if (!std::holds_alternative<Value::Object>(item.value())) {
+        return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      const auto ep = get_required_u64(item, "epoch");
+      const auto cb64 = get_required_string(item, "commit_b64");
+      if (!ep.has_value() || !cb64.has_value()) {
+        return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      const auto cbytes = base64_decode(cb64.value());
+      if (!cbytes.has_value() || cbytes->empty()) {
+        return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
+                                               MpClientError::http_response_schema);
+      }
+      MlsCatchupCommit rec{};
+      rec.epoch = ep.value();
+      rec.commit_bytes = std::move(*cbytes);
+      if (const Value *pf = item.find("proposals"); pf != nullptr) {
+        if (const auto *parr = std::get_if<Value::Array>(&pf->value())) {
+          for (const auto &pitem : *parr) {
+            if (const auto *ps = std::get_if<std::string>(&pitem.value())) {
+              const auto pbytes = base64_decode(*ps);
+              if (!pbytes.has_value()) {
+                return fail_c<MlsFetchCommitsResponse>(
+                    ErrorCode::corrupt, MpClientError::http_response_schema);
+              }
+              rec.referenced_proposals.push_back(std::move(*pbytes));
+            }
+          }
+        }
+      }
+      out.commits.push_back(std::move(rec));
+    }
+  }
+  return Result<MlsFetchCommitsResponse>::success(std::move(out));
+}
+
+Result<MlsWelcomeResponse> MpControlClient::mls_fetch_welcome(PartyId party_id) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsWelcomeResponse>::failure(auth.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::get;
+  req.path = "/v1/parties/" + party_id.to_decimal() + "/mls/welcome";
+  req.query = "?";
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsWelcomeResponse>::failure(resp.error());
+  }
+  if (resp.value().status == 404 || resp.value().status == 204) {
+    return Result<MlsWelcomeResponse>::success(MlsWelcomeResponse{});
+  }
+  if (resp.value().status != 200) {
+    return Result<MlsWelcomeResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsWelcomeResponse>::failure(obj.error());
+  }
+  const auto wb64 = get_optional_string(obj.value(), "welcome_b64");
+  if (!wb64.has_value() || !wb64.value().has_value() || wb64.value()->empty()) {
+    return Result<MlsWelcomeResponse>::success(MlsWelcomeResponse{});
+  }
+  const auto wab64 = get_required_string(obj.value(), "welcome_auth_b64");
+  const auto epoch = get_required_u64(obj.value(), "target_epoch");
+  const auto ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  if (!wab64.has_value() || !epoch.has_value() || !ds_pk.has_value()) {
+    return fail_c<MlsWelcomeResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  const auto wbytes = base64_decode(*wb64.value());
+  const auto wabytes = base64_decode(wab64.value());
+  if (!wbytes.has_value() || !wabytes.has_value()) {
+    return fail_c<MlsWelcomeResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  return Result<MlsWelcomeResponse>::success(MlsWelcomeResponse{
+      true,
+      epoch.value(),
+      std::move(*wbytes),
+      std::move(*wabytes),
+      ds_pk.value(),
+  });
+}
+
+Result<void> MpControlClient::mls_ack_welcome(PartyId party_id,
+                                              std::uint64_t target_epoch) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<void>::failure(auth.error());
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("target_epoch", Value{Number{target_epoch}});
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<void>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/parties/" + party_id.to_decimal() + "/mls/welcome/ack";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<void>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 204) {
+    return Result<void>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  return Result<void>::success();
+}
+
+Result<std::vector<MlsDeviceListEntry>>
+MpControlClient::mls_fetch_device_lists(PartyId party_id) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<std::vector<MlsDeviceListEntry>>::failure(auth.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::get;
+  req.path = "/v1/parties/" + party_id.to_decimal() + "/mls/device-lists";
+  req.query = "?";
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<std::vector<MlsDeviceListEntry>>::failure(resp.error());
+  }
+  if (resp.value().status != 200) {
+    return Result<std::vector<MlsDeviceListEntry>>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<std::vector<MlsDeviceListEntry>>::failure(obj.error());
+  }
+  std::vector<MlsDeviceListEntry> out;
+  if (const Value *lf = obj.value().find("device_lists"); lf != nullptr) {
+    const auto *arr = std::get_if<Value::Array>(&lf->value());
+    if (arr == nullptr) {
+      return fail_c<std::vector<MlsDeviceListEntry>>(
+          ErrorCode::corrupt, MpClientError::http_response_schema);
+    }
+    out.reserve(arr->size());
+    for (const auto &item : *arr) {
+      if (!std::holds_alternative<Value::Object>(item.value())) {
+        return fail_c<std::vector<MlsDeviceListEntry>>(
+            ErrorCode::corrupt, MpClientError::http_response_schema);
+      }
+      const auto acct_raw = get_required_u64_or_decimal(item, "account_id");
+      const auto rpk = get_required_pubkey_b64(item, "root_pubkey_b64");
+      const auto lb64 = get_required_string(item, "device_list_b64");
+      if (!acct_raw.has_value() || !rpk.has_value() || !lb64.has_value()) {
+        return fail_c<std::vector<MlsDeviceListEntry>>(
+            ErrorCode::corrupt, MpClientError::http_response_schema);
+      }
+      const auto acct_id = AccountId::create(acct_raw.value());
+      const auto lbytes = base64_decode(lb64.value());
+      if (!acct_id.has_value() || !lbytes.has_value() || lbytes->empty()) {
+        return fail_c<std::vector<MlsDeviceListEntry>>(
+            ErrorCode::corrupt, MpClientError::http_response_schema);
+      }
+      out.push_back(MlsDeviceListEntry{
+          acct_id.value(),
+          rpk.value(),
+          std::move(*lbytes),
+      });
+    }
+  }
+  return Result<std::vector<MlsDeviceListEntry>>::success(std::move(out));
 }
 
 } // namespace blackbird::mp

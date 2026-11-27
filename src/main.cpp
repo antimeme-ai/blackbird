@@ -1047,6 +1047,7 @@ void maybe_renew_cwt_silently(mp::MpIdentityStore &store,
 struct LiveV2JoinFormat {
   std::string self_handle;
   std::string room_code;
+  std::optional<mp::PartyId> party_id;
 };
 
 std::string
@@ -1057,7 +1058,7 @@ format_live_v2_members_joined(const std::vector<mp::RoomMemberInfo> &members,
   const std::string self_clean = strip_leading_at_live(fmt.self_handle);
   for (const auto &m : members) {
     const std::string h = party_chat_sanitize(strip_leading_at_live(m.handle), 64U);
-    if (h.empty() || h == self_clean)
+    if (h.empty() || (h == self_clean && !m.is_browser && !m.is_guest))
       continue;
     if (count > 0U)
       peers += ", ";
@@ -1073,6 +1074,9 @@ format_live_v2_members_joined(const std::vector<mp::RoomMemberInfo> &members,
   if (!fmt.room_code.empty()) {
     return "● Connected — party live · Room code: " +
            party_chat_sanitize(fmt.room_code, 32U) + "\n";
+  }
+  if (fmt.party_id.has_value()) {
+    return "● Connected — party #" + fmt.party_id->to_decimal() + " live\n";
   }
   return "● Connected — party live\n";
 }
@@ -1128,6 +1132,16 @@ public:
 
   MpRoomV2Session *mp2_session() const noexcept { return room_v2_session_.get(); }
 
+  std::optional<brakes::TurnTaintState> active_party_taint() const {
+    if (room_v2_session_ != nullptr && room_v2_session_->is_active()) {
+      return room_v2_session_->turn_taint_snapshot();
+    }
+    if (party_session_ != nullptr && party_session_->is_active()) {
+      return party_session_->turn_taint_snapshot();
+    }
+    return std::nullopt;
+  }
+
   LivePartyBridge build_live_party_bridge(const std::string *active_model) {
     LivePartyBridge bridge{};
     bridge.read_state = [this]() -> LivePartyRoomState {
@@ -1140,10 +1154,13 @@ public:
       const auto snap = room_v2_session_->snapshot();
       const auto party_snap = room_v2_session_->to_party_snapshot();
       out.connected = snap.active;
+      out.party_id = snap.party_id.value();
       out.state_name = std::string{mp_room_v2_state_name(snap.state)};
       out.room_code = snap.room_code;
       out.room_name = snap.room_name;
-      out.share_url = snap.share_url;
+      out.share_url = mp::is_usable_room_share_url(snap.share_url)
+                          ? mp::redact_invite_secrets(snap.share_url)
+                          : std::string{};
       out.latest_seq = snap.latest_seq;
       out.members.reserve(party_snap.participants.size());
       for (const auto &p : party_snap.participants) {
@@ -1168,6 +1185,8 @@ public:
         }
         for (const auto &raw_m : snap.members) {
           if (raw_m.handle == p.id) {
+            if (raw_m.is_browser)
+              info.is_browser = true;
             if (!info.account_id.has_value() && raw_m.account_id.has_value())
               info.account_id = raw_m.account_id->value();
             if (info.agent_summary.empty() && !raw_m.agent_summary.empty())
@@ -1185,6 +1204,7 @@ public:
         if (m.sender_account_id.has_value())
           mi.sender_account_id = m.sender_account_id->value();
         mi.sender_is_guest = m.sender_is_guest;
+        mi.sender_is_browser = m.sender_is_browser;
         mi.sender_client = m.sender_client;
         mi.sender_agent_name = m.sender_agent_name;
         mi.target = m.target;
@@ -1340,9 +1360,12 @@ public:
       if (tui_)
         ui_.party_chat(room_v2_session_->to_party_snapshot());
       const std::string code = room_v2_session_->room_code();
-      return "Sent" + (!code.empty() ? (" [" + code + "]") : std::string{}) + " (" +
-             party_chat_sanitize(target, 48) + "): " + party_chat_sanitize(body, 240) +
-             "\n";
+      const std::string tag =
+          !code.empty()
+              ? (" [" + code + "]")
+              : (" [party #" + room_v2_session_->party_id().to_decimal() + "]");
+      return "Sent" + tag + " (" + party_chat_sanitize(target, 48) +
+             "): " + party_chat_sanitize(body, 240) + "\n";
     }
     const auto res = party_session_->post_chat(body, MpTuiChatTarget{target});
     if (!res.has_value()) {
@@ -1763,19 +1786,29 @@ private:
     }
 
     const std::string code = party_chat_sanitize(r.room_code, 32);
-    const std::string share = party_chat_sanitize(r.share_url, 256);
+    const std::string share = mp::is_usable_room_share_url(r.share_url)
+                                  ? party_chat_sanitize(r.share_url, 256)
+                                  : std::string{};
+    const std::string room_label = mp::format_room_display_label(r.party_id, code);
+    std::string out;
     if (target_handle.has_value()) {
       const std::string who =
           "@" + party_chat_sanitize(r.invited_handle.value_or(*target_handle), 48);
-      return "Invited " + who + " · Room code: " + code + " · Share: " + share + "\n";
+      out = "Invited " + who + " · " + room_label;
+    } else {
+      out = "Party live · " + room_label;
     }
-    return "Party live · Room code: " + code + " · Share: " + share + "\n";
+    if (!share.empty()) {
+      out += " · Share: " + share;
+    }
+    out += "\n";
+    return out;
   }
 
   std::string handle_v2_join(std::string_view rest) {
     const auto [target_tok, extra] = split_ws_token(rest);
     if (!extra.empty())
-      return "Usage: /join [@handle|CODE|url]\n";
+      return "Usage: /join [invite-url|@handle|party_id]\n";
 
     auto opened = open_online_client();
     if (!opened.client.has_value() || !opened.store.has_value())
@@ -1783,26 +1816,31 @@ private:
 
     mp::RoomEnterRequest req{};
     req.target = std::string{target_tok};
+    const CleanseLiveStringGuard target_guard{req.target};
     req.client = "blackbird";
     req.agent_name = "Blackbird";
     const auto entered = opened.client->room_enter(req);
     if (!entered.has_value()) {
       if (target_tok.empty() && mp::mp_client_error_of(entered.error()) ==
                                     mp::MpClientError::http_not_found) {
-        return "No pending party invites right now. Try `/join @friend` or `/join "
-               "CODE`.\n";
+        return "No pending party invites right now. Try `/join <invite-url>` or `/join "
+               "@friend`.\n";
       }
       return "Join failed: " + format_live_mp_error(entered.error()) + "\n";
     }
     const auto &r = entered.value();
+    const std::string safe_share = mp::is_usable_room_share_url(r.share_url)
+                                       ? mp::redact_invite_secrets(r.share_url)
+                                       : std::string{};
     if (const auto attach_err = attach_live_room_v2(
             opened, LiveRoomV2AttachParams{r.party_id, r.ws_path, r.room_code, r.name,
-                                           r.share_url, r.members});
+                                           safe_share, r.members});
         attach_err.has_value()) {
       return *attach_err;
     }
     return format_live_v2_members_joined(
-        r.members, LiveV2JoinFormat{opened.store->state().handle, r.room_code});
+        r.members,
+        LiveV2JoinFormat{opened.store->state().handle, r.room_code, r.party_id});
   }
 
   std::string handle_v2_leave(std::string_view rest) {
@@ -1945,10 +1983,12 @@ private:
   std::string handle_party_status() const {
     if (room_v2_session_ != nullptr && room_v2_session_->is_active()) {
       const std::string code = room_v2_session_->room_code();
-      const std::string share = room_v2_session_->share_url();
-      std::string out = "Party live";
-      if (!code.empty())
-        out += " · Room code: " + code;
+      const std::string share =
+          mp::is_usable_room_share_url(room_v2_session_->share_url())
+              ? mp::redact_invite_secrets(room_v2_session_->share_url())
+              : std::string{};
+      std::string out = "Party live · " + mp::format_room_display_label(
+                                              room_v2_session_->party_id(), code);
       if (!share.empty())
         out += " · Share: " + share;
       out += "\n  Chat:     Alt+P (Party pane) or `/party say <msg>`\n"
@@ -1961,7 +2001,8 @@ private:
     }
     return "Not in a party.\n"
            "  Invite: `/invite [@handle]` (starts a party & invites a friend)\n"
-           "  Join:   `/join [@handle|CODE]` (or bare `/join` to accept an invite)\n";
+           "  Join:   `/join [invite-url|@handle|party_id]` (or bare `/join` to accept "
+           "an invite)\n";
   }
 
   std::string handle_party_info(std::string_view rest) {
@@ -1971,8 +2012,10 @@ private:
       std::string out = snap.status_summary + "\n";
       if (!snap.room_code.empty())
         out += "  Room code: " + snap.room_code + "\n";
-      if (!snap.share_url.empty())
-        out += "  Share:     " + snap.share_url + "\n";
+      else
+        out += "  Party:     #" + snap.party_id.to_decimal() + "\n";
+      if (mp::is_usable_room_share_url(snap.share_url))
+        out += "  Share:     " + mp::redact_invite_secrets(snap.share_url) + "\n";
       out += "  Members:   " + std::to_string(snap.members.size()) + "\n";
       for (const auto &m : snap.members) {
         out += "    ● @" + m.handle;
@@ -3293,6 +3336,19 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       }
     };
     engine.effect_policy = [&](std::string_view op_name, const Value &op_input) {
+      // Dynamically latch any remote/browser party taint that arrived before or
+      // during this turn. Once latched, taint persists through the full turn
+      // even if the peer or browser participant leaves mid-turn.
+      if (const auto party_taint = online_hub.active_party_taint();
+          party_taint.has_value() && party_taint->has_peer_data()) {
+        if (!turn_capture.respond_brakes_gate.has_value()) {
+          brakes::EffectivePolicy eff_policy{};
+          if (auto loaded = brakes::load_effective_policy(); loaded.has_value())
+            eff_policy = std::move(loaded).value();
+          turn_capture.respond_brakes_gate.emplace(std::move(eff_policy));
+        }
+        (void)turn_capture.respond_brakes_gate->latch_taint_from(*party_taint);
+      }
       if (turn_capture.respond_brakes_gate.has_value()) {
         const auto decision = evaluate_mp_room_v2_respond_effect(
             *turn_capture.respond_brakes_gate, op_name, op_input,
@@ -3499,13 +3555,14 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                         : one ? RawMainInputKind::once
                         : tui ? RawMainInputKind::tui
                               : RawMainInputKind::plain;
-      const auto length = prompt.size();
+      const std::string audit_prompt = mp::redact_invite_secrets(prompt);
+      const auto length = audit_prompt.size();
       RawSessionCall input{
           4200, 4201, &session_capture,
           std::array{detail::raw_native_field(kind), detail::raw_native_field(length)}};
       input.run([&] {
         auto original = input.bytes_credit(length);
-        (void)input.bytes(4202, prompt, original);
+        (void)input.bytes(4202, audit_prompt, original);
         const auto input_context = input.context();
         RawSessionCall dispatch{4203, 4204, &input_context};
         const auto command_context = dispatch.context();
@@ -4493,12 +4550,18 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                     clean_title.empty() ? std::string{"Completed turn"} : clean_title;
                 std::error_code ws_ec;
                 turn_capture.workspace_root = std::filesystem::current_path(ws_ec);
-                if (mention != nullptr) {
-                  brakes::EffectivePolicy eff_policy{};
-                  if (auto loaded = brakes::load_effective_policy(); loaded.has_value())
-                    eff_policy = std::move(loaded).value();
+                const auto party_taint = online_hub.active_party_taint();
+                brakes::EffectivePolicy eff_policy{};
+                if (auto loaded = brakes::load_effective_policy(); loaded.has_value())
+                  eff_policy = std::move(loaded).value();
+                if (mention != nullptr ||
+                    (party_taint.has_value() && party_taint->has_peer_data()) ||
+                    eff_policy.effective_profile > brakes::BrakesProfile::black_flag) {
                   brakes::BrakesGate gate{std::move(eff_policy)};
-                  (void)gate.ingest_peer(mention->provenance);
+                  if (mention != nullptr)
+                    (void)gate.ingest_peer(mention->provenance);
+                  if (party_taint.has_value())
+                    (void)gate.latch_taint_from(*party_taint);
                   turn_capture.respond_brakes_gate.emplace(std::move(gate));
                 }
                 online_hub.notify_turn_working(turn_capture.title);
@@ -4646,7 +4709,7 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
                       }
                     } else {
                       emit(
-                          "Unknown command: " + std::string{prompt} +
+                          "Unknown command: " + mp::redact_invite_secrets(prompt) +
                           ". /help lists commands; /quit or /exit closes Blackbird.\n");
                     }
                   }
@@ -5131,7 +5194,6 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
       const auto initial_kind = (resume_turn || resume_requested)
                                     ? RawMainInputKind::resume
                                     : RawMainInputKind::tui;
-      const auto initial_length = initial.size();
       std::optional<InstrumentSource> instrument_source;
       try {
         const auto instrument_path = runtime_resource(
@@ -5176,15 +5238,17 @@ int run_session(int argc, char **argv, SessionSuccessorOutputs outputs,
           return std::nullopt;
         }
       };
+      const std::string audit_initial = mp::redact_invite_secrets(initial);
+      const auto audit_initial_length = audit_initial.size();
       RawSessionCall initial_input{
           4200, 4201, &session_capture,
           std::array{detail::raw_native_field(initial_kind),
-                     detail::raw_native_field(initial_length)}};
+                     detail::raw_native_field(audit_initial_length)}};
       initial_input.run([&] {
-        auto initial_credit = initial_input.bytes_credit(initial_length);
+        auto initial_credit = initial_input.bytes_credit(audit_initial_length);
         const auto initial_original =
-            initial_input.bytes(4202, initial, initial_credit);
-        ui.initial_source({initial_original, 0, initial_length});
+            initial_input.bytes(4202, audit_initial, initial_credit);
+        ui.initial_source({initial_original, 0, audit_initial_length});
         ui.raw_parent(initial_input.reference());
         struct JoinedHandoff {
           RawSuccessorHandoff &handoff;

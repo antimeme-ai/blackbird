@@ -9,9 +9,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -433,6 +435,8 @@ parse_members_array(const Value &obj, std::optional<mp::AccountId> self_account_
     m.is_guest = is_guest;
     m.handle = clean_handle;
     m.client = party_chat_sanitize(json_opt_string(item, "client").value_or(""), 32U);
+    m.is_browser =
+        json_opt_bool(item, "is_browser") || mp_room_v2_is_browser_client(m.client);
     m.agent_name =
         party_chat_sanitize(json_opt_string(item, "agent_name").value_or(""), 48U);
     m.agent_state =
@@ -441,7 +445,7 @@ parse_members_array(const Value &obj, std::optional<mp::AccountId> self_account_
         party_chat_sanitize(json_opt_string(item, "agent_summary").value_or(""), 128U);
     m.status =
         party_chat_sanitize(json_opt_string(item, "status").value_or("live"), 24U);
-    m.is_self = !m.is_guest && self_account_id.has_value() &&
+    m.is_self = !m.is_guest && !m.is_browser && self_account_id.has_value() &&
                 m.account_id.has_value() && *m.account_id == *self_account_id;
     out.push_back(std::move(m));
   }
@@ -486,6 +490,205 @@ brakes::EffectivePolicy load_effective_brakes_policy_or_default() {
   return brakes::EffectivePolicy{};
 }
 
+brakes::PeerProvenance make_mp2_peer_provenance(std::optional<mp::AccountId> acct_id,
+                                                bool is_guest, bool is_browser,
+                                                const brakes::EffectivePolicy &policy) {
+  brakes::PeerProvenance prov{};
+  prov.origin = brakes::PeerOriginKind::online_peer;
+  prov.account_id = acct_id.has_value() ? acct_id->value() : 0U;
+  prov.is_external_guest = is_guest || is_browser;
+  if (is_browser) {
+    prov.safety_number = acct_id.has_value()
+                             ? ("mp2-browser-acct-" + acct_id->to_decimal())
+                             : std::string{"mp2-browser"};
+  } else if (acct_id.has_value()) {
+    prov.safety_number = "mp2-acct-" + acct_id->to_decimal();
+  } else {
+    prov.safety_number = "mp2-guest";
+  }
+  prov.effective_trust = std::min(brakes::PartyTrustProfile::advisory,
+                                  policy.party_trust.max_default_profile);
+  return prov;
+}
+
+std::string room_b64_encode(std::span<const std::uint8_t> bytes) {
+  static constexpr char kAlpha[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((bytes.size() + 2U) / 3U) * 4U);
+  std::size_t i = 0U;
+  while (i + 3U <= bytes.size()) {
+    const std::uint32_t t = (static_cast<std::uint32_t>(bytes[i]) << 16U) |
+                            (static_cast<std::uint32_t>(bytes[i + 1U]) << 8U) |
+                            static_cast<std::uint32_t>(bytes[i + 2U]);
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 6U) & 0x3fU]);
+    out.push_back(kAlpha[t & 0x3fU]);
+    i += 3U;
+  }
+  const std::size_t rem = bytes.size() - i;
+  if (rem == 1U) {
+    const std::uint32_t t = static_cast<std::uint32_t>(bytes[i]) << 16U;
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2U) {
+    const std::uint32_t t = (static_cast<std::uint32_t>(bytes[i]) << 16U) |
+                            (static_cast<std::uint32_t>(bytes[i + 1U]) << 8U);
+    out.push_back(kAlpha[(t >> 18U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 12U) & 0x3fU]);
+    out.push_back(kAlpha[(t >> 6U) & 0x3fU]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+std::optional<std::vector<std::uint8_t>> room_b64_decode(std::string_view text) {
+  if (text.empty() || (text.size() % 4U) != 0U) {
+    return std::nullopt;
+  }
+  auto val = [](char ch) noexcept -> int {
+    if (ch >= 'A' && ch <= 'Z')
+      return ch - 'A';
+    if (ch >= 'a' && ch <= 'z')
+      return 26 + (ch - 'a');
+    if (ch >= '0' && ch <= '9')
+      return 52 + (ch - '0');
+    if (ch == '+')
+      return 62;
+    if (ch == '/')
+      return 63;
+    return -1;
+  };
+  std::vector<std::uint8_t> out;
+  out.reserve((text.size() / 4U) * 3U);
+  for (std::size_t i = 0U; i < text.size(); i += 4U) {
+    const bool pad2 = (text[i + 2U] == '=');
+    const bool pad3 = (text[i + 3U] == '=');
+    if ((pad2 || pad3) && (i + 4U != text.size())) {
+      return std::nullopt;
+    }
+    if (pad2 && !pad3) {
+      return std::nullopt;
+    }
+    const int v0 = val(text[i]);
+    const int v1 = val(text[i + 1U]);
+    const int v2 = pad2 ? 0 : val(text[i + 2U]);
+    const int v3 = pad3 ? 0 : val(text[i + 3U]);
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
+      return std::nullopt;
+    }
+    const std::uint32_t t = (static_cast<std::uint32_t>(v0) << 18U) |
+                            (static_cast<std::uint32_t>(v1) << 12U) |
+                            (static_cast<std::uint32_t>(v2) << 6U) |
+                            static_cast<std::uint32_t>(v3);
+    out.push_back(static_cast<std::uint8_t>((t >> 16U) & 0xffU));
+    if (!pad2) {
+      out.push_back(static_cast<std::uint8_t>((t >> 8U) & 0xffU));
+    }
+    if (!pad3) {
+      out.push_back(static_cast<std::uint8_t>(t & 0xffU));
+    }
+  }
+  return out;
+}
+
+// Canonical binary inner routed payload (zero JSON internals):
+// "\x01MP2I"(5) || target_len(u16 BE) || target || body
+std::vector<std::uint8_t> encode_inner_routed_payload(std::string_view target,
+                                                      std::string_view body) {
+  static constexpr std::array<std::uint8_t, 5> kMagic = {0x01U, 'M', 'P', '2', 'I'};
+  const std::uint16_t tlen = static_cast<std::uint16_t>(
+      std::min<std::size_t>(target.size(), kMaxRoomTargetBytes));
+  std::vector<std::uint8_t> out;
+  out.reserve(kMagic.size() + 2U + tlen + body.size());
+  out.insert(out.end(), kMagic.begin(), kMagic.end());
+  out.push_back(static_cast<std::uint8_t>((tlen >> 8U) & 0xffU));
+  out.push_back(static_cast<std::uint8_t>(tlen & 0xffU));
+  out.insert(out.end(), target.begin(),
+             target.begin() + static_cast<std::ptrdiff_t>(tlen));
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+
+void decode_inner_routed_payload(std::span<const std::uint8_t> raw,
+                                 std::string &out_target, std::string &out_body) {
+  static constexpr std::array<std::uint8_t, 5> kMagic = {0x01U, 'M', 'P', '2', 'I'};
+  if (raw.size() >= kMagic.size() + 2U &&
+      std::memcmp(raw.data(), kMagic.data(), kMagic.size()) == 0) {
+    const std::size_t tlen =
+        (static_cast<std::size_t>(raw[5]) << 8U) | static_cast<std::size_t>(raw[6]);
+    if (kMagic.size() + 2U + tlen <= raw.size()) {
+      out_target.assign(reinterpret_cast<const char *>(raw.data() + 7U), tlen);
+      const std::size_t bstart = 7U + tlen;
+      out_body.assign(reinterpret_cast<const char *>(raw.data() + bstart),
+                      raw.size() - bstart);
+      if (out_target.empty()) {
+        out_target = "@all";
+      }
+      return;
+    }
+  }
+  out_target = "@all";
+  out_body.assign(reinterpret_cast<const char *>(raw.data()), raw.size());
+}
+
+// Canonical binary inner ephemeral status payload (zero JSON internals):
+// "\x01MP2S"(5) || len16(client) || len16(agent_name) || len16(agent_state) ||
+// len16(agent_summary)
+std::vector<std::uint8_t>
+encode_inner_ephemeral_status(const MpRoomV2StatusUpdate &st) {
+  static constexpr std::array<std::uint8_t, 5> kMagic = {0x01U, 'M', 'P', '2', 'S'};
+  std::vector<std::uint8_t> out(kMagic.begin(), kMagic.end());
+  auto append_str = [&](std::string_view s, std::size_t cap) {
+    const std::uint16_t n =
+        static_cast<std::uint16_t>(std::min<std::size_t>(s.size(), cap));
+    out.push_back(static_cast<std::uint8_t>((n >> 8U) & 0xffU));
+    out.push_back(static_cast<std::uint8_t>(n & 0xffU));
+    out.insert(out.end(), s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n));
+  };
+  append_str(st.client, 32U);
+  append_str(st.agent_name, 48U);
+  append_str(st.agent_state, 32U);
+  append_str(st.agent_summary, 128U);
+  return out;
+}
+
+std::optional<MpRoomV2StatusUpdate>
+decode_inner_ephemeral_status(std::span<const std::uint8_t> raw) {
+  static constexpr std::array<std::uint8_t, 5> kMagic = {0x01U, 'M', 'P', '2', 'S'};
+  if (raw.size() < kMagic.size() + 8U ||
+      std::memcmp(raw.data(), kMagic.data(), kMagic.size()) != 0) {
+    return std::nullopt;
+  }
+  std::size_t pos = kMagic.size();
+  auto read_str = [&](std::size_t cap) -> std::optional<std::string> {
+    if (pos + 2U > raw.size()) {
+      return std::nullopt;
+    }
+    const std::size_t n = (static_cast<std::size_t>(raw[pos]) << 8U) |
+                          static_cast<std::size_t>(raw[pos + 1U]);
+    pos += 2U;
+    if (n > cap || pos + n > raw.size()) {
+      return std::nullopt;
+    }
+    std::string s(reinterpret_cast<const char *>(raw.data() + pos), n);
+    pos += n;
+    return s;
+  };
+  const auto client = read_str(32U);
+  const auto agent_name = read_str(48U);
+  const auto agent_state = read_str(32U);
+  const auto agent_summary = read_str(128U);
+  if (!client.has_value() || !agent_name.has_value() || !agent_state.has_value() ||
+      !agent_summary.has_value() || pos != raw.size()) {
+    return std::nullopt;
+  }
+  return MpRoomV2StatusUpdate{*client, *agent_name, *agent_state, *agent_summary};
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -514,6 +717,12 @@ std::string_view mp_room_v2_error_name(MpRoomV2Error detail) noexcept {
     return "protocol_error";
   case MpRoomV2Error::secret_rejected:
     return "secret_rejected";
+  case MpRoomV2Error::mls_unavailable:
+    return "mls_unavailable";
+  case MpRoomV2Error::mls_encrypt_failed:
+    return "mls_encrypt_failed";
+  case MpRoomV2Error::mls_send_blocked:
+    return "mls_send_blocked";
   }
   return "unknown";
 }
@@ -522,20 +731,48 @@ std::string_view mp_room_v2_error_name(MpRoomV2Error detail) noexcept {
 // Agent Card validation, scrubbing, serialization & `@agent` mention detection
 // ---------------------------------------------------------------------------
 
+bool mp_room_v2_is_browser_client(std::string_view client) noexcept {
+  const std::string_view trimmed = trim_ascii_ws(client);
+  return ascii_iequals(trimmed, "web") || ascii_iequals(trimmed, "browser");
+}
+
 bool mp_room_v2_contains_secret_token(std::string_view text) noexcept {
   if (text.empty()) {
     return false;
   }
-  static constexpr std::array<std::string_view, 14> kMarkers{
-      "mprk1_",      "mpinv1_", "mppi1_", "mpcs1_",      "mpguest1_",
-      "mpdl1_",      "sk-ant-", "sk-or-", "sk-proj-",    "ghp_",
-      "github_pat_", "xoxb-",   "xoxp-",  "-----begin ",
+  static constexpr std::array<std::string_view, 15> kMarkers{
+      "mprk1_", "mpinv1_",     "mppi1_",  "mpcs1_", "mpguest1_",
+      "mpws1_", "mpdl1_",      "sk-ant-", "sk-or-", "sk-proj-",
+      "ghp_",   "github_pat_", "xoxb-",   "xoxp-",  "-----begin ",
   };
   for (std::size_t i = 0U; i < text.size(); ++i) {
     const std::string_view tail = text.substr(i);
     for (const std::string_view marker : kMarkers) {
       if (ascii_istarts_with(tail, marker)) {
         return true;
+      }
+    }
+  }
+  // Also reject canonical `#<secret>` fragment invite URLs
+  // (`multiplayer.tech/p/i/...#...` or `clank.party/i/...#...`).
+  static constexpr std::array<std::string_view, 2> kInvitePaths{
+      "multiplayer.tech/p/i/",
+      "clank.party/i/",
+  };
+  for (std::size_t i = 0U; i < text.size(); ++i) {
+    const std::string_view tail = text.substr(i);
+    for (const std::string_view prefix : kInvitePaths) {
+      if (!ascii_istarts_with(tail, prefix)) {
+        continue;
+      }
+      const std::string_view rest = tail.substr(prefix.size());
+      const std::size_t hash = rest.find('#');
+      if (hash != std::string_view::npos && hash + 1U < rest.size()) {
+        const char next = rest[hash + 1U];
+        if (next != ' ' && next != '\t' && next != '\r' && next != '\n' &&
+            next != '[') {
+          return true;
+        }
       }
     }
   }
@@ -798,6 +1035,19 @@ evaluate_mp_room_v2_respond_effect(const brakes::BrakesGate &gate,
   }
   brakes::ToolCallRequest req{};
   req.tool_name = std::string{op_name};
+  if (op_name == "party_chat") {
+    std::string_view action;
+    if (const auto *a = op_input.find("action");
+        a != nullptr && std::holds_alternative<std::string>(a->value())) {
+      action = a->string();
+    }
+    if (action == "read" || action == "status") {
+      req.effect_class = brakes::ToolEffectClass::read_only;
+    } else {
+      req.requires_network = true;
+      req.effect_class = brakes::ToolEffectClass::outbound_network;
+    }
+  }
   if (const auto *p = op_input.find("path");
       p != nullptr && std::holds_alternative<std::string>(p->value())) {
     req.target_path = std::filesystem::path{p->string()};
@@ -828,8 +1078,24 @@ std::string_view mp_room_v2_state_name(MpRoomV2State state) noexcept {
 
 Result<std::unique_ptr<MpRoomV2Session>> MpRoomV2Session::start(MpRoomV2Config config) {
   if (!config.identity.account_id.has_value() ||
-      !config.identity.device_id.has_value()) {
+      !config.identity.device_id.has_value() ||
+      config.identity.device_id->value() == 0U) {
     return fail<std::unique_ptr<MpRoomV2Session>>(ErrorCode::provider_auth,
+                                                  MpRoomV2Error::invalid_config);
+  }
+  // Fail closed when e2ee_mode == 1 without a valid MpMlsEngine + group state!
+  if (config.e2ee_mode == 1U) {
+    if (!config.mls_engine || !config.mls_engine->valid() ||
+        !config.mls_group_id.has_value()) {
+      return fail<std::unique_ptr<MpRoomV2Session>>(ErrorCode::invalid_identity,
+                                                    MpRoomV2Error::mls_unavailable);
+    }
+    if (!config.mls_engine->room_status(*config.mls_group_id).has_value()) {
+      return fail<std::unique_ptr<MpRoomV2Session>>(ErrorCode::invalid_identity,
+                                                    MpRoomV2Error::mls_unavailable);
+    }
+  } else if (config.e2ee_mode > 1U) {
+    return fail<std::unique_ptr<MpRoomV2Session>>(ErrorCode::invalid_range,
                                                   MpRoomV2Error::invalid_config);
   }
   std::string ws_path = config.ws_path.empty()
@@ -882,6 +1148,8 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
     : client_(std::move(params.client)), socket_(std::move(params.socket)),
       party_id_(params.config.party_id),
       local_account_id_(params.config.identity.account_id),
+      local_device_id_(params.config.identity.device_id),
+      mls_engine_(std::move(params.config.mls_engine)),
       ws_path_(std::move(params.ws_path)),
       local_handle_(std::move(params.local_handle)),
       client_name_(params.config.client_name.empty() ? std::string{"blackbird"}
@@ -890,6 +1158,12 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
                                                    : params.config.agent_name),
       max_retained_messages_(std::clamp<std::size_t>(
           params.config.max_retained_messages, 1U, kMpRoomV2MaxRetainedMessagesCap)),
+      room_code_(party_chat_sanitize(params.config.room_code, 32U)),
+      room_name_(party_chat_sanitize(params.config.room_name, 128U)),
+      share_url_(mp::is_usable_room_share_url(params.config.share_url)
+                     ? party_chat_sanitize(params.config.share_url, 256U)
+                     : std::string{}),
+      brakes_gate_(load_effective_brakes_policy_or_default()),
       poll_interval_ms_(
           std::clamp<std::uint32_t>(params.config.poll_interval_ms, 5U, 250U)),
       ping_interval_ms_(
@@ -897,12 +1171,9 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
       reconnect_base_ms_(std::max<std::uint32_t>(params.config.reconnect_base_ms, 50U)),
       reconnect_max_ms_(
           std::max<std::uint32_t>(params.config.reconnect_max_ms, reconnect_base_ms_)),
-      state_(MpRoomV2State::connecting),
-      room_code_(party_chat_sanitize(params.config.room_code, 32U)),
-      room_name_(party_chat_sanitize(params.config.room_name, 128U)),
-      share_url_(party_chat_sanitize(params.config.share_url, 256U)),
-      brakes_gate_(load_effective_brakes_policy_or_default()),
-      wake_read_fd_(params.wake_read_fd), wake_write_fd_(params.wake_write_fd) {
+      wake_read_fd_(params.wake_read_fd), wake_write_fd_(params.wake_write_fd),
+      e2ee_mode_(params.config.e2ee_mode), state_(MpRoomV2State::connecting),
+      mls_group_id_(params.config.mls_group_id) {
   std::vector<MpRoomV2Member> initial;
   initial.reserve(params.config.initial_members.size() + 1U);
   for (const auto &im : params.config.initial_members) {
@@ -915,16 +1186,18 @@ MpRoomV2Session::MpRoomV2Session(PrivateTag, InitParams params)
     m.is_guest = im.is_guest || !im.account_id.has_value();
     m.handle = clean_h;
     m.client = party_chat_sanitize(im.client, 32U);
+    m.is_browser = im.is_browser || mp_room_v2_is_browser_client(m.client);
     m.agent_name = party_chat_sanitize(im.agent_name, 48U);
     m.agent_state = party_chat_sanitize(im.agent_state, 32U);
     m.agent_summary = party_chat_sanitize(im.agent_summary, 128U);
     m.status =
         im.status.empty() ? std::string{"live"} : party_chat_sanitize(im.status, 24U);
-    m.is_self = !m.is_guest && local_account_id_.has_value() &&
+    m.is_self = !m.is_guest && !m.is_browser && local_account_id_.has_value() &&
                 m.account_id.has_value() && *m.account_id == *local_account_id_;
     initial.push_back(std::move(m));
   }
   apply_members_locked(initial);
+  refresh_mls_status_locked();
   rebuild_status_summary_locked();
 }
 
@@ -1050,31 +1323,89 @@ Result<std::string> MpRoomV2Session::send_chat(std::string body,
     ++local_msg_counter_;
     msg_id = generate_client_msg_id(local_msg_counter_);
 
-    MpRoomV2Message optimistic{};
-    optimistic.seq = 0U;
-    optimistic.ts_ms = wall_now_ms();
-    optimistic.client_msg_id = msg_id;
-    optimistic.sender_account_id = local_account_id_;
-    optimistic.sender_handle = local_handle_;
-    optimistic.sender_client = client_name_;
-    optimistic.sender_agent_name = agent_name_;
-    optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
-    optimistic.kind = "chat";
-    optimistic.body_encoding = "utf8";
-    optimistic.body = body;
-    optimistic.rendered_body = party_chat_sanitize(body, 2048U);
-    optimistic.delivered = false;
-    optimistic.local_self = true;
-    upsert_message_locked(std::move(optimistic));
+    if (e2ee_mode_ == 1U) {
+      if (!mls_engine_ || !mls_group_id_.has_value()) {
+        return fail<std::string>(ErrorCode::invalid_identity,
+                                 MpRoomV2Error::mls_unavailable);
+      }
+      MlsInnerMsgId inner_id{};
+      if (const auto rnd = mp::random_bytes(inner_id); !rnd.has_value()) {
+        return fail<std::string>(ErrorCode::external_unknown,
+                                 MpRoomV2Error::mls_encrypt_failed);
+      }
+      auto inner_bytes = encode_inner_routed_payload(target.value, body);
+      auto enc = mls_engine_->encrypt_app(*mls_group_id_, inner_id, MpMlsMsgClass::chat,
+                                          inner_bytes, wall_now_ms() / 1000U);
+      if (!enc.has_value()) {
+        refresh_mls_status_locked();
+        const auto mls_err = mp_mls_error_of(enc.error());
+        if (mls_err == MpMlsError::self_clone_detected ||
+            mls_err == MpMlsError::pending_removal ||
+            mls_err == MpMlsError::frame_cap) {
+          return fail<std::string>(ErrorCode::conflict,
+                                   MpRoomV2Error::mls_send_blocked);
+        }
+        return fail<std::string>(enc.error().code, MpRoomV2Error::mls_encrypt_failed);
+      }
 
-    outbox_.push_back(OutboundMessage{
-        msg_id,
-        "chat",
-        std::move(target.value),
-        "utf8",
-        std::move(body),
-        false,
-    });
+      MpRoomV2Message optimistic{};
+      optimistic.seq = 0U;
+      optimistic.ts_ms = wall_now_ms();
+      optimistic.client_msg_id = msg_id;
+      optimistic.sender_account_id = local_account_id_;
+      optimistic.sender_handle = local_handle_;
+      optimistic.sender_client = client_name_;
+      optimistic.sender_agent_name = agent_name_;
+      optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
+      optimistic.kind = "chat";
+      optimistic.body_encoding = "opaque_b64";
+      optimistic.body = body;
+      optimistic.rendered_body = party_chat_sanitize(body, 2048U);
+      optimistic.delivered = false;
+      optimistic.local_self = true;
+      upsert_message_locked(std::move(optimistic));
+
+      OutboundMessage ob{};
+      ob.client_msg_id = msg_id;
+      ob.kind = "e2ee_app";
+      ob.target = "*";
+      ob.body_encoding = "opaque_b64";
+      ob.body = room_b64_encode(enc.value().wire_bytes);
+      ob.sent_on_current_socket = false;
+      ob.is_e2ee = true;
+      ob.inner_msg_id = inner_id;
+      ob.mls_msg_class = MpMlsMsgClass::chat;
+      ob.plaintext_inner = std::move(inner_bytes);
+      ob.sent_epoch = enc.value().mls_epoch;
+      outbox_.push_back(std::move(ob));
+      refresh_mls_status_locked();
+    } else {
+      MpRoomV2Message optimistic{};
+      optimistic.seq = 0U;
+      optimistic.ts_ms = wall_now_ms();
+      optimistic.client_msg_id = msg_id;
+      optimistic.sender_account_id = local_account_id_;
+      optimistic.sender_handle = local_handle_;
+      optimistic.sender_client = client_name_;
+      optimistic.sender_agent_name = agent_name_;
+      optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
+      optimistic.kind = "chat";
+      optimistic.body_encoding = "utf8";
+      optimistic.body = body;
+      optimistic.rendered_body = party_chat_sanitize(body, 2048U);
+      optimistic.delivered = false;
+      optimistic.local_self = true;
+      upsert_message_locked(std::move(optimistic));
+
+      OutboundMessage ob{};
+      ob.client_msg_id = msg_id;
+      ob.kind = "chat";
+      ob.target = std::move(target.value);
+      ob.body_encoding = "utf8";
+      ob.body = std::move(body);
+      ob.sent_on_current_socket = false;
+      outbox_.push_back(std::move(ob));
+    }
     rebuild_status_summary_locked();
   }
   signal_wake();
@@ -1110,32 +1441,92 @@ Result<std::string> MpRoomV2Session::send_agent_card(const MpRoomV2AgentCard &ca
     ++local_msg_counter_;
     msg_id = generate_client_msg_id(local_msg_counter_);
 
-    MpRoomV2Message optimistic{};
-    optimistic.seq = 0U;
-    optimistic.ts_ms = wall_now_ms();
-    optimistic.client_msg_id = msg_id;
-    optimistic.sender_account_id = local_account_id_;
-    optimistic.sender_handle = local_handle_;
-    optimistic.sender_client = client_name_;
-    optimistic.sender_agent_name = agent_name_;
-    optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
-    optimistic.kind = "agent_card";
-    optimistic.body_encoding = "utf8";
-    optimistic.body = body;
-    optimistic.rendered_body = render_agent_card_body(body);
-    optimistic.parsed_agent_card = std::move(parsed_card);
-    optimistic.delivered = false;
-    optimistic.local_self = true;
-    upsert_message_locked(std::move(optimistic));
+    if (e2ee_mode_ == 1U) {
+      if (!mls_engine_ || !mls_group_id_.has_value()) {
+        return fail<std::string>(ErrorCode::invalid_identity,
+                                 MpRoomV2Error::mls_unavailable);
+      }
+      MlsInnerMsgId inner_id{};
+      if (const auto rnd = mp::random_bytes(inner_id); !rnd.has_value()) {
+        return fail<std::string>(ErrorCode::external_unknown,
+                                 MpRoomV2Error::mls_encrypt_failed);
+      }
+      auto inner_bytes = encode_inner_routed_payload(target.value, body);
+      auto enc =
+          mls_engine_->encrypt_app(*mls_group_id_, inner_id, MpMlsMsgClass::agent_card,
+                                   inner_bytes, wall_now_ms() / 1000U);
+      if (!enc.has_value()) {
+        refresh_mls_status_locked();
+        const auto mls_err = mp_mls_error_of(enc.error());
+        if (mls_err == MpMlsError::self_clone_detected ||
+            mls_err == MpMlsError::pending_removal ||
+            mls_err == MpMlsError::frame_cap) {
+          return fail<std::string>(ErrorCode::conflict,
+                                   MpRoomV2Error::mls_send_blocked);
+        }
+        return fail<std::string>(enc.error().code, MpRoomV2Error::mls_encrypt_failed);
+      }
 
-    outbox_.push_back(OutboundMessage{
-        msg_id,
-        "agent_card",
-        std::move(target.value),
-        "utf8",
-        std::move(body),
-        false,
-    });
+      MpRoomV2Message optimistic{};
+      optimistic.seq = 0U;
+      optimistic.ts_ms = wall_now_ms();
+      optimistic.client_msg_id = msg_id;
+      optimistic.sender_account_id = local_account_id_;
+      optimistic.sender_handle = local_handle_;
+      optimistic.sender_client = client_name_;
+      optimistic.sender_agent_name = agent_name_;
+      optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
+      optimistic.kind = "agent_card";
+      optimistic.body_encoding = "opaque_b64";
+      optimistic.body = body;
+      optimistic.rendered_body = render_agent_card_body(body);
+      optimistic.parsed_agent_card = std::move(parsed_card);
+      optimistic.delivered = false;
+      optimistic.local_self = true;
+      upsert_message_locked(std::move(optimistic));
+
+      OutboundMessage ob{};
+      ob.client_msg_id = msg_id;
+      ob.kind = "e2ee_app";
+      ob.target = "*";
+      ob.body_encoding = "opaque_b64";
+      ob.body = room_b64_encode(enc.value().wire_bytes);
+      ob.sent_on_current_socket = false;
+      ob.is_e2ee = true;
+      ob.inner_msg_id = inner_id;
+      ob.mls_msg_class = MpMlsMsgClass::agent_card;
+      ob.plaintext_inner = std::move(inner_bytes);
+      ob.sent_epoch = enc.value().mls_epoch;
+      outbox_.push_back(std::move(ob));
+      refresh_mls_status_locked();
+    } else {
+      MpRoomV2Message optimistic{};
+      optimistic.seq = 0U;
+      optimistic.ts_ms = wall_now_ms();
+      optimistic.client_msg_id = msg_id;
+      optimistic.sender_account_id = local_account_id_;
+      optimistic.sender_handle = local_handle_;
+      optimistic.sender_client = client_name_;
+      optimistic.sender_agent_name = agent_name_;
+      optimistic.target = party_chat_sanitize(target.value, kMaxRoomTargetBytes);
+      optimistic.kind = "agent_card";
+      optimistic.body_encoding = "utf8";
+      optimistic.body = body;
+      optimistic.rendered_body = render_agent_card_body(body);
+      optimistic.parsed_agent_card = std::move(parsed_card);
+      optimistic.delivered = false;
+      optimistic.local_self = true;
+      upsert_message_locked(std::move(optimistic));
+
+      OutboundMessage ob{};
+      ob.client_msg_id = msg_id;
+      ob.kind = "agent_card";
+      ob.target = std::move(target.value);
+      ob.body_encoding = "utf8";
+      ob.body = std::move(body);
+      ob.sent_on_current_socket = false;
+      outbox_.push_back(std::move(ob));
+    }
     rebuild_status_summary_locked();
   }
   signal_wake();
@@ -1155,7 +1546,51 @@ Result<void> MpRoomV2Session::update_status(MpRoomV2StatusUpdate status) {
   }
   {
     std::lock_guard<std::mutex> lock(state_mu_);
-    pending_status_ = std::move(status);
+    if (e2ee_mode_ == 1U) {
+      if (!mls_engine_ || !mls_group_id_.has_value()) {
+        return fail_void(ErrorCode::invalid_identity, MpRoomV2Error::mls_unavailable);
+      }
+      MlsInnerMsgId inner_id{};
+      if (const auto rnd = mp::random_bytes(inner_id); !rnd.has_value()) {
+        return fail_void(ErrorCode::external_unknown,
+                         MpRoomV2Error::mls_encrypt_failed);
+      }
+      auto inner_bytes = encode_inner_ephemeral_status(status);
+      auto enc = mls_engine_->encrypt_app(*mls_group_id_, inner_id,
+                                          MpMlsMsgClass::ephemeral_status, inner_bytes,
+                                          wall_now_ms() / 1000U);
+      if (!enc.has_value()) {
+        refresh_mls_status_locked();
+        const auto mls_err = mp_mls_error_of(enc.error());
+        if (mls_err == MpMlsError::self_clone_detected ||
+            mls_err == MpMlsError::pending_removal ||
+            mls_err == MpMlsError::frame_cap) {
+          return fail_void(ErrorCode::conflict, MpRoomV2Error::mls_send_blocked);
+        }
+        return fail_void(enc.error().code, MpRoomV2Error::mls_encrypt_failed);
+      }
+      // Replace any unsent queued ephemeral status to bound outbox size.
+      std::erase_if(outbox_, [](const OutboundMessage &pending) {
+        return !pending.sent_on_current_socket && pending.kind == "e2ee_ephemeral";
+      });
+      ++local_msg_counter_;
+      OutboundMessage ob{};
+      ob.client_msg_id = generate_client_msg_id(local_msg_counter_);
+      ob.kind = "e2ee_ephemeral";
+      ob.target = "*";
+      ob.body_encoding = "opaque_b64";
+      ob.body = room_b64_encode(enc.value().wire_bytes);
+      ob.sent_on_current_socket = false;
+      ob.is_e2ee = true;
+      ob.inner_msg_id = inner_id;
+      ob.mls_msg_class = MpMlsMsgClass::ephemeral_status;
+      ob.plaintext_inner = std::move(inner_bytes);
+      ob.sent_epoch = enc.value().mls_epoch;
+      outbox_.push_back(std::move(ob));
+      refresh_mls_status_locked();
+    } else {
+      pending_status_ = std::move(status);
+    }
   }
   signal_wake();
   return Result<void>::success();
@@ -1241,14 +1676,22 @@ MpRoomV2Snapshot MpRoomV2Session::snapshot() {
   mention_alerts_.clear();
   snap.pending_agent_mention = pending_agent_mention_;
   snap.status_summary = status_summary_;
+  snap.e2ee_mode = e2ee_mode_;
+  if (e2ee_mode_ == 1U && mls_engine_ && mls_group_id_.has_value()) {
+    if (const auto st = mls_engine_->room_status(*mls_group_id_, wall_now_ms() / 1000U);
+        st.has_value()) {
+      mls_status_ = st.value();
+    }
+  }
+  snap.mls_status = mls_status_;
   return snap;
 }
 
 PartySnapshot MpRoomV2Session::to_party_snapshot() const {
   std::lock_guard<std::mutex> lock(state_mu_);
   PartySnapshot snap{};
-  snap.room_scope =
-      !room_code_.empty() ? ("room/" + room_code_) : std::string{"party/live"};
+  snap.room_scope = !room_code_.empty() ? ("room/" + room_code_)
+                                        : ("party #" + party_id_.to_decimal());
   snap.mode_override = PartyModeOverride::auto_detect;
   snap.compact_room_presentation = true;
 
@@ -1371,7 +1814,7 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
                                             : PartyMemberRole::operator_human;
     pm.sender_host = m.sender_client;
     pm.sender_model = m.kind == "agent_card" ? m.sender_agent_name : std::string{};
-    pm.verified_peer = !m.sender_is_guest;
+    pm.verified_peer = !m.sender_is_guest && !m.sender_is_browser;
     pm.target = m.target.empty() ? std::string{"@all"} : m.target;
     pm.kind = map_message_kind(m.kind);
     std::string body_out = m.rendered_body;
@@ -1379,7 +1822,7 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
       body_out += m.delivered ? " ✓" : " …";
     }
     pm.body = std::move(body_out);
-    pm.untrusted_remote = m.sender_is_guest && !m.local_self;
+    pm.untrusted_remote = (m.sender_is_guest || m.sender_is_browser) && !m.local_self;
     if (m.parsed_agent_card.has_value()) {
       PartyAgentCard pc{};
       pc.title = m.parsed_agent_card->title;
@@ -1399,6 +1842,26 @@ PartySnapshot MpRoomV2Session::to_party_snapshot() const {
         pending_agent_mention_->sender_handle,
         pending_agent_mention_->sanitized_preview,
     };
+  }
+  if (e2ee_mode_ == 1U) {
+    std::optional<MpMlsRoomStatus> st = mls_status_;
+    if (mls_engine_ && mls_group_id_.has_value()) {
+      if (const auto live_st =
+              mls_engine_->room_status(*mls_group_id_, wall_now_ms() / 1000U);
+          live_st.has_value()) {
+        st = live_st.value();
+      }
+    }
+    if (st.has_value()) {
+      PartyMlsStatus pms{};
+      pms.mls_epoch = st->mls_epoch;
+      pms.trust_tier = static_cast<std::uint32_t>(st->trust_tier);
+      pms.has_declared_agent = st->has_declared_agent;
+      pms.has_pending_removals = st->has_pending_removals;
+      pms.clone_detected = st->clone_detected;
+      pms.epoch_authenticator = st->epoch_authenticator_code;
+      snap.mls_status = std::move(pms);
+    }
   }
   return snap;
 }
@@ -1446,18 +1909,27 @@ void MpRoomV2Session::apply_members_locked(const std::vector<MpRoomV2Member> &me
   members_ = members;
   bool has_self = false;
   for (auto &m : members_) {
-    if (!m.is_guest && local_account_id_.has_value() && m.account_id.has_value() &&
-        *m.account_id == *local_account_id_) {
+    m.is_browser = m.is_browser || mp_room_v2_is_browser_client(m.client);
+    if (!m.is_guest && !m.is_browser && local_account_id_.has_value() &&
+        m.account_id.has_value() && *m.account_id == *local_account_id_) {
       m.is_self = true;
       has_self = true;
     } else {
       m.is_self = false;
+      // Latch remote taint immediately for ANY multi-account party (including
+      // personal parties with >1 account) or ANY browser participant (even
+      // matching the local operator's own account/@handle). Taint is monotonic
+      // and NEVER cleared if the peer or browser participant later leaves.
+      const auto prov = make_mp2_peer_provenance(m.account_id, m.is_guest, m.is_browser,
+                                                 brakes_gate_.policy());
+      (void)brakes_gate_.ingest_peer(prov);
     }
   }
   if (!has_self && local_account_id_.has_value()) {
     MpRoomV2Member self{};
     self.account_id = *local_account_id_;
     self.is_guest = false;
+    self.is_browser = false;
     self.handle = local_handle_;
     self.client = client_name_;
     self.agent_name = agent_name_;
@@ -1590,7 +2062,7 @@ void MpRoomV2Session::rebuild_status_summary_locked() {
     } else if (!room_code_.empty()) {
       status_summary_ = "● Live — room code " + room_code_;
     } else {
-      status_summary_ = "● Live";
+      status_summary_ = "● Live — party #" + party_id_.to_decimal();
     }
     return;
   }
@@ -1603,6 +2075,17 @@ void MpRoomV2Session::rebuild_status_summary_locked() {
 
 void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action) {
   const std::uint64_t prev_latest_seq = latest_seq_;
+  const std::uint64_t server_e2ee =
+      json_u64_or_decimal(obj, "e2ee_mode")
+          .value_or(json_opt_bool(obj, "e2ee_mode") ? 1U : 0U);
+  if (server_e2ee == 1U && (e2ee_mode_ != 1U || !mls_engine_ || !mls_engine_->valid() ||
+                            !mls_group_id_.has_value())) {
+    state_ = MpRoomV2State::disconnected;
+    push_notice_locked("Refused E2EE room without active MLS engine (fail-closed).");
+    rebuild_status_summary_locked();
+    action.force_disconnect = true;
+    return;
+  }
   if (const auto rc = json_opt_string(obj, "room_code");
       rc.has_value() && !rc->empty()) {
     room_code_ = party_chat_sanitize(*rc, 32U);
@@ -1648,9 +2131,9 @@ void MpRoomV2Session::handle_hello_locked(const Value &obj, FrameAction &action)
   state_ = MpRoomV2State::live;
   connected_once_ = true;
   if (was_reconnecting) {
-    push_notice_locked("Reconnected to party" + (!room_code_.empty()
-                                                     ? (" (" + room_code_ + ")")
-                                                     : std::string{}));
+    push_notice_locked("Reconnected to party" +
+                       (!room_code_.empty() ? (" (" + room_code_ + ")")
+                                            : (" (#" + party_id_.to_decimal() + ")")));
   }
   for (auto &out : outbox_) {
     out.sent_on_current_socket = false;
@@ -1686,6 +2169,7 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
   msg.body = body;
   msg.delivered = true;
 
+  std::optional<std::uint64_t> outer_sender_device_id;
   if (const Value *sender_field = obj.find("sender");
       sender_field != nullptr &&
       std::holds_alternative<Value::Object>(sender_field->value())) {
@@ -1695,6 +2179,7 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
         msg.sender_account_id = aid.value();
       }
     }
+    outer_sender_device_id = json_u64_or_decimal(*sender_field, "device_id");
     msg.sender_handle = party_chat_sanitize(
         strip_at(json_opt_string(*sender_field, "handle").value_or("")), 64U);
     msg.sender_client =
@@ -1703,23 +2188,192 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
         json_opt_string(*sender_field, "agent_name").value_or(""), 48U);
     msg.sender_is_guest =
         !msg.sender_account_id.has_value() || json_opt_bool(*sender_field, "is_guest");
-  }
-  const bool matched_outbox =
-      !cmsg_id.empty() &&
-      std::any_of(outbox_.begin(), outbox_.end(), [&](const OutboundMessage &pending) {
-        return pending.client_msg_id == cmsg_id;
-      });
-  msg.local_self = matched_outbox || (local_account_id_.has_value() &&
-                                      msg.sender_account_id.has_value() &&
-                                      *msg.sender_account_id == *local_account_id_);
-
-  if (msg.kind == "agent_card" && msg.body_encoding == "utf8") {
-    msg.parsed_agent_card = parse_mp_room_v2_agent_card(msg.body);
-    msg.rendered_body = render_agent_card_body(msg.body);
-  } else if (msg.body_encoding == "opaque_b64") {
-    msg.rendered_body = "[encrypted message]";
+    msg.sender_is_browser = json_opt_bool(*sender_field, "is_browser") ||
+                            mp_room_v2_is_browser_client(msg.sender_client);
   } else {
-    msg.rendered_body = party_chat_sanitize(msg.body, 2048U);
+    msg.sender_is_guest = true;
+  }
+
+  auto matched_outbox_it = outbox_.end();
+  if (!cmsg_id.empty()) {
+    matched_outbox_it = std::find_if(outbox_.begin(), outbox_.end(),
+                                     [&](const OutboundMessage &pending) {
+                                       return pending.client_msg_id == cmsg_id;
+                                     });
+  }
+  const bool matched_outbox = (matched_outbox_it != outbox_.end());
+
+  bool decrypted_is_historical_catchup = is_history;
+  bool decrypted_from_mls = false;
+
+  if (e2ee_mode_ == 1U) {
+    if (msg.kind == "system") {
+      msg.rendered_body = party_chat_sanitize(msg.body, 2048U);
+      upsert_message_locked(std::move(msg));
+      rebuild_status_summary_locked();
+      return;
+    }
+    // Strict downgrade protection: NEVER render or trigger on non-opaque_b64 member
+    // frames inside an e2ee_mode == 1 room!
+    if (msg.body_encoding != "opaque_b64") {
+      push_notice_locked("Rejected unencrypted member frame in E2EE room.");
+      return;
+    }
+    if (!mls_engine_ || !mls_group_id_.has_value()) {
+      push_notice_locked("MLS engine unavailable; dropped encrypted frame.");
+      return;
+    }
+
+    // Own echoed outbox frame: OpenMLS cannot decrypt its own sender ratchet.
+    // Verify exact ciphertext bytes match what we sent so a hostile server cannot
+    // substitute content under our client_msg_id!
+    if (matched_outbox && matched_outbox_it->is_e2ee) {
+      if (matched_outbox_it->body != body) {
+        push_notice_locked("Rejected tampered self-echo ciphertext in E2EE room.");
+        return;
+      }
+      const bool is_ephemeral_echo = (matched_outbox_it->kind == "e2ee_ephemeral");
+      outbox_.erase(matched_outbox_it);
+      if (!is_ephemeral_echo) {
+        for (auto &existing : messages_) {
+          if (existing.client_msg_id == cmsg_id) {
+            existing.delivered = true;
+            if (seq > 0U) {
+              existing.seq = seq;
+              remember_seen_seq_locked(seq);
+              if (seq > latest_seq_) {
+                latest_seq_ = seq;
+                latest_seq_atomic_.store(latest_seq_, std::memory_order_release);
+              }
+            }
+            if (ts_ms > 0U) {
+              existing.ts_ms = ts_ms;
+            }
+            break;
+          }
+        }
+      }
+      rebuild_status_summary_locked();
+      return;
+    }
+
+    const auto wire_opt = room_b64_decode(body);
+    if (!wire_opt.has_value()) {
+      push_notice_locked("Rejected malformed base64 E2EE frame.");
+      return;
+    }
+    const auto dec_res =
+        mls_engine_->decrypt_app(*mls_group_id_, *wire_opt, is_history);
+    if (!dec_res.has_value()) {
+      const auto mls_err = mp_mls_error_of(dec_res.error());
+      if (mls_err == MpMlsError::duplicate_msg) {
+        return;
+      }
+      if (mls_err == MpMlsError::self_clone_detected) {
+        refresh_mls_status_locked();
+        push_notice_locked(
+            "SECURITY ALERT: Cloned device key suspected — outbound sends frozen.");
+        return;
+      }
+      push_notice_locked("Failed to verify/decrypt E2EE frame (" +
+                         std::string{mp_mls_error_name(mls_err)} + ").");
+      return;
+    }
+
+    const auto &dec = dec_res.value();
+    // Assert authenticated MLS sender leaf matches outer server metadata when present!
+    if (msg.sender_account_id.has_value() &&
+        msg.sender_account_id->value() != dec.auth_account_id) {
+      push_notice_locked(
+          "Rejected E2EE frame: outer account_id disagrees with MLS leaf.");
+      return;
+    }
+    if (outer_sender_device_id.has_value() && *outer_sender_device_id != 0U &&
+        *outer_sender_device_id != dec.auth_device_id) {
+      push_notice_locked(
+          "Rejected E2EE frame: outer device_id disagrees with MLS leaf.");
+      return;
+    }
+
+    const auto auth_acct = mp::AccountId::create(dec.auth_account_id);
+    if (!auth_acct.has_value()) {
+      return;
+    }
+    // Derive sender identity & browser taint strictly from authenticated MLS leaf!
+    msg.sender_account_id = auth_acct.value();
+    msg.sender_is_guest = false;
+    msg.sender_is_browser = (dec.sender_client_class == 3U);
+    if (msg.sender_is_browser && msg.sender_client.empty()) {
+      msg.sender_client = "browser";
+    }
+    msg.local_self = false;
+    decrypted_is_historical_catchup = is_history || dec.is_historical_catchup;
+    decrypted_from_mls = true;
+
+    // Pass authenticated sender_client_class == 3 & auth_account_id into BrakesGate!
+    const auto ev_prov = make_mp2_peer_provenance(
+        msg.sender_account_id, false, msg.sender_is_browser, brakes_gate_.policy());
+    (void)brakes_gate_.ingest_peer(ev_prov);
+
+    if (dec.msg_class == MpMlsMsgClass::ephemeral_status) {
+      if (const auto st = decode_inner_ephemeral_status(dec.plaintext);
+          st.has_value()) {
+        for (auto &m : members_) {
+          if (m.account_id.has_value() && *m.account_id == auth_acct.value() &&
+              m.is_browser == msg.sender_is_browser) {
+            m.agent_name = party_chat_sanitize(st->agent_name, 48U);
+            m.agent_state = party_chat_sanitize(st->agent_state, 32U);
+            m.agent_summary = party_chat_sanitize(st->agent_summary, 128U);
+            break;
+          }
+        }
+        rebuild_status_summary_locked();
+      }
+      return;
+    }
+    if (dec.msg_class == MpMlsMsgClass::invite_control) {
+      (void)mls_engine_->register_invite_record(*mls_group_id_, dec.plaintext);
+      return;
+    }
+
+    std::string inner_target;
+    std::string inner_body;
+    decode_inner_routed_payload(dec.plaintext, inner_target, inner_body);
+    msg.target = party_chat_sanitize(inner_target, kMaxRoomTargetBytes);
+    msg.body = std::move(inner_body);
+    if (dec.msg_class == MpMlsMsgClass::agent_card) {
+      msg.kind = "agent_card";
+      msg.parsed_agent_card = parse_mp_room_v2_agent_card(msg.body);
+      msg.rendered_body = render_agent_card_body(msg.body);
+    } else {
+      msg.kind = "chat";
+      msg.rendered_body = party_chat_sanitize(msg.body, 2048U);
+    }
+    refresh_mls_status_locked();
+  } else {
+    // Browser-authored messages (sender.is_browser == true or sender.client == "web")
+    // and guest messages are ALWAYS untrusted remote input, NEVER local operator
+    // authority, even when sender.handle / sender.account_id matches our own.
+    msg.local_self = !msg.sender_is_browser && !msg.sender_is_guest &&
+                     (matched_outbox || (local_account_id_.has_value() &&
+                                         msg.sender_account_id.has_value() &&
+                                         *msg.sender_account_id == *local_account_id_));
+
+    if (!msg.local_self) {
+      const auto ev_prov =
+          make_mp2_peer_provenance(msg.sender_account_id, msg.sender_is_guest,
+                                   msg.sender_is_browser, brakes_gate_.policy());
+      (void)brakes_gate_.ingest_peer(ev_prov);
+    }
+
+    if (msg.kind == "agent_card" && msg.body_encoding == "utf8") {
+      msg.parsed_agent_card = parse_mp_room_v2_agent_card(msg.body);
+      msg.rendered_body = render_agent_card_body(msg.body);
+    } else if (msg.body_encoding == "opaque_b64") {
+      msg.rendered_body = "[encrypted message]";
+    } else {
+      msg.rendered_body = party_chat_sanitize(msg.body, 2048U);
+    }
   }
 
   // If this event echoes one of our queued messages, remove from retry outbox.
@@ -1732,10 +2386,14 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
   // Detect incoming remote `@<self_handle>` / `@<self_handle>:agent` /
   // `@<self_handle>'s agent` mentions in both chat messages and `agent_card`
   // events, and isolate through Brakes Stage 1. Never triggers on self-sent
-  // echoes, encrypted opaque frames, or duplicates.
+  // echoes, historical catch-up (`is_history` or `dec.is_historical_catchup`),
+  // undecrypted opaque frames, or duplicates!
   bool mentions_self = false;
   std::string_view mention_payload;
-  if (!is_history && !already_seen && !msg.local_self && msg.body_encoding == "utf8") {
+  const bool eligible_body =
+      (e2ee_mode_ == 1U) ? decrypted_from_mls : (msg.body_encoding == "utf8");
+  if (!is_history && !decrypted_is_historical_catchup && !already_seen &&
+      !msg.local_self && eligible_body) {
     if (msg.kind == "chat") {
       mentions_self = detect_self_agent_mention(msg.body, local_handle_) ||
                       detect_self_agent_mention(msg.target, local_handle_);
@@ -1750,23 +2408,17 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
     }
   }
   if (mentions_self) {
-    const bool sender_is_guest = !msg.sender_account_id.has_value();
-    const std::string room_scope =
-        !room_code_.empty() ? ("room/" + room_code_) : std::string{"party/live"};
+    const bool sender_is_guest = msg.sender_is_guest;
+    const bool sender_is_browser = msg.sender_is_browser;
+    const std::string room_scope = !room_code_.empty()
+                                       ? ("room/" + room_code_)
+                                       : ("party #" + party_id_.to_decimal());
     const std::string sender_handle =
         msg.sender_handle.empty() ? std::string{"peer"} : msg.sender_handle;
 
-    brakes::PeerProvenance prov{};
-    prov.origin = brakes::PeerOriginKind::online_peer;
-    prov.account_id =
-        msg.sender_account_id.has_value() ? msg.sender_account_id->value() : 0U;
-    prov.is_external_guest = sender_is_guest;
-    prov.safety_number = msg.sender_account_id.has_value()
-                             ? ("mp2-acct-" + msg.sender_account_id->to_decimal())
-                             : std::string{"mp2-guest"};
-    prov.effective_trust =
-        std::min(brakes::PartyTrustProfile::advisory,
-                 brakes_gate_.policy().party_trust.max_default_profile);
+    brakes::PeerProvenance prov =
+        make_mp2_peer_provenance(msg.sender_account_id, sender_is_guest,
+                                 sender_is_browser, brakes_gate_.policy());
 
     const brakes::PartyTrustProfile clamped_trust = brakes_gate_.ingest_peer(prov);
     prov.effective_trust = clamped_trust;
@@ -1780,6 +2432,7 @@ void MpRoomV2Session::handle_event_locked(const Value &obj, bool is_history) {
       pending.ts_ms = msg.ts_ms;
       pending.sender_account_id = msg.sender_account_id;
       pending.sender_is_guest = sender_is_guest;
+      pending.sender_is_browser = sender_is_browser;
       pending.sender_handle = sender_handle;
       pending.sender_client = msg.sender_client;
       pending.sender_agent_name = msg.sender_agent_name;
@@ -1845,7 +2498,16 @@ void MpRoomV2Session::handle_error_locked(const Value &obj, FrameAction &action)
   const std::string code =
       party_chat_sanitize(json_opt_string(obj, "code").value_or("error"), 48U);
   const std::uint64_t retry_ms = json_u64_or_decimal(obj, "retry_ms").value_or(0U);
-  if (retry_ms > 0U || code == "rate_limited") {
+  if (code == "mls_epoch_stale" && e2ee_mode_ == 1U) {
+    requeue_stale_e2ee_outbox_locked(action);
+  } else if (code == "device_seq_rollback" && e2ee_mode_ == 1U && mls_engine_ &&
+             mls_group_id_.has_value()) {
+    (void)mls_engine_->mark_clone_detected(*mls_group_id_);
+    refresh_mls_status_locked();
+    push_notice_locked(
+        "SECURITY ALERT: Server reported device_seq_rollback — outbound sends frozen.");
+    return;
+  } else if (retry_ms > 0U || code == "rate_limited") {
     action.retry_backoff_ms = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(retry_ms > 0U ? retry_ms : 1000U, 30000U));
     for (auto &pending : outbox_) {
@@ -1857,6 +2519,163 @@ void MpRoomV2Session::handle_error_locked(const Value &obj, FrameAction &action)
   } else {
     push_notice_locked("Party error: " + code);
   }
+}
+
+void MpRoomV2Session::refresh_mls_status_locked() {
+  if (e2ee_mode_ == 1U && mls_engine_ && mls_group_id_.has_value()) {
+    if (const auto st = mls_engine_->room_status(*mls_group_id_, wall_now_ms() / 1000U);
+        st.has_value()) {
+      mls_status_ = st.value();
+    }
+  }
+}
+
+void MpRoomV2Session::requeue_stale_e2ee_outbox_locked(FrameAction &action) {
+  if (e2ee_mode_ != 1U || !mls_engine_ || !mls_group_id_.has_value()) {
+    return;
+  }
+  const std::uint64_t now_s = wall_now_ms() / 1000U;
+  const auto st = mls_engine_->room_status(*mls_group_id_, now_s);
+  if (!st.has_value()) {
+    return;
+  }
+  const std::uint64_t current_epoch = st.value().mls_epoch;
+  bool any_requeued = false;
+  for (auto &pending : outbox_) {
+    if (!pending.is_e2ee) {
+      continue;
+    }
+    if (pending.sent_epoch < current_epoch) {
+      // Re-encrypt in the advanced epoch preserving the EXACT `inner_msg_id[16]`
+      // (§7.2)!
+      auto enc = mls_engine_->encrypt_app(*mls_group_id_, pending.inner_msg_id,
+                                          pending.mls_msg_class,
+                                          pending.plaintext_inner, now_s);
+      if (enc.has_value()) {
+        pending.body = room_b64_encode(enc.value().wire_bytes);
+        pending.sent_epoch = enc.value().mls_epoch;
+        pending.sent_on_current_socket = false;
+        any_requeued = true;
+      }
+    } else {
+      pending.sent_on_current_socket = false;
+      any_requeued = true;
+    }
+  }
+  refresh_mls_status_locked();
+  if (any_requeued) {
+    action.need_flush_outbox = true;
+  }
+}
+
+void MpRoomV2Session::handle_mls_commit_tentative_locked(const Value &obj,
+                                                         FrameAction &action) {
+  if (e2ee_mode_ != 1U || !mls_engine_ || !mls_group_id_.has_value()) {
+    return;
+  }
+  const auto cb64 = json_opt_string(obj, "commit_b64");
+  if (!cb64.has_value() || cb64->empty()) {
+    return;
+  }
+  const auto cbytes = room_b64_decode(*cb64);
+  if (!cbytes.has_value()) {
+    return;
+  }
+  const std::uint64_t parent_epoch =
+      json_u64_or_decimal(obj, "parent_epoch")
+          .value_or(mls_status_.has_value() ? mls_status_->mls_epoch : 0U);
+  const std::uint64_t target_epoch =
+      json_u64_or_decimal(obj, "target_epoch").value_or(parent_epoch + 1U);
+
+  const auto ack_res = mls_engine_->stage_tentative_commit(*mls_group_id_, *cbytes);
+  if (!ack_res.has_value()) {
+    return;
+  }
+  action.pending_commit_ack = PendingCommitAck{
+      parent_epoch,
+      target_epoch,
+      ack_res.value().status,
+      ack_res.value().ack_bytes,
+  };
+}
+
+void MpRoomV2Session::handle_mls_commit_finalized_locked(const Value &obj,
+                                                         FrameAction &action) {
+  if (e2ee_mode_ != 1U || !mls_engine_ || !mls_group_id_.has_value()) {
+    return;
+  }
+  if (const Value *pf = obj.find("proposals"); pf != nullptr) {
+    if (const auto *arr = std::get_if<Value::Array>(&pf->value())) {
+      for (const auto &item : *arr) {
+        if (const auto *ps = std::get_if<std::string>(&item.value())) {
+          if (const auto pbytes = room_b64_decode(*ps); pbytes.has_value()) {
+            (void)mls_engine_->apply_proposal(*mls_group_id_, *pbytes);
+          }
+        }
+      }
+    }
+  }
+  const auto cb64 = json_opt_string(obj, "commit_b64");
+  if (!cb64.has_value() || cb64->empty()) {
+    return;
+  }
+  const auto cbytes = room_b64_decode(*cb64);
+  if (!cbytes.has_value()) {
+    return;
+  }
+  const std::uint64_t now_s = wall_now_ms() / 1000U;
+  const auto fin = mls_engine_->finalize_commit(*mls_group_id_, *cbytes, now_s);
+  if (!fin.has_value()) {
+    if (mp_mls_error_of(fin.error()) == MpMlsError::self_clone_detected) {
+      refresh_mls_status_locked();
+      push_notice_locked(
+          "SECURITY ALERT: Unauthored commit from own device_id — clone suspected!");
+      return;
+    }
+    push_notice_locked("Failed to apply finalized MLS commit (" +
+                       std::string{mp_mls_error_name(mp_mls_error_of(fin.error()))} +
+                       ").");
+    return;
+  }
+  (void)mls_engine_->prune_past_epochs(*mls_group_id_, now_s);
+  refresh_mls_status_locked();
+  requeue_stale_e2ee_outbox_locked(action);
+  rebuild_status_summary_locked();
+}
+
+void MpRoomV2Session::handle_mls_rekey_needed_locked(const Value &obj,
+                                                     FrameAction &action) {
+  if (e2ee_mode_ != 1U || !mls_engine_ || !mls_group_id_.has_value()) {
+    return;
+  }
+  bool applied_proposals = false;
+  if (const Value *pf = obj.find("proposals"); pf != nullptr) {
+    if (const auto *arr = std::get_if<Value::Array>(&pf->value())) {
+      for (const auto &item : *arr) {
+        if (const auto *ps = std::get_if<std::string>(&item.value())) {
+          if (const auto pbytes = room_b64_decode(*ps); pbytes.has_value()) {
+            if (mls_engine_->apply_proposal(*mls_group_id_, *pbytes).has_value()) {
+              applied_proposals = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (json_opt_bool(obj, "is_elected_committer")) {
+    if (auto c = mls_engine_->commit_pending_or_self_update(*mls_group_id_,
+                                                            applied_proposals);
+        c.has_value()) {
+      action.pending_rekey_commit = std::move(c).value();
+    }
+  }
+  refresh_mls_status_locked();
+  push_notice_locked("MLS rekey required for room.");
+}
+
+void MpRoomV2Session::handle_mls_welcome_ready_locked(const Value &obj) {
+  (void)obj;
+  push_notice_locked("MLS Welcome ready for room.");
 }
 
 void MpRoomV2Session::handle_text_frame_locked(std::string_view json_text,
@@ -1885,6 +2704,14 @@ void MpRoomV2Session::handle_text_frame_locked(std::string_view json_text,
     handle_presence_locked(obj);
   } else if (*type == "error") {
     handle_error_locked(obj, action);
+  } else if (*type == "mls_commit_tentative") {
+    handle_mls_commit_tentative_locked(obj, action);
+  } else if (*type == "mls_commit_finalized") {
+    handle_mls_commit_finalized_locked(obj, action);
+  } else if (*type == "mls_rekey_needed") {
+    handle_mls_rekey_needed_locked(obj, action);
+  } else if (*type == "mls_welcome_ready") {
+    handle_mls_welcome_ready_locked(obj);
   }
 }
 
@@ -2114,6 +2941,38 @@ void MpRoomV2Session::worker_loop(const std::stop_token &stop_token) {
       {
         std::lock_guard<std::mutex> lock(state_mu_);
         handle_text_frame_locked(text->payload, action);
+      }
+      if (action.force_disconnect) {
+        (void)active_sock.close(1008U);
+        socket_.reset();
+        signal_wake();
+        break;
+      }
+      if (action.pending_commit_ack.has_value()) {
+        const auto &ack = *action.pending_commit_ack;
+        Value::Object ack_frame;
+        ack_frame.emplace_back("v", Value{Number{std::uint64_t{2U}}});
+        ack_frame.emplace_back("t", Value{"mls_commit_ack"});
+        ack_frame.emplace_back("parent_epoch", Value{Number{ack.parent_epoch}});
+        ack_frame.emplace_back("target_epoch", Value{Number{ack.target_epoch}});
+        ack_frame.emplace_back("status",
+                               Value{Number{static_cast<std::uint64_t>(ack.status)}});
+        ack_frame.emplace_back("ack_b64", Value{room_b64_encode(ack.ack_bytes)});
+        if (const auto dumped = dump_json(Value::object(std::move(ack_frame)));
+            dumped.has_value()) {
+          (void)active_sock.send_text(dumped.value());
+        }
+      }
+      if (action.pending_rekey_commit.has_value()) {
+        Value::Object cframe;
+        cframe.emplace_back("v", Value{Number{std::uint64_t{2U}}});
+        cframe.emplace_back("t", Value{"mls_commit"});
+        cframe.emplace_back("commit_b64",
+                            Value{room_b64_encode(*action.pending_rekey_commit)});
+        if (const auto dumped = dump_json(Value::object(std::move(cframe)));
+            dumped.has_value()) {
+          (void)active_sock.send_text(dumped.value());
+        }
       }
       if (action.retry_backoff_ms > 0U) {
         rate_limit_until =

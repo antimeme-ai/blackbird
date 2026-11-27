@@ -17,6 +17,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod mls_ffi;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};

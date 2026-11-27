@@ -123,6 +123,17 @@ struct PartyPendingMention {
   bool operator==(const PartyPendingMention &) const = default;
 };
 
+struct PartyMlsStatus {
+  std::uint64_t mls_epoch = 0U;
+  std::uint32_t trust_tier = 0U; // 0..3 (Tier 0..Tier 3)
+  bool has_declared_agent = false;
+  bool has_pending_removals = false;
+  bool clone_detected = false;
+  std::string epoch_authenticator; // 6x4 Crockford Base32 (29 chars)
+
+  bool operator==(const PartyMlsStatus &) const = default;
+};
+
 struct PartyMessage {
   std::string id;
   std::int64_t timestamp_ns = 0;
@@ -202,6 +213,7 @@ struct PartySnapshot {
   bool known_peers_present = false;
   bool compact_room_presentation = false;
   std::optional<PartyPendingMention> pending_mention;
+  std::optional<PartyMlsStatus> mls_status;
 
   std::size_t operator_count() const noexcept;
   std::size_t online_operator_count() const noexcept;

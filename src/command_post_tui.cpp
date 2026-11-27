@@ -2899,14 +2899,18 @@ std::string handle_online_party(std::string_view rest, const OnlineEnvConfig &en
   if (action == "join") {
     const auto [target, extra] = split_first_token(tail);
     if (target.empty() || !extra.empty())
-      return "Usage: /online party join <party_id|mppi1_...>\n";
+      return "Usage: /online party join <invite-url|party_id|mppi1_...>\n";
     std::optional<mp::PartyId> pid;
     std::optional<std::string> invite_link;
     CleanseOptionalStringGuard invite_guard{invite_link};
-    if (target.starts_with("mppi1_")) {
+    if (auto frag = mp::parse_fragment_invite_url(target); frag.has_value()) {
+      pid = frag->party_id;
+      invite_link = std::move(frag->canonical_url);
+    } else if (target.starts_with("mppi1_")) {
       auto parsed = parse_online_party_invite_link(target);
       if (!parsed.has_value()) {
         return "Invalid online party invite link (expected "
+               "https://multiplayer.tech/p/i/<party_id>#<secret> or "
                "mppi1_<party_id>_<secret>)\n";
       }
       pid = parsed->party_id;
@@ -2914,7 +2918,8 @@ std::string handle_online_party(std::string_view rest, const OnlineEnvConfig &en
     } else {
       const auto parsed = mp::PartyId::parse_decimal(target);
       if (!parsed.has_value()) {
-        return "Invalid party_id: '" + sanitize_inline(target, 64) + "'\n";
+        return "Invalid party_id: '" +
+               sanitize_inline(mp::redact_invite_secrets(target), 64) + "'\n";
       }
       pid = parsed.value();
     }

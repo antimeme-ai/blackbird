@@ -1,5 +1,9 @@
 #include "blackbird/mp_protocol.hpp"
 
+#if defined(BLACKBIRD_HAS_MLS) && BLACKBIRD_HAS_MLS
+#include "blackbird_mls_abi.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -2180,6 +2184,67 @@ Result<std::string> compute_safety_number(AccountId account_id,
   return Result<std::string>::success(std::move(out));
 }
 
+Result<std::string> compute_safety_number_v2(AccountId account_id,
+                                             const Ed25519PubKey &root_pubkey,
+                                             std::uint8_t custody_mode) {
+  if (custody_mode > 1U) {
+    return fail<std::string>(ErrorCode::invalid_range, MpError::invalid_public_key);
+  }
+  if (const auto valid = validate_ed25519_pubkey_strict(root_pubkey);
+      !valid.has_value()) {
+    return Result<std::string>::failure(valid.error());
+  }
+#if defined(BLACKBIRD_HAS_MLS) && BLACKBIRD_HAS_MLS
+  char code_buf[BB_MLS_SAFETY_NUMBER_V2_LEN + 1U]{};
+  const BbMlsStatus st = bb_mls_safety_number_v2(account_id.value(), root_pubkey.data(),
+                                                 custody_mode, code_buf);
+  if (st != BB_MLS_OK) {
+    return fail<std::string>(ErrorCode::external_unknown, MpError::crypto_internal);
+  }
+  return Result<std::string>::success(std::string{code_buf});
+#else
+  static constexpr std::string_view kDomain = "mp-safety-v2:";
+  static_assert(kDomain.size() == 13U);
+
+  std::array<std::uint8_t, kDomain.size() + 8U + 32U + 1U> preimage{};
+  static_assert(preimage.size() == 54U);
+  std::memcpy(preimage.data(), kDomain.data(), kDomain.size());
+  const std::uint64_t acct_val = account_id.value();
+  for (std::size_t i = 0U; i < 8U; ++i) {
+    preimage[kDomain.size() + i] =
+        static_cast<std::uint8_t>((acct_val >> ((7U - i) * 8U)) & 0xffU);
+  }
+  std::memcpy(preimage.data() + kDomain.size() + 8U, root_pubkey.data(),
+              root_pubkey.size());
+  preimage[kDomain.size() + 8U + 32U] = custody_mode;
+
+  const auto digest = sha256(preimage);
+  if (!digest.has_value()) {
+    return Result<std::string>::failure(digest.error());
+  }
+  static constexpr std::string_view kCrockfordBase32 =
+      "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  std::string out;
+  out.reserve(kSafetyNumberFormattedLength);
+  for (std::size_t chunk = 0U; chunk < 4U; ++chunk) {
+    const std::size_t base = chunk * 5U;
+    std::uint64_t bits = 0U;
+    for (std::size_t byte_idx = 0U; byte_idx < 5U; ++byte_idx) {
+      bits = (bits << 8U) | static_cast<std::uint64_t>(digest.value()[base + byte_idx]);
+    }
+    for (std::size_t sym = 0U; sym < 8U; ++sym) {
+      if (!out.empty() && (((chunk * 8U) + sym) % 4U) == 0U) {
+        out.push_back('-');
+      }
+      const std::size_t shift = (7U - sym) * 5U;
+      const auto index = static_cast<std::size_t>((bits >> shift) & 0x1fU);
+      out.push_back(kCrockfordBase32[index]);
+    }
+  }
+  return Result<std::string>::success(std::move(out));
+#endif
+}
+
 namespace {
 
 inline constexpr std::string_view kCrockfordBase32Alphabet =
@@ -3691,9 +3756,11 @@ Result<void> validate_path_and_query(const HttpTarget &target) {
     }
   }
   if (target.query.size() > 1U) {
-    const bool allowed =
-        target.method == HttpMethod::get &&
-        (target.path == "/v1/accounts/resolve" || is_party_requests_path(target.path));
+    const bool is_mls_commits = target.path.starts_with("/v1/parties/") &&
+                                target.path.ends_with("/mls/commits");
+    const bool allowed = target.method == HttpMethod::get &&
+                         (target.path == "/v1/accounts/resolve" ||
+                          is_party_requests_path(target.path) || is_mls_commits);
     if (!allowed) {
       return fail_void(ErrorCode::invalid_identity, MpError::rfc9421_query_not_allowed);
     }

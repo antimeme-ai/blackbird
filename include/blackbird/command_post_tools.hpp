@@ -18,6 +18,7 @@ struct LivePartyMemberInfo {
   std::string handle;
   std::optional<std::uint64_t> account_id;
   bool is_guest = false;
+  bool is_browser = false;
   bool is_self = false;
   std::string clients;
   std::string state;
@@ -39,6 +40,7 @@ struct LivePartyMessageInfo {
   std::string sender_handle;
   std::optional<std::uint64_t> sender_account_id;
   bool sender_is_guest = false;
+  bool sender_is_browser = false;
   std::string sender_client;
   std::string sender_agent_name;
   std::string target = "@all";
@@ -50,6 +52,7 @@ struct LivePartyMessageInfo {
 
 struct LivePartyRoomState {
   bool connected = false;
+  std::optional<std::uint64_t> party_id;
   std::string state_name;
   std::string room_code;
   std::string room_name;

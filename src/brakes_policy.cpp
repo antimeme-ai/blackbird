@@ -2053,6 +2053,35 @@ PartyTrustProfile TurnTaintState::ingest(const PeerProvenance &provenance,
   return ingest(provenance, policy.party_trust);
 }
 
+PartyTrustProfile
+TurnTaintState::latch_from(const TurnTaintState &other,
+                           const PartyTrustSectionPolicy &policy) noexcept {
+  if (!other.has_peer_data()) {
+    return effective_trust_;
+  }
+  PartyTrustProfile clamped =
+      std::min(other.effective_trust(), policy.max_peer_override);
+  if (other.external_guest_seen()) {
+    clamped = std::min(clamped, policy.max_external_guest_profile);
+    external_guest_seen_ = true;
+  }
+  peer_ingested_ = true;
+  effective_trust_ = std::min(effective_trust_, clamped);
+  ingested_count_ = std::max(ingested_count_, other.ingested_count());
+  if (other.last_origin() != PeerOriginKind::local_operator) {
+    last_origin_ = other.last_origin();
+  }
+  if (!other.last_safety_number().empty()) {
+    last_safety_number_ = other.last_safety_number();
+  }
+  return effective_trust_;
+}
+
+PartyTrustProfile TurnTaintState::latch_from(const TurnTaintState &other,
+                                             const EffectivePolicy &policy) noexcept {
+  return latch_from(other, policy.party_trust);
+}
+
 void TurnTaintState::reset_by_operator() noexcept {
   peer_ingested_ = false;
   external_guest_seen_ = false;

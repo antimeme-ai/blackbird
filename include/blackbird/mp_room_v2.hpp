@@ -3,6 +3,7 @@
 #include "blackbird/brakes_policy.hpp"
 #include "blackbird/foundation.hpp"
 #include "blackbird/mp_client.hpp"
+#include "blackbird/mp_mls.hpp"
 #include "blackbird/mp_protocol.hpp"
 #include "blackbird/party_chat.hpp"
 
@@ -48,6 +49,9 @@ enum class MpRoomV2Error : std::int64_t {
   wake_pipe_failed = 2306,
   protocol_error = 2307,
   secret_rejected = 2308,
+  mls_unavailable = 2309,
+  mls_encrypt_failed = 2310,
+  mls_send_blocked = 2311,
 };
 
 constexpr MpRoomV2Error mp_room_v2_error_of(const Error &error) noexcept {
@@ -88,8 +92,13 @@ struct MpRoomV2AgentCard {
 };
 
 // Returns true when `text` contains recognizable multiplayer/provider secret
-// tokens (`mprk1_`, `mpinv1_`, `mppi1_`, `mpcs1_`, `mpguest1_`, PEM keys, etc.).
+// tokens (`mprk1_`, `mpinv1_`, `mppi1_`, `mpcs1_`, `mpguest1_`, `mpws1_`,
+// canonical `#<secret>` fragment invite URLs, PEM keys, etc.).
 bool mp_room_v2_contains_secret_token(std::string_view text) noexcept;
+
+// Returns true when a member/sender client tag identifies a browser participant
+// (`"web"` or `"browser"`, case-insensitive).
+bool mp_room_v2_is_browser_client(std::string_view client) noexcept;
 
 // Returns true when `status` is one of "done"|"working"|"testing"|"blocked"|"error".
 bool mp_room_v2_valid_agent_card_status(std::string_view status) noexcept;
@@ -114,6 +123,7 @@ struct MpRoomV2PendingMention {
   std::uint64_t ts_ms = 0U;
   std::optional<mp::AccountId> sender_account_id;
   bool sender_is_guest = false;
+  bool sender_is_browser = false;
   std::string sender_handle;
   std::string sender_client;
   std::string sender_agent_name;
@@ -154,6 +164,7 @@ struct MpRoomV2StatusUpdate {
 struct MpRoomV2Member {
   std::optional<mp::AccountId> account_id;
   bool is_guest = false;
+  bool is_browser = false;
   std::string handle;
   std::string client;
   std::string agent_name;
@@ -171,6 +182,7 @@ struct MpRoomV2Message {
   std::string client_msg_id;
   std::optional<mp::AccountId> sender_account_id;
   bool sender_is_guest = false;
+  bool sender_is_browser = false;
   std::string sender_handle;
   std::string sender_client;
   std::string sender_agent_name;
@@ -202,6 +214,9 @@ struct MpRoomV2Config {
   std::uint32_t reconnect_base_ms = kMpRoomV2DefaultReconnectBaseMs;
   std::uint32_t reconnect_max_ms = kMpRoomV2DefaultReconnectMaxMs;
   std::size_t max_retained_messages = kMpRoomV2DefaultMaxRetainedMessages;
+  std::uint8_t e2ee_mode = 0U; // 0=legacy plaintext, 1=mandatory MLS E2EE
+  std::shared_ptr<MpMlsEngine> mls_engine;
+  std::optional<MlsGroupId> mls_group_id;
 };
 
 struct MpRoomV2Snapshot {
@@ -219,6 +234,8 @@ struct MpRoomV2Snapshot {
   std::vector<MpRoomV2PendingMention> mention_alerts;
   std::optional<MpRoomV2PendingMention> pending_agent_mention;
   std::string status_summary;
+  std::uint8_t e2ee_mode = 0U;
+  std::optional<MpMlsRoomStatus> mls_status;
 
   bool operator==(const MpRoomV2Snapshot &) const = default;
 };
@@ -238,6 +255,18 @@ private:
     std::string body_encoding;
     std::string body;
     bool sent_on_current_socket = false;
+    bool is_e2ee = false;
+    MlsInnerMsgId inner_msg_id{};
+    MpMlsMsgClass mls_msg_class = MpMlsMsgClass::chat;
+    std::vector<std::uint8_t> plaintext_inner;
+    std::uint64_t sent_epoch = 0U;
+  };
+
+  struct PendingCommitAck {
+    std::uint64_t parent_epoch = 0U;
+    std::uint64_t target_epoch = 0U;
+    std::uint8_t status = 1U;
+    std::vector<std::uint8_t> ack_bytes;
   };
 
   struct InitParams {
@@ -306,6 +335,9 @@ private:
     std::uint64_t resume_seq = 0U;
     bool need_flush_outbox = false;
     std::uint32_t retry_backoff_ms = 0U;
+    bool force_disconnect = false;
+    std::optional<PendingCommitAck> pending_commit_ack;
+    std::optional<std::vector<std::uint8_t>> pending_rekey_commit;
   };
 
   void start_worker();
@@ -316,6 +348,12 @@ private:
   void handle_ack_locked(const Value &obj);
   void handle_presence_locked(const Value &obj);
   void handle_error_locked(const Value &obj, FrameAction &action);
+  void handle_mls_commit_tentative_locked(const Value &obj, FrameAction &action);
+  void handle_mls_commit_finalized_locked(const Value &obj, FrameAction &action);
+  void handle_mls_rekey_needed_locked(const Value &obj, FrameAction &action);
+  void handle_mls_welcome_ready_locked(const Value &obj);
+  void requeue_stale_e2ee_outbox_locked(FrameAction &action);
+  void refresh_mls_status_locked();
   void apply_members_locked(const std::vector<MpRoomV2Member> &members);
   void upsert_message_locked(MpRoomV2Message msg);
   void push_notice_locked(std::string_view notice);
@@ -336,18 +374,16 @@ private:
   mp::MpControlClient client_;
   std::optional<mp::MpControlSocket> socket_;
 
-  // Immutable session config.
+  // Immutable session config (8-byte aligned members grouped first).
   mp::PartyId party_id_;
   std::optional<mp::AccountId> local_account_id_;
+  std::optional<mp::DeviceId> local_device_id_;
+  std::shared_ptr<MpMlsEngine> mls_engine_;
   std::string ws_path_;
   std::string local_handle_;
   std::string client_name_;
   std::string agent_name_;
   std::size_t max_retained_messages_ = kMpRoomV2DefaultMaxRetainedMessages;
-  std::uint32_t poll_interval_ms_ = kMpRoomV2DefaultPollMs;
-  std::uint32_t ping_interval_ms_ = kMpRoomV2DefaultPingIntervalMs;
-  std::uint32_t reconnect_base_ms_ = kMpRoomV2DefaultReconnectBaseMs;
-  std::uint32_t reconnect_max_ms_ = kMpRoomV2DefaultReconnectMaxMs;
 
   // Wake pipe & lifecycle protection.
   std::mutex lifecycle_mu_;
@@ -355,7 +391,6 @@ private:
 
   // Shared state protected by state_mu_.
   mutable std::mutex state_mu_;
-  MpRoomV2State state_ = MpRoomV2State::connecting;
   std::string room_code_;
   std::string room_name_;
   std::string share_url_;
@@ -372,15 +407,26 @@ private:
   std::deque<MpRoomV2PendingMention> mention_alerts_;
   std::optional<MpRoomV2PendingMention> pending_agent_mention_;
   brakes::BrakesGate brakes_gate_;
+  std::optional<MpMlsRoomStatus> mls_status_;
   std::string status_summary_;
-  bool connected_once_ = false;
   std::uint64_t local_msg_counter_ = 0U;
+  std::atomic<std::uint64_t> latest_seq_atomic_{0U};
 
+  // 4-byte aligned members grouped together.
+  std::uint32_t poll_interval_ms_ = kMpRoomV2DefaultPollMs;
+  std::uint32_t ping_interval_ms_ = kMpRoomV2DefaultPingIntervalMs;
+  std::uint32_t reconnect_base_ms_ = kMpRoomV2DefaultReconnectBaseMs;
+  std::uint32_t reconnect_max_ms_ = kMpRoomV2DefaultReconnectMaxMs;
   std::atomic<int> wake_read_fd_{-1};
   std::atomic<int> wake_write_fd_{-1};
+
+  // 1-byte aligned members grouped together to minimize struct padding.
+  std::uint8_t e2ee_mode_ = 0U;
+  MpRoomV2State state_ = MpRoomV2State::connecting;
+  bool connected_once_ = false;
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> stopped_{false};
-  std::atomic<std::uint64_t> latest_seq_atomic_{0U};
+  std::optional<MlsGroupId> mls_group_id_;
 
   // Declared last so it joins first on destruction.
   std::jthread worker_thread_;

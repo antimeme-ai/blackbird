@@ -508,6 +508,7 @@ struct RoomInviteResponse {
 struct RoomMemberInfo {
   std::optional<AccountId> account_id;
   bool is_guest = false;
+  bool is_browser = false;
   std::string handle;
   std::string client;
   std::string agent_name;
@@ -516,6 +517,32 @@ struct RoomMemberInfo {
   std::string status;
   bool operator==(const RoomMemberInfo &) const = default;
 };
+
+struct ParsedFragmentInviteUrl {
+  PartyId party_id = PartyId::create(1U).value();
+  std::string secret;
+  std::string canonical_url;
+  bool operator==(const ParsedFragmentInviteUrl &) const = default;
+};
+
+// Parses canonical fragment invite URLs:
+//   https://multiplayer.tech/p/i/<party_id>#<secret>
+//   https://clank.party/i/<party_id>#<secret>
+// Rejects non-HTTPS, userinfo, query strings, extra path segments, invalid
+// party_id, or empty/malformed/non-base64url fragment secrets.
+std::optional<ParsedFragmentInviteUrl> parse_fragment_invite_url(std::string_view raw);
+
+// Replaces any `#<secret>` fragment on canonical invite URLs (`multiplayer.tech/p/i/`
+// or `clank.party/i/`) with `#[REDACTED]` so invite secrets are never printed
+// or written to terminal output, prompt history, or audit logs.
+std::string redact_invite_secrets(std::string_view text);
+
+// Returns true when `url` is a non-empty share URL that is NOT a broken empty-code
+// root URL (such as `https://clank.party/` or `https://multiplayer.tech/p/`).
+bool is_usable_room_share_url(std::string_view url) noexcept;
+
+// Formats either `Room code: <code>` (when non-empty) or `party #<id>` (when empty).
+std::string format_room_display_label(PartyId party_id, std::string_view room_code);
 
 struct RoomEnterRequest {
   std::string target;
@@ -601,6 +628,126 @@ struct RenewDeviceCwtResponse {
   std::vector<std::uint8_t> device_cwt;
   std::uint64_t cwt_expires_ms = 0U;
   bool operator==(const RenewDeviceCwtResponse &) const = default;
+};
+
+// ---------------------------------------------------------------------------
+// 2c. MLS E2EE Control-Plane REST DTOs (`mp2-mls-v1`)
+// ---------------------------------------------------------------------------
+
+struct MlsReserveDeviceRequest {
+  Ed25519PubKey mls_sig_pubkey{};
+  std::uint8_t client_class = 1U;
+  bool agent_capable = true;
+  std::string device_label;
+};
+
+struct MlsReserveDeviceResponse {
+  DeviceId device_id = DeviceId::create(1U).value();
+  std::uint32_t root_gen = 1U;
+  std::uint32_t device_gen = 1U;
+  bool operator==(const MlsReserveDeviceResponse &) const = default;
+};
+
+struct MlsUploadDeviceBindingRequest {
+  std::vector<std::uint8_t> device_binding; // exact 236B MpMlsDeviceBindingV1
+};
+
+struct MlsPublishDeviceListRequest {
+  std::vector<std::uint8_t> device_list; // canonical AccountDeviceListV1
+};
+
+struct MlsInitPartyRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::array<std::uint8_t, 24> group_id{};
+  std::vector<std::uint8_t> group_info_bytes;
+};
+
+struct MlsInitPartyResponse {
+  std::uint64_t mls_epoch = 0U;
+  Ed25519PubKey ds_pubkey{};
+  bool operator==(const MlsInitPartyResponse &) const = default;
+};
+
+struct MlsRegisterInviteRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::uint64_t invite_id = 0U;
+  std::array<std::uint8_t, 32> server_token_hash{};
+  std::uint32_t max_uses = 1U;
+  std::uint64_t expires_at_ms = 0U;
+};
+
+struct MlsRegisterInviteResponse {
+  std::uint64_t invite_id = 0U;
+  std::uint64_t invite_epoch = 0U;
+  bool operator==(const MlsRegisterInviteResponse &) const = default;
+};
+
+struct MlsJoinPartyRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::uint64_t invite_id = 0U;
+  std::array<std::uint8_t, 32> server_invite_token{};
+  std::array<std::uint8_t, 32> kp_ref{};
+  std::vector<std::uint8_t> kp_bytes;
+  std::array<std::uint8_t, 32> join_proof{};
+};
+
+struct MlsSubmitCommitRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::uint64_t parent_epoch = 0U;
+  std::vector<std::uint8_t> commit_bytes;
+  std::optional<std::vector<std::uint8_t>> welcome_bytes;
+  std::optional<std::vector<std::uint8_t>> welcome_auth_bytes;
+  std::optional<DeviceId> welcome_target_device_id;
+};
+
+struct MlsSubmitCommitResponse {
+  std::uint64_t target_epoch = 0U;
+  bool finalized = false;
+  std::string commit_sha256_hex;
+  bool operator==(const MlsSubmitCommitResponse &) const = default;
+};
+
+struct MlsSubmitCommitAckRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::uint64_t parent_epoch = 0U;
+  std::uint64_t target_epoch = 0U;
+  std::uint8_t status = 1U; // 1=OK, 2=REJECT
+  std::vector<std::uint8_t> ack_bytes;
+};
+
+struct MlsCatchupCommit {
+  std::uint64_t epoch = 0U;
+  std::vector<std::uint8_t> commit_bytes;
+  std::vector<std::vector<std::uint8_t>> referenced_proposals;
+  bool operator==(const MlsCatchupCommit &) const = default;
+};
+
+struct MlsFetchCommitsRequest {
+  PartyId party_id = PartyId::create(1U).value();
+  std::uint64_t from_epoch = 0U;
+  std::uint32_t limit = 32U;
+};
+
+struct MlsFetchCommitsResponse {
+  std::uint64_t head_epoch = 0U;
+  std::vector<MlsCatchupCommit> commits;
+  bool operator==(const MlsFetchCommitsResponse &) const = default;
+};
+
+struct MlsWelcomeResponse {
+  bool available = false;
+  std::uint64_t target_epoch = 0U;
+  std::vector<std::uint8_t> welcome_bytes;
+  std::vector<std::uint8_t> welcome_auth_bytes;
+  Ed25519PubKey ds_pubkey{};
+  bool operator==(const MlsWelcomeResponse &) const = default;
+};
+
+struct MlsDeviceListEntry {
+  AccountId account_id = AccountId::create(1U).value();
+  Ed25519PubKey root_pubkey{};
+  std::vector<std::uint8_t> device_list_bytes;
+  bool operator==(const MlsDeviceListEntry &) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -763,6 +910,24 @@ public:
   Result<AuthSessionPollResponse>
   auth_session_poll(const AuthSessionPollRequest &request);
   Result<RenewDeviceCwtResponse> renew_device_cwt();
+
+  // MLS E2EE Control-Plane HTTPS endpoints (`mp2-mls-v1`)
+  Result<MlsReserveDeviceResponse>
+  mls_reserve_device(const MlsReserveDeviceRequest &request);
+  Result<void> mls_upload_device_binding(const MlsUploadDeviceBindingRequest &request);
+  Result<void> mls_publish_device_list(const MlsPublishDeviceListRequest &request);
+  Result<MlsInitPartyResponse> mls_init_party(const MlsInitPartyRequest &request);
+  Result<MlsRegisterInviteResponse>
+  mls_register_invite(const MlsRegisterInviteRequest &request);
+  Result<void> mls_join_party(const MlsJoinPartyRequest &request);
+  Result<MlsSubmitCommitResponse>
+  mls_submit_commit(const MlsSubmitCommitRequest &request);
+  Result<void> mls_submit_commit_ack(const MlsSubmitCommitAckRequest &request);
+  Result<MlsFetchCommitsResponse>
+  mls_fetch_commits(const MlsFetchCommitsRequest &request);
+  Result<MlsWelcomeResponse> mls_fetch_welcome(PartyId party_id);
+  Result<void> mls_ack_welcome(PartyId party_id, std::uint64_t target_epoch);
+  Result<std::vector<MlsDeviceListEntry>> mls_fetch_device_lists(PartyId party_id);
 
   // Live RFC 6455 WebSockets (automatically retry once on clock_skew)
   Result<MpControlSocket> connect_account_socket();

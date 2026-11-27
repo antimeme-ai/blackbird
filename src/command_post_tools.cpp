@@ -3781,7 +3781,8 @@ Value handle_party_chat(const Value &arguments, const CommandPostToolContext &co
       Value::Object item{
           {"handle", Value{sanitize_untrusted_text(m.handle, 64)}},
           {"is_guest", Value{m.is_guest}},
-          {"is_self", Value{m.is_self}},
+          {"is_browser", Value{m.is_browser}},
+          {"is_self", Value{m.is_self && !m.is_browser && !m.is_guest}},
           {"clients", Value{sanitize_untrusted_text(m.clients, 64)}},
           {"state", Value{sanitize_untrusted_text(m.state, 24)}},
       };
@@ -3819,6 +3820,9 @@ Value handle_party_chat(const Value &arguments, const CommandPostToolContext &co
         {"member_count", Value{Number{st.members.size()}}},
         {"members", Value{build_members_array(st.members)}},
     };
+    if (st.party_id.has_value()) {
+      out.emplace_back("party_id", Value{Number{*st.party_id}});
+    }
     if (!st.connected) {
       out.emplace_back("hint",
                        Value{"Operator is not currently in a live online party room "
@@ -3881,10 +3885,30 @@ Value handle_party_chat(const Value &arguments, const CommandPostToolContext &co
       const std::string clean_kind = sanitize_untrusted_text(m.kind, 32);
       const std::string quoted_body = escape_and_quote_peer_text(m.body, 4096);
 
+      const std::string clean_client = sanitize_untrusted_text(m.sender_client, 32);
+      const auto is_browser_client = [](std::string_view c) noexcept {
+        if (c.size() != 3U && c.size() != 7U)
+          return false;
+        auto lower = [](char ch) noexcept {
+          return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+        };
+        const std::string_view expected = c.size() == 3U ? "web" : "browser";
+        for (std::size_t k = 0U; k < c.size(); ++k) {
+          if (lower(c[k]) != expected[k])
+            return false;
+        }
+        return true;
+      };
+      const bool sender_is_browser =
+          m.sender_is_browser || is_browser_client(clean_client);
+      const bool trusted_local_self =
+          m.local_self && !m.sender_is_guest && !sender_is_browser;
+
       Value::Object prov{
           {"sender_handle", Value{clean_sender}},
           {"sender_is_guest", Value{m.sender_is_guest}},
-          {"sender_client", Value{sanitize_untrusted_text(m.sender_client, 32)}},
+          {"sender_is_browser", Value{sender_is_browser}},
+          {"sender_client", Value{clean_client}},
       };
       if (m.sender_account_id.has_value())
         prov.emplace_back("sender_account_id", Value{Number{*m.sender_account_id}});
@@ -3895,11 +3919,11 @@ Value handle_party_chat(const Value &arguments, const CommandPostToolContext &co
           {"sender_handle", Value{clean_sender}},
           {"target", Value{clean_target}},
           {"kind", Value{clean_kind}},
-          {"local_self", Value{m.local_self}},
+          {"local_self", Value{trusted_local_self}},
           {"provenance", Value::object(std::move(prov))},
       };
 
-      if (m.local_self) {
+      if (trusted_local_self) {
         item.emplace_back("untrusted_peer_data", Value{false});
         item.emplace_back("body", Value{sanitize_untrusted_text(m.body, 4096)});
       } else {

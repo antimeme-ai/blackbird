@@ -6,6 +6,7 @@
 #include "blackbird/flight_deck_hero.hpp"
 #include "blackbird/json.hpp"
 #include "blackbird/local_timing.hpp"
+#include "blackbird/mp_client.hpp"
 #include "blackbird/os_sandbox.hpp"
 #include "blackbird/packet.hpp"
 #include "blackbird/process_lifetime.hpp"
@@ -2047,10 +2048,16 @@ InputResult Composer::feed(char byte, RawUiInput *raw, bool inspecting) {
     auto result = feed_impl(byte, raw, inspecting);
     if (!result.source.record.ordinal) {
       const auto action = result.action;
-      const auto length = result.text.size();
       if (action == InputAction::choose_command || action == InputAction::submit ||
           action == InputAction::select_view ||
           action == InputAction::answer_question || action == InputAction::party_send) {
+        std::string redacted_storage;
+        std::string_view logged_text = result.text;
+        if (result.text.find('#') != std::string::npos) {
+          redacted_storage = mp::redact_invite_secrets(result.text);
+          logged_text = redacted_storage;
+        }
+        const auto logged_length = logged_text.size();
         const auto ref =
             raw_ui_emit(4010,
                         std::array{ByteView{raw->feed.lane},
@@ -2059,12 +2066,12 @@ InputResult Composer::feed(char byte, RawUiInput *raw, bool inspecting) {
                                    detail::raw_native_field(action),
                                    detail::raw_native_field(cursor_),
                                    detail::raw_native_field(text_.size()),
-                                   detail::raw_native_field(length),
-                                   detail::raw_string_field(result.text)},
+                                   detail::raw_native_field(logged_length),
+                                   detail::raw_string_field(logged_text)},
                         RawPartition::data, raw->data);
         if (!ref.ordinal)
           throw Error{ErrorCode::audit_unavailable};
-        result.source = {ref, 0, length};
+        result.source = {ref, 0, logged_length};
       } else {
         const auto ref =
             raw_ui_emit(4010,
@@ -2489,16 +2496,23 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
       slash_open_ = false;
     }
     auto result = text_;
+    std::string redacted_storage;
+    std::string_view logged_result = result;
+    if (result.find('#') != std::string::npos) {
+      redacted_storage = mp::redact_invite_secrets(result);
+      logged_result = redacted_storage;
+    }
     if (raw && raw->enabled && raw_enabled()) {
       const auto action = InputAction::submit;
-      const auto length = result.size();
+      const auto length = logged_result.size();
       const auto ref = raw_ui_emit(
           4010,
           std::array{
               ByteView{raw->feed.lane}, detail::raw_native_field(raw->feed.ordinal),
               detail::raw_native_field(raw->index), detail::raw_native_field(action),
               detail::raw_native_field(cursor_), detail::raw_native_field(text_.size()),
-              detail::raw_native_field(length), detail::raw_string_field(result)},
+              detail::raw_native_field(length),
+              detail::raw_string_field(logged_result)},
           RawPartition::data, raw->data);
       if (!ref.ordinal)
         throw Error{ErrorCode::audit_unavailable};
@@ -2506,7 +2520,7 @@ InputResult Composer::feed_impl(char byte, RawUiInput *raw, bool inspecting) {
     }
     if (!result.empty() && result != "/quit" && result != "/exit" &&
         !terminal_is_bang_shell_command(result)) {
-      history_.push_back(result);
+      history_.push_back(redacted_storage.empty() ? result : redacted_storage);
       history_capture_bound_ = trim_history(history_);
     }
     text_.clear();
@@ -3860,7 +3874,8 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
         return returned(false);
       }
       launch.stage(4);
-      transcript.append(ChatKind::user, prompt, false, original.record);
+      transcript.append(ChatKind::user, mp::redact_invite_secrets(prompt), false,
+                        original.record);
       if (transfer)
         transfer->stage_before_launch();
       busy = true;

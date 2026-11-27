@@ -128,7 +128,10 @@ jobs:
             sudo make -C "$tmpdir/lua-5.5.1" install
           fi
 
-      - name: Verify Rust/Cargo toolchain for iroh P2P support
+      - name: Install stable Rust toolchain (>= 1.91 for edition 2024 / OpenMLS)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Rust/Cargo toolchain for iroh P2P and MLS support
         shell: bash
         run: |
           set -euo pipefail

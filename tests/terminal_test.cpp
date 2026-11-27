@@ -1219,6 +1219,27 @@ int main() {
       ::close(master);
     }
 
+    // Composer submission of canonical #fragment invite URLs MUST return the full
+    // raw URL (preserving `#<secret>` for `/join`) while NEVER storing `<secret>`
+    // in prompt history.
+    {
+      Composer frag_composer;
+      const std::string secret = "SecretFragToken_0123456789abcdef0123456789a";
+      const std::string cmd = "/join https://multiplayer.tech/p/i/9876543210#" + secret;
+      frag_composer.draft(cmd);
+      const auto res = frag_composer.feed('\r');
+      require(res.action == InputAction::submit, "composer submit action");
+      require(res.text == cmd,
+              "composer submit must pass raw #fragment URL to /join intact");
+      const auto st = frag_composer.state();
+      require(st.history.size() == 1U, "composer history records submitted command");
+      require(st.history[0].find(secret) == std::string::npos,
+              "composer history MUST NEVER store #fragment invite secret");
+      require(st.history[0] ==
+                  "/join https://multiplayer.tech/p/i/9876543210#[REDACTED]",
+              "composer history must redact #fragment invite secret");
+    }
+
     std::filesystem::remove_all(dir);
 
   } catch (const std::exception &e) {
