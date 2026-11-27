@@ -242,6 +242,11 @@ BbMlsStatus bb_mls_prepare_join(BbMlsEngine *engine, const char *fragment_b64url
                                 size_t fragment_b64url_len,
                                 BbMlsPrepareJoinOut *out_join);
 
+BbMlsStatus bb_mls_prepare_direct_join(BbMlsEngine *engine,
+                                       const uint8_t group_id[BB_MLS_GROUP_ID_LEN],
+                                       uint8_t out_kp_ref[BB_MLS_HASH_LEN],
+                                       BbMlsByteBuf *out_kp_bytes);
+
 BbMlsStatus bb_mls_process_welcome(BbMlsEngine *engine, uint64_t expected_party_id,
                                    const uint8_t expected_ds_pubkey[BB_MLS_PUBKEY_LEN],
                                    const uint8_t *welcome_bytes, size_t welcome_len,
@@ -257,6 +262,11 @@ BbMlsStatus bb_mls_commit_add_invitee(BbMlsEngine *engine,
                                       const uint8_t join_proof[BB_MLS_HASH_LEN],
                                       uint64_t now_s, uint8_t allow_delegated,
                                       BbMlsAddCommitOut *out_commit);
+
+BbMlsStatus bb_mls_commit_add_sibling(BbMlsEngine *engine,
+                                      const uint8_t group_id[BB_MLS_GROUP_ID_LEN],
+                                      const uint8_t *kp_bytes, size_t kp_len,
+                                      uint64_t now_s, BbMlsAddCommitOut *out_commit);
 
 BbMlsStatus bb_mls_apply_proposal(BbMlsEngine *engine,
                                   const uint8_t group_id[BB_MLS_GROUP_ID_LEN],

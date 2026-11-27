@@ -15,10 +15,11 @@ pub mod invite;
 pub mod policy;
 
 pub use client::{
-    generate_single_use_key_package, mp_join_config, unbounded_mls_lifetime, AddMemberCommitOutput,
-    DecryptedAppMessage, DeviceIdentity, MpMlsClient, PendingOutboxEntry, MP_MAX_FORWARD_DISTANCE,
-    MP_MAX_FRAMES_PER_EPOCH, MP_MAX_PAST_EPOCHS, MP_OUT_OF_ORDER_TOLERANCE,
-    MP_PAST_EPOCH_RETENTION_SECS, MP_PCS_UPDATE_FRAME_THRESHOLD,
+    derive_sibling_welcome_mac_key, generate_single_use_key_package, mp_join_config,
+    unbounded_mls_lifetime, AddMemberCommitOutput, DecryptedAppMessage, DeviceIdentity,
+    MpMlsClient, PendingOutboxEntry, MP_MAX_FORWARD_DISTANCE, MP_MAX_FRAMES_PER_EPOCH,
+    MP_MAX_PAST_EPOCHS, MP_OUT_OF_ORDER_TOLERANCE, MP_PAST_EPOCH_RETENTION_SECS,
+    MP_PCS_UPDATE_FRAME_THRESHOLD,
 };
 pub use crypto::{
     ct_eq_bytes, encode_crockford_grouped_4, is_canonical_ed25519_scalar, sha256, sign_ed25519,

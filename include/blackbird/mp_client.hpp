@@ -489,10 +489,30 @@ struct PartyMutationResponse {
 // 2b. Room Protocol v2 (mp2) & Cloud Auth REST DTOs
 // ---------------------------------------------------------------------------
 
+struct RoomCreateRequest {
+  std::optional<std::string> name;
+  std::string client = "blackbird";
+  std::string agent_name = "Blackbird";
+  std::uint8_t e2ee_mode = 1U;
+  std::optional<std::string> operation_id;
+};
+
+struct RoomCreateResponse {
+  PartyId party_id = PartyId::create(1U).value();
+  std::string room_code;
+  std::string name;
+  std::string share_url;
+  std::string ws_path;
+  std::uint8_t e2ee_mode = 0U;
+  std::optional<Ed25519PubKey> party_ds_pubkey;
+  bool operator==(const RoomCreateResponse &) const = default;
+};
+
 struct RoomInviteRequest {
   std::optional<std::string> handle;
   std::optional<PartyId> party_id;
   std::optional<std::string> name;
+  std::uint8_t e2ee_mode = 1U;
 };
 
 struct RoomInviteResponse {
@@ -502,6 +522,8 @@ struct RoomInviteResponse {
   std::string handle_url;
   std::string ws_path;
   std::optional<std::string> invited_handle;
+  std::uint8_t e2ee_mode = 0U;
+  std::optional<Ed25519PubKey> party_ds_pubkey;
   bool operator==(const RoomInviteResponse &) const = default;
 };
 
@@ -557,6 +579,8 @@ struct RoomEnterResponse {
   std::string share_url;
   std::string ws_path;
   std::vector<RoomMemberInfo> members;
+  std::uint8_t e2ee_mode = 0U;
+  std::optional<Ed25519PubKey> party_ds_pubkey;
   bool operator==(const RoomEnterResponse &) const = default;
 };
 
@@ -656,6 +680,34 @@ struct MlsPublishDeviceListRequest {
   std::vector<std::uint8_t> device_list; // canonical AccountDeviceListV1
 };
 
+struct MlsCloudBindRequest {
+  Ed25519PubKey mls_sig_pubkey{};
+  std::uint8_t client_class = 1U;
+  bool agent_capable = true;
+  std::optional<std::uint64_t> iat_s;
+  std::optional<std::uint64_t> exp_s;
+  std::vector<std::uint8_t> device_sig; // empty on step 1 ("sign_pop"), 64B on step 2
+};
+
+struct MlsCloudBindResponse {
+  std::string step; // "sign_pop" (step 1) or "bound" (step 2)
+  AccountId account_id = AccountId::create(1U).value();
+  DeviceId device_id = DeviceId::create(1U).value();
+  std::uint32_t device_gen = 1U;
+  std::uint32_t root_gen = 1U;
+  Ed25519PubKey root_pubkey{};
+  std::uint8_t custody_mode = 0U;
+  std::uint64_t iat_s = 0U;
+  std::uint64_t exp_s = 0U;
+  std::vector<std::uint8_t> body_bytes;        // 108B on step == "sign_pop"
+  std::vector<std::uint8_t> root_sig_bytes;    // 64B on step == "sign_pop"
+  std::vector<std::uint8_t> pop_message_bytes; // 50B on step == "sign_pop"
+  std::array<std::uint8_t, 236> device_binding{};
+  std::vector<std::uint8_t> device_list_bytes;
+  std::uint64_t list_version = 1U;
+  bool operator==(const MlsCloudBindResponse &) const = default;
+};
+
 struct MlsInitPartyRequest {
   PartyId party_id = PartyId::create(1U).value();
   std::array<std::uint8_t, 24> group_id{};
@@ -685,10 +737,10 @@ struct MlsRegisterInviteResponse {
 struct MlsJoinPartyRequest {
   PartyId party_id = PartyId::create(1U).value();
   std::uint64_t invite_id = 0U;
-  std::array<std::uint8_t, 32> server_invite_token{};
+  std::optional<std::array<std::uint8_t, 32>> server_invite_token;
   std::array<std::uint8_t, 32> kp_ref{};
   std::vector<std::uint8_t> kp_bytes;
-  std::array<std::uint8_t, 32> join_proof{};
+  std::optional<std::array<std::uint8_t, 32>> join_proof;
 };
 
 struct MlsSubmitCommitRequest {
@@ -698,6 +750,7 @@ struct MlsSubmitCommitRequest {
   std::optional<std::vector<std::uint8_t>> welcome_bytes;
   std::optional<std::vector<std::uint8_t>> welcome_auth_bytes;
   std::optional<DeviceId> welcome_target_device_id;
+  std::optional<std::array<std::uint8_t, 32>> welcome_kp_ref;
 };
 
 struct MlsSubmitCommitResponse {
@@ -740,6 +793,7 @@ struct MlsWelcomeResponse {
   std::vector<std::uint8_t> welcome_bytes;
   std::vector<std::uint8_t> welcome_auth_bytes;
   Ed25519PubKey ds_pubkey{};
+  std::uint64_t welcome_id = 0U;
   bool operator==(const MlsWelcomeResponse &) const = default;
 };
 
@@ -901,6 +955,7 @@ public:
   Result<PartyMutationResponse> disband_party(const DisbandPartyRequest &request);
 
   // Room Protocol v2 & Cloud Auth REST API
+  Result<RoomCreateResponse> room_create(const RoomCreateRequest &request);
   Result<RoomInviteResponse> room_invite(const RoomInviteRequest &request);
   Result<RoomEnterResponse> room_enter(const RoomEnterRequest &request);
   Result<RoomLeaveResponse> room_leave(PartyId party_id);
@@ -912,6 +967,7 @@ public:
   Result<RenewDeviceCwtResponse> renew_device_cwt();
 
   // MLS E2EE Control-Plane HTTPS endpoints (`mp2-mls-v1`)
+  Result<MlsCloudBindResponse> mls_cloud_bind(const MlsCloudBindRequest &request);
   Result<MlsReserveDeviceResponse>
   mls_reserve_device(const MlsReserveDeviceRequest &request);
   Result<void> mls_upload_device_binding(const MlsUploadDeviceBindingRequest &request);

@@ -172,6 +172,8 @@ struct MpRoomV2Member {
   std::string agent_summary;
   std::string status = "live";
   bool is_self = false;
+  std::optional<mp::DeviceId> device_id;
+  std::string nick;
 
   bool operator==(const MpRoomV2Member &) const = default;
 };
@@ -194,6 +196,8 @@ struct MpRoomV2Message {
   std::optional<MpRoomV2AgentCard> parsed_agent_card;
   bool delivered = false;
   bool local_self = false;
+  std::optional<mp::DeviceId> sender_device_id;
+  std::string sender_nick;
 
   bool operator==(const MpRoomV2Message &) const = default;
 };
@@ -217,6 +221,9 @@ struct MpRoomV2Config {
   std::uint8_t e2ee_mode = 0U; // 0=legacy plaintext, 1=mandatory MLS E2EE
   std::shared_ptr<MpMlsEngine> mls_engine;
   std::optional<MlsGroupId> mls_group_id;
+  std::optional<mp::Ed25519PubKey> party_ds_pubkey;
+  bool is_room_creator = false;
+  std::optional<std::string> mls_invite_fragment;
 };
 
 struct MpRoomV2Snapshot {
@@ -236,9 +243,21 @@ struct MpRoomV2Snapshot {
   std::string status_summary;
   std::uint8_t e2ee_mode = 0U;
   std::optional<MpMlsRoomStatus> mls_status;
+  std::string topic;
+  std::string local_nick;
+  bool mls_joining = false;
 
   bool operator==(const MpRoomV2Snapshot &) const = default;
 };
+
+// Opens a local `MpMlsEngine` under `state_dir` bound to `identity`.
+// Uses self-custody (`custody_mode = 1`) when `identity.root_seed` is present, or
+// automatically calls `POST /v1/accounts/me/mls/cloud-bind` (`custody_mode = 0`) when
+// `client != nullptr` and no local root key is present (`blackbird login` cloud users).
+Result<std::shared_ptr<MpMlsEngine>> open_mp_mls_engine_for_identity(
+    const std::filesystem::path &state_dir, const mp::MpIdentityState &identity,
+    mp::MpControlClient *client = nullptr, std::uint8_t client_class = 1U,
+    bool agent_capable = true);
 
 // ---------------------------------------------------------------------------
 // Live Room Protocol v2 (`mp2`) Session Controller (Pure WSS over TLS 1.3)
@@ -300,9 +319,20 @@ public:
   // guaranteed delivery (retrying across reconnects with the same client_msg_id).
   Result<std::string> send_chat(std::string body,
                                 MpRoomV2Target target = MpRoomV2Target{});
+  Result<std::string> send_action(const std::string &action,
+                                  MpRoomV2Target target = MpRoomV2Target{});
+  Result<std::string> set_nick(std::string_view nick);
+  Result<std::string> set_topic(std::string_view topic);
   Result<std::string> send_agent_card(const MpRoomV2AgentCard &card,
                                       MpRoomV2Target target = MpRoomV2Target{});
   Result<void> update_status(MpRoomV2StatusUpdate status);
+
+  // Classic IRC helpers (local readouts / notices).
+  std::string topic() const;
+  std::string local_nick() const;
+  std::string format_names_line() const;
+  std::string post_local_names_notice();
+  void post_local_topic_notice();
 
   // Thread-safe snapshots (snapshot() drains accumulated plain-English notices
   // and urgent mention_alerts; to_party_snapshot() renders PartyChatPane state).
@@ -330,14 +360,33 @@ public:
 private:
   using SteadyClock = std::chrono::steady_clock;
 
+  struct PendingJoinRequest {
+    std::uint64_t account_id = 0U;
+    std::uint64_t device_id = 0U;
+    std::uint64_t invite_id = 0U;
+    MlsHash32 kp_ref{};
+    std::vector<std::uint8_t> kp_bytes;
+    std::optional<MlsHash32> join_proof;
+  };
+
   struct FrameAction {
     bool need_send_resume = false;
     std::uint64_t resume_seq = 0U;
     bool need_flush_outbox = false;
     std::uint32_t retry_backoff_ms = 0U;
     bool force_disconnect = false;
+    bool need_mls_bootstrap = false;
+    bool need_mls_join_pump = false;
+    bool need_mls_poll_welcome = false;
+    bool need_mls_catchup = false;
+    std::uint64_t catchup_from_epoch = 1U;
     std::optional<PendingCommitAck> pending_commit_ack;
     std::optional<std::vector<std::uint8_t>> pending_rekey_commit;
+    std::vector<PendingJoinRequest> pending_join_requests;
+  };
+
+  struct PendingControlFrame {
+    std::string payload;
   };
 
   void start_worker();
@@ -347,20 +396,42 @@ private:
   void handle_event_locked(const Value &obj, bool is_history = false);
   void handle_ack_locked(const Value &obj);
   void handle_presence_locked(const Value &obj);
+  void handle_irc_nick_frame_locked(const Value &obj);
+  void handle_irc_topic_frame_locked(const Value &obj);
   void handle_error_locked(const Value &obj, FrameAction &action);
+  void handle_mls_join_request_locked(const Value &obj, FrameAction &action);
   void handle_mls_commit_tentative_locked(const Value &obj, FrameAction &action);
   void handle_mls_commit_finalized_locked(const Value &obj, FrameAction &action);
+  void handle_mls_commit_discarded_locked();
   void handle_mls_rekey_needed_locked(const Value &obj, FrameAction &action);
-  void handle_mls_welcome_ready_locked(const Value &obj);
+  void handle_mls_welcome_ready_locked(const Value &obj, FrameAction &action);
+  void pump_mls_bootstrap();
+  void pump_mls_join_and_welcome(bool allow_kp_upload);
+  void pump_mls_catchup(std::uint64_t from_epoch);
+  void pump_mls_pending_joiners(const std::vector<PendingJoinRequest> &requests);
   void requeue_stale_e2ee_outbox_locked(FrameAction &action);
   void refresh_mls_status_locked();
-  void apply_members_locked(const std::vector<MpRoomV2Member> &members);
+  void apply_members_locked(const std::vector<MpRoomV2Member> &members,
+                            bool emit_irc_notices = false);
+  struct MemberNickUpdate {
+    std::optional<mp::AccountId> acct_id;
+    std::optional<mp::DeviceId> dev_id;
+    std::string_view handle;
+    std::string_view nick;
+  };
+
   void upsert_message_locked(MpRoomV2Message msg);
+  void append_irc_notice_locked(const std::string &text);
+  std::string lookup_member_nick_locked(std::optional<mp::AccountId> acct_id,
+                                        std::optional<mp::DeviceId> dev_id,
+                                        std::string_view handle) const;
+  void set_member_nick_locked(const MemberNickUpdate &update);
   void push_notice_locked(std::string_view notice);
   void rebuild_status_summary_locked();
   bool send_resume_frame(mp::MpControlSocket &sock, std::uint64_t last_seq);
   bool flush_outbox(mp::MpControlSocket &sock);
   bool flush_pending_status(mp::MpControlSocket &sock);
+  bool flush_pending_control_frames(mp::MpControlSocket &sock);
   std::uint32_t compute_reconnect_backoff_ms(std::uint32_t attempt) const noexcept;
   bool try_acquire_wake_user() noexcept;
   void release_wake_user() noexcept;
@@ -402,6 +473,7 @@ private:
   std::unordered_set<std::string> seen_client_msg_ids_;
   std::deque<std::string> seen_client_msg_id_order_;
   std::deque<OutboundMessage> outbox_;
+  std::deque<PendingControlFrame> control_outbox_;
   std::optional<MpRoomV2StatusUpdate> pending_status_;
   std::deque<std::string> notices_;
   std::deque<MpRoomV2PendingMention> mention_alerts_;
@@ -409,6 +481,12 @@ private:
   brakes::BrakesGate brakes_gate_;
   std::optional<MpMlsRoomStatus> mls_status_;
   std::string status_summary_;
+  std::string topic_;
+  std::string local_nick_;
+  std::vector<std::pair<std::string, std::string>> member_nicks_;
+  std::optional<mp::Ed25519PubKey> party_ds_pubkey_;
+  std::optional<MlsGroupId> server_mls_group_id_;
+  std::optional<std::string> mls_invite_fragment_;
   std::uint64_t local_msg_counter_ = 0U;
   std::atomic<std::uint64_t> latest_seq_atomic_{0U};
 
@@ -424,6 +502,8 @@ private:
   std::uint8_t e2ee_mode_ = 0U;
   MpRoomV2State state_ = MpRoomV2State::connecting;
   bool connected_once_ = false;
+  bool mls_joining_ = false;
+  bool mls_kp_uploaded_ = false;
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> stopped_{false};
   std::optional<MlsGroupId> mls_group_id_;

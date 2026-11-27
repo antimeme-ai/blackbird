@@ -2175,6 +2175,775 @@ int main() {
     }
 
     e2ee_sess->stop();
+
+    // 12. Live MLS `e2ee_mode = 1` full bootstrap, sibling Welcome-join WITHOUT
+    //     disconnect, fail-closed plaintext refusal, same-account sibling message
+    //     receipt, and encrypted IRC `/nick`, `/me`, `/topic`, `/names`, join/part!
+    {
+      const auto live_party_id = PartyId::create(8888888888ULL).value();
+      const std::uint64_t sib_dev = 9004ULL;
+      Ed25519Seed sib_dev_seed{};
+      sib_dev_seed.fill(0x57U);
+      const auto sib_dsk = require_val(Ed25519SigningKey::from_seed(sib_dev_seed));
+
+      const MpMlsActiveDeviceEntry dev_a{alice_dev, 1U, alice_dsk.public_key()};
+      const MpMlsActiveDeviceEntry dev_b{sib_dev, 1U, sib_dsk.public_key()};
+      const std::array<MpMlsActiveDeviceEntry, 2> sib_entries =
+          (alice_dev < sib_dev) ? std::array<MpMlsActiveDeviceEntry, 2>{dev_a, dev_b}
+                                : std::array<MpMlsActiveDeviceEntry, 2>{dev_b, dev_a};
+
+      auto creator_eng = make_e2ee_engine(
+          E2eeEngineSpec{tmp.path / "live_mls_creator", alice_acct, alice_dev, 1U, true,
+                         alice_root_seed, alice_dev_seed, sib_entries, 0x61U});
+      auto sibling_eng = make_e2ee_engine(
+          E2eeEngineSpec{tmp.path / "live_mls_sibling", alice_acct, sib_dev, 1U, true,
+                         alice_root_seed, sib_dev_seed, sib_entries, 0x62U});
+
+      struct LiveMlsMockServer {
+        std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx{nullptr, &SSL_CTX_free};
+        int listen_fd = -1;
+        std::uint16_t port = 0U;
+        std::atomic<bool> stop{false};
+        std::string ds_pubkey_b64;
+        std::uint64_t party_id = 0U;
+        std::uint64_t acct_id = 0U;
+        std::uint64_t creator_dev = 0U;
+        std::uint64_t sibling_dev = 0U;
+        Ed25519Seed cloud_root_seed{};
+        std::uint64_t cloud_dev_id = 0U;
+
+        std::mutex mu;
+        int create_e2ee_seen = -1;
+        int cloud_bind_step1_calls = 0;
+        int cloud_bind_step2_calls = 0;
+        bool init_called = false;
+        std::string group_id_b64;
+        bool kp_uploaded = false;
+        std::string pending_kp_json;
+        bool commit_submitted = false;
+        bool welcome_acked = false;
+        std::string stored_welcome_b64;
+        std::string stored_welcome_auth_b64;
+        std::string stored_kp_ref_b64;
+        std::vector<std::string> captured_wire_sends;
+        std::vector<std::string> creator_outbox_frames;
+        std::vector<std::string> sibling_outbox_frames;
+        std::uint64_t next_seq = 1U;
+        std::thread accept_thr;
+        std::vector<std::thread> workers;
+
+        struct Config {
+          std::string ds_pubkey_b64;
+          std::uint64_t party_id = 0U;
+          std::uint64_t acct_id = 0U;
+          std::uint64_t creator_dev = 0U;
+          std::uint64_t sibling_dev = 0U;
+        };
+
+        LiveMlsMockServer(const EphemeralCert &ecert, Config scfg)
+            : ds_pubkey_b64(std::move(scfg.ds_pubkey_b64)), party_id(scfg.party_id),
+              acct_id(scfg.acct_id), creator_dev(scfg.creator_dev),
+              sibling_dev(scfg.sibling_dev) {
+          ctx.reset(SSL_CTX_new(TLS_server_method()));
+          require_ok(ctx != nullptr);
+          require_ok(SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION) == 1);
+          require_ok(SSL_CTX_use_certificate(ctx.get(), ecert.cert.get()) == 1);
+          require_ok(SSL_CTX_use_PrivateKey(ctx.get(), ecert.key.get()) == 1);
+          SSL_CTX_set_alpn_select_cb(ctx.get(), &alpn_select_http11, nullptr);
+
+          listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+          require_ok(listen_fd >= 0);
+          const int one = 1;
+          (void)::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+          sockaddr_in addr{};
+          addr.sin_family = AF_INET;
+          addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          addr.sin_port = 0;
+          require_ok(::bind(listen_fd, reinterpret_cast<sockaddr *>(&addr),
+                            sizeof(addr)) == 0);
+          require_ok(::listen(listen_fd, 16) == 0);
+          socklen_t alen = sizeof(addr);
+          require_ok(::getsockname(listen_fd, reinterpret_cast<sockaddr *>(&addr),
+                                   &alen) == 0);
+          port = ntohs(addr.sin_port);
+          accept_thr = std::thread([this]() { run(); });
+        }
+
+        ~LiveMlsMockServer() {
+          stop.store(true, std::memory_order_release);
+          if (listen_fd >= 0) {
+            ::shutdown(listen_fd, SHUT_RDWR);
+            ::close(listen_fd);
+            listen_fd = -1;
+          }
+          if (accept_thr.joinable())
+            accept_thr.join();
+          for (auto &w : workers) {
+            if (w.joinable())
+              w.join();
+          }
+        }
+
+        void run() {
+          while (!stop.load(std::memory_order_acquire)) {
+            pollfd pfd{listen_fd, POLLIN, 0};
+            if (::poll(&pfd, 1U, 30) <= 0)
+              continue;
+            const int cfd = ::accept(listen_fd, nullptr, nullptr);
+            if (cfd < 0)
+              continue;
+            workers.emplace_back([this, cfd]() {
+              handle_conn(cfd);
+              ::close(cfd);
+            });
+          }
+        }
+
+        void send_http_json(SSL *ssl, int status, std::string_view json_body) {
+          const std::string hdr =
+              "HTTP/1.1 " + std::to_string(status) +
+              " OK\r\nContent-Type: application/json\r\nContent-Length: " +
+              std::to_string(json_body.size()) + "\r\nConnection: close\r\n\r\n";
+          ssl_write_str(ssl, hdr);
+          ssl_write_str(ssl, json_body);
+        }
+
+        void handle_conn(int cfd) {
+          std::unique_ptr<SSL, decltype(&SSL_free)> ssl{SSL_new(ctx.get()), &SSL_free};
+          if (!ssl || SSL_set_fd(ssl.get(), cfd) != 1 || SSL_accept(ssl.get()) != 1)
+            return;
+          std::string raw;
+          std::array<char, 4096> buf{};
+          std::size_t hdr_end = std::string::npos;
+          while (hdr_end == std::string::npos) {
+            const int n = SSL_read(ssl.get(), buf.data(), static_cast<int>(buf.size()));
+            if (n <= 0)
+              return;
+            raw.append(buf.data(), static_cast<std::size_t>(n));
+            hdr_end = raw.find("\r\n\r\n");
+          }
+          const std::size_t first_eol = raw.find("\r\n");
+          const std::string req_line = raw.substr(0, first_eol);
+          const std::size_t sp1 = req_line.find(' ');
+          const std::size_t sp2 = req_line.find(' ', sp1 + 1U);
+          const std::string method = req_line.substr(0, sp1);
+          const std::string target = req_line.substr(sp1 + 1U, sp2 - sp1 - 1U);
+          const std::string path = target.substr(0, target.find('?'));
+
+          std::string ws_key;
+          std::string sig_input;
+          std::size_t content_len = 0U;
+          bool is_upgrade = false;
+          {
+            std::size_t p = first_eol + 2U;
+            while (p < hdr_end) {
+              const std::size_t e = raw.find("\r\n", p);
+              const std::string_view line{raw.data() + p, e - p};
+              const std::size_t c = line.find(':');
+              if (c != std::string_view::npos) {
+                const std::string k = to_lower_ascii(line.substr(0, c));
+                const std::string v{trim_spaces(line.substr(c + 1U))};
+                if (k == "sec-websocket-key")
+                  ws_key = v;
+                else if (k == "upgrade" && to_lower_ascii(v) == "websocket")
+                  is_upgrade = true;
+                else if (k == "content-length")
+                  content_len = static_cast<std::size_t>(std::stoull(v));
+                else if (k == "signature-input")
+                  sig_input = v;
+              }
+              p = e + 2U;
+            }
+          }
+          const bool is_creator_req = sig_input.find("." + std::to_string(creator_dev) +
+                                                     "\"") != std::string::npos;
+
+          if (is_upgrade) {
+            const std::string resp =
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+                ws_accept_for(ws_key) + "\r\nSec-WebSocket-Protocol: mp2\r\n\r\n";
+            ssl_write_str(ssl.get(), resp);
+
+            std::string gid_copy;
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              gid_copy = group_id_b64;
+            }
+            std::string hello =
+                "{\"v\":2,\"t\":\"hello\",\"e2ee_mode\":1,\"room_code\":\"LIVE-1\","
+                "\"name\":\"Live E2EE\",\"latest_seq\":0,\"mls_epoch\":0,"
+                "\"party_ds_pubkey_b64\":\"" +
+                ds_pubkey_b64 + "\"";
+            if (!gid_copy.empty()) {
+              hello += ",\"group_id_b64\":\"" + gid_copy + "\"";
+            }
+            hello += ",\"self\":{\"account_id\":" + std::to_string(acct_id) +
+                     ",\"handle\":\"antimeme\"},"
+                     "\"members\":[{\"account_id\":" +
+                     std::to_string(acct_id) +
+                     ",\"device_id\":" + std::to_string(creator_dev) +
+                     ",\"handle\":\"antimeme\",\"client\":\"blackbird\",\"status\":"
+                     "\"live\"}],"
+                     "\"history\":[]}";
+            send_server_text_ws_frame(ssl.get(), hello);
+
+            while (!stop.load(std::memory_order_acquire)) {
+              {
+                std::vector<std::string> pending;
+                {
+                  std::lock_guard<std::mutex> lock(mu);
+                  auto &q =
+                      is_creator_req ? creator_outbox_frames : sibling_outbox_frames;
+                  pending.swap(q);
+                }
+                for (const auto &f : pending) {
+                  send_server_text_ws_frame(ssl.get(), f);
+                }
+              }
+              auto frame =
+                  read_client_ws_frame(ssl.get(), cfd, std::chrono::milliseconds{25});
+              if (!frame.has_value())
+                continue;
+              if (frame->opcode == 0x8U)
+                break;
+              if (frame->opcode != 0x1U)
+                continue;
+              if (frame->payload == kMp2HeartbeatPing) {
+                send_server_text_ws_frame(ssl.get(), kMp2HeartbeatPong);
+                continue;
+              }
+              const auto parsed = parse_json(frame->payload);
+              if (!parsed.has_value())
+                continue;
+              const Value &obj = parsed.value();
+              const Value *tf = obj.find("t");
+              if (tf == nullptr || !std::holds_alternative<std::string>(tf->value()))
+                continue;
+              if (tf->string() == "send") {
+                const std::string cid = obj.find("client_msg_id")->string();
+                const std::string b64 = obj.find("body")->string();
+                const std::string kind = obj.find("kind")->string();
+                const std::string enc = obj.find("body_encoding")->string();
+                const std::string tgt = obj.find("target")->string();
+                std::uint64_t seq = 0U;
+                {
+                  std::lock_guard<std::mutex> lock(mu);
+                  captured_wire_sends.push_back(frame->payload);
+                  seq = next_seq++;
+                  const std::uint64_t sender_dev =
+                      is_creator_req ? creator_dev : sibling_dev;
+                  const std::string ev =
+                      "{\"v\":2,\"t\":\"event\",\"seq\":" + std::to_string(seq) +
+                      ",\"ts_ms\":1770000100000,\"client_msg_id\":\"" + cid +
+                      "\",\"kind\":\"" + kind + "\",\"target\":\"" + tgt +
+                      "\",\"body_encoding\":\"" + enc + "\",\"body\":\"" + b64 +
+                      "\",\"sender\":{\"account_id\":" + std::to_string(acct_id) +
+                      ",\"device_id\":" + std::to_string(sender_dev) +
+                      ",\"handle\":\"antimeme\",\"client\":\"blackbird\"}}";
+                  if (is_creator_req) {
+                    sibling_outbox_frames.push_back(ev);
+                  } else {
+                    creator_outbox_frames.push_back(ev);
+                  }
+                }
+                const std::string ack = "{\"v\":2,\"t\":\"ack\",\"client_msg_id\":\"" +
+                                        cid + "\",\"seq\":" + std::to_string(seq) +
+                                        ",\"ts_ms\":1770000100000}";
+                send_server_text_ws_frame(ssl.get(), ack);
+              }
+            }
+            return;
+          }
+
+          // HTTP REST handler
+          std::string body = raw.substr(hdr_end + 4U);
+          while (body.size() < content_len) {
+            const int n = SSL_read(ssl.get(), buf.data(), static_cast<int>(buf.size()));
+            if (n <= 0)
+              break;
+            body.append(buf.data(), static_cast<std::size_t>(n));
+          }
+          if (method == "POST" && path == "/v1/rooms/create") {
+            const auto parsed = parse_json(body);
+            if (parsed.has_value()) {
+              if (const Value *em = parsed.value().find("e2ee_mode"); em != nullptr) {
+                if (const auto *num = std::get_if<Number>(&em->value())) {
+                  std::lock_guard<std::mutex> lock(mu);
+                  create_e2ee_seen =
+                      static_cast<int>(std::get<std::uint64_t>(num->storage()));
+                }
+              }
+            }
+            send_http_json(
+                ssl.get(), 200,
+                "{\"party_id\":" + std::to_string(party_id) +
+                    ",\"room_code\":\"LIVE-1\",\"name\":\"Live E2EE\","
+                    "\"e2ee_mode\":1,\"party_ds_pubkey_b64\":\"" +
+                    ds_pubkey_b64 + "\",\"share_url\":\"https://multiplayer.tech/p/" +
+                    std::to_string(party_id) + "\",\"ws_path\":\"/v1/parties/" +
+                    std::to_string(party_id) + "/ws\"}");
+            return;
+          }
+          if (method == "POST" && path.ends_with("/mls/init")) {
+            const auto parsed = parse_json(body);
+            require_ok(parsed.has_value());
+            const std::string gid_b64 = parsed.value().find("group_id_b64")->string();
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              init_called = true;
+              group_id_b64 = gid_b64;
+            }
+            send_http_json(ssl.get(), 200,
+                           "{\"mls_epoch\":0,\"group_id_b64\":\"" + gid_b64 +
+                               "\",\"party_ds_pubkey_b64\":\"" + ds_pubkey_b64 + "\"}");
+            return;
+          }
+          if (method == "POST" && path.ends_with("/mls/join")) {
+            const auto parsed = parse_json(body);
+            require_ok(parsed.has_value());
+            const std::string kp_b64 = parsed.value().find("kp_blob_b64")->string();
+            const std::string kpref_b64 = parsed.value().find("kp_ref_b64")->string();
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              kp_uploaded = true;
+              stored_kp_ref_b64 = kpref_b64;
+              const std::string jr =
+                  "{\"v\":2,\"t\":\"mls_join_request\",\"account_id\":" +
+                  std::to_string(acct_id) +
+                  ",\"device_id\":" + std::to_string(sibling_dev) +
+                  ",\"kp_ref_b64\":\"" + kpref_b64 + "\",\"kp_blob_b64\":\"" + kp_b64 +
+                  "\"}";
+              creator_outbox_frames.push_back(jr);
+            }
+            send_http_json(ssl.get(), 201, "{\"kp_id\":1}");
+            return;
+          }
+          if (method == "POST" &&
+              (path.ends_with("/mls/commits") || path.ends_with("/mls/commit"))) {
+            const auto parsed = parse_json(body);
+            require_ok(parsed.has_value());
+            const Value *warr = parsed.value().find("welcomes");
+            require_ok(warr != nullptr &&
+                       std::holds_alternative<Value::Array>(warr->value()));
+            const auto &arr = std::get<Value::Array>(warr->value());
+            require_ok(arr.size() == 1U);
+            const std::string wb64 = arr[0].find("welcome_blob_b64")->string();
+            const std::string wab64 = arr[0].find("welcome_auth_blob_b64")->string();
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              commit_submitted = true;
+              stored_welcome_b64 = wb64;
+              stored_welcome_auth_b64 = wab64;
+              sibling_outbox_frames.push_back("{\"v\":2,\"t\":\"mls_welcome_ready\"}");
+            }
+            send_http_json(ssl.get(), 200,
+                           "{\"status\":\"finalized\",\"parent_epoch\":0,"
+                           "\"mls_epoch\":1,\"commit_sha256_b64\":\"AAAA\"}");
+            return;
+          }
+          if (method == "GET" && path.ends_with("/mls/welcome")) {
+            std::string wb, wab, kpr;
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              wb = stored_welcome_b64;
+              wab = stored_welcome_auth_b64;
+              kpr = stored_kp_ref_b64;
+            }
+            if (wb.empty()) {
+              send_http_json(ssl.get(), 200,
+                             "{\"party_ds_pubkey_b64\":\"" + ds_pubkey_b64 +
+                                 "\",\"welcome\":null}");
+            } else {
+              send_http_json(ssl.get(), 200,
+                             "{\"party_ds_pubkey_b64\":\"" + ds_pubkey_b64 +
+                                 "\",\"welcome\":{\"welcome_id\":1,\"mls_epoch\":1,"
+                                 "\"kp_ref_b64\":\"" +
+                                 kpr + "\",\"welcome_blob_b64\":\"" + wb +
+                                 "\",\"welcome_auth_blob_b64\":\"" + wab + "\"}}");
+            }
+            return;
+          }
+          if (method == "POST" && path.ends_with("/mls/welcome/ack")) {
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              welcome_acked = true;
+            }
+            send_http_json(ssl.get(), 200, "{\"acked\":true}");
+            return;
+          }
+          if (method == "GET" && path.ends_with("/mls/commits")) {
+            send_http_json(ssl.get(), 200, "{\"current_epoch\":1,\"commits\":[]}");
+            return;
+          }
+          if (method == "POST" && path == "/v1/accounts/me/mls/cloud-bind") {
+            auto b64_dec = [](std::string_view s) {
+              std::vector<std::uint8_t> out((s.size() / 4U) * 3U + 3U);
+              const int n = EVP_DecodeBlock(
+                  out.data(), reinterpret_cast<const unsigned char *>(s.data()),
+                  static_cast<int>(s.size()));
+              require_ok(n >= 0);
+              std::size_t actual = static_cast<std::size_t>(n);
+              if (s.size() >= 1U && s[s.size() - 1U] == '=')
+                --actual;
+              if (s.size() >= 2U && s[s.size() - 2U] == '=')
+                --actual;
+              out.resize(actual);
+              return out;
+            };
+            const auto parsed = parse_json(body);
+            require_ok(parsed.has_value());
+            const auto &obj = parsed.value();
+            const Value *pkf = obj.find("mls_sig_pubkey_b64");
+            require_ok(pkf != nullptr &&
+                       std::holds_alternative<std::string>(pkf->value()));
+            const auto dev_pk_vec = b64_dec(pkf->string());
+            require_ok(dev_pk_vec.size() == 32U);
+            Ed25519PubKey dev_pk{};
+            std::memcpy(dev_pk.data(), dev_pk_vec.data(), 32U);
+            const auto rsk = require_val(Ed25519SigningKey::from_seed(cloud_root_seed));
+            const auto rpk = rsk.public_key();
+
+            const std::uint64_t now_s = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            std::uint64_t iat_s = now_s - 5U;
+            std::uint64_t exp_s = iat_s + 86400U;
+            if (const Value *f = obj.find("iat_s"); f != nullptr) {
+              if (const auto *num = std::get_if<Number>(&f->value())) {
+                iat_s = std::get<std::uint64_t>(num->storage());
+              }
+            }
+            if (const Value *f = obj.find("exp_s"); f != nullptr) {
+              if (const auto *num = std::get_if<Number>(&f->value())) {
+                exp_s = std::get<std::uint64_t>(num->storage());
+              }
+            }
+
+            // Build canonical 108-byte MpMlsDeviceBindingBodyV1 + root_sig.
+            auto append_be64 = [](std::vector<std::uint8_t> &v, std::uint64_t x) {
+              for (int sh = 56; sh >= 0; sh -= 8) {
+                v.push_back(static_cast<std::uint8_t>((x >> static_cast<unsigned>(sh)) &
+                                                      0xffU));
+              }
+            };
+            auto append_be32 = [](std::vector<std::uint8_t> &v, std::uint32_t x) {
+              for (int sh = 24; sh >= 0; sh -= 8) {
+                v.push_back(static_cast<std::uint8_t>((x >> static_cast<unsigned>(sh)) &
+                                                      0xffU));
+              }
+            };
+            std::vector<std::uint8_t> body108;
+            body108.reserve(108U);
+            body108.push_back(1U);
+            append_be64(body108, acct_id);
+            append_be32(body108, 1U);
+            append_be64(body108, cloud_dev_id);
+            append_be32(body108, 1U);
+            body108.push_back(1U); // client_class = blackbird
+            body108.push_back(1U); // agent_capable = true
+            body108.push_back(0U); // custody_mode = 0 (cloud-managed)
+            append_be64(body108, iat_s);
+            append_be64(body108, exp_s);
+            body108.insert(body108.end(), rpk.begin(), rpk.end());
+            body108.insert(body108.end(), dev_pk.begin(), dev_pk.end());
+
+            static constexpr std::string_view kBindDom = "mp-mls-dev-bind-v1:";
+            std::vector<std::uint8_t> bind_msg;
+            bind_msg.insert(bind_msg.end(), kBindDom.begin(), kBindDom.end());
+            bind_msg.insert(bind_msg.end(), body108.begin(), body108.end());
+            const auto root_sig = require_val(rsk.sign(bind_msg));
+
+            std::vector<std::uint8_t> pop_in;
+            pop_in.insert(pop_in.end(), body108.begin(), body108.end());
+            pop_in.insert(pop_in.end(), root_sig.begin(), root_sig.end());
+            const auto pop_dig = require_val(sha256(pop_in));
+            static constexpr std::string_view kPopDom = "mp-mls-dev-pop-v1:";
+            std::vector<std::uint8_t> pop_msg;
+            pop_msg.insert(pop_msg.end(), kPopDom.begin(), kPopDom.end());
+            pop_msg.insert(pop_msg.end(), pop_dig.begin(), pop_dig.end());
+
+            const Value *sigf = obj.find("device_sig_b64");
+            if (sigf == nullptr) {
+              {
+                std::lock_guard<std::mutex> lock(mu);
+                ++cloud_bind_step1_calls;
+              }
+              send_http_json(
+                  ssl.get(), 200,
+                  "{\"ok\":true,\"step\":\"sign_pop\",\"account_id\":\"" +
+                      std::to_string(acct_id) + "\",\"device_id\":\"" +
+                      std::to_string(cloud_dev_id) +
+                      "\",\"device_gen\":1,\"root_gen\":1,\"custody_mode\":0,"
+                      "\"root_pubkey_b64\":\"" +
+                      b64_encode(rpk) + "\",\"iat_s\":" + std::to_string(iat_s) +
+                      ",\"exp_s\":" + std::to_string(exp_s) + ",\"body_b64\":\"" +
+                      b64_encode(body108) + "\",\"root_sig_b64\":\"" +
+                      b64_encode(root_sig) + "\",\"pop_message_b64\":\"" +
+                      b64_encode(pop_msg) + "\"}");
+              return;
+            }
+            const auto dsig_vec = b64_dec(sigf->string());
+            require_ok(dsig_vec.size() == 64U);
+            MlsDeviceBinding full_bind{};
+            std::memcpy(full_bind.data(), body108.data(), 108U);
+            std::memcpy(full_bind.data() + 108U, root_sig.data(), 64U);
+            std::memcpy(full_bind.data() + 172U, dsig_vec.data(), 64U);
+            require_ok(mp_mls_verify_device_binding(full_bind).has_value());
+            const std::array<MpMlsActiveDeviceEntry, 1> dlist_entries{
+                MpMlsActiveDeviceEntry{cloud_dev_id, 1U, dev_pk},
+            };
+            const auto dlist = require_val(
+                mp_mls_sign_device_list(AccountId::create(acct_id).value(), 1U, 1U,
+                                        iat_s, exp_s, dlist_entries, cloud_root_seed));
+            {
+              std::lock_guard<std::mutex> lock(mu);
+              ++cloud_bind_step2_calls;
+            }
+            send_http_json(ssl.get(), 200,
+                           "{\"ok\":true,\"step\":\"bound\",\"account_id\":\"" +
+                               std::to_string(acct_id) + "\",\"device_id\":\"" +
+                               std::to_string(cloud_dev_id) +
+                               "\",\"device_gen\":1,\"root_gen\":1,\"custody_mode\":0,"
+                               "\"root_pubkey_b64\":\"" +
+                               b64_encode(rpk) + "\",\"binding_b64\":\"" +
+                               b64_encode(full_bind) + "\",\"device_list_b64\":\"" +
+                               b64_encode(dlist) + "\",\"list_version\":1}");
+            return;
+          }
+          send_http_json(ssl.get(), 404, "{\"error\":\"not_found\"}");
+        }
+      };
+
+      LiveMlsMockServer live_srv{cert, LiveMlsMockServer::Config{
+                                           b64_encode(ds_sk.public_key()),
+                                           live_party_id.value(),
+                                           alice_acct,
+                                           alice_dev,
+                                           sib_dev,
+                                       }};
+      MpClientConfig live_ccfg = cfg;
+      live_ccfg.port = live_srv.port;
+
+      // 12a. room_create defaults to e2ee_mode = 1 and parses party_ds_pubkey_b64!
+      MpControlClient live_client{live_ccfg, store.state()};
+      const auto created_room =
+          require_val(live_client.room_create(RoomCreateRequest{}));
+      require_ok(created_room.e2ee_mode == 1U);
+      require_ok(created_room.party_ds_pubkey.has_value() &&
+                 *created_room.party_ds_pubkey == ds_sk.public_key());
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        require_ok(live_srv.create_e2ee_seen == 1);
+      }
+
+      // 12b. Creator attaches with mls_group_id = nullopt, is_room_creator = true ->
+      //      bootstraps MLS group via /mls/init without disconnecting!
+      MpRoomV2Config creator_cfg{};
+      creator_cfg.client_config = live_ccfg;
+      creator_cfg.identity = store.state();
+      creator_cfg.party_id = live_party_id;
+      creator_cfg.ws_path = created_room.ws_path;
+      creator_cfg.room_code = created_room.room_code;
+      creator_cfg.e2ee_mode = created_room.e2ee_mode;
+      creator_cfg.mls_engine = creator_eng;
+      creator_cfg.party_ds_pubkey = created_room.party_ds_pubkey;
+      creator_cfg.is_room_creator = true;
+      creator_cfg.poll_interval_ms = 15U;
+      creator_cfg.ping_interval_ms = 1000U;
+      auto creator_sess = require_val(MpRoomV2Session::start(std::move(creator_cfg)));
+      require_ok(wait_until(
+          [&]() {
+            const auto s = creator_sess->snapshot();
+            return s.state == MpRoomV2State::live && !s.mls_joining &&
+                   s.mls_status.has_value() && s.mls_status->mls_epoch == 0U;
+          },
+          5000));
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        require_ok(live_srv.init_called && !live_srv.group_id_b64.empty());
+      }
+
+      // 12c. Sibling device (same account_id, distinct device_id) attaches with
+      //      e2ee_mode = 1, mls_group_id = nullopt -> NEVER disconnects, holds sends
+      //      fail-closed while joining, uploads KP, receives Welcome, joins epoch 1!
+      MpIdentityState sib_identity = store.state();
+      sib_identity.device_seed = CleansedSeed{sib_dev_seed};
+      sib_identity.device_id = DeviceId::create(sib_dev).value();
+
+      MpRoomV2Config sibling_cfg{};
+      sibling_cfg.client_config = live_ccfg;
+      sibling_cfg.identity = sib_identity;
+      sibling_cfg.party_id = live_party_id;
+      sibling_cfg.ws_path = created_room.ws_path;
+      sibling_cfg.room_code = created_room.room_code;
+      sibling_cfg.e2ee_mode = 1U;
+      sibling_cfg.mls_engine = sibling_eng;
+      sibling_cfg.party_ds_pubkey = ds_sk.public_key();
+      sibling_cfg.is_room_creator = false;
+      sibling_cfg.poll_interval_ms = 15U;
+      sibling_cfg.ping_interval_ms = 1000U;
+      auto sibling_sess = require_val(MpRoomV2Session::start(std::move(sibling_cfg)));
+
+      // Fail-closed check before Welcome completes (if still joining, send_chat MUST
+      // return mls_unavailable and NEVER downgrade to plaintext!)
+      {
+        const auto pre_snap = sibling_sess->snapshot();
+        if (pre_snap.mls_joining) {
+          const auto refused = sibling_sess->send_chat("must-not-leak-plaintext");
+          require_ok(!refused.has_value() && mp_room_v2_error_of(refused.error()) ==
+                                                 MpRoomV2Error::mls_unavailable);
+        }
+      }
+
+      // Wait for full live KP upload -> creator auto-commit -> sibling Welcome join!
+      require_ok(wait_until(
+          [&]() {
+            const auto cs = creator_sess->snapshot();
+            const auto ss = sibling_sess->snapshot();
+            return cs.state == MpRoomV2State::live && ss.state == MpRoomV2State::live &&
+                   !ss.mls_joining && cs.mls_status.has_value() &&
+                   ss.mls_status.has_value() && cs.mls_status->mls_epoch == 1U &&
+                   ss.mls_status->mls_epoch == 1U &&
+                   cs.mls_status->epoch_authenticator_code ==
+                       ss.mls_status->epoch_authenticator_code;
+          },
+          5000));
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        require_ok(live_srv.kp_uploaded && live_srv.commit_submitted &&
+                   live_srv.welcome_acked);
+      }
+
+      // 12d. Anti-spoofing & secret rejection on IRC commands
+      require_ok(!sibling_sess->set_nick("@spoof").has_value());
+      require_ok(!sibling_sess->set_nick("bad\x1b[31m").has_value());
+      require_ok(!sibling_sess->set_nick("has space").has_value());
+      const auto secret_topic = sibling_sess->set_topic("leak sk-ant-secret12345");
+      require_ok(!secret_topic.has_value() &&
+                 mp_room_v2_error_of(secret_topic.error()) ==
+                     MpRoomV2Error::secret_rejected);
+
+      // 12e. Sibling sends encrypted /nick, /topic, /me, and chat to creator (same
+      //      account_id, distinct device_id) -> creator receives ALL of them, while
+      //      server NEVER sees plaintext!
+      require_val(sibling_sess->set_nick("gpu-01"));
+      require_val(sibling_sess->set_topic("Ship v0.9.1"));
+      require_val(sibling_sess->send_action("warms up the GPUs"));
+      require_val(sibling_sess->send_chat("hello from sibling server"));
+
+      require_ok(wait_until(
+          [&]() {
+            const auto cs = creator_sess->snapshot();
+            bool saw_chat = false;
+            bool saw_action = false;
+            for (const auto &m : cs.messages) {
+              if (m.kind == "chat" && m.body == "hello from sibling server" &&
+                  m.sender_nick == "gpu-01" && !m.local_self) {
+                saw_chat = true;
+              }
+              if (m.kind == "irc_action" && m.body == "warms up the GPUs" &&
+                  m.sender_nick == "gpu-01") {
+                saw_action = true;
+              }
+            }
+            return saw_chat && saw_action && cs.topic == "Ship v0.9.1";
+          },
+          5000));
+
+      // Verify server wire captures contain ZERO plaintext leaks!
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        require_ok(live_srv.captured_wire_sends.size() >= 4U);
+        for (const auto &raw_send : live_srv.captured_wire_sends) {
+          require_ok(raw_send.find("gpu-01") == std::string::npos);
+          require_ok(raw_send.find("Ship v0.9.1") == std::string::npos);
+          require_ok(raw_send.find("warms up the GPUs") == std::string::npos);
+          require_ok(raw_send.find("hello from sibling server") == std::string::npos);
+          require_ok(raw_send.find("must-not-leak-plaintext") == std::string::npos);
+          require_ok(raw_send.find("\"kind\":\"e2ee_app\"") != std::string::npos);
+        }
+      }
+
+      // 12f. Presence joinline/partline + /names roster notice
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        live_srv.creator_outbox_frames.push_back(
+            "{\"v\":2,\"t\":\"presence\",\"members\":["
+            "{\"account_id\":" +
+            std::to_string(alice_acct) + ",\"device_id\":" + std::to_string(alice_dev) +
+            ",\"handle\":\"antimeme\",\"client\":\"blackbird\",\"status\":\"live\"},"
+            "{\"account_id\":" +
+            std::to_string(bob_acct) + ",\"device_id\":" + std::to_string(bob_dev) +
+            ",\"handle\":\"phall\",\"client\":\"outpost\",\"status\":\"live\"}]}");
+      }
+      require_ok(wait_until(
+          [&]() {
+            const auto cs = creator_sess->snapshot();
+            for (const auto &m : cs.messages) {
+              if (m.kind == "irc_notice" &&
+                  m.body.find("--> phall (@phall · outpost) has joined") !=
+                      std::string::npos) {
+                return true;
+              }
+            }
+            return false;
+          },
+          3000));
+      const std::string names_line = creator_sess->post_local_names_notice();
+      require_ok(names_line.find("[Users: ") == 0U);
+      require_ok(names_line.find("@phall · outpost · live") != std::string::npos);
+      {
+        std::lock_guard<std::mutex> lock(live_srv.mu);
+        live_srv.creator_outbox_frames.push_back(
+            "{\"v\":2,\"t\":\"presence\",\"members\":["
+            "{\"account_id\":" +
+            std::to_string(alice_acct) + ",\"device_id\":" + std::to_string(alice_dev) +
+            ",\"handle\":\"antimeme\",\"client\":\"blackbird\",\"status\":\"live\"}]}");
+      }
+      require_ok(wait_until(
+          [&]() {
+            const auto cs = creator_sess->snapshot();
+            for (const auto &m : cs.messages) {
+              if (m.kind == "irc_notice" &&
+                  m.body.find("<-- phall (@phall) has left") != std::string::npos) {
+                return true;
+              }
+            }
+            return false;
+          },
+          3000));
+
+      sibling_sess->stop();
+      creator_sess->stop();
+
+      // 12g. Cloud-managed (`custody_mode = 0`, no local root_seed) 2-step
+      // `POST /v1/accounts/me/mls/cloud-bind` handshake via
+      // `open_mp_mls_engine_for_identity`.
+      {
+        const std::uint64_t cloud_dev = 777U;
+        live_srv.cloud_root_seed = alice_root_seed;
+        live_srv.cloud_dev_id = cloud_dev;
+        MpIdentityState cloud_id = store.state();
+        cloud_id.root_seed.reset(); // cloud-managed user has NO local root key
+        cloud_id.device_id = DeviceId::create(cloud_dev).value();
+        Ed25519Seed cloud_dev_seed{};
+        cloud_dev_seed.fill(0x9CU);
+        cloud_id.device_seed = CleansedSeed{cloud_dev_seed};
+        MpControlClient cloud_client{live_ccfg, cloud_id};
+        const auto cloud_dir = tmp.path / "mls_cloud_bind";
+        std::filesystem::create_directories(cloud_dir);
+        auto cloud_eng = require_val(
+            open_mp_mls_engine_for_identity(cloud_dir, cloud_id, &cloud_client));
+        require_ok(cloud_eng != nullptr && cloud_eng->valid());
+        {
+          std::lock_guard<std::mutex> lock(live_srv.mu);
+          require_ok(live_srv.cloud_bind_step1_calls == 1);
+          require_ok(live_srv.cloud_bind_step2_calls == 1);
+        }
+      }
+    }
   }
 
   std::cout << "mp_room_v2_test PASS\n";

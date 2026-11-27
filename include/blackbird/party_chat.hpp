@@ -53,6 +53,8 @@ enum class PartyMessageKind : std::uint8_t {
   decision,
   conflict,
   system,
+  irc_action,
+  irc_notice,
 };
 
 enum class PartyMessageFilter : std::uint8_t {
@@ -81,6 +83,19 @@ Result<PartyMessageFilter> parse_party_message_filter(std::string_view name) noe
 
 bool valid_party_alias(std::string_view alias) noexcept;
 
+// Validates a per-session IRC nick (`1..=32` printable UTF-8 codepoints, <= 64 bytes;
+// forbids whitespace, leading `@` spoofing, C0/C1/DEL/ESC/ANSI, BiDi, zero-width,
+// line/paragraph separators, Unicode Tag chars, and invalid UTF-8).
+Result<std::string> validate_irc_nick(std::string_view raw);
+
+// Formats a display identity that ALWAYS preserves the verified `@handle` badge
+// alongside any optional session nick (`"<nick> (@<handle>)"` or `"@<handle>"`).
+struct IrcDisplayNameInput {
+  std::string_view nick;
+  std::string_view handle;
+};
+std::string format_irc_display_name(IrcDisplayNameInput input);
+
 // Hostile terminal-escape sanitizer: escapes all ESC (0x1B), C0 (0x00..0x1F),
 // DEL (0x7F), bare C1 (0x80..0x9F including 0x9B CSI), UTF-8 C1 (C2 80..C2 9F),
 // Unicode bidi overrides/isolates (U+202A..202E, U+2066..2069, U+200E, U+200F,
@@ -101,6 +116,7 @@ struct PartyParticipant {
   std::optional<std::string> provider;
   std::optional<std::string> remote_model;
   bool local_self = false;
+  std::string nick;
 
   bool operator==(const PartyParticipant &) const = default;
 };
@@ -148,6 +164,7 @@ struct PartyMessage {
   std::string body;
   bool untrusted_remote = false;
   std::optional<PartyAgentCard> agent_card;
+  std::string sender_nick;
 
   bool operator==(const PartyMessage &) const = default;
 };
@@ -214,6 +231,7 @@ struct PartySnapshot {
   bool compact_room_presentation = false;
   std::optional<PartyPendingMention> pending_mention;
   std::optional<PartyMlsStatus> mls_status;
+  std::string room_topic;
 
   std::size_t operator_count() const noexcept;
   std::size_t online_operator_count() const noexcept;

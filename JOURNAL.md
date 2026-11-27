@@ -14344,3 +14344,13 @@ Blackbird must not present itself as another product.
   - Implemented C++23 RAII `MpMlsEngine` with persistent MLS state, macOS (`com.apple.metadata:com_apple_backup_excludeItem`) / Linux backup exclusion, exact `512 / 2048 / 8192 / 24000 B` message padding buckets, Tier 0–3 verification states with `epoch_authenticator` export, authenticated `BrakesGate` provenance binding, and historical catch-up non-triggering so replayed encrypted room history never fires live agent mentions.
 - **Self-Contained Release Packaging (`CMakeLists.txt`, `.github/workflows/release.yml`):**
   - Bumped `BLACKBIRD_RELEASE_VERSION` to `v0.9.0`, added `crates/mp-mls` dependency tracking in CMake, and pinned `dtolnay/rust-toolchain@stable` (`rustc >= 1.91`, Rust 2024 edition) across both `macos-15` and `ubuntu-24.04` release runners.
+
+## 2026-11-27 — Release `v0.9.1`: Live MLS Mode-1 Room Wiring, 2-Step Cloud-Bind, Sibling-Device Multi-Server Fleet, and Classic IRC Chat
+
+- **Live MLS `e2ee_mode = 1` Lifecycle (`include/blackbird/{mp_client,mp_mls,mp_room_v2}.hpp`, `src/{mp_client,mp_mls,mp_room_v2,main}.cpp`, `crates/mp-mls/`, `crates/blackbird-p2p/`):**
+  - Defaulted `rooms/create` and `rooms/invite` to `e2ee_mode = 1` (preserving opt-in `e2ee_mode = 0` legacy compatibility) and parsed `e2ee_mode` + `party_ds_pubkey_b64` across REST and `hello`.
+  - Implemented 2-step `POST /v1/accounts/me/mls/cloud-bind` for cloud-managed (`custody_mode = 0`) accounts (`sign_pop` -> local verification of `"mp-mls-dev-pop-v1:" || SHA-256(body[108] || root_sig[64])` -> Ed25519 PoP -> `MpMlsDeviceBindingV1` + `AccountDeviceListV1`), while keeping self-custody (`custody_mode = 1`) local signing intact.
+  - Wired creator MLS bootstrap, joiner & same-account sibling-device direct KeyPackage/Welcome join (`commit_add_sibling_device`), tentative commit verification & `CommitAckV1` submission, finalized commit catch-up, and strict fail-closed refusal without disconnecting valid mode-1 sessions awaiting Welcome.
+- **Classic IRC Chat Charm (`include/blackbird/party_chat.hpp`, `src/{party_chat,party_lobby,mp_room_v2,terminal,main}.cpp`):**
+  - Added IRC joinlines/partlines (`-->` / `<--`), per-session `/nick <name>` (sanitized 1..32 chars, always paired with verified `@handle`), `/me <action>`, `/topic [text]`, `/names`, and crisp `[HH:MM]` timestamps.
+  - In `e2ee_mode = 1` rooms, `/nick`, `/me`, and `/topic` travel exclusively inside encrypted `e2ee_app` JSON payloads (`{"mp_irc":1,"t":"nick"|"me"|"topic",...}`) so the server never sees clear metadata.

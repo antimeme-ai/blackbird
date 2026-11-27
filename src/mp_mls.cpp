@@ -383,6 +383,26 @@ Result<MpMlsPreparedJoin> MpMlsEngine::prepare_join(std::string_view fragment_b6
   return Result<MpMlsPreparedJoin>::success(std::move(out));
 }
 
+Result<MpMlsPreparedDirectJoin>
+MpMlsEngine::prepare_direct_join(const MlsGroupId &group_id) {
+  if (handle_ == nullptr) {
+    return Result<MpMlsPreparedDirectJoin>::failure(
+        {ErrorCode::stale_handle, static_cast<std::int64_t>(MpMlsError::null_pointer)});
+  }
+  MlsHash32 kp_ref{};
+  MlsBufGuard kp_guard{};
+  const BbMlsStatus st = bb_mls_prepare_direct_join(handle_, group_id.data(),
+                                                    kp_ref.data(), &kp_guard.buf);
+  if (st != BB_MLS_OK) {
+    return Result<MpMlsPreparedDirectJoin>::failure(map_mls_status(st));
+  }
+  MpMlsPreparedDirectJoin out{};
+  out.group_id = group_id;
+  out.kp_ref = kp_ref;
+  out.kp_bytes = kp_guard.take_vec();
+  return Result<MpMlsPreparedDirectJoin>::success(std::move(out));
+}
+
 Result<MlsGroupId>
 MpMlsEngine::process_welcome(mp::PartyId expected_party_id,
                              const mp::Ed25519PubKey &expected_ds_pubkey,
@@ -416,6 +436,27 @@ MpMlsEngine::commit_add_invitee(const MlsGroupId &group_id, std::uint64_t invite
   const BbMlsStatus st = bb_mls_commit_add_invitee(
       handle_, group_id.data(), invite_id, kp_bytes.data(), kp_bytes.size(),
       join_proof.data(), now_s, allow_delegated ? 1U : 0U, &raw);
+  MlsBufGuard c_guard{raw.commit_bytes};
+  MlsBufGuard w_guard{raw.welcome_bytes};
+  MlsBufGuard wa_guard{raw.welcome_auth_bytes};
+  if (st != BB_MLS_OK) {
+    return Result<MpMlsAddCommit>::failure(map_mls_status(st));
+  }
+  return Result<MpMlsAddCommit>::success(
+      MpMlsAddCommit{c_guard.take_vec(), w_guard.take_vec(), wa_guard.take_vec()});
+}
+
+Result<MpMlsAddCommit>
+MpMlsEngine::commit_add_sibling(const MlsGroupId &group_id,
+                                std::span<const std::uint8_t> kp_bytes,
+                                std::uint64_t now_s) {
+  if (handle_ == nullptr) {
+    return Result<MpMlsAddCommit>::failure(
+        {ErrorCode::stale_handle, static_cast<std::int64_t>(MpMlsError::null_pointer)});
+  }
+  BbMlsAddCommitOut raw{};
+  const BbMlsStatus st = bb_mls_commit_add_sibling(
+      handle_, group_id.data(), kp_bytes.data(), kp_bytes.size(), now_s, &raw);
   MlsBufGuard c_guard{raw.commit_bytes};
   MlsBufGuard w_guard{raw.welcome_bytes};
   MlsBufGuard wa_guard{raw.welcome_auth_bytes};
@@ -735,6 +776,9 @@ Result<void> MpMlsEngine::register_invite_record(const MlsGroupId &,
 Result<MpMlsPreparedJoin> MpMlsEngine::prepare_join(std::string_view) {
   return mls_unsupported<MpMlsPreparedJoin>();
 }
+Result<MpMlsPreparedDirectJoin> MpMlsEngine::prepare_direct_join(const MlsGroupId &) {
+  return mls_unsupported<MpMlsPreparedDirectJoin>();
+}
 Result<MlsGroupId> MpMlsEngine::process_welcome(mp::PartyId, const mp::Ed25519PubKey &,
                                                 std::span<const std::uint8_t>,
                                                 std::span<const std::uint8_t>) {
@@ -745,6 +789,11 @@ Result<MpMlsAddCommit> MpMlsEngine::commit_add_invitee(const MlsGroupId &,
                                                        std::span<const std::uint8_t>,
                                                        const MlsHash32 &, std::uint64_t,
                                                        bool) {
+  return mls_unsupported<MpMlsAddCommit>();
+}
+Result<MpMlsAddCommit> MpMlsEngine::commit_add_sibling(const MlsGroupId &,
+                                                       std::span<const std::uint8_t>,
+                                                       std::uint64_t) {
   return mls_unsupported<MpMlsAddCommit>();
 }
 Result<void> MpMlsEngine::apply_proposal(const MlsGroupId &,

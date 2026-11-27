@@ -27,12 +27,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use mp_mls::{
-    compute_join_proof, compute_safety_number_v2, format_epoch_authenticator,
-    generate_single_use_key_package, AccountDeviceListV1, AckStatus, ActiveDeviceEntryV1,
-    ClientClass, CommitAckV1, CustodyMode, DeviceIdentity, InviteFragmentV2, InviteRecordV1,
-    InviteSecrets, MpCryptoProvider, MpMlsClient, MpMlsDeviceBindingBodyV1, MpMlsDeviceBindingV1,
-    MpMlsError, MpMlsLeafCredV1, MpRoomPolicyExtV1, MpStrictCrypto, MsgClass, RoomTrustTier,
-    RootRotationStmtV1, WelcomeAuthV1, DEVICE_BINDING_LEN, INVITE_RECORD_V1_LEN,
+    compute_join_proof, compute_safety_number_v2, derive_sibling_welcome_mac_key,
+    format_epoch_authenticator, generate_single_use_key_package, AccountDeviceListV1, AckStatus,
+    ActiveDeviceEntryV1, ClientClass, CommitAckV1, CustodyMode, DeviceIdentity, InviteFragmentV2,
+    InviteRecordV1, InviteSecrets, MpCryptoProvider, MpMlsClient, MpMlsDeviceBindingBodyV1,
+    MpMlsDeviceBindingV1, MpMlsError, MpMlsLeafCredV1, MpRoomPolicyExtV1, MpStrictCrypto, MsgClass,
+    RoomTrustTier, RootRotationStmtV1, WelcomeAuthV1, DEVICE_BINDING_LEN, INVITE_RECORD_V1_LEN,
     MAX_DEVICES_PER_ACCOUNT, MP_GROUP_ID_LEN, ROOT_ROTATION_LEN, WELCOME_AUTH_V1_LEN,
 };
 use openmls_traits::crypto::OpenMlsCrypto;
@@ -1726,6 +1726,66 @@ pub unsafe extern "C" fn bb_mls_prepare_join(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bb_mls_prepare_direct_join(
+    engine: *mut BbMlsEngine,
+    group_id: *const u8,
+    out_kp_ref: *mut u8,
+    out_kp_bytes: *mut BbMlsByteBuf,
+) -> BbMlsStatus {
+    catch_ffi(|| {
+        if engine.is_null() || group_id.is_null() || out_kp_ref.is_null() || out_kp_bytes.is_null()
+        {
+            return BbMlsStatus::ErrNullPointer;
+        }
+        unsafe { *out_kp_bytes = BbMlsByteBuf::empty() };
+        let Ok(gid) = (unsafe { read_fixed::<BB_MLS_GROUP_ID_LEN>(group_id) }) else {
+            return BbMlsStatus::ErrNullPointer;
+        };
+
+        let eng = unsafe { &*engine };
+        let Ok(mut guard) = eng.inner.lock() else {
+            return BbMlsStatus::ErrPanic;
+        };
+        let own_acct = guard.identity.account_id();
+        let own_root_pk = guard.identity.cred.binding.body.root_pubkey;
+        let sibling_mac_key = match derive_sibling_welcome_mac_key(&gid, own_acct, &own_root_pk) {
+            Ok(k) => k,
+            Err(e) => return map_error(&e),
+        };
+        let provider = MpCryptoProvider::new();
+        let (kp_bytes, kp_ref) = match generate_single_use_key_package(&guard.identity, &provider) {
+            Ok(v) => v,
+            Err(e) => return map_error(&e),
+        };
+
+        guard.pending_joins.insert(
+            gid,
+            PendingJoinState {
+                group_id: gid,
+                invite_id: 1,
+                invite_epoch: 0,
+                expires_at_s: u64::MAX / 2,
+                policy_bits: 0,
+                inviter_root_pk: own_root_pk,
+                member_join_mac_key: sibling_mac_key,
+                kp_ref,
+                provider,
+            },
+        );
+        if let Err(st) = guard.persist() {
+            guard.pending_joins.remove(&gid);
+            return st;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(kp_ref.as_ptr(), out_kp_ref, BB_MLS_HASH_LEN);
+            *out_kp_bytes = BbMlsByteBuf::from_vec(kp_bytes);
+        }
+        BbMlsStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bb_mls_process_welcome(
     engine: *mut BbMlsEngine,
     expected_party_id: u64,
@@ -1860,6 +1920,62 @@ pub unsafe extern "C" fn bb_mls_commit_add_invitee(
             now_s,
             allow_delegated != 0,
         ) {
+            Ok(v) => v,
+            Err(e) => return map_error(&e),
+        };
+        let wa_bytes = match add_out.welcome_auth.encode() {
+            Ok(v) => v.to_vec(),
+            Err(e) => return map_error(&e),
+        };
+        if let Err(st) = guard.persist() {
+            return st;
+        }
+
+        let out = unsafe { &mut *out_commit };
+        out.commit_bytes = BbMlsByteBuf::from_vec(add_out.commit_bytes);
+        out.welcome_bytes = BbMlsByteBuf::from_vec(add_out.welcome_bytes);
+        out.welcome_auth_bytes = BbMlsByteBuf::from_vec(wa_bytes);
+        BbMlsStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bb_mls_commit_add_sibling(
+    engine: *mut BbMlsEngine,
+    group_id: *const u8,
+    kp_bytes: *const u8,
+    kp_len: usize,
+    now_s: u64,
+    out_commit: *mut BbMlsAddCommitOut,
+) -> BbMlsStatus {
+    catch_ffi(|| {
+        if engine.is_null() || out_commit.is_null() {
+            return BbMlsStatus::ErrNullPointer;
+        }
+        unsafe {
+            (*out_commit).commit_bytes = BbMlsByteBuf::empty();
+            (*out_commit).welcome_bytes = BbMlsByteBuf::empty();
+            (*out_commit).welcome_auth_bytes = BbMlsByteBuf::empty();
+        }
+        let Ok(gid) = (unsafe { read_fixed::<BB_MLS_GROUP_ID_LEN>(group_id) }) else {
+            return BbMlsStatus::ErrNullPointer;
+        };
+        let kp = match unsafe { read_bytes(kp_bytes, kp_len, BB_MLS_MAX_CTRL_BLOB_BYTES) } {
+            Ok(b) => b,
+            Err(st) => return st,
+        };
+
+        let eng = unsafe { &*engine };
+        let Ok(mut guard) = eng.inner.lock() else {
+            return BbMlsStatus::ErrPanic;
+        };
+        let Some(entry) = guard.groups.get_mut(&gid) else {
+            return BbMlsStatus::ErrNotFound;
+        };
+        let add_out = match entry
+            .client
+            .commit_add_sibling_device(kp, resolve_now_s(now_s))
+        {
             Ok(v) => v,
             Err(e) => return map_error(&e),
         };

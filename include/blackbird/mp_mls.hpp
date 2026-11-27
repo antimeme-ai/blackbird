@@ -137,6 +137,12 @@ struct MpMlsPreparedJoin {
   std::vector<std::uint8_t> kp_bytes;
 };
 
+struct MpMlsPreparedDirectJoin {
+  MlsGroupId group_id{};
+  MlsHash32 kp_ref{};
+  std::vector<std::uint8_t> kp_bytes;
+};
+
 struct MpMlsAddCommit {
   std::vector<std::uint8_t> commit_bytes;
   std::vector<std::uint8_t> welcome_bytes;
@@ -246,6 +252,8 @@ public:
 
   Result<MpMlsPreparedJoin> prepare_join(std::string_view fragment_b64url);
 
+  Result<MpMlsPreparedDirectJoin> prepare_direct_join(const MlsGroupId &group_id);
+
   Result<MlsGroupId> process_welcome(mp::PartyId expected_party_id,
                                      const mp::Ed25519PubKey &expected_ds_pubkey,
                                      std::span<const std::uint8_t> welcome_bytes,
@@ -257,6 +265,10 @@ public:
                                             const MlsHash32 &join_proof,
                                             std::uint64_t now_s,
                                             bool allow_delegated = false);
+
+  Result<MpMlsAddCommit> commit_add_sibling(const MlsGroupId &group_id,
+                                            std::span<const std::uint8_t> kp_bytes,
+                                            std::uint64_t now_s = 0U);
 
   Result<void> apply_proposal(const MlsGroupId &group_id,
                               std::span<const std::uint8_t> proposal_bytes);

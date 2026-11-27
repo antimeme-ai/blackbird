@@ -1351,8 +1351,19 @@ public:
       }
     }
     if (room_v2_session_ != nullptr && room_v2_session_->is_active()) {
+      // Allow IRC commands even when typed via `/party say /me ...`, etc.
+      if (trimmed.starts_with("/me ") || trimmed.starts_with("/nick ") ||
+          trimmed == "/topic" || trimmed.starts_with("/topic ") ||
+          trimmed == "/names" || trimmed.starts_with("/names ")) {
+        if (auto irc_out = try_handle_irc_command(trimmed); irc_out.has_value()) {
+          return irc_out;
+        }
+      }
       const auto res = room_v2_session_->send_chat(body, MpRoomV2Target{target});
       if (!res.has_value()) {
+        if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::mls_unavailable) {
+          return "Joining E2EE group... wait a moment before sending.\n";
+        }
         return "Party send failed: " +
                std::string{mp_room_v2_error_name(mp_room_v2_error_of(res.error()))} +
                "\n";
@@ -1380,9 +1391,84 @@ public:
            "): " + party_chat_sanitize(body, 240) + "\n";
   }
 
+  std::optional<std::string> try_handle_irc_command(std::string_view prompt) {
+    const auto trimmed = trim_ascii_ws(prompt);
+    const auto [cmd, args] = split_ws_token(trimmed);
+    if (cmd != "/nick" && cmd != "/me" && cmd != "/topic" && cmd != "/names")
+      return std::nullopt;
+    if (!mp2_active())
+      return "Not in an active live party — run `/invite` or `/join` first.\n";
+    if (cmd == "/names") {
+      const std::string line = room_v2_session_->post_local_names_notice();
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      return line + "\n";
+    }
+    if (cmd == "/nick") {
+      if (trim_ascii_ws(args).empty())
+        return "Usage: /nick <name> (1..32 printable chars, no spaces)\n";
+      const auto res = room_v2_session_->set_nick(args);
+      if (!res.has_value()) {
+        if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::mls_unavailable)
+          return "Joining E2EE group... wait a moment before changing nick.\n";
+        return "Invalid nick — use 1..32 printable non-space characters (no leading "
+               "@).\n";
+      }
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      return "* @" + party_chat_sanitize(room_v2_session_->local_handle(), 64) +
+             " is now known as " + res.value() + "\n";
+    }
+    if (cmd == "/me") {
+      if (trim_ascii_ws(args).empty())
+        return "Usage: /me <action>\n";
+      const auto res = room_v2_session_->send_action(std::string{args});
+      if (!res.has_value()) {
+        if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::mls_unavailable)
+          return "Joining E2EE group... wait a moment before sending.\n";
+        return "Action failed: " +
+               std::string{mp_room_v2_error_name(mp_room_v2_error_of(res.error()))} +
+               "\n";
+      }
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      const std::string actor = format_irc_display_name(IrcDisplayNameInput{
+          room_v2_session_->local_nick(), room_v2_session_->local_handle()});
+      return "* " + actor + " " + party_chat_sanitize(args, 240) + "\n";
+    }
+    // `/topic` (query) or `/topic <text>` (set)
+    const auto topic_arg = trim_ascii_ws(args);
+    if (topic_arg.empty()) {
+      room_v2_session_->post_local_topic_notice();
+      if (tui_)
+        ui_.party_chat(room_v2_session_->to_party_snapshot());
+      const std::string cur = room_v2_session_->topic();
+      return cur.empty() ? "* No topic is set.\n" : ("* Topic: " + cur + "\n");
+    }
+    const auto res = room_v2_session_->set_topic(topic_arg);
+    if (!res.has_value()) {
+      if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::secret_rejected)
+        return "Topic refused: recognizable secret token detected.\n";
+      if (mp_room_v2_error_of(res.error()) == MpRoomV2Error::mls_unavailable)
+        return "Joining E2EE group... wait a moment before setting topic.\n";
+      return "Topic update failed: " +
+             std::string{mp_room_v2_error_name(mp_room_v2_error_of(res.error()))} +
+             "\n";
+    }
+    if (tui_)
+      ui_.party_chat(room_v2_session_->to_party_snapshot());
+    const std::string actor = format_irc_display_name(IrcDisplayNameInput{
+        room_v2_session_->local_nick(), room_v2_session_->local_handle()});
+    return "* " + actor + " changed the topic to: " + res.value() + "\n";
+  }
+
   std::optional<std::string> try_handle_slash(std::string_view prompt) {
     const auto trimmed = trim_ascii_ws(prompt);
     const auto [cmd, args] = split_ws_token(trimmed);
+
+    // Classic IRC Party Chat commands
+    if (cmd == "/nick" || cmd == "/me" || cmd == "/topic" || cmd == "/names")
+      return try_handle_irc_command(trimmed);
 
     // 1-verb Xbox Live commands
     if (cmd == "/login")
@@ -1482,6 +1568,9 @@ private:
     std::string room_name;
     std::string share_url;
     std::vector<mp::RoomMemberInfo> members;
+    std::uint8_t e2ee_mode = 0U;
+    std::optional<mp::Ed25519PubKey> party_ds_pubkey;
+    bool is_room_creator = false;
   };
 
   std::optional<std::string> attach_live_room_v2(const OpenedOnlineClient &opened,
@@ -1506,6 +1595,17 @@ private:
     rcfg.client_name = "blackbird";
     rcfg.agent_name = "Blackbird";
     rcfg.initial_members = params.members;
+    rcfg.e2ee_mode = params.e2ee_mode;
+    rcfg.party_ds_pubkey = params.party_ds_pubkey;
+    rcfg.is_room_creator = params.is_room_creator;
+    if (mp_mls_compiled_in()) {
+      mp::MpControlClient mls_client(opened.client_cfg, opened.store->state());
+      if (auto eng = open_mp_mls_engine_for_identity(
+              opened.env.state_dir, opened.store->state(), &mls_client);
+          eng.has_value()) {
+        rcfg.mls_engine = std::move(eng).value();
+      }
+    }
 
     auto started = MpRoomV2Session::start(std::move(rcfg));
     if (!started.has_value()) {
@@ -1769,6 +1869,7 @@ private:
 
     mp::RoomInviteRequest req{};
     req.handle = target_handle;
+    req.e2ee_mode = 1U;
     if (room_v2_session_ != nullptr && room_v2_session_->is_active()) {
       req.party_id = room_v2_session_->party_id();
     }
@@ -1778,9 +1879,15 @@ private:
     }
     const auto &r = inv.value();
     if (const auto attach_err = attach_live_room_v2(
-            opened,
-            LiveRoomV2AttachParams{
-                r.party_id, r.ws_path, r.room_code, "", r.share_url, {}});
+            opened, LiveRoomV2AttachParams{r.party_id,
+                                           r.ws_path,
+                                           r.room_code,
+                                           "",
+                                           r.share_url,
+                                           {},
+                                           r.e2ee_mode,
+                                           r.party_ds_pubkey,
+                                           !req.party_id.has_value()});
         attach_err.has_value()) {
       return *attach_err;
     }
@@ -1834,7 +1941,8 @@ private:
                                        : std::string{};
     if (const auto attach_err = attach_live_room_v2(
             opened, LiveRoomV2AttachParams{r.party_id, r.ws_path, r.room_code, r.name,
-                                           safe_share, r.members});
+                                           safe_share, r.members, r.e2ee_mode,
+                                           r.party_ds_pubkey, false});
         attach_err.has_value()) {
       return *attach_err;
     }

@@ -880,6 +880,7 @@ Result<PartyParticipant> participant_from_value(const Value &value) {
       std::move(provider).value(),
       std::move(remote_model).value(),
       local_self.value(),
+      std::string{},
   });
 }
 
@@ -939,6 +940,7 @@ Result<PartyMessage> message_from_value(const Value &value) {
       std::move(body).value(),
       untrusted.value(),
       std::nullopt,
+      std::string{},
   });
 }
 

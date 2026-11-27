@@ -1083,6 +1083,126 @@ void test_compact_room_presentation_rendering() {
           "compact direct chat must preserve target mention");
   require(plain.find("[GUEST] @visitor: hi") != std::string::npos,
           "compact chat must label unauthenticated guests with [GUEST]");
+  require((plain.find("[") != std::string::npos &&
+           plain.find(":20]") != std::string::npos) ||
+              plain.find("] @spongebob:") != std::string::npos,
+          "compact chat must render crisp [HH:MM] timestamps");
+}
+
+void test_irc_flavor_rendering_and_anti_spoofing() {
+  // 1. Nick validation & anti-spoofing
+  require(must(validate_irc_nick("gpu-01"), "valid nick") == "gpu-01", "gpu-01 valid");
+  require(must(validate_irc_nick("blackbird-east"), "valid nick") == "blackbird-east",
+          "blackbird-east valid");
+  require(!validate_irc_nick("").has_value(), "empty nick rejected");
+  require(!validate_irc_nick("   ").has_value(), "whitespace nick rejected");
+  require(!validate_irc_nick("@patrick").has_value(), "leading @ spoofing rejected");
+  require(!validate_irc_nick("bad nick").has_value(), "embedded space rejected");
+  require(!validate_irc_nick(std::string(33U, 'a')).has_value(),
+          "33-char nick rejected");
+  require(!validate_irc_nick("evil\x1b[31mred").has_value(), "ANSI ESC nick rejected");
+  require(!validate_irc_nick("evil\xe2\x80\x8bzero").has_value(),
+          "zero-width nick rejected");
+  require(!validate_irc_nick("evil\xe2\x80\xae"
+                             "bidi")
+               .has_value(),
+          "BiDi override nick rejected");
+  require(!validate_irc_nick("bad\x07"
+                             "bell")
+               .has_value(),
+          "C0 control nick rejected");
+
+  // 2. Display identity always preserves verified @handle badge
+  require(format_irc_display_name(IrcDisplayNameInput{"gpu-01", "patrick"}) ==
+              "gpu-01 (@patrick)",
+          "nick must preserve verified @handle badge");
+  require(format_irc_display_name(IrcDisplayNameInput{"patrick", "@patrick"}) ==
+              "@patrick",
+          "identical nick/handle must not duplicate");
+  require(format_irc_display_name(IrcDisplayNameInput{"@spoof", "patrick"}) ==
+              "@patrick",
+          "invalid spoofed nick must fall back to verified @handle");
+
+  // 3. PartyChatPane IRC rendering: [HH:MM], topic header, join/part, /me italic,
+  // /names
+  PartySnapshot snap{};
+  snap.room_scope = "room/IRC1";
+  snap.room_topic = "Ship v0.9.1 cleanly";
+  snap.mode = PartyMode::multi_operator;
+  snap.compact_room_presentation = true;
+
+  PartyParticipant me{};
+  me.id = "patrick";
+  me.nick = "laptop";
+  me.display_name = "laptop (@patrick)";
+  me.role = PartyMemberRole::operator_human;
+  me.host = "blackbird";
+  me.state = PartyParticipantState::online;
+  me.local_self = true;
+
+  PartyParticipant peer{};
+  peer.id = "phall";
+  peer.nick = "gpu-01";
+  peer.display_name = "gpu-01 (@phall)";
+  peer.role = PartyMemberRole::operator_human;
+  peer.host = "blackbird";
+  peer.state = PartyParticipantState::online;
+  snap.participants = {me, peer};
+
+  PartyMessage join_m{};
+  join_m.id = "j1";
+  join_m.timestamp_ns = 1795587256000000000LL;
+  join_m.sender_id = "system";
+  join_m.kind = PartyMessageKind::irc_notice;
+  join_m.body = "--> gpu-01 (@phall · blackbird) has joined";
+
+  PartyMessage action_m{};
+  action_m.id = "a1";
+  action_m.timestamp_ns = 1795587260000000000LL;
+  action_m.sender_id = "@phall";
+  action_m.sender_nick = "gpu-01";
+  action_m.sender_role = PartyMemberRole::operator_human;
+  action_m.kind = PartyMessageKind::irc_action;
+  action_m.body = "spins up the H100 cluster";
+
+  PartyMessage names_m{};
+  names_m.id = "n1";
+  names_m.timestamp_ns = 1795587265000000000LL;
+  names_m.sender_id = "system";
+  names_m.kind = PartyMessageKind::irc_notice;
+  names_m.body = "[Users: laptop (@patrick · blackbird · live), gpu-01 (@phall · "
+                 "blackbird · live)]";
+
+  PartyMessage part_m{};
+  part_m.id = "p1";
+  part_m.timestamp_ns = 1795587270000000000LL;
+  part_m.sender_id = "system";
+  part_m.kind = PartyMessageKind::irc_notice;
+  part_m.body = "<-- gpu-01 (@phall) has left";
+
+  snap.messages = {join_m, action_m, names_m, part_m};
+
+  PartyChatPane pane{snap};
+  const PartyChatFrame plain_frame = pane.render_frame(120, 20, false);
+  for (const auto &line : plain_frame.lines)
+    assert_zero_raw_controls(line);
+  const std::string plain = plain_frame.text();
+  require(plain.find("Topic: Ship v0.9.1 cleanly") != std::string::npos,
+          "header must display room topic");
+  require(plain.find("--> gpu-01 (@phall · blackbird) has joined") != std::string::npos,
+          "joinline must render cleanly");
+  require(plain.find("* gpu-01 (@phall) spins up the H100 cluster") !=
+              std::string::npos,
+          "/me action must render with verified @handle badge");
+  require(plain.find("[Users: laptop (@patrick · blackbird · live)") !=
+              std::string::npos,
+          "/names roster notice must render cleanly");
+  require(plain.find("<-- gpu-01 (@phall) has left") != std::string::npos,
+          "partline must render cleanly");
+
+  const std::string colored = pane.render_frame(120, 20, true).text();
+  require(colored.find("\x1b[3;") != std::string::npos,
+          "/me action must render in italic style when color enabled");
 }
 
 } // namespace
@@ -1098,6 +1218,7 @@ int main() {
     test_unverified_and_revoked_bridge_peer_cannot_impersonate_or_escalate();
     test_structured_agent_card_rendering_and_hostile_sanitization();
     test_compact_room_presentation_rendering();
+    test_irc_flavor_rendering_and_anti_spoofing();
     std::cout << "party_chat_test: all checks passed\n";
     return 0;
   } catch (const std::exception &ex) {

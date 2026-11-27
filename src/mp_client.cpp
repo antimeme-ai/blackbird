@@ -6174,11 +6174,122 @@ std::string format_room_display_label(PartyId party_id, std::string_view room_co
   return "party #" + party_id.to_decimal();
 }
 
+namespace {
+
+std::uint8_t parse_optional_e2ee_mode(const Value &obj) noexcept {
+  if (const auto u = get_required_u64(obj, "e2ee_mode"); u.has_value()) {
+    return u.value() == 1U ? 1U : 0U;
+  }
+  if (const Value *f = obj.find("e2ee_mode"); f != nullptr) {
+    if (const auto *b = std::get_if<bool>(&f->value())) {
+      return *b ? 1U : 0U;
+    }
+  }
+  return 0U;
+}
+
+std::optional<Ed25519PubKey> parse_optional_ds_pubkey(const Value &obj) {
+  if (const auto pk = get_required_pubkey_b64(obj, "party_ds_pubkey_b64");
+      pk.has_value()) {
+    return pk.value();
+  }
+  if (const auto pk = get_required_pubkey_b64(obj, "ds_pubkey_b64"); pk.has_value()) {
+    return pk.value();
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+Result<RoomCreateResponse>
+MpControlClient::room_create(const RoomCreateRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<RoomCreateResponse>::failure(auth.error());
+  }
+  if (request.e2ee_mode > 1U) {
+    return fail_c<RoomCreateResponse>(ErrorCode::invalid_range,
+                                      MpClientError::invalid_config);
+  }
+
+  Value::Object body_obj;
+  if (request.name.has_value() && !request.name->empty()) {
+    body_obj.emplace_back("name", Value{*request.name});
+  }
+  body_obj.emplace_back(
+      "client",
+      Value{request.client.empty() ? std::string{"blackbird"} : request.client});
+  if (!request.agent_name.empty()) {
+    body_obj.emplace_back("agent_name", Value{request.agent_name});
+  }
+  body_obj.emplace_back("e2ee_mode",
+                        Value{Number{static_cast<std::uint64_t>(request.e2ee_mode)}});
+  if (request.operation_id.has_value() && !request.operation_id->empty()) {
+    body_obj.emplace_back("operation_id", Value{*request.operation_id});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<RoomCreateResponse>::failure(body_bytes.error());
+  }
+
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/rooms/create";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<RoomCreateResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<RoomCreateResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<RoomCreateResponse>::failure(obj.error());
+  }
+  const auto pid_raw = get_required_u64_or_decimal(obj.value(), "party_id");
+  const auto room_code = get_optional_string(obj.value(), "room_code");
+  const auto name = get_optional_string(obj.value(), "name");
+  const auto share_url = get_optional_string(obj.value(), "share_url");
+  const auto ws_path = get_required_string(obj.value(), "ws_path");
+  if (!pid_raw.has_value() || !room_code.has_value() || !name.has_value() ||
+      !share_url.has_value() || !ws_path.has_value()) {
+    return fail_c<RoomCreateResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  const auto pid = PartyId::create(pid_raw.value());
+  if (!pid.has_value()) {
+    return fail_c<RoomCreateResponse>(ErrorCode::corrupt,
+                                      MpClientError::http_response_schema);
+  }
+  return Result<RoomCreateResponse>::success(RoomCreateResponse{
+      pid.value(),
+      room_code.value().value_or(""),
+      name.value().value_or(""),
+      share_url.value().value_or(""),
+      ws_path.value(),
+      parse_optional_e2ee_mode(obj.value()),
+      parse_optional_ds_pubkey(obj.value()),
+  });
+}
+
 Result<RoomInviteResponse>
 MpControlClient::room_invite(const RoomInviteRequest &request) {
   auto auth = require_device_auth(identity_);
   if (!auth.has_value()) {
     return Result<RoomInviteResponse>::failure(auth.error());
+  }
+  if (request.e2ee_mode > 1U) {
+    return fail_c<RoomInviteResponse>(ErrorCode::invalid_range,
+                                      MpClientError::invalid_config);
   }
 
   Value::Object body_obj;
@@ -6196,6 +6307,8 @@ MpControlClient::room_invite(const RoomInviteRequest &request) {
   if (request.name.has_value() && !request.name->empty()) {
     body_obj.emplace_back("name", Value{*request.name});
   }
+  body_obj.emplace_back("e2ee_mode",
+                        Value{Number{static_cast<std::uint64_t>(request.e2ee_mode)}});
   auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
   if (!body_bytes.has_value()) {
     return Result<RoomInviteResponse>::failure(body_bytes.error());
@@ -6247,6 +6360,8 @@ MpControlClient::room_invite(const RoomInviteRequest &request) {
       handle_url.value().value_or(""),
       ws_path.value(),
       invited_handle.value(),
+      parse_optional_e2ee_mode(obj.value()),
+      parse_optional_ds_pubkey(obj.value()),
   });
 }
 
@@ -6316,6 +6431,8 @@ Result<RoomEnterResponse> MpControlClient::room_enter(const RoomEnterRequest &re
       share_url.value().value_or(""),
       ws_path.value(),
       std::move(members).value(),
+      parse_optional_e2ee_mode(obj.value()),
+      parse_optional_ds_pubkey(obj.value()),
   });
 }
 
@@ -6763,6 +6880,131 @@ Result<MpControlSocket> MpControlClient::connect_party_socket_v2(PartyId party_i
 // MLS E2EE Control-Plane HTTPS endpoints (`mp2-mls-v1`)
 // ---------------------------------------------------------------------------
 
+Result<MlsCloudBindResponse>
+MpControlClient::mls_cloud_bind(const MlsCloudBindRequest &request) {
+  auto auth = require_device_auth(identity_);
+  if (!auth.has_value()) {
+    return Result<MlsCloudBindResponse>::failure(auth.error());
+  }
+  Value::Object body_obj;
+  body_obj.emplace_back("mls_sig_pubkey_b64",
+                        Value{base64_encode(request.mls_sig_pubkey)});
+  body_obj.emplace_back(
+      "client_class", Value{Number{static_cast<std::uint64_t>(request.client_class)}});
+  body_obj.emplace_back("agent_capable", Value{request.agent_capable});
+  if (request.iat_s.has_value()) {
+    body_obj.emplace_back("iat_s", Value{Number{*request.iat_s}});
+  }
+  if (request.exp_s.has_value()) {
+    body_obj.emplace_back("exp_s", Value{Number{*request.exp_s}});
+  }
+  if (!request.device_sig.empty()) {
+    body_obj.emplace_back("device_sig_b64", Value{base64_encode(request.device_sig)});
+  }
+  auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
+  if (!body_bytes.has_value()) {
+    return Result<MlsCloudBindResponse>::failure(body_bytes.error());
+  }
+  RawHttpRequest req{};
+  req.method = HttpMethod::post;
+  req.path = "/v1/accounts/me/mls/cloud-bind";
+  req.query = "?";
+  req.body = std::move(body_bytes).value();
+
+  const auto resp = signed_rest_call(
+      config_, clock_offset_s_, auth.value().signing_key,
+      KeyId{DeviceKeyId{auth.value().account_id, auth.value().device_id}}, req);
+  if (!resp.has_value()) {
+    return Result<MlsCloudBindResponse>::failure(resp.error());
+  }
+  if (resp.value().status != 200 && resp.value().status != 201) {
+    return Result<MlsCloudBindResponse>::failure(
+        map_http_error(resp.value().status, response_is_clock_skew(resp.value())));
+  }
+  const std::string_view text{reinterpret_cast<const char *>(resp.value().body.data()),
+                              resp.value().body.size()};
+  const auto obj = parse_json_object_body(text);
+  if (!obj.has_value()) {
+    return Result<MlsCloudBindResponse>::failure(obj.error());
+  }
+  const auto acct_raw = get_required_u64_or_decimal(obj.value(), "account_id");
+  const auto dev_raw = get_required_u64_or_decimal(obj.value(), "device_id");
+  const auto dev_gen = get_required_u64(obj.value(), "device_gen");
+  const auto root_gen = get_required_u64(obj.value(), "root_gen");
+  const auto root_pk = get_required_pubkey_b64(obj.value(), "root_pubkey_b64");
+  if (!acct_raw.has_value() || !dev_raw.has_value() || !dev_gen.has_value() ||
+      !root_gen.has_value() || !root_pk.has_value()) {
+    return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+  }
+  const auto acct_id = AccountId::create(acct_raw.value());
+  const auto dev_id = DeviceId::create(dev_raw.value());
+  if (!acct_id.has_value() || !dev_id.has_value()) {
+    return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+  }
+
+  MlsCloudBindResponse out{};
+  out.account_id = acct_id.value();
+  out.device_id = dev_id.value();
+  out.device_gen = static_cast<std::uint32_t>(dev_gen.value());
+  out.root_gen = static_cast<std::uint32_t>(root_gen.value());
+  out.root_pubkey = root_pk.value();
+  const auto cm_res = get_required_u64(obj.value(), "custody_mode");
+  out.custody_mode = (cm_res.has_value() && cm_res.value() == 1U) ? std::uint8_t{1U}
+                                                                  : std::uint8_t{0U};
+
+  const auto step_opt = get_optional_string(obj.value(), "step");
+  if (step_opt.has_value() && step_opt.value().has_value() &&
+      *step_opt.value() == "sign_pop") {
+    const auto iat_res = get_required_u64(obj.value(), "iat_s");
+    const auto exp_res = get_required_u64(obj.value(), "exp_s");
+    const auto body_b64 = get_required_string(obj.value(), "body_b64");
+    const auto root_sig_b64 = get_required_string(obj.value(), "root_sig_b64");
+    const auto pop_b64 = get_required_string(obj.value(), "pop_message_b64");
+    if (!iat_res.has_value() || !exp_res.has_value() || !body_b64.has_value() ||
+        !root_sig_b64.has_value() || !pop_b64.has_value()) {
+      return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+    }
+    const auto b_vec = base64_decode(body_b64.value());
+    const auto rs_vec = base64_decode(root_sig_b64.value());
+    const auto pm_vec = base64_decode(pop_b64.value());
+    if (!b_vec.has_value() || b_vec->size() != 108U || !rs_vec.has_value() ||
+        rs_vec->size() != 64U || !pm_vec.has_value() || pm_vec->size() != 50U) {
+      return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                          MpClientError::http_response_schema);
+    }
+    out.step = "sign_pop";
+    out.iat_s = iat_res.value();
+    out.exp_s = exp_res.value();
+    out.body_bytes = std::move(*b_vec);
+    out.root_sig_bytes = std::move(*rs_vec);
+    out.pop_message_bytes = std::move(*pm_vec);
+    return Result<MlsCloudBindResponse>::success(std::move(out));
+  }
+
+  const auto binding_b64 = get_required_string(obj.value(), "binding_b64");
+  const auto dlist_b64 = get_required_string(obj.value(), "device_list_b64");
+  if (!binding_b64.has_value() || !dlist_b64.has_value()) {
+    return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+  }
+  const auto binding_vec = base64_decode(binding_b64.value());
+  const auto dlist_vec = base64_decode(dlist_b64.value());
+  if (!binding_vec.has_value() || binding_vec->size() != 236U ||
+      !dlist_vec.has_value() || dlist_vec->empty()) {
+    return fail_c<MlsCloudBindResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+  }
+  out.step = "bound";
+  std::memcpy(out.device_binding.data(), binding_vec->data(), 236U);
+  out.device_list_bytes = std::move(*dlist_vec);
+  const auto lv_res = get_required_u64(obj.value(), "list_version");
+  out.list_version = lv_res.has_value() ? lv_res.value() : 1U;
+  return Result<MlsCloudBindResponse>::success(std::move(out));
+}
+
 Result<MlsReserveDeviceResponse>
 MpControlClient::mls_reserve_device(const MlsReserveDeviceRequest &request) {
   auto auth = require_device_auth(identity_);
@@ -6946,7 +7188,10 @@ MpControlClient::mls_init_party(const MlsInitPartyRequest &request) {
     return Result<MlsInitPartyResponse>::failure(obj.error());
   }
   const auto epoch = get_required_u64(obj.value(), "mls_epoch");
-  const auto ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  auto ds_pk = get_required_pubkey_b64(obj.value(), "party_ds_pubkey_b64");
+  if (!ds_pk.has_value()) {
+    ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  }
   if (!epoch.has_value() || !ds_pk.has_value()) {
     return fail_c<MlsInitPartyResponse>(ErrorCode::corrupt,
                                         MpClientError::http_response_schema);
@@ -6965,8 +7210,9 @@ MpControlClient::mls_register_invite(const MlsRegisterInviteRequest &request) {
   if (request.invite_id > 0U) {
     body_obj.emplace_back("invite_id", Value{Number{request.invite_id}});
   }
-  body_obj.emplace_back("server_token_hash_b64",
-                        Value{base64_encode(request.server_token_hash)});
+  const std::string token_hash_b64 = base64_encode(request.server_token_hash);
+  body_obj.emplace_back("token_hash_b64", Value{token_hash_b64});
+  body_obj.emplace_back("server_token_hash_b64", Value{token_hash_b64});
   body_obj.emplace_back("max_uses",
                         Value{Number{static_cast<std::uint64_t>(request.max_uses)}});
   body_obj.emplace_back("expires_at_ms", Value{Number{request.expires_at_ms}});
@@ -7015,12 +7261,20 @@ Result<void> MpControlClient::mls_join_party(const MlsJoinPartyRequest &request)
     return fail_cv(ErrorCode::invalid_range, MpClientError::invalid_config);
   }
   Value::Object body_obj;
-  body_obj.emplace_back("invite_id", Value{Number{request.invite_id}});
-  body_obj.emplace_back("server_invite_token_b64",
-                        Value{base64_encode(request.server_invite_token)});
+  if (request.invite_id > 0U) {
+    body_obj.emplace_back("invite_id", Value{Number{request.invite_id}});
+  }
+  if (request.server_invite_token.has_value()) {
+    body_obj.emplace_back("server_invite_token_b64",
+                          Value{base64_encode(*request.server_invite_token)});
+  }
   body_obj.emplace_back("kp_ref_b64", Value{base64_encode(request.kp_ref)});
-  body_obj.emplace_back("kp_b64", Value{base64_encode(request.kp_bytes)});
-  body_obj.emplace_back("join_proof_b64", Value{base64_encode(request.join_proof)});
+  const std::string kp_b64 = base64_encode(request.kp_bytes);
+  body_obj.emplace_back("kp_blob_b64", Value{kp_b64});
+  body_obj.emplace_back("kp_b64", Value{kp_b64});
+  if (request.join_proof.has_value()) {
+    body_obj.emplace_back("join_proof_b64", Value{base64_encode(*request.join_proof)});
+  }
   auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
   if (!body_bytes.has_value()) {
     return Result<void>::failure(body_bytes.error());
@@ -7058,17 +7312,30 @@ MpControlClient::mls_submit_commit(const MlsSubmitCommitRequest &request) {
   }
   Value::Object body_obj;
   body_obj.emplace_back("parent_epoch", Value{Number{request.parent_epoch}});
-  body_obj.emplace_back("commit_b64", Value{base64_encode(request.commit_bytes)});
-  if (request.welcome_bytes.has_value() && !request.welcome_bytes->empty()) {
-    body_obj.emplace_back("welcome_b64", Value{base64_encode(*request.welcome_bytes)});
-  }
-  if (request.welcome_auth_bytes.has_value() && !request.welcome_auth_bytes->empty()) {
-    body_obj.emplace_back("welcome_auth_b64",
-                          Value{base64_encode(*request.welcome_auth_bytes)});
-  }
-  if (request.welcome_target_device_id.has_value()) {
-    body_obj.emplace_back("welcome_target_device_id",
-                          Value{Number{request.welcome_target_device_id->value()}});
+  const std::string commit_b64 = base64_encode(request.commit_bytes);
+  body_obj.emplace_back("commit_blob_b64", Value{commit_b64});
+  body_obj.emplace_back("commit_b64", Value{commit_b64});
+  if (request.welcome_bytes.has_value() && !request.welcome_bytes->empty() &&
+      request.welcome_auth_bytes.has_value() && !request.welcome_auth_bytes->empty() &&
+      request.welcome_target_device_id.has_value()) {
+    const std::string wb64 = base64_encode(*request.welcome_bytes);
+    const std::string wab64 = base64_encode(*request.welcome_auth_bytes);
+    if (request.welcome_kp_ref.has_value()) {
+      Value::Object w_entry;
+      w_entry.emplace_back("target_device_id",
+                           Value{Number{request.welcome_target_device_id->value()}});
+      w_entry.emplace_back("kp_ref_b64", Value{base64_encode(*request.welcome_kp_ref)});
+      w_entry.emplace_back("welcome_blob_b64", Value{wb64});
+      w_entry.emplace_back("welcome_auth_blob_b64", Value{wab64});
+      Value::Array welcomes_arr;
+      welcomes_arr.push_back(Value::object(std::move(w_entry)));
+      body_obj.emplace_back("welcomes", Value{std::move(welcomes_arr)});
+    } else {
+      body_obj.emplace_back("welcome_b64", Value{wb64});
+      body_obj.emplace_back("welcome_auth_b64", Value{wab64});
+      body_obj.emplace_back("welcome_target_device_id",
+                            Value{Number{request.welcome_target_device_id->value()}});
+    }
   }
   auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
   if (!body_bytes.has_value()) {
@@ -7076,7 +7343,7 @@ MpControlClient::mls_submit_commit(const MlsSubmitCommitRequest &request) {
   }
   RawHttpRequest req{};
   req.method = HttpMethod::post;
-  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/commit";
+  req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/commits";
   req.query = "?";
   req.body = std::move(body_bytes).value();
 
@@ -7097,10 +7364,19 @@ MpControlClient::mls_submit_commit(const MlsSubmitCommitRequest &request) {
   if (!obj.has_value()) {
     return Result<MlsSubmitCommitResponse>::failure(obj.error());
   }
-  const auto target_epoch = get_required_u64(obj.value(), "target_epoch");
-  const auto sha = get_optional_string(obj.value(), "commit_sha256");
+  auto target_epoch = get_required_u64(obj.value(), "mls_epoch");
+  if (!target_epoch.has_value()) {
+    target_epoch = get_required_u64(obj.value(), "target_epoch");
+  }
+  auto sha = get_optional_string(obj.value(), "commit_sha256_b64");
+  if (!sha.has_value() || !sha.value().has_value()) {
+    sha = get_optional_string(obj.value(), "commit_sha256");
+  }
   bool finalized = false;
-  if (const Value *ff = obj.value().find("finalized"); ff != nullptr) {
+  if (const auto status_str = get_optional_string(obj.value(), "status");
+      status_str.has_value() && status_str.value().has_value()) {
+    finalized = (*status_str.value() == "finalized");
+  } else if (const Value *ff = obj.value().find("finalized"); ff != nullptr) {
     const auto fb = value_as_bool_or_flag(*ff);
     if (!fb.has_value()) {
       return fail_c<MlsSubmitCommitResponse>(ErrorCode::corrupt,
@@ -7134,6 +7410,27 @@ MpControlClient::mls_submit_commit_ack(const MlsSubmitCommitAckRequest &request)
   body_obj.emplace_back("status",
                         Value{Number{static_cast<std::uint64_t>(request.status)}});
   body_obj.emplace_back("ack_b64", Value{base64_encode(request.ack_bytes)});
+  // Unpack canonical CommitAckV1 binary fields for PartyDO `/mls/ack`:
+  // ver(1) || gid(24) || parent(8) || target(8) || commit_sha256(32) ||
+  // acct(8) || dev(8) || status(1) || auth_len(2) || auth(0|32) || sig(64).
+  if (request.ack_bytes.size() >= 156U && request.ack_bytes[0] == 1U) {
+    const std::size_t auth_len =
+        (static_cast<std::size_t>(request.ack_bytes[90]) << 8U) |
+        static_cast<std::size_t>(request.ack_bytes[91]);
+    if (92U + auth_len + 64U == request.ack_bytes.size()) {
+      body_obj.emplace_back("commit_sha256_b64",
+                            Value{base64_encode(std::span<const std::uint8_t>{
+                                request.ack_bytes.data() + 41U, 32U})});
+      if (auth_len > 0U) {
+        body_obj.emplace_back("epoch_auth_hash_b64",
+                              Value{base64_encode(std::span<const std::uint8_t>{
+                                  request.ack_bytes.data() + 92U, auth_len})});
+      }
+      body_obj.emplace_back("ack_sig_b64",
+                            Value{base64_encode(std::span<const std::uint8_t>{
+                                request.ack_bytes.data() + 92U + auth_len, 64U})});
+    }
+  }
   auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
   if (!body_bytes.has_value()) {
     return Result<void>::failure(body_bytes.error());
@@ -7165,10 +7462,11 @@ MpControlClient::mls_fetch_commits(const MlsFetchCommitsRequest &request) {
     return Result<MlsFetchCommitsResponse>::failure(auth.error());
   }
   const std::uint32_t clamped_limit = std::clamp<std::uint32_t>(request.limit, 1U, 32U);
+  const std::uint64_t eff_from = std::max<std::uint64_t>(request.from_epoch, 1U);
   RawHttpRequest req{};
   req.method = HttpMethod::get;
   req.path = "/v1/parties/" + request.party_id.to_decimal() + "/mls/commits";
-  req.query = "?from_epoch=" + std::to_string(request.from_epoch) +
+  req.query = "?from_epoch=" + std::to_string(eff_from) +
               "&limit=" + std::to_string(clamped_limit);
 
   const auto resp = signed_rest_call(
@@ -7188,8 +7486,12 @@ MpControlClient::mls_fetch_commits(const MlsFetchCommitsRequest &request) {
     return Result<MlsFetchCommitsResponse>::failure(obj.error());
   }
   MlsFetchCommitsResponse out{};
-  if (const auto head = get_required_u64(obj.value(), "head_epoch"); head.has_value()) {
+  if (const auto head = get_required_u64(obj.value(), "current_epoch");
+      head.has_value()) {
     out.head_epoch = head.value();
+  } else if (const auto head2 = get_required_u64(obj.value(), "head_epoch");
+             head2.has_value()) {
+    out.head_epoch = head2.value();
   }
   if (const Value *cf = obj.value().find("commits"); cf != nullptr) {
     const auto *arr = std::get_if<Value::Array>(&cf->value());
@@ -7203,8 +7505,14 @@ MpControlClient::mls_fetch_commits(const MlsFetchCommitsRequest &request) {
         return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
                                                MpClientError::http_response_schema);
       }
-      const auto ep = get_required_u64(item, "epoch");
-      const auto cb64 = get_required_string(item, "commit_b64");
+      auto ep = get_required_u64(item, "mls_epoch");
+      if (!ep.has_value()) {
+        ep = get_required_u64(item, "epoch");
+      }
+      auto cb64 = get_required_string(item, "commit_blob_b64");
+      if (!cb64.has_value()) {
+        cb64 = get_required_string(item, "commit_b64");
+      }
       if (!ep.has_value() || !cb64.has_value()) {
         return fail_c<MlsFetchCommitsResponse>(ErrorCode::corrupt,
                                                MpClientError::http_response_schema);
@@ -7217,7 +7525,11 @@ MpControlClient::mls_fetch_commits(const MlsFetchCommitsRequest &request) {
       MlsCatchupCommit rec{};
       rec.epoch = ep.value();
       rec.commit_bytes = std::move(*cbytes);
-      if (const Value *pf = item.find("proposals"); pf != nullptr) {
+      const Value *pf = item.find("proposals_b64");
+      if (pf == nullptr) {
+        pf = item.find("proposals");
+      }
+      if (pf != nullptr) {
         if (const auto *parr = std::get_if<Value::Array>(&pf->value())) {
           for (const auto &pitem : *parr) {
             if (const auto *ps = std::get_if<std::string>(&pitem.value())) {
@@ -7266,18 +7578,56 @@ Result<MlsWelcomeResponse> MpControlClient::mls_fetch_welcome(PartyId party_id) 
   if (!obj.has_value()) {
     return Result<MlsWelcomeResponse>::failure(obj.error());
   }
-  const auto wb64 = get_optional_string(obj.value(), "welcome_b64");
-  if (!wb64.has_value() || !wb64.value().has_value() || wb64.value()->empty()) {
+  // Support both live PartyDO nested schema (`{ party_ds_pubkey_b64, welcome: { ... }
+  // }`) and flat legacy schema (`{ welcome_b64, welcome_auth_b64, target_epoch,
+  // ds_pubkey_b64 }`).
+  const Value *wobj = &obj.value();
+  if (const Value *nested = obj.value().find("welcome"); nested != nullptr) {
+    if (std::holds_alternative<std::nullptr_t>(nested->value())) {
+      return Result<MlsWelcomeResponse>::success(MlsWelcomeResponse{});
+    }
+    if (!std::holds_alternative<Value::Object>(nested->value())) {
+      return fail_c<MlsWelcomeResponse>(ErrorCode::corrupt,
+                                        MpClientError::http_response_schema);
+    }
+    wobj = nested;
+  }
+  std::string welcome_b64;
+  if (const auto wb64 = get_optional_string(*wobj, "welcome_blob_b64");
+      wb64.has_value()) {
+    if (const auto &inner = wb64.value(); inner.has_value() && !inner->empty()) {
+      welcome_b64 = *inner;
+    }
+  }
+  if (welcome_b64.empty()) {
+    if (const auto wb64 = get_optional_string(*wobj, "welcome_b64"); wb64.has_value()) {
+      if (const auto &inner = wb64.value(); inner.has_value() && !inner->empty()) {
+        welcome_b64 = *inner;
+      }
+    }
+  }
+  if (welcome_b64.empty()) {
     return Result<MlsWelcomeResponse>::success(MlsWelcomeResponse{});
   }
-  const auto wab64 = get_required_string(obj.value(), "welcome_auth_b64");
-  const auto epoch = get_required_u64(obj.value(), "target_epoch");
-  const auto ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  auto wab64 = get_required_string(*wobj, "welcome_auth_blob_b64");
+  if (!wab64.has_value()) {
+    wab64 = get_required_string(*wobj, "welcome_auth_b64");
+  }
+  auto epoch = get_required_u64(*wobj, "mls_epoch");
+  if (!epoch.has_value()) {
+    epoch = get_required_u64(*wobj, "target_epoch");
+  }
+  auto ds_pk = get_required_pubkey_b64(obj.value(), "party_ds_pubkey_b64");
+  if (!ds_pk.has_value()) {
+    ds_pk = get_required_pubkey_b64(obj.value(), "ds_pubkey_b64");
+  }
+  const auto wid_res = get_required_u64(*wobj, "welcome_id");
+  const std::uint64_t welcome_id = wid_res.has_value() ? wid_res.value() : 0U;
   if (!wab64.has_value() || !epoch.has_value() || !ds_pk.has_value()) {
     return fail_c<MlsWelcomeResponse>(ErrorCode::corrupt,
                                       MpClientError::http_response_schema);
   }
-  const auto wbytes = base64_decode(*wb64.value());
+  const auto wbytes = base64_decode(welcome_b64);
   const auto wabytes = base64_decode(wab64.value());
   if (!wbytes.has_value() || !wabytes.has_value()) {
     return fail_c<MlsWelcomeResponse>(ErrorCode::corrupt,
@@ -7289,6 +7639,7 @@ Result<MlsWelcomeResponse> MpControlClient::mls_fetch_welcome(PartyId party_id) 
       std::move(*wbytes),
       std::move(*wabytes),
       ds_pk.value(),
+      welcome_id,
   });
 }
 
@@ -7300,6 +7651,7 @@ Result<void> MpControlClient::mls_ack_welcome(PartyId party_id,
   }
   Value::Object body_obj;
   body_obj.emplace_back("target_epoch", Value{Number{target_epoch}});
+  body_obj.emplace_back("welcome_id", Value{Number{std::uint64_t{0U}}});
   auto body_bytes = dump_json_bytes(Value::object(std::move(body_obj)));
   if (!body_bytes.has_value()) {
     return Result<void>::failure(body_bytes.error());
@@ -7365,7 +7717,10 @@ MpControlClient::mls_fetch_device_lists(PartyId party_id) {
       }
       const auto acct_raw = get_required_u64_or_decimal(item, "account_id");
       const auto rpk = get_required_pubkey_b64(item, "root_pubkey_b64");
-      const auto lb64 = get_required_string(item, "device_list_b64");
+      auto lb64 = get_required_string(item, "list_b64");
+      if (!lb64.has_value()) {
+        lb64 = get_required_string(item, "device_list_b64");
+      }
       if (!acct_raw.has_value() || !rpk.has_value() || !lb64.has_value()) {
         return fail_c<std::vector<MlsDeviceListEntry>>(
             ErrorCode::corrupt, MpClientError::http_response_schema);

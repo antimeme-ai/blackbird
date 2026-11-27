@@ -1388,6 +1388,12 @@ ChatRow terminal_party_strip(const PartyChatPane &pane, std::size_t max_cells) {
       row.push_back({" · ", Ink::border});
       row.push_back({card_badge, card_ink});
       row.push_back({" " + card_text, Ink::normal});
+    } else if (!snap.room_topic.empty() && tier.include_secondary_status) {
+      const std::string clean_topic = sanitize_strip_text(snap.room_topic, 40U);
+      if (!clean_topic.empty()) {
+        row.push_back({" · ", Ink::border});
+        row.push_back({"Topic: " + clean_topic, Ink::muted});
+      }
     }
     row.push_back({tier.long_hint ? full_hint : short_hint,
                    unread > 0 ? Ink::selected : Ink::muted});
@@ -5849,11 +5855,19 @@ void TerminalUI::run(const std::function<void(std::string_view)> &perform,
                   raw_text.back() == '\r'))
             raw_text.remove_suffix(1);
           if (!raw_text.empty()) {
-            const std::string target_prefix = raw_text.starts_with('@')
-                                                  ? std::string{}
-                                                  : party_pane.selected_target() + " ";
-            const std::string cmd =
-                "/party say " + target_prefix + std::string{raw_text};
+            const bool is_irc_slash =
+                raw_text.starts_with("/me ") || raw_text.starts_with("/nick ") ||
+                raw_text == "/topic" || raw_text.starts_with("/topic ") ||
+                raw_text == "/names" || raw_text.starts_with("/names ");
+            std::string cmd;
+            if (is_irc_slash) {
+              cmd = std::string{raw_text};
+            } else {
+              const std::string target_prefix =
+                  raw_text.starts_with('@') ? std::string{}
+                                            : party_pane.selected_target() + " ";
+              cmd = "/party say " + target_prefix + std::string{raw_text};
+            }
             party_pane.clear_composer();
             dispatch_synthetic_command(cmd, keyboard_read);
           }

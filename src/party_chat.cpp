@@ -1316,10 +1316,12 @@ enum class PartyInk : std::uint8_t {
   dot_online,
   dot_idle,
   dot_offline,
+  irc_action,
+  irc_notice,
 };
 
 std::string_view sgr_for(PartyInk ink) noexcept {
-  constexpr std::array<std::string_view, 14> kCodes{
+  constexpr std::array<std::string_view, 16> kCodes{
       "\x1b[0m",                  // normal
       "\x1b[0;38;2;86;95;137m",   // border
       "\x1b[1;38;2;232;227;217m", // header
@@ -1334,6 +1336,8 @@ std::string_view sgr_for(PartyInk ink) noexcept {
       "\x1b[1;38;2;90;255;170m",  // dot_online
       "\x1b[0;38;2;224;175;104m", // dot_idle
       "\x1b[0;38;2;122;134;156m", // dot_offline
+      "\x1b[3;38;2;180;190;254m", // irc_action (italic subtle accent)
+      "\x1b[0;38;2;140;160;185m", // irc_notice (classic join/part/topic/names)
   };
   return kCodes[static_cast<std::size_t>(ink)];
 }
@@ -1491,6 +1495,10 @@ std::string_view party_message_kind_name(PartyMessageKind kind) noexcept {
     return "conflict";
   case PartyMessageKind::system:
     return "system";
+  case PartyMessageKind::irc_action:
+    return "irc_action";
+  case PartyMessageKind::irc_notice:
+    return "irc_notice";
   }
   return {};
 }
@@ -1508,7 +1516,61 @@ Result<PartyMessageKind> parse_party_message_kind(std::string_view name) noexcep
     return Result<PartyMessageKind>::success(PartyMessageKind::conflict);
   if (equals_ci(name, "system"))
     return Result<PartyMessageKind>::success(PartyMessageKind::system);
+  if (equals_ci(name, "irc_action"))
+    return Result<PartyMessageKind>::success(PartyMessageKind::irc_action);
+  if (equals_ci(name, "irc_notice"))
+    return Result<PartyMessageKind>::success(PartyMessageKind::irc_notice);
   return Result<PartyMessageKind>::failure({ErrorCode::invalid_range});
+}
+
+Result<std::string> validate_irc_nick(std::string_view raw) {
+  const std::string_view trimmed = trim_ascii(raw);
+  if (trimmed.empty() || trimmed.size() > 64U)
+    return Result<std::string>::failure({ErrorCode::invalid_range});
+  // Forbid leading '@' so a session nick can never spoof an @handle.
+  if (trimmed.front() == '@')
+    return Result<std::string>::failure({ErrorCode::invalid_identity});
+
+  std::size_t codepoints = 0U;
+  std::size_t i = 0U;
+  while (i < trimmed.size()) {
+    const DecodedUtf8 dec = decode_utf8_at(trimmed, i);
+    if (dec.length == 0U)
+      return Result<std::string>::failure({ErrorCode::invalid_range});
+    const char32_t cp = dec.scalar;
+    // Reject C0, ASCII space/tabs/whitespace, DEL, C1 controls.
+    if (cp <= 0x20U || (cp >= 0x7fU && cp <= 0x9fU))
+      return Result<std::string>::failure({ErrorCode::invalid_range});
+    // Reject BiDi controls, zero-width chars, soft hyphen, word joiner, line/paragraph
+    // separators, BOM, and Unicode Tag block (U+E0000..U+E007F).
+    if (is_bidi_or_format_control(cp) || cp == 0x00adU || cp == 0x200bU ||
+        cp == 0x200cU || cp == 0x200dU || cp == 0x2028U || cp == 0x2029U ||
+        cp == 0x2060U || (cp >= 0xe0000U && cp <= 0xe007fU)) {
+      return Result<std::string>::failure({ErrorCode::invalid_range});
+    }
+    ++codepoints;
+    if (codepoints > 32U)
+      return Result<std::string>::failure({ErrorCode::invalid_range});
+    i += dec.length;
+  }
+  if (codepoints == 0U)
+    return Result<std::string>::failure({ErrorCode::invalid_range});
+  return Result<std::string>::success(std::string{trimmed});
+}
+
+std::string format_irc_display_name(IrcDisplayNameInput input) {
+  std::string_view bare = trim_ascii(input.handle);
+  while (!bare.empty() && bare.front() == '@')
+    bare.remove_prefix(1U);
+  const std::string clean_handle = party_chat_sanitize(bare, 64U);
+  const std::string badge =
+      clean_handle.empty() ? std::string{"@peer"} : ("@" + clean_handle);
+  if (const auto valid = validate_irc_nick(input.nick); valid.has_value()) {
+    if (!clean_handle.empty() && equals_ci(valid.value(), clean_handle))
+      return badge;
+    return valid.value() + " (" + badge + ")";
+  }
+  return badge;
 }
 
 std::string_view party_message_filter_name(PartyMessageFilter filter) noexcept {
@@ -2783,9 +2845,18 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
     std::string plain = compact ? ("PARTY · " + safe_scope)
                                 : ("PARTY CHAT " + mode_badge + " " + safe_scope);
     if (split) {
-      plain += " · " + counts + " | To: " + safe_target + unread_str;
-    } else if (!unread_str.empty()) {
+      plain += " · " + counts + " | To: " + safe_target;
+      if (!snapshot_.room_topic.empty()) {
+        plain += " · Topic: " + party_chat_sanitize(snapshot_.room_topic, 80);
+      }
       plain += unread_str;
+    } else {
+      if (!snapshot_.room_topic.empty()) {
+        plain += " · " + party_chat_sanitize(snapshot_.room_topic, 48);
+      }
+      if (!unread_str.empty()) {
+        plain += unread_str;
+      }
     }
     std::string line = pad_to_cells(plain, W);
     if (color)
@@ -2853,13 +2924,57 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
       const std::string ts_full = format_timestamp_tag({m.timestamp_ns, idx});
       const std::string ts =
           (compact && ts_full.size() == 8U && ts_full[2] == ':' && ts_full[5] == ':')
-              ? ts_full.substr(0U, 5U)
+              ? ("[" + ts_full.substr(0U, 5U) + "]")
               : ts_full;
+
+      // Classic IRC notices (`--> join`, `<-- part`, `* nick/topic`, `[Users: ...]`)
+      if (m.kind == PartyMessageKind::irc_notice) {
+        const std::string safe_notice = party_chat_sanitize(m.body, 2048);
+        const std::string full = ts + " " + safe_notice;
+        const std::size_t indent_cols = feed_col_w >= 24 ? 4U : 0U;
+        const std::size_t cont_w =
+            feed_col_w > indent_cols ? (feed_col_w - indent_cols) : feed_col_w;
+        auto wrapped = wrap_words_sanitized(full, {feed_col_w, cont_w});
+        for (std::size_t wi = 0; wi < wrapped.size(); ++wi) {
+          feed_lines.push_back(
+              {(wi == 0 ? std::string{} : std::string(indent_cols, ' ')) +
+                   std::move(wrapped[wi]),
+               PartyInk::irc_notice});
+        }
+        continue;
+      }
+
       const std::string rbadge{role_badge(m.sender_role)};
-      const std::string sender =
+      const std::string raw_sender =
           party_chat_sanitize(m.sender_id.empty() ? std::string_view{"unknown"}
                                                   : std::string_view{m.sender_id},
                               32);
+      const std::string sender =
+          !m.sender_nick.empty()
+              ? format_irc_display_name(IrcDisplayNameInput{m.sender_nick, raw_sender})
+              : raw_sender;
+
+      // Classic IRC `/me` actions (`[HH:MM] * <nick> (@<handle>) <action>`)
+      if (m.kind == PartyMessageKind::irc_action) {
+        const std::string safe_action = party_chat_sanitize(m.body, 2048);
+        std::string full = ts + " ";
+        if (m.untrusted_remote) {
+          full += compact ? "[GUEST] " : "[PEER:UNTRUSTED] ";
+        }
+        full += "* " + sender + " " + safe_action;
+        const std::size_t indent_cols = feed_col_w >= 24 ? 4U : 0U;
+        const std::size_t cont_w =
+            feed_col_w > indent_cols ? (feed_col_w - indent_cols) : feed_col_w;
+        auto wrapped = wrap_words_sanitized(full, {feed_col_w, cont_w});
+        for (std::size_t wi = 0; wi < wrapped.size(); ++wi) {
+          feed_lines.push_back(
+              {(wi == 0 ? std::string{} : std::string(indent_cols, ' ')) +
+                   std::move(wrapped[wi]),
+               m.untrusted_remote ? PartyInk::untrusted_badge : PartyInk::irc_action});
+        }
+        continue;
+      }
+
       const std::string target =
           party_chat_sanitize(normalize_target_tag(m.target), 32);
 
@@ -3100,8 +3215,13 @@ PartyChatFrame PartyChatPane::render_frame(PartyPaneWidth width_arg,
         if (compact) {
           const bool is_guest = p.display_name.find("[guest]") != std::string::npos;
           const std::string clean_id = party_chat_sanitize(p.id, 18);
-          l1 += is_guest ? (clean_id + " [guest]")
-                         : (clean_id.starts_with('@') ? clean_id : ("@" + clean_id));
+          if (is_guest) {
+            l1 += clean_id + " [guest]";
+          } else if (!p.nick.empty()) {
+            l1 += format_irc_display_name(IrcDisplayNameInput{p.nick, clean_id});
+          } else {
+            l1 += clean_id.starts_with('@') ? clean_id : ("@" + clean_id);
+          }
         } else {
           l1 += std::string{role_badge(p.role)} + " " + party_chat_sanitize(p.id, 18);
         }

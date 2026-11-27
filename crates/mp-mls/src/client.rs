@@ -42,7 +42,9 @@ use crate::identity::{
     check_safe_counter, compute_room_trust_tier, format_epoch_authenticator, AccountDeviceListV1,
     AccountRootPinStore, DeviceListTracker, MpMlsLeafCredV1, RoomTrustTier, RootRotationStmtV1,
 };
-use crate::invite::{validate_policy_bits, verify_join_proof, InviteRecordV1, WelcomeAuthV1};
+use crate::invite::{
+    validate_policy_bits, verify_join_proof, InviteRecordV1, InviteSecrets, WelcomeAuthV1,
+};
 use crate::policy::{
     build_ds_external_sender, evaluate_local_policy, extract_public_group_leaves,
     leaf_capabilities, leaf_device_list_extensions, required_capabilities_extension,
@@ -238,6 +240,25 @@ pub struct DecryptedAppMessage {
     /// `true` iff `(auth_device_id, inner_msg_id)` was already delivered previously
     /// (e.g., epoch-stale requeue deduplication per §7.1 / §7.2).
     pub is_duplicate: bool,
+}
+
+/// Derives the deterministic `member_join_mac_key` shared by sibling devices of the same
+/// account (`account_id` + `root_pubkey`) for a given `group_id` so a second device under
+/// the same operator can join an active E2EE room without an out-of-band invite fragment
+/// while still authenticating `WelcomeAuthV1` against a lone malicious DS.
+pub fn derive_sibling_welcome_mac_key(
+    group_id: &[u8; MP_GROUP_ID_LEN],
+    account_id: u64,
+    root_pubkey: &Ed25519PubKey,
+) -> Result<[u8; 32], MpMlsError> {
+    let mut preimage = Vec::with_capacity(26 + MP_GROUP_ID_LEN + 8 + 32);
+    preimage.extend_from_slice(b"mp-mls-sibling-welcome-v1:");
+    preimage.extend_from_slice(group_id);
+    preimage.extend_from_slice(&account_id.to_be_bytes());
+    preimage.extend_from_slice(root_pubkey);
+    let seed = sha256(&preimage);
+    let secrets = InviteSecrets::derive(group_id, &seed)?;
+    Ok(secrets.member_join_mac_key)
 }
 
 /// Output of `MpMlsClient::commit_add_member_with_invite`.
@@ -862,6 +883,132 @@ impl MpMlsClient {
             commit_sha256: sha256(&commit_bytes),
             consumed_kp_ref: Some(kp_ref),
             invite_id_used: Some(invite_id),
+            updated_identity: None,
+        });
+
+        Ok(AddMemberCommitOutput {
+            commit_bytes,
+            welcome_bytes,
+            welcome_auth,
+        })
+    }
+
+    /// Validates a same-account sibling device's `KeyPackage` (same `account_id`, same
+    /// `root_pubkey`, distinct `device_id`, valid `0xFF02` `AccountDeviceListV1`) and builds
+    /// a path-bearing `Add` Commit + `Welcome` + sibling-keyed `WelcomeAuthV1`.
+    pub fn commit_add_sibling_device(
+        &mut self,
+        kp_bytes: &[u8],
+        now_s: u64,
+    ) -> Result<AddMemberCommitOutput, MpMlsError> {
+        check_safe_counter(now_s)?;
+        let policy = self.room_policy()?;
+
+        let kp_msg = MlsMessageIn::tls_deserialize_exact_bytes(kp_bytes)
+            .map_err(|e| MpMlsError::OpenMls(format!("KeyPackage decode failed: {e}")))?;
+        let kp_in: KeyPackageIn = match kp_msg.extract() {
+            MlsMessageBodyIn::KeyPackage(kp) => kp,
+            _ => {
+                return Err(MpMlsError::KeyPackageAdmissionRejected(
+                    "expected MlsMessageBodyIn::KeyPackage",
+                ));
+            }
+        };
+        let kp = kp_in
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| MpMlsError::OpenMls(format!("KeyPackage validation failed: {e}")))?;
+
+        let kp_ref: [u8; 32] = kp
+            .hash_ref(self.provider.crypto())
+            .map_err(|e| MpMlsError::OpenMls(e.to_string()))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| MpMlsError::KeyPackageAdmissionRejected("invalid kp_ref length"))?;
+
+        if self.consumed_kp_refs.contains_key(&kp_ref) {
+            return Err(MpMlsError::KeyPackageAdmissionRejected(
+                "KeyPackage kp_ref already consumed (replay rejected)",
+            ));
+        }
+
+        let (joiner_cred, _joiner_list) = validate_key_package_admission(
+            &kp,
+            now_s,
+            &policy,
+            Some(&self.pins),
+            Some(&self.device_lists),
+        )?;
+
+        let own_body = &self.identity.cred.binding.body;
+        let join_body = &joiner_cred.binding.body;
+        if join_body.account_id != own_body.account_id
+            || join_body.root_pubkey != own_body.root_pubkey
+        {
+            return Err(MpMlsError::PinnedRootMismatch);
+        }
+        if join_body.device_id == own_body.device_id {
+            return Err(MpMlsError::KeyPackageAdmissionRejected(
+                "cannot add own device_id as sibling",
+            ));
+        }
+
+        let sibling_mac_key = derive_sibling_welcome_mac_key(
+            &self.group_id,
+            own_body.account_id,
+            &own_body.root_pubkey,
+        )?;
+
+        let signer = self.identity.openmls_signer();
+        let bundle = self
+            .group
+            .commit_builder()
+            .consume_proposal_store(false)
+            .propose_adds([kp])
+            .force_self_update(true)
+            .load_psks(self.provider.storage())
+            .map_err(|e| MpMlsError::OpenMls(e.to_string()))?
+            .use_ratchet_tree_extension(true)
+            .build(self.provider.rand(), self.provider.crypto(), &signer, |_| true)
+            .map_err(|e| MpMlsError::OpenMls(format!("CommitBuilder::build failed: {e}")))?
+            .stage_commit(&self.provider)
+            .map_err(|e| MpMlsError::OpenMls(format!("stage_commit failed: {e}")))?;
+
+        let (commit_msg, welcome_opt, group_info_opt) = bundle.into_contents();
+        let welcome = welcome_opt
+            .ok_or_else(|| MpMlsError::OpenMls("Add commit did not produce Welcome".into()))?;
+        let group_info = group_info_opt
+            .ok_or_else(|| MpMlsError::OpenMls("Add commit did not produce GroupInfo".into()))?;
+
+        let commit_bytes = commit_msg
+            .tls_serialize_detached()
+            .map_err(|e| MpMlsError::OpenMls(e.to_string()))?;
+        let welcome_msg = MlsMessageOut::from_welcome(welcome, ProtocolVersion::Mls10);
+        let welcome_bytes = welcome_msg
+            .tls_serialize_detached()
+            .map_err(|e| MpMlsError::OpenMls(e.to_string()))?;
+
+        let tree_hash: [u8; 32] = group_info
+            .group_context()
+            .tree_hash()
+            .try_into()
+            .map_err(|_| MpMlsError::OpenMls("unexpected tree_hash length".into()))?;
+        let confirmation_tag = extract_commit_confirmation_tag(&commit_bytes)?;
+
+        let welcome_auth = WelcomeAuthV1::new(
+            &sibling_mac_key,
+            self.group_id,
+            group_info.group_context().epoch().as_u64(),
+            1,
+            policy.invite_epoch,
+            kp_ref,
+            tree_hash,
+            confirmation_tag,
+        )?;
+
+        self.pending_commit_meta = Some(PendingCommitMeta {
+            commit_sha256: sha256(&commit_bytes),
+            consumed_kp_ref: Some(kp_ref),
+            invite_id_used: None,
             updated_identity: None,
         });
 
